@@ -1,0 +1,8 @@
+[package]
+name = "mindrune"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "2a44156b21d63b0342a366b26d9222a6edd4622c" }

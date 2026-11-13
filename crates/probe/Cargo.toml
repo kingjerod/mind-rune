@@ -1,0 +1,15 @@
+[package]
+name = "mr-probe"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "mindrune-probe"
+path = "src/main.rs"
+
+[dependencies]
+mr-agent = { path = "../agent" }
+mr-claude = { path = "../claude" }
+serde_json.workspace = true
+uuid.workspace = true

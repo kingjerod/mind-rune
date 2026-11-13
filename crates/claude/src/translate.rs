@@ -1,0 +1,1992 @@
+//! Turns the stream of parsed `claude` output into the agent-neutral
+//! [`SessionEvent`]s the UI consumes.
+//!
+//! [`Translator`] is stateful: it remembers whether a turn is open, which kind
+//! of block is open, and the last known model, permission mode and title. Each message
+//! kind has its own method, so a new rule is a new arm in [`Translator::push`]
+//! plus one method.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use mr_agent::{
+    AgentError, Answer, LimitWindow, ModelOption, PermissionMode, Question, RemoteAccess,
+    RequestId, SessionEvent, SessionId, SessionInfo, ToolCallId, ToolDetail, ToolOutcome,
+    TurnSummary, UsageLimits, UserRequest, UserRequestKind,
+};
+use serde_json::{Value, json};
+
+use crate::encode::PermissionReply;
+use crate::mode::mode_from_wire;
+use crate::wire::{Block, BlockKind, Incoming, StreamEvent, ToolResult};
+
+/// What a control request this adapter sends asks for, so its reply can be
+/// turned into an event. See [`Translator::track`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tracked {
+    /// The `initialize` request; its reply starts the session when the
+    /// translator knows the session (see [`Translator::for_session`]).
+    Initialize,
+    RemoteOn,
+    RemoteOff,
+    SetModel(String),
+    SetMode(PermissionMode),
+    Rename(String),
+    Other,
+}
+
+/// What the adapter knows about a session before `claude` reports anything:
+/// the id it chose or resumed, the folder, and what the user asked for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionStart {
+    pub id: SessionId,
+    pub folder: PathBuf,
+    /// The model asked for, such as the alias `haiku`; `None` for the default.
+    pub model: Option<String>,
+    pub permission_mode: Option<PermissionMode>,
+}
+
+/// Translates one session's output, message by message.
+#[derive(Debug, Default)]
+pub struct Translator {
+    /// The session as known before any output, for `Started` at the reply to
+    /// `initialize`. Without it, the first `Init` gives `Started`.
+    start: Option<SessionStart>,
+    /// Whether `Started` has been given.
+    started: bool,
+    /// The last model `Init` named. Shared with the rules that report model changes.
+    model: Option<String>,
+    /// The last known permission mode. Shared by the `Init` and `ModeChanged` rules.
+    mode: Option<PermissionMode>,
+    /// The last title reported. `Init` does not name one.
+    title: Option<String>,
+    /// The `session_url` of the most recent successful `RemoteOn` reply,
+    /// forgotten when Remote Control is turned off or fails to turn on.
+    remote_url: Option<String>,
+    /// Control requests sent and not yet answered, by `request_id`.
+    tracked: HashMap<String, Tracked>,
+    turn_open: bool,
+    /// The kind of the block a `BlockStart` opened and a `BlockStop` has not closed.
+    open_block: Option<BlockKind>,
+    /// Whether a non-empty delta was passed on for the open block.
+    block_has_text: bool,
+    /// Whether the current top-level message is being streamed: set at its
+    /// `MessageStart`, cleared at its `MessageStop` and at `Result`. While it
+    /// is set, an `Assistant` record's text and thinking were already given
+    /// as deltas.
+    streaming: bool,
+    /// `usage_tokens` of the latest top-level `Assistant` record.
+    last_usage_tokens: Option<u64>,
+    /// Requests raised and not yet answered or withdrawn, by `request_id`.
+    pending: HashMap<String, PendingRequest>,
+}
+
+/// What a raised request needs to remember to build its reply.
+#[derive(Debug)]
+struct PendingRequest {
+    kind: PendingKind,
+    /// The request's `input`, always a JSON object.
+    input: Value,
+    /// What always-allow sends back: the first suggestion alone, and only when
+    /// it has a label. Decided when the request is raised, so the label shown
+    /// and the permission granted cannot differ.
+    always_allow: Option<Value>,
+}
+
+#[derive(Debug, PartialEq)]
+enum PendingKind {
+    Permission,
+    Question,
+    Plan,
+}
+
+impl Translator {
+    /// A translator that knows nothing in advance: the first `Init` gives
+    /// `Started`, with no models.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A translator for a session the adapter opened: the reply to the request
+    /// tracked as [`Tracked::Initialize`] gives `Started`, before any turn, and
+    /// the first `Init` then reports only what differs from it.
+    pub fn for_session(start: SessionStart) -> Self {
+        Self {
+            start: Some(start),
+            ..Self::default()
+        }
+    }
+
+    /// Records what a control request asks for. Call it before sending the
+    /// request, so its reply cannot arrive first.
+    pub fn track(&mut self, request_id: &str, what: Tracked) {
+        self.tracked.insert(request_id.to_string(), what);
+    }
+
+    /// Feeds one parsed line and returns the events it gives, in order.
+    pub fn push(&mut self, message: Incoming) -> Vec<SessionEvent> {
+        match message {
+            Incoming::Init {
+                session_id,
+                model,
+                permission_mode,
+                version,
+                cwd,
+            } => self.init(session_id, model, permission_mode, version, cwd),
+            Incoming::ModeChanged { permission_mode } => self.mode_changed(&permission_mode),
+            Incoming::Stream {
+                parent: None,
+                event,
+            } => self.stream(event),
+            Incoming::Assistant {
+                parent: None,
+                blocks,
+                usage_tokens,
+                ..
+            } => self.assistant(blocks, usage_tokens),
+            Incoming::ToolResults {
+                parent: None,
+                results,
+            } => results.into_iter().map(tool_finished).collect(),
+            Incoming::ControlRequest {
+                request_id,
+                subtype,
+                body,
+            } if subtype == "can_use_tool" => self.can_use_tool(request_id, &body),
+            Incoming::ControlCancel { request_id } => self.cancelled(&request_id),
+            Incoming::RateLimit {
+                five_hour,
+                seven_day,
+            } => vec![SessionEvent::UsageLimits(UsageLimits {
+                session: five_hour.map(limit_window),
+                weekly: seven_day.map(limit_window),
+            })],
+            Incoming::BridgeState {
+                state,
+                detail,
+                failure_kind,
+            } => self.bridge_state(&state, detail, failure_kind.as_deref()),
+            Incoming::TitleChanged { title } => self.title_changed(title).into_iter().collect(),
+            Incoming::ControlResponse {
+                request_id,
+                ok,
+                body,
+                error,
+                error_code,
+            } => self.control_response(&request_id, ok, &body, error, error_code.as_deref()),
+            Incoming::Result {
+                is_error,
+                interrupted,
+                text,
+                cost_usd,
+                duration_ms,
+                context_window,
+            } => self.result(
+                is_error,
+                interrupted,
+                text,
+                cost_usd,
+                duration_ms,
+                context_window,
+            ),
+            // Sub-agent records (`parent` set) and the kinds later rules cover.
+            Incoming::Stream { .. }
+            | Incoming::Assistant { .. }
+            | Incoming::ToolResults { .. }
+            | Incoming::ControlRequest { .. }
+            | Incoming::Ignored { .. } => Vec::new(),
+        }
+    }
+
+    fn init(
+        &mut self,
+        session_id: String,
+        model: String,
+        permission_mode: String,
+        version: String,
+        cwd: String,
+    ) -> Vec<SessionEvent> {
+        let mode = mode_from_wire(&permission_mode);
+        if !self.started {
+            self.started = true;
+            self.model = Some(model.clone());
+            self.mode = Some(mode.clone());
+            return vec![SessionEvent::Started(SessionInfo {
+                id: SessionId(session_id),
+                folder: cwd.into(),
+                model,
+                permission_mode: mode,
+                agent_version: version,
+                models: Vec::new(),
+            })];
+        }
+        let mut events: Vec<SessionEvent> = self.model_changed_to(model).into_iter().collect();
+        events.extend(self.mode_changed_to(mode));
+        events
+    }
+
+    fn mode_changed(&mut self, permission_mode: &str) -> Vec<SessionEvent> {
+        self.mode_changed_to(mode_from_wire(permission_mode))
+            .into_iter()
+            .collect()
+    }
+
+    fn mode_changed_to(&mut self, mode: PermissionMode) -> Option<SessionEvent> {
+        if self.mode.as_ref() == Some(&mode) {
+            return None;
+        }
+        self.mode = Some(mode.clone());
+        Some(SessionEvent::PermissionModeChanged(mode))
+    }
+
+    fn model_changed_to(&mut self, model: String) -> Option<SessionEvent> {
+        if self.model.as_deref() == Some(model.as_str()) {
+            return None;
+        }
+        self.model = Some(model.clone());
+        Some(SessionEvent::ModelChanged(model))
+    }
+
+    fn title_changed(&mut self, title: String) -> Option<SessionEvent> {
+        if self.title.as_deref() == Some(title.as_str()) {
+            return None;
+        }
+        self.title = Some(title.clone());
+        Some(SessionEvent::TitleChanged(title))
+    }
+
+    /// There is no "stopped" state: turning Remote Control off gives only the reply.
+    fn bridge_state(
+        &mut self,
+        state: &str,
+        detail: Option<String>,
+        failure_kind: Option<&str>,
+    ) -> Vec<SessionEvent> {
+        let access = match state {
+            "failed" => RemoteAccess::Failed {
+                reason: detail.unwrap_or_else(|| "Remote Control failed".into()),
+                needs_login: failure_kind == Some("auth"),
+            },
+            "ready" => RemoteAccess::Starting,
+            "connected" => RemoteAccess::On {
+                url: self.remote_url.clone(),
+            },
+            _ => return Vec::new(),
+        };
+        vec![SessionEvent::RemoteAccess(access)]
+    }
+
+    /// The event for the reply to a request that was tracked, which is then forgotten.
+    fn control_response(
+        &mut self,
+        request_id: &str,
+        ok: bool,
+        body: &Value,
+        error: Option<String>,
+        error_code: Option<&str>,
+    ) -> Vec<SessionEvent> {
+        let Some(tracked) = self.tracked.remove(request_id) else {
+            return Vec::new();
+        };
+        let reason = || {
+            error
+                .clone()
+                .unwrap_or_else(|| "The request was refused".into())
+        };
+        let event = match (tracked, ok) {
+            (Tracked::Other, _) | (Tracked::Initialize, false) => None,
+            (Tracked::Initialize, true) => self.initialized(body),
+            (Tracked::RemoteOn, true) => {
+                self.remote_url = body
+                    .get("session_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Some(SessionEvent::RemoteAccess(RemoteAccess::Starting))
+            }
+            (Tracked::RemoteOn, false) => {
+                self.remote_url = None;
+                Some(SessionEvent::RemoteAccess(RemoteAccess::Failed {
+                    reason: error
+                        .clone()
+                        .unwrap_or_else(|| "Remote Control failed".into()),
+                    needs_login: error_code == Some("remote_control_auth"),
+                }))
+            }
+            (Tracked::RemoteOff, true) => {
+                self.remote_url = None;
+                Some(SessionEvent::RemoteAccess(RemoteAccess::Off))
+            }
+            (Tracked::SetModel(asked), true) => {
+                let model = body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map_or(asked, str::to_string);
+                self.model_changed_to(model)
+            }
+            (Tracked::SetMode(mode), true) => self.mode_changed_to(mode),
+            (Tracked::Rename(title), true) => self.title_changed(title),
+            (Tracked::RemoteOff, false) => Some(command_failed("remote access", reason())),
+            (Tracked::SetModel(_), false) => Some(command_failed("model", reason())),
+            (Tracked::SetMode(_), false) => Some(command_failed("permission mode", reason())),
+            (Tracked::Rename(_), false) => Some(command_failed("rename", reason())),
+        };
+        event.into_iter().collect()
+    }
+
+    /// `Started` from a successful reply to `initialize`, once, and only when
+    /// the session is known in advance.
+    fn initialized(&mut self, body: &Value) -> Option<SessionEvent> {
+        if self.started {
+            return None;
+        }
+        let start = self.start.clone()?;
+        let text = |key: &str| body.get(key).and_then(Value::as_str);
+        let models: Vec<ModelOption> = body
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(model_option)
+            .collect();
+        let wanted = start.model.as_deref().unwrap_or("default");
+        let model = models
+            .iter()
+            .find(|option| option.id == wanted && !option.resolved.is_empty())
+            .map_or_else(
+                || start.model.clone().unwrap_or_default(),
+                |option| option.resolved.clone(),
+            );
+        let permission_mode = text("current_permission_mode")
+            .map(mode_from_wire)
+            .or(start.permission_mode)
+            .unwrap_or(PermissionMode::Ask);
+        self.started = true;
+        self.model = Some(model.clone());
+        self.mode = Some(permission_mode.clone());
+        Some(SessionEvent::Started(SessionInfo {
+            id: start.id,
+            folder: start.folder,
+            model,
+            permission_mode,
+            agent_version: text("claude_code_version").unwrap_or_default().to_string(),
+            models,
+        }))
+    }
+
+    fn stream(&mut self, event: StreamEvent) -> Vec<SessionEvent> {
+        match event {
+            StreamEvent::MessageStart => {
+                self.streaming = true;
+                if self.turn_open {
+                    Vec::new()
+                } else {
+                    self.turn_open = true;
+                    vec![SessionEvent::TurnStarted]
+                }
+            }
+            StreamEvent::BlockStart(kind) => {
+                self.open_block = Some(kind);
+                self.block_has_text = false;
+                Vec::new()
+            }
+            StreamEvent::TextDelta(text) => self.delta(text, SessionEvent::TextDelta),
+            StreamEvent::ThinkingDelta(text) => self.delta(text, SessionEvent::ThinkingDelta),
+            StreamEvent::BlockStop => {
+                let shown = matches!(self.open_block, Some(BlockKind::Text | BlockKind::Thinking))
+                    && self.block_has_text;
+                self.open_block = None;
+                self.block_has_text = false;
+                if shown {
+                    vec![SessionEvent::BlockFinished]
+                } else {
+                    Vec::new()
+                }
+            }
+            StreamEvent::MessageStop => {
+                self.streaming = false;
+                Vec::new()
+            }
+            StreamEvent::Other => Vec::new(),
+        }
+    }
+
+    fn delta(&mut self, text: String, make: fn(String) -> SessionEvent) -> Vec<SessionEvent> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.block_has_text = true;
+        vec![make(text)]
+    }
+
+    fn assistant(&mut self, blocks: Vec<Block>, usage_tokens: Option<u64>) -> Vec<SessionEvent> {
+        let streamed = self.streaming;
+        self.last_usage_tokens = usage_tokens;
+        let mut events = Vec::new();
+        for block in blocks {
+            match block {
+                Block::ToolUse { id, name, input } => {
+                    let detail = tool_detail(&name, &input);
+                    events.push(SessionEvent::ToolStarted {
+                        id: ToolCallId(id),
+                        name,
+                        detail,
+                    });
+                }
+                Block::Text(text) if !streamed && !text.is_empty() => {
+                    events.push(SessionEvent::TextDelta(text));
+                    events.push(SessionEvent::BlockFinished);
+                }
+                Block::Thinking(text) if !streamed && !text.is_empty() => {
+                    events.push(SessionEvent::ThinkingDelta(text));
+                    events.push(SessionEvent::BlockFinished);
+                }
+                Block::Text(_) | Block::Thinking(_) | Block::Other => {}
+            }
+        }
+        events
+    }
+
+    fn can_use_tool(&mut self, request_id: String, body: &Value) -> Vec<SessionEvent> {
+        // A request that cannot be understood still reaches the user: `claude` waits for a reply.
+        let tool = body
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown tool");
+        let input = match body.get("input") {
+            Some(input) if input.is_object() => input.clone(),
+            _ => json!({}),
+        };
+        let suggestions = body
+            .get("permission_suggestions")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let label = always_allow_label(&suggestions);
+        let always_allow = label
+            .as_ref()
+            .and_then(|_| suggestions.get(0))
+            .map(|first| json!([first]));
+        let (pending_kind, kind) = match tool {
+            "AskUserQuestion" => (
+                PendingKind::Question,
+                UserRequestKind::Question {
+                    questions: questions(&input),
+                },
+            ),
+            "ExitPlanMode" => (
+                PendingKind::Plan,
+                UserRequestKind::PlanApproval {
+                    plan_markdown: input
+                        .get("plan")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+            ),
+            _ => (
+                PendingKind::Permission,
+                UserRequestKind::Permission {
+                    tool: tool.to_string(),
+                    detail: tool_detail(tool, &input),
+                    always_allow_label: label,
+                },
+            ),
+        };
+        self.pending.insert(
+            request_id.clone(),
+            PendingRequest {
+                kind: pending_kind,
+                input,
+                always_allow,
+            },
+        );
+        vec![SessionEvent::NeedsUser(UserRequest {
+            id: RequestId(request_id),
+            kind,
+        })]
+    }
+
+    fn cancelled(&mut self, request_id: &str) -> Vec<SessionEvent> {
+        match self.pending.remove(request_id) {
+            Some(_) => vec![SessionEvent::RequestWithdrawn {
+                id: RequestId(request_id.to_string()),
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    /// Builds the reply to a raised request from the user's answer. The request
+    /// is forgotten only when the answer fits it; a mismatch leaves it pending.
+    pub fn answer(
+        &mut self,
+        id: &RequestId,
+        answer: Answer,
+    ) -> Result<PermissionReply, AgentError> {
+        let pending = self
+            .pending
+            .get(&id.0)
+            .ok_or_else(|| AgentError::Protocol(format!("no pending request {}", id.0)))?;
+        let reply = match (&pending.kind, answer) {
+            (PendingKind::Permission, Answer::Allow { always }) => {
+                let updated_permissions = pending.always_allow.clone().filter(|_| always);
+                PermissionReply::Allow {
+                    updated_input: pending.input.clone(),
+                    updated_permissions,
+                }
+            }
+            (PendingKind::Permission, Answer::Deny { message }) => PermissionReply::Deny {
+                message: message.unwrap_or_else(|| "Denied by the user".into()),
+            },
+            (PendingKind::Question, Answer::Answers(list)) => {
+                let answers: serde_json::Map<String, Value> = list
+                    .into_iter()
+                    .map(|a| {
+                        let text = if a.chosen.is_empty() {
+                            a.free_text.unwrap_or_default()
+                        } else {
+                            a.chosen.join(", ")
+                        };
+                        (a.prompt, Value::String(text))
+                    })
+                    .collect();
+                let mut updated_input = pending.input.clone();
+                updated_input["answers"] = Value::Object(answers);
+                PermissionReply::Allow {
+                    updated_input,
+                    updated_permissions: None,
+                }
+            }
+            (PendingKind::Plan, Answer::ApprovePlan) => PermissionReply::Allow {
+                updated_input: pending.input.clone(),
+                updated_permissions: None,
+            },
+            (PendingKind::Plan, Answer::KeepPlanning { feedback }) => PermissionReply::Deny {
+                message: feedback.unwrap_or_else(|| "Keep planning".into()),
+            },
+            (kind, answer) => {
+                return Err(AgentError::Protocol(format!(
+                    "{answer:?} does not fit the {kind:?} request {}",
+                    id.0
+                )));
+            }
+        };
+        self.pending.remove(&id.0);
+        Ok(reply)
+    }
+
+    fn result(
+        &mut self,
+        is_error: bool,
+        interrupted: bool,
+        text: String,
+        cost_usd: f64,
+        duration_ms: u64,
+        context_window: Option<u64>,
+    ) -> Vec<SessionEvent> {
+        self.turn_open = false;
+        self.streaming = false;
+        self.open_block = None;
+        self.block_has_text = false;
+        // A stopped turn is reported as an error by `claude`, but is not a failure.
+        if is_error && !interrupted {
+            return vec![SessionEvent::TurnFailed { reason: text }];
+        }
+        let context_used = match (self.last_usage_tokens, context_window) {
+            (Some(used), Some(window)) if window > 0 => Some((used as f64 / window as f64) as f32),
+            _ => None,
+        };
+        vec![SessionEvent::TurnFinished(TurnSummary {
+            cost_usd,
+            context_used,
+            duration_ms,
+            interrupted,
+        })]
+    }
+}
+
+/// One entry of the `initialize` reply's `models`. An entry without a `value`
+/// cannot be asked for, so it is skipped. A missing name is the `value`.
+fn model_option(entry: &Value) -> Option<ModelOption> {
+    let text = |key: &str| entry.get(key).and_then(Value::as_str);
+    let id = text("value")?;
+    Some(ModelOption {
+        id: id.to_string(),
+        name: text("displayName").unwrap_or(id).to_string(),
+        resolved: text("resolvedModel").unwrap_or_default().to_string(),
+    })
+}
+
+fn limit_window((used, resets_at_unix): (f32, i64)) -> LimitWindow {
+    LimitWindow {
+        used,
+        resets_at_unix,
+    }
+}
+
+fn command_failed(what: &str, reason: String) -> SessionEvent {
+    SessionEvent::CommandFailed {
+        what: what.into(),
+        reason,
+    }
+}
+
+fn tool_finished(result: ToolResult) -> SessionEvent {
+    let output = result.text;
+    SessionEvent::ToolFinished {
+        id: ToolCallId(result.tool_use_id),
+        outcome: if result.is_error {
+            ToolOutcome::Failed { output }
+        } else {
+            ToolOutcome::Ok { output }
+        },
+    }
+}
+
+/// The questions an `AskUserQuestion` input holds. Entries without a prompt are skipped.
+fn questions(input: &Value) -> Vec<Question> {
+    let list = input.get("questions").and_then(Value::as_array);
+    list.into_iter()
+        .flatten()
+        .filter_map(|q| {
+            let prompt = q.get("question").and_then(Value::as_str)?.to_string();
+            let options = q
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.get("label").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            let multi_select = q
+                .get("multiSelect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(Question {
+                prompt,
+                options,
+                multi_select,
+            })
+        })
+        .collect()
+}
+
+/// The words for the "always allow" choice, from the first of a request's
+/// permission suggestions only; that suggestion is also the only one sent back.
+/// A rule suggestion names every rule it grants, each as `Tool(content)`, or as
+/// `Tool` when it has no content, and says where the grant lasts. `None` when
+/// the suggestion is not one this adapter can describe exactly: a rule without
+/// a tool name, or with content that is not text, never gets a label.
+pub fn always_allow_label(suggestions: &Value) -> Option<String> {
+    let first = suggestions.get(0)?;
+    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+        value.get(key).and_then(Value::as_str)
+    }
+    let destination = text(first, "destination")?;
+    match text(first, "type")? {
+        "addRules" if text(first, "behavior") == Some("allow") => {
+            let rules = first
+                .get("rules")?
+                .as_array()?
+                .iter()
+                .map(rule_label)
+                .collect::<Option<Vec<_>>>()?;
+            if rules.is_empty() {
+                return None;
+            }
+            let scope = match destination {
+                "session" => "for this session",
+                "localSettings" => "in this project",
+                "projectSettings" => "for everyone in this project",
+                "userSettings" => "in all projects",
+                _ => return None,
+            };
+            Some(format!("Always allow {} {scope}", rules.join(", ")))
+        }
+        "setMode" if text(first, "mode") == Some("acceptEdits") && destination == "session" => {
+            Some("Allow all edits for this session".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// One permission rule as `Tool(content)` or `Tool`.
+fn rule_label(rule: &Value) -> Option<String> {
+    let tool = rule
+        .get("toolName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    match rule.get("ruleContent") {
+        None | Some(Value::Null) => Some(tool.to_string()),
+        Some(Value::String(content)) if content.is_empty() => Some(tool.to_string()),
+        Some(Value::String(content)) => Some(format!("{tool}({content})")),
+        Some(_) => None,
+    }
+}
+
+/// What a tool call does, in terms the UI can show. A tool that is not known,
+/// or a known one missing its fields, gives `Other` with the input as compact JSON.
+pub fn tool_detail(name: &str, input: &Value) -> ToolDetail {
+    let field = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_string);
+    let known = match name {
+        "Bash" => field("command").map(|command| ToolDetail::Command { command }),
+        "Edit" => match (field("file_path"), field("old_string"), field("new_string")) {
+            (Some(path), Some(old_text), Some(new_text)) => Some(ToolDetail::FileEdit {
+                path,
+                old_text,
+                new_text,
+            }),
+            _ => None,
+        },
+        "Write" => match (field("file_path"), field("content")) {
+            (Some(path), Some(content)) => Some(ToolDetail::FileWrite { path, content }),
+            _ => None,
+        },
+        "Read" => field("file_path").map(|path| ToolDetail::FileRead { path }),
+        "Grep" | "Glob" => field("pattern").map(|query| ToolDetail::Search { query }),
+        "WebSearch" => field("query").map(|query| ToolDetail::Search { query }),
+        _ => None,
+    };
+    known.unwrap_or_else(|| ToolDetail::Other {
+        input_json: input.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::parse_line;
+    use mr_agent::{ModelOption, QuestionAnswer};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn feed(lines: &[&str]) -> Vec<SessionEvent> {
+        let mut translator = Translator::new();
+        lines
+            .iter()
+            .flat_map(|line| translator.push(parse_line(line)))
+            .collect()
+    }
+
+    const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku-5-5","permissionMode":"default","claude_code_version":"2.1.319","cwd":"/work"}"#;
+    const MSG_START: &str =
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}"#;
+    const TEXT_START: &str = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#;
+    const DELTA_OK: &str = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}}"#;
+    const BLOCK_STOP: &str =
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#;
+    const ASSISTANT_OK: &str = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":40000,"cache_read_input_tokens":9000,"cache_creation_input_tokens":0,"output_tokens":1000}}}"#;
+    const MSG_STOP: &str = r#"{"type":"stream_event","event":{"type":"message_stop"}}"#;
+    const RESULT_OK: &str = r#"{"type":"result","is_error":false,"duration_ms":915,"total_cost_usd":0.002,"result":"ok","modelUsage":{"claude-haiku-5-5":{"contextWindow":1000000}}}"#;
+
+    #[test]
+    fn a_streamed_text_turn() {
+        // The order recorded live: the `assistant` record for a block comes
+        // before that block's `content_block_stop`.
+        let events = feed(&[
+            INIT,
+            MSG_START,
+            TEXT_START,
+            DELTA_OK,
+            ASSISTANT_OK,
+            BLOCK_STOP,
+            MSG_STOP,
+            RESULT_OK,
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                SessionEvent::Started(SessionInfo {
+                    id: SessionId("s1".into()),
+                    folder: "/work".into(),
+                    model: "claude-haiku-5-5".into(),
+                    permission_mode: PermissionMode::Ask,
+                    agent_version: "2.1.319".into(),
+                    models: vec![]
+                }),
+                SessionEvent::TurnStarted,
+                SessionEvent::TextDelta("ok".into()),
+                SessionEvent::BlockFinished,
+                SessionEvent::TurnFinished(TurnSummary {
+                    cost_usd: 0.002,
+                    context_used: Some(0.05),
+                    duration_ms: 915,
+                    interrupted: false
+                }),
+            ]
+        );
+    }
+
+    /// The first line of the V1 recording: the real reply to `initialize`.
+    fn initialize_reply() -> &'static str {
+        include_str!("../tests/fixtures/live/v1-remote.jsonl")
+            .lines()
+            .next()
+            .unwrap()
+    }
+
+    fn opening(model: Option<&str>, mode: Option<PermissionMode>) -> Translator {
+        let mut t = Translator::for_session(SessionStart {
+            id: SessionId("chosen".into()),
+            folder: "/work".into(),
+            model: model.map(str::to_string),
+            permission_mode: mode,
+        });
+        t.track("probe_1", Tracked::Initialize);
+        t
+    }
+
+    fn started_info(events: &[SessionEvent]) -> SessionInfo {
+        match events {
+            [SessionEvent::Started(info)] => info.clone(),
+            other => panic!("expected Started alone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_initialize_reply_starts_the_session_before_any_turn() {
+        let mut t = opening(None, None);
+        let info = started_info(&t.push(parse_line(initialize_reply())));
+        assert_eq!(info.id, SessionId("chosen".into()));
+        assert_eq!(info.folder, PathBuf::from("/work"));
+        assert_eq!(info.model, "claude-fable-5-2", "the default entry");
+        assert_eq!(info.permission_mode, PermissionMode::Ask);
+        assert_eq!(info.agent_version, "2.1.319");
+        assert_eq!(
+            info.models[1],
+            ModelOption {
+                id: "opus".into(),
+                name: "Opus 5.5".into(),
+                resolved: "claude-opus-5-5".into()
+            }
+        );
+        assert_eq!(info.models.len(), 3);
+        // The turn's init repeats what is known: nothing new to report.
+        let init = r#"{"type":"system","subtype":"init","session_id":"chosen","model":"claude-fable-5-2","permissionMode":"default","claude_code_version":"2.1.319","cwd":"/work"}"#;
+        assert!(t.push(parse_line(init)).is_empty());
+        assert!(t.push(parse_line(initialize_reply())).is_empty());
+    }
+
+    #[test]
+    fn the_model_asked_for_is_resolved_from_the_list_or_kept_as_asked() {
+        let mut t = opening(Some("opus"), Some(PermissionMode::Plan));
+        let info = started_info(&t.push(parse_line(initialize_reply())));
+        assert_eq!(info.model, "claude-opus-5-5");
+        assert_eq!(
+            info.permission_mode,
+            PermissionMode::Ask,
+            "the reply's mode wins"
+        );
+
+        let mut t = opening(Some("haiku"), None);
+        let info = started_info(&t.push(parse_line(initialize_reply())));
+        assert_eq!(info.model, "haiku", "no entry for it");
+        // The first init then reports only what differs.
+        assert_eq!(
+            t.push(parse_line(INIT)),
+            vec![SessionEvent::ModelChanged("claude-haiku-5-5".into())]
+        );
+    }
+
+    #[test]
+    fn a_sparse_initialize_reply_falls_back_to_what_was_asked() {
+        let mut t = opening(None, Some(PermissionMode::AcceptEdits));
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"probe_1","response":{"models":[{"displayName":"No value"},{"value":"x","displayName":"X","resolvedModel":"claude-x"}]}}}"#;
+        let info = started_info(&t.push(parse_line(reply)));
+        assert_eq!(info.model, "", "nothing asked and no default entry");
+        assert_eq!(info.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(info.agent_version, "");
+        assert_eq!(
+            info.models,
+            vec![ModelOption {
+                id: "x".into(),
+                name: "X".into(),
+                resolved: "claude-x".into()
+            }]
+        );
+        assert_eq!(
+            t.push(parse_line(INIT)),
+            vec![
+                SessionEvent::ModelChanged("claude-haiku-5-5".into()),
+                SessionEvent::PermissionModeChanged(PermissionMode::Ask)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_initialize_gives_nothing_and_the_init_starts_the_session() {
+        let mut t = opening(None, None);
+        let failed = r#"{"type":"control_response","response":{"subtype":"error","request_id":"probe_1","error":"no"}}"#;
+        assert!(t.push(parse_line(failed)).is_empty());
+        let info = started_info(&t.push(parse_line(INIT)));
+        assert_eq!(info.model, "claude-haiku-5-5");
+    }
+
+    #[test]
+    fn without_partial_messages_the_whole_text_still_arrives() {
+        let events = feed(&[INIT, ASSISTANT_OK, RESULT_OK]);
+        assert_eq!(
+            &events[1..3],
+            &[
+                SessionEvent::TextDelta("ok".into()),
+                SessionEvent::BlockFinished
+            ]
+        );
+    }
+
+    fn assistant_text(text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    fn texts(events: &[SessionEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_message_that_was_not_streamed_arrives_after_one_that_was() {
+        let later = assistant_text("later");
+        let next = assistant_text("next turn");
+        let streamed = [
+            MSG_START,
+            TEXT_START,
+            DELTA_OK,
+            ASSISTANT_OK,
+            BLOCK_STOP,
+            MSG_STOP,
+        ];
+        let mut lines = vec![INIT];
+        lines.extend(streamed);
+        lines.push(&later);
+        lines.push(RESULT_OK);
+        lines.push(INIT);
+        lines.extend(streamed);
+        lines.push(RESULT_OK);
+        lines.push(INIT);
+        lines.push(&next);
+        lines.push(RESULT_OK);
+        let events = feed(&lines);
+        assert_eq!(texts(&events), ["ok", "later", "ok", "next turn"]);
+        let at = events
+            .iter()
+            .position(|e| *e == SessionEvent::TextDelta("later".into()))
+            .unwrap();
+        assert_eq!(events[at + 1], SessionEvent::BlockFinished);
+    }
+
+    #[test]
+    fn a_message_cut_off_by_its_result_does_not_hide_the_next_one() {
+        let stopped = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming","duration_ms":1,"total_cost_usd":0}"#;
+        let next = assistant_text("next turn");
+        let events = feed(&[INIT, MSG_START, TEXT_START, DELTA_OK, stopped, &next]);
+        assert_eq!(texts(&events), ["ok", "next turn"]);
+    }
+
+    #[test]
+    fn a_tool_call_starts_and_finishes() {
+        let call = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let done = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a.txt"}]}}"#;
+        let events = feed(&[INIT, MSG_START, call, done]);
+        assert_eq!(
+            &events[2..],
+            &[
+                SessionEvent::ToolStarted {
+                    id: ToolCallId("t1".into()),
+                    name: "Bash".into(),
+                    detail: ToolDetail::Command {
+                        command: "ls".into()
+                    }
+                },
+                SessionEvent::ToolFinished {
+                    id: ToolCallId("t1".into()),
+                    outcome: ToolOutcome::Ok {
+                        output: "a.txt".into()
+                    }
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_init_reports_only_what_changed() {
+        let same = INIT;
+        let other = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-5-5","permissionMode":"plan","claude_code_version":"2.1.319","cwd":"/work"}"#;
+        let events = feed(&[INIT, same, other]);
+        assert_eq!(
+            &events[1..],
+            &[
+                SessionEvent::ModelChanged("claude-sonnet-5-5".into()),
+                SessionEvent::PermissionModeChanged(PermissionMode::Plan)
+            ]
+        );
+    }
+
+    #[test]
+    fn sub_agent_records_are_not_shown() {
+        let sub = r#"{"type":"assistant","parent_tool_use_id":"t9","message":{"id":"m3","content":[{"type":"text","text":"inner"}]}}"#;
+        assert_eq!(feed(&[INIT, sub]).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_result_fails_the_turn() {
+        let bad = r#"{"type":"result","is_error":true,"result":"Failed to authenticate","duration_ms":92,"total_cost_usd":0}"#;
+        assert_eq!(
+            feed(&[INIT, bad])[1],
+            SessionEvent::TurnFailed {
+                reason: "Failed to authenticate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn tool_details_by_tool() {
+        assert_eq!(
+            tool_detail(
+                "Edit",
+                &json!({"file_path":"/a","old_string":"x","new_string":"y"})
+            ),
+            ToolDetail::FileEdit {
+                path: "/a".into(),
+                old_text: "x".into(),
+                new_text: "y".into()
+            }
+        );
+        assert_eq!(
+            tool_detail("Write", &json!({"file_path":"/a","content":"c"})),
+            ToolDetail::FileWrite {
+                path: "/a".into(),
+                content: "c".into()
+            }
+        );
+        assert_eq!(
+            tool_detail("Read", &json!({"file_path":"/a"})),
+            ToolDetail::FileRead { path: "/a".into() }
+        );
+        assert_eq!(
+            tool_detail("Grep", &json!({"pattern":"TODO"})),
+            ToolDetail::Search {
+                query: "TODO".into()
+            }
+        );
+        assert_eq!(
+            tool_detail("WebSearch", &json!({"query":"rust"})),
+            ToolDetail::Search {
+                query: "rust".into()
+            }
+        );
+        assert_eq!(
+            tool_detail("Mystery", &json!({"a":1})),
+            ToolDetail::Other {
+                input_json: r#"{"a":1}"#.into()
+            }
+        );
+        assert_eq!(
+            tool_detail("Bash", &json!({})),
+            ToolDetail::Other {
+                input_json: "{}".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_stopped_turn_finishes_without_failing() {
+        let stopped = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming","errors":["x"],"duration_ms":3555,"total_cost_usd":0.06}"#;
+        assert_eq!(
+            feed(&[INIT, MSG_START, stopped])[2],
+            SessionEvent::TurnFinished(TurnSummary {
+                cost_usd: 0.06,
+                context_used: None,
+                duration_ms: 3555,
+                interrupted: true
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_thinking_block_gives_no_events() {
+        let think_start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}"#;
+        let think_delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":null}}}"#;
+        let sig_delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}}"#;
+        assert_eq!(
+            feed(&[
+                INIT,
+                MSG_START,
+                think_start,
+                think_delta,
+                sig_delta,
+                BLOCK_STOP
+            ])
+            .len(),
+            2,
+            "Started and TurnStarted only"
+        );
+        let whole = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"","signature":"sig"}]}}"#;
+        assert_eq!(feed(&[INIT, whole]).len(), 1);
+    }
+
+    #[test]
+    fn a_status_record_reports_a_mode_change_once() {
+        let plan = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan"}"#;
+        assert_eq!(
+            &feed(&[INIT, plan, plan])[1..],
+            &[SessionEvent::PermissionModeChanged(PermissionMode::Plan)]
+        );
+    }
+
+    fn request(
+        id: &str,
+        tool: &str,
+        input: serde_json::Value,
+        suggestions: serde_json::Value,
+    ) -> Incoming {
+        Incoming::ControlRequest {
+            request_id: id.into(),
+            subtype: "can_use_tool".into(),
+            body: json!({"subtype":"can_use_tool","tool_name":tool,"input":input,
+                         "permission_suggestions":suggestions,"tool_use_id":"t1"}),
+        }
+    }
+
+    fn project_rule() -> serde_json::Value {
+        json!([{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"npm test:*"}],
+                "behavior":"allow","destination":"localSettings"}])
+    }
+
+    #[test]
+    fn a_permission_request_needs_the_user_and_can_be_allowed_once() {
+        let mut t = Translator::new();
+        let events = t.push(request(
+            "req_1",
+            "Bash",
+            json!({"command":"npm test"}),
+            project_rule(),
+        ));
+        assert_eq!(
+            events,
+            vec![SessionEvent::NeedsUser(UserRequest {
+                id: RequestId("req_1".into()),
+                kind: UserRequestKind::Permission {
+                    tool: "Bash".into(),
+                    detail: ToolDetail::Command {
+                        command: "npm test".into()
+                    },
+                    always_allow_label: Some(
+                        "Always allow Bash(npm test:*) in this project".into()
+                    )
+                }
+            })]
+        );
+        let reply = t
+            .answer(&RequestId("req_1".into()), Answer::Allow { always: false })
+            .unwrap();
+        assert_eq!(
+            reply,
+            PermissionReply::Allow {
+                updated_input: json!({"command":"npm test"}),
+                updated_permissions: None
+            }
+        );
+        assert!(
+            t.answer(&RequestId("req_1".into()), Answer::Allow { always: false })
+                .is_err(),
+            "answered once only"
+        );
+    }
+
+    #[test]
+    fn always_allow_sends_back_exactly_the_suggestion() {
+        let mut t = Translator::new();
+        t.push(request(
+            "req_2",
+            "Bash",
+            json!({"command":"npm test"}),
+            project_rule(),
+        ));
+        let reply = t
+            .answer(&RequestId("req_2".into()), Answer::Allow { always: true })
+            .unwrap();
+        assert_eq!(
+            reply,
+            PermissionReply::Allow {
+                updated_input: json!({"command":"npm test"}),
+                updated_permissions: Some(project_rule())
+            }
+        );
+    }
+
+    #[test]
+    fn deny_has_a_default_message() {
+        let mut t = Translator::new();
+        t.push(request(
+            "req_3",
+            "Bash",
+            json!({"command":"rm -rf /"}),
+            json!(null),
+        ));
+        assert_eq!(
+            t.answer(&RequestId("req_3".into()), Answer::Deny { message: None })
+                .unwrap(),
+            PermissionReply::Deny {
+                message: "Denied by the user".into()
+            }
+        );
+    }
+
+    #[test]
+    fn labels_follow_the_suggestion() {
+        let rule = |dest: &str| json!([{"type":"addRules","rules":[{"toolName":"WebFetch"}],"behavior":"allow","destination":dest}]);
+        assert_eq!(
+            always_allow_label(&rule("session")).as_deref(),
+            Some("Always allow WebFetch for this session")
+        );
+        assert_eq!(
+            always_allow_label(&rule("localSettings")).as_deref(),
+            Some("Always allow WebFetch in this project")
+        );
+        assert_eq!(
+            always_allow_label(&rule("projectSettings")).as_deref(),
+            Some("Always allow WebFetch for everyone in this project")
+        );
+        assert_eq!(
+            always_allow_label(&rule("userSettings")).as_deref(),
+            Some("Always allow WebFetch in all projects")
+        );
+        assert_eq!(always_allow_label(&rule("somewhereNew")), None);
+        assert_eq!(
+            always_allow_label(
+                &json!([{"type":"setMode","mode":"acceptEdits","destination":"session"}])
+            )
+            .as_deref(),
+            Some("Allow all edits for this session")
+        );
+        assert_eq!(always_allow_label(&json!([])), None);
+        assert_eq!(always_allow_label(&json!(null)), None);
+        assert_eq!(
+            always_allow_label(
+                &json!([{"type":"addRules","rules":[{"toolName":"Bash"}],"behavior":"deny","destination":"session"}])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_label_says_which_tool_each_rule_is_for() {
+        let rule = |tool: &str, content: &str| {
+            json!([{"type":"addRules","behavior":"allow","destination":"localSettings",
+                "rules":[{"toolName":tool,"ruleContent":content}]}])
+        };
+        let bash = always_allow_label(&rule("Bash", "//a/**"));
+        let read = always_allow_label(&rule("Read", "//a/**"));
+        assert_eq!(
+            bash.as_deref(),
+            Some("Always allow Bash(//a/**) in this project")
+        );
+        assert_eq!(
+            read.as_deref(),
+            Some("Always allow Read(//a/**) in this project")
+        );
+        assert_eq!(
+            always_allow_label(&rule("WebFetch", "")).as_deref(),
+            Some("Always allow WebFetch in this project"),
+            "empty content is the whole tool"
+        );
+        assert_eq!(always_allow_label(&rule("", "npm test:*")), None);
+    }
+
+    #[test]
+    fn a_question_is_answered_by_adding_answers_to_the_input() {
+        let input = json!({"questions":[{"question":"Which?","header":"Pick",
+            "options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"multiSelect":false}]});
+        let mut t = Translator::new();
+        let events = t.push(request(
+            "req_4",
+            "AskUserQuestion",
+            input.clone(),
+            json!(null),
+        ));
+        assert_eq!(
+            events,
+            vec![SessionEvent::NeedsUser(UserRequest {
+                id: RequestId("req_4".into()),
+                kind: UserRequestKind::Question {
+                    questions: vec![Question {
+                        prompt: "Which?".into(),
+                        options: vec!["A".into(), "B".into()],
+                        multi_select: false
+                    }]
+                }
+            })]
+        );
+        assert!(
+            t.answer(&RequestId("req_4".into()), Answer::Allow { always: false })
+                .is_err(),
+            "wrong kind of answer"
+        );
+        let reply = t
+            .answer(
+                &RequestId("req_4".into()),
+                Answer::Answers(vec![QuestionAnswer {
+                    prompt: "Which?".into(),
+                    chosen: vec!["A".into()],
+                    free_text: None,
+                }]),
+            )
+            .unwrap();
+        let mut expected = input;
+        expected["answers"] = json!({"Which?":"A"});
+        assert_eq!(
+            reply,
+            PermissionReply::Allow {
+                updated_input: expected,
+                updated_permissions: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_plan_is_approved_or_sent_back() {
+        let mut t = Translator::new();
+        let events = t.push(request(
+            "req_5",
+            "ExitPlanMode",
+            json!({"plan":"# Plan"}),
+            json!(null),
+        ));
+        assert!(matches!(&events[0], SessionEvent::NeedsUser(UserRequest {
+            kind: UserRequestKind::PlanApproval { plan_markdown }, .. }) if plan_markdown == "# Plan"));
+        assert_eq!(
+            t.answer(
+                &RequestId("req_5".into()),
+                Answer::KeepPlanning { feedback: None }
+            )
+            .unwrap(),
+            PermissionReply::Deny {
+                message: "Keep planning".into()
+            }
+        );
+    }
+
+    #[test]
+    fn other_control_requests_raise_nothing() {
+        let mut t = Translator::new();
+        let other = Incoming::ControlRequest {
+            request_id: "req_6".into(),
+            subtype: "hook_callback".into(),
+            body: json!({}),
+        };
+        assert!(t.push(other).is_empty());
+    }
+
+    #[test]
+    fn always_allow_sends_only_the_first_suggestion() {
+        let three = json!([
+            {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch probe-marker.txt"}],"behavior":"allow","destination":"localSettings"},
+            {"type":"addDirectories","directories":["/work"],"destination":"session"},
+            {"type":"setMode","mode":"acceptEdits","destination":"session"}]);
+        let mut t = Translator::new();
+        t.push(request(
+            "req_1",
+            "Bash",
+            json!({"command":"touch probe-marker.txt"}),
+            three.clone(),
+        ));
+        let reply = t
+            .answer(&RequestId("req_1".into()), Answer::Allow { always: true })
+            .unwrap();
+        assert_eq!(
+            reply,
+            PermissionReply::Allow {
+                updated_input: json!({"command":"touch probe-marker.txt"}),
+                updated_permissions: Some(json!([three[0].clone()]))
+            }
+        );
+    }
+
+    #[test]
+    fn always_allow_without_a_usable_suggestion_allows_once() {
+        let mut t = Translator::new();
+        t.push(request(
+            "req_1",
+            "Bash",
+            json!({"command":"ls"}),
+            json!(null),
+        ));
+        let reply = t
+            .answer(&RequestId("req_1".into()), Answer::Allow { always: true })
+            .unwrap();
+        assert_eq!(
+            reply,
+            PermissionReply::Allow {
+                updated_input: json!({"command":"ls"}),
+                updated_permissions: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_cancelled_request_is_withdrawn() {
+        let mut t = Translator::new();
+        t.push(request(
+            "req_1",
+            "Bash",
+            json!({"command":"ls"}),
+            json!(null),
+        ));
+        assert_eq!(
+            t.push(Incoming::ControlCancel {
+                request_id: "req_1".into()
+            }),
+            vec![SessionEvent::RequestWithdrawn {
+                id: RequestId("req_1".into())
+            }]
+        );
+        assert!(
+            t.answer(&RequestId("req_1".into()), Answer::Allow { always: false })
+                .is_err()
+        );
+        assert!(
+            t.push(Incoming::ControlCancel {
+                request_id: "nope".into()
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_mode_suggestion_is_labelled_only_when_it_lasts_for_the_session() {
+        let mode = |dest: &str| json!([{"type":"setMode","mode":"acceptEdits","destination":dest}]);
+        assert_eq!(
+            always_allow_label(&mode("session")).as_deref(),
+            Some("Allow all edits for this session")
+        );
+        assert_eq!(always_allow_label(&mode("userSettings")), None);
+        assert_eq!(always_allow_label(&mode("localSettings")), None);
+    }
+
+    #[test]
+    fn a_label_names_every_rule_the_suggestion_grants() {
+        let two = json!([{"type":"addRules","behavior":"allow","destination":"session",
+            "rules":[{"toolName":"Read","ruleContent":"//a/**"},{"toolName":"Bash"}]}]);
+        assert_eq!(
+            always_allow_label(&two).as_deref(),
+            Some("Always allow Read(//a/**), Bash for this session")
+        );
+        let nameless = json!([{"type":"addRules","behavior":"allow","destination":"session",
+            "rules":[{"toolName":"Read"},{"ruleContent":"x"}]}]);
+        assert_eq!(always_allow_label(&nameless), None);
+        let odd_content = json!([{"type":"addRules","behavior":"allow","destination":"session",
+            "rules":[{"toolName":"Read","ruleContent":7}]}]);
+        assert_eq!(always_allow_label(&odd_content), None);
+        let none =
+            json!([{"type":"addRules","behavior":"allow","destination":"session","rules":[]}]);
+        assert_eq!(always_allow_label(&none), None);
+        // Whatever the label says, always-allow sends the suggestion as received.
+        let mut t = Translator::new();
+        t.push(request("req_1", "Read", json!({}), two.clone()));
+        assert_eq!(
+            t.answer(&RequestId("req_1".into()), Answer::Allow { always: true })
+                .unwrap(),
+            PermissionReply::Allow {
+                updated_input: json!({}),
+                updated_permissions: Some(two)
+            }
+        );
+    }
+
+    #[test]
+    fn a_question_with_a_malformed_input_can_still_be_answered() {
+        let mut t = Translator::new();
+        let events = t.push(request("req_1", "AskUserQuestion", json!("x"), json!(null)));
+        assert!(matches!(&events[0], SessionEvent::NeedsUser(UserRequest {
+            kind: UserRequestKind::Question { questions }, .. }) if questions.is_empty()));
+        let reply = t
+            .answer(
+                &RequestId("req_1".into()),
+                Answer::Answers(vec![QuestionAnswer {
+                    prompt: "Which?".into(),
+                    chosen: vec![],
+                    free_text: Some("none".into()),
+                }]),
+            )
+            .unwrap();
+        assert_eq!(
+            reply,
+            PermissionReply::Allow {
+                updated_input: json!({"answers":{"Which?":"none"}}),
+                updated_permissions: None
+            }
+        );
+        t.push(request("req_2", "Bash", json!(null), json!(null)));
+        assert_eq!(
+            t.answer(&RequestId("req_2".into()), Answer::Allow { always: false })
+                .unwrap(),
+            PermissionReply::Allow {
+                updated_input: json!({}),
+                updated_permissions: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_request_without_a_tool_name_still_asks_the_user() {
+        let mut t = Translator::new();
+        let nameless = Incoming::ControlRequest {
+            request_id: "req_1".into(),
+            subtype: "can_use_tool".into(),
+            body: json!({"subtype":"can_use_tool","input":{"a":1},"permission_suggestions":project_rule()}),
+        };
+        assert_eq!(
+            t.push(nameless),
+            vec![SessionEvent::NeedsUser(UserRequest {
+                id: RequestId("req_1".into()),
+                kind: UserRequestKind::Permission {
+                    tool: "unknown tool".into(),
+                    detail: ToolDetail::Other {
+                        input_json: r#"{"a":1}"#.into()
+                    },
+                    always_allow_label: Some(
+                        "Always allow Bash(npm test:*) in this project".into()
+                    )
+                }
+            })]
+        );
+        assert_eq!(
+            t.answer(&RequestId("req_1".into()), Answer::Deny { message: None })
+                .unwrap(),
+            PermissionReply::Deny {
+                message: "Denied by the user".into()
+            }
+        );
+    }
+
+    #[test]
+    fn remote_control_turns_on_as_recorded_live() {
+        let mut t = Translator::new();
+        t.track("probe_2", Tracked::RemoteOn);
+        let ready =
+            r#"{"type":"system","subtype":"bridge_state","state":"ready","session_id":"s1"}"#;
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"probe_2","response":{"session_url":"https://claude.ai/code/session_X","bridge_epoch":1}}}"#;
+        let connected = r#"{"type":"system","subtype":"bridge_state","state":"connected","bridge_epoch":1,"session_id":"s1"}"#;
+        let mut events = Vec::new();
+        for l in [ready, reply, connected] {
+            events.extend(t.push(parse_line(l)));
+        }
+        assert_eq!(
+            events,
+            vec![
+                SessionEvent::RemoteAccess(RemoteAccess::Starting),
+                SessionEvent::RemoteAccess(RemoteAccess::Starting),
+                SessionEvent::RemoteAccess(RemoteAccess::On {
+                    url: Some("https://claude.ai/code/session_X".into())
+                })
+            ]
+        );
+    }
+
+    fn remote_reply(id: &str, url: Option<&str>) -> String {
+        let body = match url {
+            Some(url) => format!(r#","response":{{"session_url":"{url}"}}"#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}"{body}}}}}"#
+        )
+    }
+
+    const READY: &str = r#"{"type":"system","subtype":"bridge_state","state":"ready"}"#;
+    const CONNECTED: &str = r#"{"type":"system","subtype":"bridge_state","state":"connected"}"#;
+    const URL: &str = "https://claude.ai/code/session_X";
+
+    /// Remote Control on with a URL, connected, then off.
+    fn on_then_off() -> Translator {
+        let mut t = Translator::new();
+        t.track("on1", Tracked::RemoteOn);
+        t.track("off", Tracked::RemoteOff);
+        for line in [READY, &remote_reply("on1", Some(URL)), CONNECTED] {
+            t.push(parse_line(line));
+        }
+        assert_eq!(
+            t.push(parse_line(&remote_reply("off", None))),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::Off)]
+        );
+        t
+    }
+
+    #[test]
+    fn remote_control_on_off_on_forgets_the_first_url() {
+        let mut t = on_then_off();
+        t.track("on2", Tracked::RemoteOn);
+        t.push(parse_line(READY));
+        t.push(parse_line(&remote_reply("on2", None)));
+        assert_eq!(
+            t.push(parse_line(CONNECTED)),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::On { url: None })]
+        );
+    }
+
+    #[test]
+    fn the_url_is_forgotten_when_remote_control_is_turned_off() {
+        // Here the second `connected` comes before the second reply.
+        let mut t = on_then_off();
+        t.track("on2", Tracked::RemoteOn);
+        t.push(parse_line(READY));
+        assert_eq!(
+            t.push(parse_line(CONNECTED)),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::On { url: None })]
+        );
+    }
+
+    #[test]
+    fn the_url_is_forgotten_when_turning_remote_control_on_fails() {
+        let mut t = Translator::new();
+        t.track("on1", Tracked::RemoteOn);
+        t.track("on2", Tracked::RemoteOn);
+        for line in [READY, &remote_reply("on1", Some(URL)), CONNECTED] {
+            t.push(parse_line(line));
+        }
+        let failed = r#"{"type":"control_response","response":{"subtype":"error","request_id":"on2","error":"no"}}"#;
+        t.push(parse_line(failed));
+        assert_eq!(
+            t.push(parse_line(CONNECTED)),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::On { url: None })]
+        );
+    }
+
+    #[test]
+    fn a_rename_is_reported_once() {
+        let mut t = Translator::new();
+        t.track("probe_2", Tracked::Rename("Probe rename B".into()));
+        let changed = r#"{"type":"system","subtype":"session_title_changed","title":"Probe rename B","session_id":"s1"}"#;
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"probe_2"}}"#;
+        let mut events = t.push(parse_line(changed));
+        events.extend(t.push(parse_line(reply)));
+        assert_eq!(
+            events,
+            vec![SessionEvent::TitleChanged("Probe rename B".into())]
+        );
+    }
+
+    #[test]
+    fn a_model_change_reports_the_resolved_name() {
+        let mut t = Translator::new();
+        t.track("probe_2", Tracked::SetModel("sonnet".into()));
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"probe_2","response":{"model":"claude-sonnet-5-5"}}}"#;
+        assert_eq!(
+            t.push(parse_line(reply)),
+            vec![SessionEvent::ModelChanged("claude-sonnet-5-5".into())]
+        );
+    }
+
+    #[test]
+    fn usage_limits_from_the_live_recording() {
+        let l = r#"{"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":0.08,"resetsAt":1794385200},"seven_day":{"utilization":0.06,"resetsAt":1794776400}}}}"#;
+        assert_eq!(
+            feed(&[l]),
+            vec![SessionEvent::UsageLimits(UsageLimits {
+                session: Some(LimitWindow {
+                    used: 0.08,
+                    resets_at_unix: 1794385200
+                }),
+                weekly: Some(LimitWindow {
+                    used: 0.06,
+                    resets_at_unix: 1794776400
+                })
+            })]
+        );
+    }
+
+    #[test]
+    fn a_refused_remote_control_request_says_a_login_is_needed() {
+        let mut t = Translator::new();
+        t.track("rc_1", Tracked::RemoteOn);
+        let refused = parse_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"rc_1","error":"Claude.ai login was rejected","error_code":"remote_control_auth"}}"#,
+        );
+        assert_eq!(
+            t.push(refused.clone()),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::Failed {
+                reason: "Claude.ai login was rejected".into(),
+                needs_login: true
+            })]
+        );
+        assert!(t.push(refused).is_empty(), "a tracked id is used once");
+    }
+
+    #[test]
+    fn a_failed_bridge_state_is_a_failure() {
+        let l = r#"{"type":"system","subtype":"bridge_state","state":"failed","detail":"Claude.ai login was rejected","failure_kind":"auth"}"#;
+        assert_eq!(
+            feed(&[l]),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::Failed {
+                reason: "Claude.ai login was rejected".into(),
+                needs_login: true
+            })]
+        );
+        assert!(
+            feed(&[
+                r#"{"type":"system","subtype":"bridge_state","state":"a-state-nobody-has-seen"}"#
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn accepted_requests_confirm_what_was_asked() {
+        let ok = |id: &str| {
+            parse_line(&format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}"}}}}"#
+            ))
+        };
+        let mut t = Translator::new();
+        t.track("a", Tracked::RemoteOn);
+        t.track("b", Tracked::RemoteOff);
+        t.track("c", Tracked::SetModel("opus".into()));
+        t.track("d", Tracked::SetMode(PermissionMode::Plan));
+        t.track("e", Tracked::Rename("New".into()));
+        assert_eq!(
+            t.push(ok("a")),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::Starting)]
+        );
+        assert_eq!(
+            t.push(ok("b")),
+            vec![SessionEvent::RemoteAccess(RemoteAccess::Off)]
+        );
+        assert_eq!(
+            t.push(ok("c")),
+            vec![SessionEvent::ModelChanged("opus".into())]
+        );
+        assert_eq!(
+            t.push(ok("d")),
+            vec![SessionEvent::PermissionModeChanged(PermissionMode::Plan)]
+        );
+        assert_eq!(
+            t.push(ok("e")),
+            vec![SessionEvent::TitleChanged("New".into())]
+        );
+        assert!(t.push(ok("never-tracked")).is_empty());
+    }
+
+    #[test]
+    fn a_refused_model_change_is_reported() {
+        let mut t = Translator::new();
+        t.track("m", Tracked::SetModel("nope".into()));
+        let refused = parse_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"m","error":"unknown model"}}"#,
+        );
+        assert_eq!(
+            t.push(refused),
+            vec![SessionEvent::CommandFailed {
+                what: "model".into(),
+                reason: "unknown model".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_mode_change_is_reported_once_whichever_record_comes_first() {
+        let mut t = Translator::new();
+        t.push(parse_line(INIT));
+        t.track("p", Tracked::SetMode(PermissionMode::Plan));
+        let status = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan","session_id":"s1"}"#;
+        let reply =
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"p"}}"#;
+        let mut events = t.push(parse_line(status));
+        events.extend(t.push(parse_line(reply)));
+        assert_eq!(
+            events,
+            vec![SessionEvent::PermissionModeChanged(PermissionMode::Plan)]
+        );
+    }
+
+    #[test]
+    fn a_model_the_session_already_uses_is_not_reported_again() {
+        let mut t = Translator::new();
+        t.push(parse_line(INIT));
+        t.track("m", Tracked::SetModel("haiku".into()));
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"m","response":{"model":"claude-haiku-5-5"}}}"#;
+        assert!(t.push(parse_line(reply)).is_empty());
+        // The same kind of reply naming another model is reported, so the
+        // silence above came from a matched reply.
+        t.track("m2", Tracked::SetModel("sonnet".into()));
+        let other = r#"{"type":"control_response","response":{"subtype":"success","request_id":"m2","response":{"model":"claude-sonnet-5-5"}}}"#;
+        assert_eq!(
+            t.push(parse_line(other)),
+            vec![SessionEvent::ModelChanged("claude-sonnet-5-5".into())]
+        );
+    }
+
+    #[test]
+    fn a_title_announced_again_is_not_reported_again() {
+        let l = r#"{"type":"system","subtype":"session_title_changed","title":"Same"}"#;
+        let other = r#"{"type":"system","subtype":"session_title_changed","title":"Other"}"#;
+        assert_eq!(
+            feed(&[l, l, other]),
+            vec![
+                SessionEvent::TitleChanged("Same".into()),
+                SessionEvent::TitleChanged("Other".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn replies_to_other_requests_and_failures_of_each_kind() {
+        let err = |id: &str| {
+            parse_line(&format!(
+                r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{id}","error":"no"}}}}"#
+            ))
+        };
+        let mut t = Translator::new();
+        t.track("o", Tracked::Other);
+        t.track("r", Tracked::RemoteOff);
+        t.track("d", Tracked::SetMode(PermissionMode::Plan));
+        t.track("e", Tracked::Rename("x".into()));
+        assert!(t.push(err("o")).is_empty());
+        for (id, what) in [
+            ("r", "remote access"),
+            ("d", "permission mode"),
+            ("e", "rename"),
+        ] {
+            assert_eq!(
+                t.push(err(id)),
+                vec![SessionEvent::CommandFailed {
+                    what: what.into(),
+                    reason: "no".into()
+                }]
+            );
+        }
+        // A failed request leaves what was known unchanged: the next init
+        // names the same model as before, so there is nothing to report.
+        t.push(parse_line(INIT));
+        t.track("m", Tracked::SetModel("opus".into()));
+        assert_eq!(
+            t.push(err("m")),
+            vec![SessionEvent::CommandFailed {
+                what: "model".into(),
+                reason: "no".into()
+            }]
+        );
+        assert!(t.push(parse_line(INIT)).is_empty());
+        assert!(t.push(err("never")).is_empty());
+    }
+
+    #[test]
+    fn bridge_states_without_a_url_and_without_a_detail() {
+        let connected = r#"{"type":"system","subtype":"bridge_state","state":"connected"}"#;
+        let failed = r#"{"type":"system","subtype":"bridge_state","state":"failed"}"#;
+        assert_eq!(
+            feed(&[connected, failed]),
+            vec![
+                SessionEvent::RemoteAccess(RemoteAccess::On { url: None }),
+                SessionEvent::RemoteAccess(RemoteAccess::Failed {
+                    reason: "Remote Control failed".into(),
+                    needs_login: false
+                }),
+            ]
+        );
+    }
+
+    /// Every event one recording gives, through a fresh `Translator::new()`.
+    fn replay(name: &str) -> Vec<SessionEvent> {
+        let path = format!("{}/tests/fixtures/live/{name}", env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut t = Translator::new();
+        text.lines().flat_map(|l| t.push(parse_line(l))).collect()
+    }
+
+    /// The properties every real recording must have.
+    fn check_recording(name: &str, events: &[SessionEvent]) {
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Started(_)))
+            .count();
+        assert_eq!(started, 1, "{name}: one Started");
+        assert!(
+            matches!(events.first(), Some(SessionEvent::Started(_))),
+            "{name}: Started first"
+        );
+        let mut turn_open = false;
+        let mut turns = 0;
+        let mut finished_tools = std::collections::HashSet::new();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                SessionEvent::TurnStarted => {
+                    assert!(!turn_open, "{name}: event {i}: a turn inside a turn");
+                    turn_open = true;
+                    turns += 1;
+                }
+                SessionEvent::TurnFinished(_) => {
+                    assert!(turn_open, "{name}: event {i}: no turn to finish");
+                    turn_open = false;
+                }
+                SessionEvent::TurnFailed { reason } => {
+                    panic!("{name}: event {i}: a turn failed: {reason}")
+                }
+                SessionEvent::ToolFinished { id, .. } => assert!(
+                    finished_tools.insert(id.clone()),
+                    "{name}: event {i}: {id:?} finished twice"
+                ),
+                SessionEvent::ThinkingDelta(_) => {
+                    panic!("{name}: event {i}: thinking is empty live")
+                }
+                SessionEvent::TextDelta(text) => {
+                    assert!(!text.is_empty(), "{name}: event {i}: empty text")
+                }
+                SessionEvent::BlockFinished => assert_ne!(
+                    events.get(i + 1),
+                    Some(&SessionEvent::BlockFinished),
+                    "{name}: event {i}: two BlockFinished in a row"
+                ),
+                _ => {}
+            }
+        }
+        assert!(!turn_open, "{name}: the last turn never ended");
+        assert!(turns > 0, "{name}: has turns");
+    }
+
+    #[test]
+    fn the_permission_recording_translates_cleanly() {
+        let events = replay("v2-permission.jsonl");
+        check_recording("V2", &events);
+    }
+
+    #[test]
+    fn the_stopped_turn_recording_finishes_one_turn_as_interrupted() {
+        let events = replay("v4-image-model-stop.jsonl");
+        check_recording("V4", &events);
+        let interrupted = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::TurnFinished(s) if s.interrupted))
+            .count();
+        assert_eq!(interrupted, 1);
+    }
+
+    #[test]
+    fn the_question_and_plan_recording_withdraws_and_changes_mode() {
+        let events = replay("v7-question-plan.jsonl");
+        check_recording("V7", &events);
+        let withdrawn = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::RequestWithdrawn { .. }))
+            .count();
+        assert!(withdrawn >= 2, "{withdrawn} withdrawn");
+        let modes: Vec<&PermissionMode> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::PermissionModeChanged(mode) => Some(mode),
+                _ => None,
+            })
+            .collect();
+        let plan = modes
+            .iter()
+            .position(|m| **m == PermissionMode::Plan)
+            .expect("a change to Plan");
+        assert!(
+            modes[plan..].contains(&&PermissionMode::Ask),
+            "and back to Ask: {modes:?}"
+        );
+    }
+}

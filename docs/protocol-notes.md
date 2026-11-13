@@ -1,0 +1,322 @@
+# Protocol notes
+
+What the real `claude` program did when driven through `mindrune-probe` on 2026-11-10. Tasks 10 to 16 of plan 1 and plans 2 to 4 treat this file as the source of truth. Where it disagrees with an earlier assumption, this file wins.
+
+Lines without a prefix below are what `claude` sent. They come from the scrubbed fixtures in `crates/claude/tests/fixtures/live/`, with some fields left out for brevity and long strings cut with `…`; the fixtures hold the full records. Lines starting with `> ` are what the probe sent. Those come from the raw recordings and are in no fixture, because the scrubber keeps only what `claude` sent. In the fixtures, UUIDs are replaced with numbered placeholders, the e-mail and home path are replaced, lists longer than six entries are cut to three, the MCP server and plugin lists are cut to one, thinking signatures are replaced, the `get_usage` reply keeps only its `five_hour` and `seven_day` windows and drops its `behaviors` block, and one file path that the stream had split across two lines was fixed by hand.
+
+## Machine notes
+
+- `claude` version: `2.1.319`. Rust `1.99.1`. Ubuntu, Linux 7.0.
+- Task 2: Rune built with no missing system libraries. `--snap` and `--tree` rendered headless on the first try with no GPU fallback, inside the agent sandbox.
+- The probe was run in the user's own terminal, never in an agent shell. An agent shell cannot see the saved login.
+- The probe was driven through a named pipe (`target/probe-in`) so commands could be typed by the controller while the recording was followed from another process.
+- Every session used `--model haiku --full-login` and the working directory `target/probe-cwd`.
+- Side effects of the run, outside this repository: session transcripts under `~/.claude/projects/` for the probe's working directory, and one plan file under `~/.claude/plans/` written by `claude` itself in V7. The always-allow rule from V3 was written to `<git root>/.claude/settings.local.json`; that file was removed after the run.
+
+## Summary of differences from the plan
+
+| Item | Difference | Task whose rules or test data change |
+| --- | --- | --- |
+| V2, V3 | A request carries several `permission_suggestions` of different kinds. Sending them all back would also switch the session to `acceptEdits`. Always-allow must send only the suggestion the label describes. | 12 |
+| V3 | The rule is saved in the git root's `.claude/settings.local.json`, not in the working directory's. | none (wording in plan 2) |
+| V5 | `set_model` answers with the resolved model id, and also emits a `user` record whose `message.content` is a string. The model that answers a turn can differ from the one `init` names. | 10, 13 |
+| V6 | A stopped turn ends in a `result` with `is_error: true`, no `result` text, and `terminal_reason` `aborted_streaming` or `aborted_tools`. It must not be shown as a failure. | 10, 11 |
+| V6, V7 | `control_cancel_request` withdraws a pending permission request. New record type. | 10, 12, and one new event in `mr-agent` |
+| V7 | `system`/`status` carries `permissionMode` whenever the mode changes, including after a plan is approved. | 10, 11 |
+| V4 | Thinking arrives with empty text: every `thinking_delta` has `"thinking":""`. Empty deltas must not be passed on. | 11 |
+| V1 | Bridge states seen: `ready`, `connected`. The `remote_control` reply carries `session_url`. | 13 |
+| V9 | `rename_session` is the right request and it works. `session_title_changed` arrives before the reply. | 7 (marker comment only), 13 |
+| V9 | `get_usage`, `get_context_usage` and `list_models` all work. Not used by plan 1. | none (plans 2 to 4) |
+
+## V1 Remote Control
+
+Sent after one finished turn: the probe command `rc on`.
+
+```json
+> {"request":{"enabled":true,"subtype":"remote_control"},"request_id":"probe_2","type":"control_request"}
+```
+
+Came back, in this order (a `system`/`background_tasks_changed` record also arrived between the first and second line):
+
+```json
+{"type":"system","subtype":"bridge_state","state":"ready","session_id":"00000000-0000-4000-8000-000000000002"}
+{"type":"control_response","response":{"subtype":"success","request_id":"probe_2","response":{"session_url":"https://claude.ai/code/session_SCRUBBED","connect_url":"https://claude.ai/code?environment=","environment_id":"","bridge_epoch":1,"bridge_session_id":"cse_SCRUBBED"}}}
+{"type":"system","subtype":"bridge_state","state":"connected","bridge_epoch":1,"session_id":"00000000-0000-4000-8000-000000000002"}
+```
+
+- `bridge_state` values in order: `ready`, then `connected`. The reply to the request arrives between them.
+- The reply's body holds `session_url` (the page on claude.ai for this session), `connect_url`, `environment_id`, `bridge_epoch` and `bridge_session_id`.
+- A turn sent while connected ran normally.
+
+Sent: `rc off`. Came back: only the reply. No `bridge_state` line follows.
+
+```json
+{"type":"control_response","response":{"subtype":"success","request_id":"probe_3"}}
+```
+
+Turning it on a second time in the same session worked the same way, with `bridge_epoch` 2 and, in the raw recording, a different `session_url`.
+
+- The `initialize` reply carries `remote_control_available: true`.
+- **Not yet confirmed by a person:** that the session shows up at claude.ai/code. The controller could not check (not signed in to claude.ai in its browser) and Jerod was away. The protocol evidence above was accepted as passing the gate.
+- The `failed` state and the `remote_control_auth` error code were seen on 2026-11-10 before the full login existed, when only the token sign-in was present. They are not in these fixtures.
+
+Fixture: `v1-remote.jsonl`. Differs from the plan: no. Task 13 gets the state names `ready` (starting) and `connected` (on), and takes the URL from the reply.
+
+## V2 Permission round trip
+
+Sent: `say Use the Bash tool to run: echo rune-claude-probe`. No request arrived, because the user's own settings already allow it. The tool result says so:
+
+```json
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01RK5qmpr2PATPM8C1D4E3Ra","type":"tool_result","content":"rune-claude-probe","is_error":false}]},"tool_result_meta":[{"id":"toolu_01RK5qmpr2PATPM8C1D4E3Ra","permission_decision":{"decision":"accept","source":"config","reason_type":"subcommandResults"}}]}
+```
+
+Sent: `say Use the Bash tool to run exactly: touch probe-marker.txt`. Came back:
+
+```json
+{"type":"control_request","request_id":"00000000-0000-4000-8000-000000000045","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"touch probe-marker.txt","description":"Create empty probe-marker.txt file"},"description":"Create empty probe-marker.txt file","permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch probe-marker.txt"}],"behavior":"allow","destination":"localSettings"},{"type":"addDirectories","directories":["/home/user/git/rune_claude/target/probe-cwd"],"destination":"session"},{"type":"setMode","mode":"acceptEdits","destination":"session"}],"blocked_path":"/home/user/git/rune_claude/target/probe-cwd/probe-marker.txt","tool_use_id":"toolu_018R9NpWTRq5sxDPoWGaojLQ"}}
+```
+
+- A request has `request_id`, and inside `request`: `subtype`, `tool_name`, `display_name`, `input`, `description`, `permission_suggestions`, `blocked_path`, `tool_use_id`. Other requests also carried `decision_reason` and `decision_reason_type` (V7), or `requires_user_interaction` (V7).
+- `permission_suggestions` here has three entries of three kinds: `addRules` to `localSettings`, `addDirectories` to `session`, and `setMode` `acceptEdits` to `session`.
+
+Answered `allow <id>`. The probe sent, and the tool then ran:
+
+```json
+> {"response":{"request_id":"<id>","response":{"behavior":"allow","updatedInput":{"command":"touch probe-marker.txt","description":"Create empty probe-marker.txt file"}},"subtype":"success"},"type":"control_response"}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_018R9NpWTRq5sxDPoWGaojLQ","type":"tool_result","content":"(Bash completed with no output)","is_error":false}]},"tool_result_meta":[{"id":"toolu_018R9NpWTRq5sxDPoWGaojLQ","permission_decision":{"decision":"accept","source":"user_temporary"}}]}
+```
+
+Repeated with another file name and answered `deny <id>`. Claude received the message as a failed tool result:
+
+```json
+> {"response":{"request_id":"<id>","response":{"behavior":"deny","message":"Denied from the probe"},"subtype":"success"},"type":"control_response"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"Denied from the probe","is_error":true,"tool_use_id":"toolu_019zfPtQQxrFY6AbobgRc2Pi"}]},"tool_use_result":"Error: Denied from the probe","tool_result_meta":[{"id":"toolu_019zfPtQQxrFY6AbobgRc2Pi","non_execution_kind":"permission-rule","permission_decision":{"decision":"reject","source":"user_reject"}}]}
+```
+
+Fixture: `v2-permission.jsonl`. Differs from the plan: the request shape is as assumed, with extra fields. The reply shapes are as assumed.
+
+## V3 Always allow
+
+Repeated with a third file name. Answered with a raw line that sends back **only the `addRules` suggestion**, not all three:
+
+```json
+> {"type":"control_response","response":{"subtype":"success","request_id":"<id>","response":{"behavior":"allow","updatedInput":{"command":"touch probe-marker-3.txt","description":"Create empty probe-marker-3.txt file"},"updatedPermissions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch probe-marker-3.txt"}],"behavior":"allow","destination":"localSettings"}]}}}
+```
+
+The tool ran. The same message sent a fourth time produced no request, and the tool result names the saved rule as the reason:
+
+```json
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01MRSLzsjytZEoKktWWvpvsh","type":"tool_result","content":"(Bash completed with no output)","is_error":false}]},"tool_result_meta":[{"id":"toolu_01MRSLzsjytZEoKktWWvpvsh","permission_decision":{"decision":"accept","source":"user_permanent","reason_type":"rule"}}]}
+```
+
+- The rule was written to `<git root>/.claude/settings.local.json` as `"permissions": {"allow": ["Bash(touch probe-marker-3.txt)"]}`. Nothing appeared under `target/probe-cwd/.claude/`. "Project" for `localSettings` means the git root, not the session's folder.
+- The probe's own `always` command was deliberately not used. At the time it echoed every suggestion, and the third one would have switched the session to `acceptEdits`. It now sends only the first, as the adapter does.
+
+Fixture: `v2-permission.jsonl`. **Differs from the plan: yes.** Task 12 said always-allow sends back all remembered suggestions. It must send only the first suggestion, the one `always_allow_label` describes. Task 12's rule and its test for `Allow { always: true }` change.
+
+## V4 Image
+
+Sent: `image target/probe-cwd/red.png What colour is this image? One word.` (a 16×16 solid red PNG). The user message carried a text block and an `image` block with a base64 source. The answer was `Red`.
+
+The reply began with a thinking block. Thinking arrives with empty text and a signature, both in the stream and in the complete record:
+
+```json
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}
+{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"scrubbed-signature"}]}}
+```
+
+Inside the block the stream carries `thinking_delta` events whose text is always empty, then one `signature_delta`. Every thinking block in the fixtures looks like this. Progress is reported separately by `system`/`thinking_tokens` records:
+
+```json
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":null}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"scrubbed-signature"}}}
+{"type":"system","subtype":"thinking_tokens","estimated_tokens":50,"estimated_tokens_delta":50,"session_id":"00000000-0000-4000-8000-000000000001"}
+```
+
+Fixture: `v4-image-model-stop.jsonl`. **Differs from the plan: yes, for thinking.** Task 11 must drop deltas whose text is empty, must not emit `BlockFinished` for a block that passed on no text, and must not emit an empty `ThinkingDelta` from a complete record.
+
+## V5 Model change
+
+Sent: `model sonnet`. Came back, before any new turn:
+
+```json
+> {"request":{"model":"sonnet","subtype":"set_model"},"request_id":"probe_2","type":"control_request"}
+{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to `sonnet (claude-sonnet-5-5)`</local-command-stdout>"},"session_id":"00000000-0000-4000-8000-000000000001","parent_tool_use_id":null,"timestamp":"2026-11-11T06:48:40.710Z","isReplay":true}
+{"type":"control_response","response":{"subtype":"success","request_id":"probe_2","response":{"model":"claude-sonnet-5-5"}}}
+```
+
+- The reply's body holds the resolved model id.
+- A `user` record with `isReplay: true` also arrives, and its `message.content` is a **string**, not a list of blocks.
+- The next turn's `system`/`init` shows `"model":"claude-sonnet-5-5"`, and so do the `message_start` event and the `assistant` records.
+- `init` names the model that is selected. It is not always the model that answers. In V7's plan-mode turn the `init` said `claude-haiku-5-5` while `message_start` and every `assistant` record of that turn said `claude-sonnet-5-5`; after the plan was approved they said haiku again. No `set_model` was sent. Plan 1 reports the selected model (from `init` and from `set_model` replies). The answering model is in `assistant.message.model`, for plan 2 to show per message if wanted.
+
+Fixture: `v4-image-model-stop.jsonl`. **Differs from the plan: yes.** Task 10 must treat a `user` record with no `tool_result` blocks, including string content, as ignored. Task 13 should report the resolved id from the reply.
+
+## V6 Stop
+
+Sent a request for a long essay, then `stop` as soon as text started streaming. Came back:
+
+```json
+> {"request":{"subtype":"interrupt"},"request_id":"probe_5","type":"control_request"}
+{"type":"control_response","response":{"subtype":"success","request_id":"probe_5","response":{"still_queued":[]}}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+{"type":"result","subtype":"error_during_execution","is_error":true,"stop_reason":null,"terminal_reason":"aborted_streaming","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],"duration_ms":3555,"total_cost_usd":0.06458246000000001,"num_turns":2}
+```
+
+- The `result` record of a stopped turn has `subtype` `error_during_execution`, `is_error` `true`, `stop_reason` `null`, **no `result` field**, an `errors` list, and `terminal_reason` `aborted_streaming`.
+- A turn stopped while a permission request was pending (V7) ends the same way with `stop_reason` `tool_use` and `terminal_reason` `aborted_tools`.
+- A normal turn has `terminal_reason` `completed`.
+- An `interrupt` sent after the turn had already finished got the same success reply and nothing else.
+- The next message after a stop was answered normally.
+
+Fixture: `v4-image-model-stop.jsonl`. **Differs from the plan: yes.** Tasks 10 and 11 treated `is_error` as failure. A `result` whose `terminal_reason` starts with `aborted` is a stopped turn and ends the turn without a failure. Task 10's `Result` gains a field for it, and its text falls back to `errors` when `result` is missing.
+
+## V7 Questions and plans
+
+Sent: `say Ask me one multiple-choice question with your question tool before doing anything else.` Came back:
+
+```json
+{"type":"control_request","request_id":"00000000-0000-4000-8000-000000000060","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"What would you like to focus on next in this repo (branch plan-1-foundations)?","header":"Next step","options":[{"label":"Continue foundations work","description":"Pick up the next planned foundations step after the recent probe commits."},{"label":"Review recent commits","description":"Review the last five commits (child process, encoding, probe and scrubber) for bugs."},{"label":"Run the test suite","description":"Build and run the tests to check the current state of the branch."},{"label":"Something else","description":"I'll describe a different task."}],"multiSelect":false}]},"tool_use_id":"toolu_012cyCMWSCcg1PfyuL36gPXz","requires_user_interaction":true}}
+```
+
+Answered with a raw line: `behavior` `allow`, and `updatedInput` equal to the request's `input` plus `"answers": {"<the question text>": "<the chosen option's label>"}`. Claude received:
+
+```json
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"Your questions have been answered: \"What would you like to focus on next in this repo (branch plan-1…","tool_use_id":"toolu_012cyCMWSCcg1PfyuL36gPXz"}]}}
+```
+
+Sent: `mode plan`. Came back:
+
+```json
+> {"request":{"mode":"plan","subtype":"set_permission_mode"},"request_id":"probe_3","type":"control_request"}
+{"type":"control_response","response":{"subtype":"success","request_id":"probe_3","response":{"mode":"plan"}}}
+{"type":"system","subtype":"status","status":null,"permissionMode":"plan","session_id":"00000000-0000-4000-8000-000000000001"}
+```
+
+Sent: `say Plan how to add a README here, then ask to leave plan mode. Do not read any files first.` Came back:
+
+```json
+{"type":"control_request","request_id":"00000000-0000-4000-8000-000000000364","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","display_name":"ExitPlanMode","input":{"plan":"# Plan: Add a README\n\n## Context\nThe repo (`rune_claude`, branch `plan-1-foundat…","planFilePath":"/home/user/.claude/plans/plan-how-to-add-silly-frost.md"},"tool_use_id":"toolu_016pZCgGXgkiknGiDrXfv274","requires_user_interaction":true}}
+```
+
+Answered `allow <id>`. Came back, in this order:
+
+```json
+{"type":"system","subtype":"status","status":null,"permissionMode":"default","session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"User has approved your plan. You can now start coding. Start with updating your todo list if applica…","tool_use_id":"toolu_016pZCgGXgkiknGiDrXfv274"}]}}
+```
+
+Stopping a turn while a permission request was waiting produced a new record type, before the reply to the interrupt:
+
+```json
+{"type":"control_cancel_request","request_id":"00000000-0000-4000-8000-000000000151"}
+```
+
+- A question arrives as `can_use_tool` with `tool_name` `AskUserQuestion`, `requires_user_interaction: true` and no `permission_suggestions`. `input.questions[]` has `question`, `header`, `options[]` (`label`, `description`) and `multiSelect`.
+- A plan arrives as `can_use_tool` with `tool_name` `ExitPlanMode`. `input` has `plan` (markdown) and `planFilePath`.
+- Approving a plan switches the mode back, reported by `system`/`status` with `"status":null,"permissionMode":"default"`.
+- `system`/`status` with `"status":"requesting"` and no `permissionMode` is sent at the start of every model request.
+- Requests can carry `decision_reason` and `decision_reason_type`. Two Bash requests had them and no `permission_suggestions`. A `Read` request outside the working folder had them and one suggestion, `addRules` to `session`.
+
+Fixture: `v7-question-plan.jsonl`. Differs from the plan: the question and plan shapes are as assumed. **New:** `control_cancel_request` (Tasks 10 and 12, plus a new event `RequestWithdrawn` in `mr-agent`), and `system`/`status` carrying the mode (Tasks 10 and 11).
+
+## V8 Is `init` sent every turn?
+
+Yes. A `system`/`init` record is sent at the start of every turn, not once per process. It is the first record after each user message. Its fields:
+
+```json
+{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000002","model":"claude-haiku-5-5","permissionMode":"default","claude_code_version":"2.1.319","cwd":"/home/user/git/rune_claude/target/probe-cwd","apiKeySource":"none","output_style":"default"}
+```
+
+Other keys present: `additional_directories`, `agents`, `analytics_disabled`, `capabilities`, `fast_mode_disabled_reason`, `fast_mode_state`, `mcp_servers`, `memory_paths`, `messaging_socket_path`, `original_cwd`, `per_turn_effort_active`, `plugins`, `product_feedback_disabled`, `skills`, `slash_commands`, `terminal_slash_commands`, `tools`, `ultrathink_available`, `ultrathink_typed_raises`, `uuid`, `view_mode`.
+
+Before the first turn, nothing but the reply to `initialize` (and `system`/`commands_changed`) is sent. The session id is not known from output until the first turn's `init`; the adapter knows it earlier because it chose it with `--session-id`. The adapter therefore reports a session as started when the reply to `initialize` arrives, using its own id and the reply's `models`, `current_permission_mode` and `claude_code_version`.
+
+Differs from the plan: no. Task 11's "a later `Init` reports only what changed" rule is needed on every turn.
+
+## V9 Other control requests
+
+Each was sent raw with ids `p1` to `p4` and `p6`; the working rename was sent with the probe's own `rename` command as `probe_2`.
+
+`get_usage` works. Selected keys of its reply are shown. `utilization` here is a **percentage** (37 means 37%), and `resets_at` is an ISO 8601 time. In `rate_limit_event` the same numbers are a fraction (`0.33`) and a Unix time.
+
+```json
+{"subscription_type":"max","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":37,"resets_at":"2026-11-11T08:19:59.618411+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"seven_day":{"utilization":10,"resets_at":"2026-11-15T20:59:59.618435+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null}}}
+```
+
+For comparison, the event sent during a turn:
+
+```json
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1794385200,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.33,"resetsAt":1794385200,"status":"allowed"},"seven_day":{"utilization":0.09,"resetsAt":1794776400,"status":"allowed"}}},"session_id":"00000000-0000-4000-8000-000000000002"}
+```
+
+`get_context_usage` works. Its reply has, among other keys:
+
+```json
+{"totalTokens":27212,"maxTokens":1000000,"percentage":3,"model":"claude-haiku-5-5","autoCompactThreshold":967000,"isAutoCompactEnabled":true}
+```
+
+`list_models` works. Each entry looks like this. The same list is in the `initialize` reply under `models`.
+
+```json
+{"value":"default","resolvedModel":"claude-fable-5-2","displayName":"Default (recommended)","description":"Fable 5.2","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsAutoMode":true,"supportsThinkingOff":false}
+```
+
+Renaming: `rename` and `set_title` are refused. `rename_session` with a `title` works, and the title change is announced **before** the reply:
+
+```json
+{"type":"control_response","response":{"subtype":"error","request_id":"p4","error":"Unsupported control request subtype: rename"}}
+> {"request":{"subtype":"rename_session","title":"Probe rename B"},"request_id":"probe_2","type":"control_request"}
+{"type":"system","subtype":"session_title_changed","title":"Probe rename B","session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"control_response","response":{"subtype":"success","request_id":"probe_2"}}
+```
+
+The reply to `initialize` is large. Keys: `commands`, `agents`, `output_style`, `available_output_styles`, `user_output_styles_dir`, `models`, `account`, `pid`, `claude_code_version`, `current_permission_mode`, `hook_on_failure_supported`, `feedback_mode`, `analytics_disabled`, `remote_control_auto_enable`, `remote_control_auto_connect_default`, `remote_control_available`, `remote_control_auto_on_by_default`, `ide_rc_auto_enable_gate`, `fast_mode_state`, `fast_mode_disabled_reason`, `session_state`, `capabilities`. Its `account` object:
+
+```json
+{"email":"user@example.com","organization":"user@example.com's Organization","subscriptionType":"Claude Max","apiProvider":"firstParty"}
+```
+
+Other record types seen and not used by plan 1: `system`/`commands_changed`, `system`/`background_tasks_changed`, `system`/`post_turn_summary`, `system`/`thinking_tokens`, `system`/`status`, and the `system`/`hook_*` records the scrubber drops.
+
+Fixture: `v9-control.jsonl`. Differs from the plan: no. The guessed `rename_session` shape in Task 7 is correct, so its "unverified" marker comment can go. Task 13 must not report the same title twice.
+
+## V10 Sign-in status
+
+`env -u CLAUDE_CODE_OAUTH_TOKEN claude auth status` printed, with the e-mail, organisation id and name replaced:
+
+```json
+{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "/home/user/.claude/projects",
+  "configDirectory": "/home/user/.claude",
+  "loginExpiresAt": "2026-12-08T18:53:18.026Z",
+  "email": "user@example.com",
+  "orgId": "00000000-0000-4000-8000-000000000001",
+  "orgName": "user@example.com's Organization",
+  "subscriptionType": "max",
+  "storedClaudeAiLogin": true,
+  "planTier": "max_5x"
+}
+```
+
+With only the token (seen earlier on 2026-11-10): `{"loggedIn": true, "authMethod": "oauth_token", "apiProvider": "firstParty"}`. Signed out: `{"loggedIn": false, "authMethod": "none", "apiProvider": "firstParty"}`.
+
+Differs from the plan: no. Task 14's field names `email` and `subscriptionType` are right. `planTier` is also available.
+
+## V11 Resume and fork
+
+Started the probe again with `--resume <id>` of the V9 session. The title was announced before the reply to `initialize`. The first turn's `init` had the same `session_id`, and a question about a word given in the earlier session was answered correctly.
+
+```json
+{"type":"system","subtype":"session_title_changed","title":"Probe rename B","session_id":"00000000-0000-4000-8000-000000000002"}
+```
+
+Started again with `--resume <id> --fork`. The `init` had a **new** `session_id`. The raw recordings show two different ids; the scrubber numbers ids per file, so the fixtures cannot show it. The title was carried over, and the earlier conversation was still remembered.
+
+Checked later the same day, by hand: `claude -p --resume <old> --fork-session --session-id <new>` gives the fork the id `<new>`. So a fork's id can be chosen up front, like a new session's. The adapter does this. (`--session-id` together with `--resume` is accepted only with `--fork-session`.)
+
+Fixtures: `v11-resume.jsonl`, `v11-fork.jsonl`. Differs from the plan: no for resume. For a fork, Task 5's arguments gained `--session-id`.
