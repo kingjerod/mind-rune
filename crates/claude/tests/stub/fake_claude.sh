@@ -8,6 +8,10 @@
 #   need-permission            -> a turn that asks to run Bash (request req_p); it
 #                                 finishes only when an allow reply for req_p arrives
 #   "subtype":"set_model"      -> a success reply naming claude-sonnet-5-5
+#   "subtype":"get_usage"      -> a success reply with the two rate-limit windows
+#   "subtype":"generate_session_title"
+#                              -> the title "Listing the folder" announced, then the same
+#                                 title in the success reply
 #   "type":"user"              -> a canned turn up to a hook_callback request; the turn's
 #                                 result is withheld until the request is answered
 #   "subtype":"remote_control" -> a refusal that asks for a login
@@ -33,6 +37,7 @@ RESULT_OK='{"type":"result","is_error":false,"duration_ms":915,"total_cost_usd":
 TOOL_CALL='{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"t_p","name":"Bash","input":{"command":"ls"}}]}}'
 PERMISSION_REQUEST='{"type":"control_request","request_id":"req_p","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"t_p"}}'
 TOOL_DONE='{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t_p","content":"a.txt"}]}}'
+USAGE='{"subscription_type":"max","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":37,"resets_at":"2026-11-11T08:19:59.618411+00:00"},"seven_day":{"utilization":10,"resets_at":"2026-11-15T20:59:59.618435+00:00"}}}'
 HOOK_REQUEST='{"type":"control_request","request_id":"req_h","request":{"subtype":"hook_callback","callback_id":"cb_1","input":{}}}'
 
 if [ -n "${ANTHROPIC_CANARY+x}" ]; then
@@ -55,6 +60,13 @@ while IFS= read -r line; do
   elif [[ "$line" == *'"subtype":"set_model"'* ]]; then
     id=$(request_id "$line")
     printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"model":"claude-sonnet-5-5"}}}\n' "$id"
+  elif [[ "$line" == *'"subtype":"generate_session_title"'* ]]; then
+    id=$(request_id "$line")
+    printf '%s\n' '{"type":"system","subtype":"session_title_changed","title":"Listing the folder","session_id":"s1"}'
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"title":"Listing the folder"}}}\n' "$id"
+  elif [[ "$line" == *'"subtype":"get_usage"'* ]]; then
+    id=$(request_id "$line")
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$USAGE"
   elif [[ "$line" == *'"subtype":"initialize"'* ]]; then
     id=$(request_id "$line")
     printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"commands":[],"models":%s,"claude_code_version":"2.1.319","current_permission_mode":"default","remote_control_available":true}}}\n' "$id" "$MODELS"

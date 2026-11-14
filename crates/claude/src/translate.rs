@@ -6,18 +6,19 @@
 //! kind has its own method, so a new rule is a new arm in [`Translator::push`]
 //! plus one method.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use mr_agent::{
-    AgentError, Answer, LimitWindow, ModelOption, PermissionMode, Question, RemoteAccess,
-    RequestId, SessionEvent, SessionId, SessionInfo, ToolCallId, ToolDetail, ToolOutcome,
-    TurnSummary, UsageLimits, UserRequest, UserRequestKind,
+    AgentError, Answer, CommandKind, LimitWindow, ModelOption, PermissionMode, Question,
+    QuestionOption, RemoteAccess, RequestId, SessionEvent, SessionId, SessionInfo, ToolCallId,
+    ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
 };
 use serde_json::{Value, json};
 
 use crate::encode::PermissionReply;
 use crate::mode::mode_from_wire;
+use crate::time::iso8601_to_unix;
 use crate::wire::{Block, BlockKind, Incoming, StreamEvent, ToolResult};
 
 /// What a control request this adapter sends asks for, so its reply can be
@@ -32,6 +33,10 @@ pub enum Tracked {
     SetModel(String),
     SetMode(PermissionMode),
     Rename(String),
+    /// The `generate_session_title` request; its reply may name the session.
+    SuggestTitle,
+    /// The `get_usage` request; its reply gives the usage limits.
+    Usage,
     Other,
 }
 
@@ -79,7 +84,15 @@ pub struct Translator {
     last_usage_tokens: Option<u64>,
     /// Requests raised and not yet answered or withdrawn, by `request_id`.
     pending: HashMap<String, PendingRequest>,
+    /// Calls to the tools that are requests to the user (see [`REQUEST_TOOLS`]) whose result
+    /// has not come yet, by `tool_use` id. They are not reported as tool calls, nor are their
+    /// results.
+    request_calls: HashSet<String>,
 }
+
+/// The tools `claude` asks the user through: it raises a request for each call, and the
+/// request is what the user sees and answers, so the call itself is not work to report.
+const REQUEST_TOOLS: [&str; 2] = ["AskUserQuestion", "ExitPlanMode"];
 
 /// What a raised request needs to remember to build its reply.
 #[derive(Debug)]
@@ -147,7 +160,11 @@ impl Translator {
             Incoming::ToolResults {
                 parent: None,
                 results,
-            } => results.into_iter().map(tool_finished).collect(),
+            } => results
+                .into_iter()
+                .filter(|result| !self.request_calls.remove(&result.tool_use_id))
+                .map(tool_finished)
+                .collect(),
             Incoming::ControlRequest {
                 request_id,
                 subtype,
@@ -325,10 +342,26 @@ impl Translator {
             }
             (Tracked::SetMode(mode), true) => self.mode_changed_to(mode),
             (Tracked::Rename(title), true) => self.title_changed(title),
-            (Tracked::RemoteOff, false) => Some(command_failed("remote access", reason())),
-            (Tracked::SetModel(_), false) => Some(command_failed("model", reason())),
-            (Tracked::SetMode(_), false) => Some(command_failed("permission mode", reason())),
-            (Tracked::Rename(_), false) => Some(command_failed("rename", reason())),
+            // Read from the program, not yet seen on the wire (see `generate_session_title`).
+            (Tracked::SuggestTitle, true) => body
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .and_then(|title| self.title_changed(title.to_string())),
+            (Tracked::Usage, true) => Some(usage_limits(body)),
+            (Tracked::RemoteOff, false) => {
+                Some(command_failed(CommandKind::SetRemoteAccess, reason()))
+            }
+            (Tracked::SetModel(_), false) => Some(command_failed(CommandKind::SetModel, reason())),
+            (Tracked::SetMode(_), false) => {
+                Some(command_failed(CommandKind::SetPermissionMode, reason()))
+            }
+            (Tracked::Rename(_), false) => Some(command_failed(CommandKind::Rename, reason())),
+            (Tracked::SuggestTitle, false) => {
+                Some(command_failed(CommandKind::SuggestTitle, reason()))
+            }
+            (Tracked::Usage, false) => Some(command_failed(CommandKind::RefreshUsage, reason())),
         };
         event.into_iter().collect()
     }
@@ -341,13 +374,7 @@ impl Translator {
         }
         let start = self.start.clone()?;
         let text = |key: &str| body.get(key).and_then(Value::as_str);
-        let models: Vec<ModelOption> = body
-            .get("models")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(model_option)
-            .collect();
+        let models = model_options(body.get("models").and_then(Value::as_array));
         let wanted = start.model.as_deref().unwrap_or("default");
         let model = models
             .iter()
@@ -385,15 +412,25 @@ impl Translator {
                 }
             }
             StreamEvent::BlockStart(kind) => {
+                let thinking = kind == BlockKind::Thinking;
                 self.open_block = Some(kind);
                 self.block_has_text = false;
-                Vec::new()
+                if thinking {
+                    vec![SessionEvent::ThinkingStarted]
+                } else {
+                    Vec::new()
+                }
             }
             StreamEvent::TextDelta(text) => self.delta(text, SessionEvent::TextDelta),
             StreamEvent::ThinkingDelta(text) => self.delta(text, SessionEvent::ThinkingDelta),
             StreamEvent::BlockStop => {
-                let shown = matches!(self.open_block, Some(BlockKind::Text | BlockKind::Thinking))
-                    && self.block_has_text;
+                // A thinking phase is always announced, so it always ends;
+                // a text block is shown only once it has text.
+                let shown = match self.open_block {
+                    Some(BlockKind::Thinking) => true,
+                    Some(BlockKind::Text) => self.block_has_text,
+                    _ => false,
+                };
                 self.open_block = None;
                 self.block_has_text = false;
                 if shown {
@@ -424,6 +461,9 @@ impl Translator {
         let mut events = Vec::new();
         for block in blocks {
             match block {
+                Block::ToolUse { id, name, .. } if REQUEST_TOOLS.contains(&name.as_str()) => {
+                    self.request_calls.insert(id);
+                }
                 Block::ToolUse { id, name, input } => {
                     let detail = tool_detail(&name, &input);
                     events.push(SessionEvent::ToolStarted {
@@ -436,8 +476,11 @@ impl Translator {
                     events.push(SessionEvent::TextDelta(text));
                     events.push(SessionEvent::BlockFinished);
                 }
-                Block::Thinking(text) if !streamed && !text.is_empty() => {
-                    events.push(SessionEvent::ThinkingDelta(text));
+                Block::Thinking(text) if !streamed => {
+                    events.push(SessionEvent::ThinkingStarted);
+                    if !text.is_empty() {
+                        events.push(SessionEvent::ThinkingDelta(text));
+                    }
                     events.push(SessionEvent::BlockFinished);
                 }
                 Block::Text(_) | Block::Thinking(_) | Block::Other => {}
@@ -540,12 +583,10 @@ impl Translator {
                 let answers: serde_json::Map<String, Value> = list
                     .into_iter()
                     .map(|a| {
-                        let text = if a.chosen.is_empty() {
-                            a.free_text.unwrap_or_default()
-                        } else {
-                            a.chosen.join(", ")
-                        };
-                        (a.prompt, Value::String(text))
+                        // The options chosen, then the user's own words, joined as the
+                        // window shows the answer once it is sent.
+                        let words: Vec<String> = a.chosen.into_iter().chain(a.free_text).collect();
+                        (a.prompt, Value::String(words.join(", ")))
                     })
                     .collect();
                 let mut updated_input = pending.input.clone();
@@ -605,14 +646,55 @@ impl Translator {
 
 /// One entry of the `initialize` reply's `models`. An entry without a `value`
 /// cannot be asked for, so it is skipped. A missing name is the `value`.
-fn model_option(entry: &Value) -> Option<ModelOption> {
-    let text = |key: &str| entry.get(key).and_then(Value::as_str);
-    let id = text("value")?;
-    Some(ModelOption {
-        id: id.to_string(),
-        name: text("displayName").unwrap_or(id).to_string(),
-        resolved: text("resolvedModel").unwrap_or_default().to_string(),
-    })
+/// The entries of a `models` list that have a `value`, each with the name of the model it
+/// stands for when its own name does not say it. That name is, in this order: the name of
+/// another entry for the model this one resolves to, when the two names differ; for the
+/// `default` entry alone, its description (the recorded list describes "Default
+/// (recommended)" as "Fable 5.2"); otherwise none.
+fn model_options(entries: Option<&Vec<Value>>) -> Vec<ModelOption> {
+    let parsed: Vec<(ModelOption, Option<&str>)> = entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let text = |key: &str| entry.get(key).and_then(Value::as_str);
+            let id = text("value")?;
+            let option = ModelOption {
+                id: id.to_string(),
+                name: text("displayName").unwrap_or(id).to_string(),
+                resolved: text("resolvedModel").unwrap_or_default().to_string(),
+                stands_for: None,
+                auto_mode: entry
+                    .get("supportsAutoMode")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            Some((option, text("description")))
+        })
+        .collect();
+    parsed
+        .iter()
+        .enumerate()
+        .map(|(i, (option, description))| {
+            let named_elsewhere = parsed
+                .iter()
+                .enumerate()
+                .find(|(j, (other, _))| {
+                    *j != i && other.id == option.resolved && other.name != option.name
+                })
+                .map(|(_, (other, _))| other.name.clone());
+            let described = || {
+                (option.id == "default")
+                    .then_some(*description)
+                    .flatten()
+                    .filter(|text| !text.trim().is_empty())
+                    .map(str::to_string)
+            };
+            ModelOption {
+                stands_for: named_elsewhere.or_else(described),
+                ..option.clone()
+            }
+        })
+        .collect()
 }
 
 fn limit_window((used, resets_at_unix): (f32, i64)) -> LimitWindow {
@@ -622,11 +704,27 @@ fn limit_window((used, resets_at_unix): (f32, i64)) -> LimitWindow {
     }
 }
 
-fn command_failed(what: &str, reason: String) -> SessionEvent {
-    SessionEvent::CommandFailed {
-        what: what.into(),
-        reason,
-    }
+/// The limits in a `get_usage` reply. Unlike the per-turn event, `utilization`
+/// is a percentage and `resets_at` is ISO 8601 text. A window missing either
+/// value is not known, which is not the same as unused.
+fn usage_limits(body: &Value) -> SessionEvent {
+    let window = |key: &str| {
+        let window = body.get("rate_limits")?.get(key)?;
+        let percent = window.get("utilization")?.as_f64()?;
+        let resets_at_unix = iso8601_to_unix(window.get("resets_at")?.as_str()?)?;
+        Some(LimitWindow {
+            used: (percent as f32 / 100.0).clamp(0.0, 1.0),
+            resets_at_unix,
+        })
+    };
+    SessionEvent::UsageLimits(UsageLimits {
+        session: window("five_hour"),
+        weekly: window("seven_day"),
+    })
+}
+
+fn command_failed(what: CommandKind, reason: String) -> SessionEvent {
+    SessionEvent::CommandFailed { what, reason }
 }
 
 fn tool_finished(result: ToolResult) -> SessionEvent {
@@ -653,13 +751,24 @@ fn questions(input: &Value) -> Vec<Question> {
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|o| o.get("label").and_then(Value::as_str).map(str::to_string))
+                .filter_map(|o| {
+                    let label = o.get("label").and_then(Value::as_str)?.to_string();
+                    Some(QuestionOption {
+                        label,
+                        description: o
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
                 .collect();
             let multi_select = q
                 .get("multiSelect")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let header = q.get("header").and_then(Value::as_str).map(str::to_string);
             Some(Question {
+                header,
                 prompt,
                 options,
                 multi_select,
@@ -854,7 +963,9 @@ mod tests {
             ModelOption {
                 id: "opus".into(),
                 name: "Opus 5.5".into(),
-                resolved: "claude-opus-5-5".into()
+                resolved: "claude-opus-5-5".into(),
+                stands_for: None,
+                auto_mode: true
             }
         );
         assert_eq!(info.models.len(), 3);
@@ -862,6 +973,84 @@ mod tests {
         let init = r#"{"type":"system","subtype":"init","session_id":"chosen","model":"claude-fable-5-2","permissionMode":"default","claude_code_version":"2.1.319","cwd":"/work"}"#;
         assert!(t.push(parse_line(init)).is_empty());
         assert!(t.push(parse_line(initialize_reply())).is_empty());
+    }
+
+    /// What each entry of `models` (a JSON list as `claude` writes it) stands for, as the
+    /// `Started` of a session whose `initialize` reply lists them says.
+    fn stands_for(models: &str) -> Vec<Option<String>> {
+        let mut t = opening(None, None);
+        let reply = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"probe_1","response":{{"models":{models}}}}}}}"#
+        );
+        started_info(&t.push(parse_line(&reply)))
+            .models
+            .into_iter()
+            .map(|option| option.stands_for)
+            .collect()
+    }
+
+    #[test]
+    fn a_model_choice_says_whether_it_supports_auto_mode() {
+        let mut t = opening(None, None);
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"probe_1","response":{"models":[
+            {"value":"default","resolvedModel":"m-1","supportsAutoMode":true},
+            {"value":"slow","resolvedModel":"m-2","supportsAutoMode":false},
+            {"value":"old","resolvedModel":"m-3"}]}}}"#;
+        let info = started_info(&t.push(parse_line(&reply.replace('\n', ""))));
+        let auto: Vec<bool> = info.models.iter().map(|m| m.auto_mode).collect();
+        assert_eq!(auto, vec![true, false, false], "false when not said");
+        let recorded = include_str!("../tests/fixtures/live/v9-control.jsonl")
+            .lines()
+            .next()
+            .unwrap();
+        let mut t = opening(None, None);
+        let info = started_info(&t.push(parse_line(recorded)));
+        assert!(info.models.iter().all(|m| m.auto_mode));
+    }
+
+    #[test]
+    fn a_model_choice_names_the_model_it_stands_for_when_its_name_does_not() {
+        // The recorded list: "Default (recommended)" is Fable 5.2, which has its own entry.
+        let recorded = include_str!("../tests/fixtures/live/v9-control.jsonl")
+            .lines()
+            .next()
+            .unwrap();
+        let mut t = opening(None, None);
+        let info = started_info(&t.push(parse_line(recorded)));
+        let names: Vec<_> = info
+            .models
+            .iter()
+            .map(|m| (m.name.as_str(), m.stands_for.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("Default (recommended)", Some("Fable 5.2")),
+                ("Opus 5.5", None),
+                ("Fable 5.2", None),
+            ]
+        );
+        // No entry for the model it resolves to: the default entry's description names it.
+        assert_eq!(
+            stands_for(
+                r#"[{"value":"default","resolvedModel":"m-9","displayName":"Default","description":"Sonnet 9"},
+                    {"value":"fast","resolvedModel":"m-1","displayName":"Fast","description":"Quick answers"}]"#
+            ),
+            vec![Some("Sonnet 9".into()), None],
+            "only the default entry's description is a model's name"
+        );
+        // An entry for it with the same name says nothing more; an empty description neither.
+        assert_eq!(
+            stands_for(
+                r#"[{"value":"default","resolvedModel":"m-9","displayName":"Sonnet 9","description":""},
+                    {"value":"m-9","resolvedModel":"m-9","displayName":"Sonnet 9"}]"#
+            ),
+            vec![None, None]
+        );
+        assert_eq!(
+            stands_for(r#"[{"value":"default","resolvedModel":"m-9","displayName":"Default"}]"#),
+            vec![None]
+        );
     }
 
     #[test]
@@ -898,7 +1087,9 @@ mod tests {
             vec![ModelOption {
                 id: "x".into(),
                 name: "X".into(),
-                resolved: "claude-x".into()
+                resolved: "claude-x".into(),
+                stands_for: None,
+                auto_mode: false
             }]
         );
         assert_eq!(
@@ -1012,6 +1203,39 @@ mod tests {
     }
 
     #[test]
+    fn a_question_or_a_plan_is_a_request_and_never_a_tool_call() {
+        let calls = r#"{"type":"assistant","message":{"id":"m3","content":[
+            {"type":"tool_use","id":"t_q","name":"AskUserQuestion","input":{"questions":[]}},
+            {"type":"tool_use","id":"t_p","name":"ExitPlanMode","input":{"plan":"Plan"}},
+            {"type":"tool_use","id":"t_b","name":"Bash","input":{"command":"ls"}}]}}"#
+            .replace('\n', "");
+        let results = r#"{"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"t_q","content":"User has answered your questions"},
+            {"type":"tool_result","tool_use_id":"t_p","content":"User has approved your plan"},
+            {"type":"tool_result","tool_use_id":"t_b","content":"a.txt"}]}}"#
+            .replace('\n', "");
+        let events = feed(&[INIT, MSG_START, &calls, &results]);
+        assert_eq!(
+            &events[2..],
+            &[
+                SessionEvent::ToolStarted {
+                    id: ToolCallId("t_b".into()),
+                    name: "Bash".into(),
+                    detail: ToolDetail::Command {
+                        command: "ls".into()
+                    }
+                },
+                SessionEvent::ToolFinished {
+                    id: ToolCallId("t_b".into()),
+                    outcome: ToolOutcome::Ok {
+                        output: "a.txt".into()
+                    }
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_second_init_reports_only_what_changed() {
         let same = INIT;
         let other = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-5-5","permissionMode":"plan","claude_code_version":"2.1.319","cwd":"/work"}"#;
@@ -1107,25 +1331,104 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_thinking_block_gives_no_events() {
-        let think_start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}"#;
-        let think_delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":null}}}"#;
-        let sig_delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}}"#;
+    fn a_thinking_block_is_announced_even_though_its_text_is_empty() {
+        let events = feed(&[
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"m"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"x"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+        ]);
         assert_eq!(
-            feed(&[
-                INIT,
-                MSG_START,
-                think_start,
-                think_delta,
-                sig_delta,
-                BLOCK_STOP
-            ])
-            .len(),
-            2,
-            "Started and TurnStarted only"
+            events,
+            vec![
+                SessionEvent::TurnStarted,
+                SessionEvent::ThinkingStarted,
+                SessionEvent::BlockFinished
+            ]
         );
+    }
+
+    #[test]
+    fn a_streamed_thinking_block_with_text_keeps_its_text_between_start_and_finish() {
+        let think_start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#;
+        let think_delta = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}}"#;
+        let events = feed(&[MSG_START, think_start, think_delta, BLOCK_STOP]);
+        assert_eq!(
+            events,
+            vec![
+                SessionEvent::TurnStarted,
+                SessionEvent::ThinkingStarted,
+                SessionEvent::ThinkingDelta("hm".into()),
+                SessionEvent::BlockFinished
+            ]
+        );
+    }
+
+    #[test]
+    fn a_thinking_block_without_partial_messages_arrives_whole_before_the_text() {
+        let both = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"hm","signature":"sig"},{"type":"text","text":"ok"}]}}"#;
+        let events = feed(&[INIT, both, RESULT_OK]);
+        assert_eq!(
+            &events[1..6],
+            &[
+                SessionEvent::ThinkingStarted,
+                SessionEvent::ThinkingDelta("hm".into()),
+                SessionEvent::BlockFinished,
+                SessionEvent::TextDelta("ok".into()),
+                SessionEvent::BlockFinished,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_thinking_block_without_partial_messages_is_still_announced() {
         let whole = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"","signature":"sig"}]}}"#;
-        assert_eq!(feed(&[INIT, whole]).len(), 1);
+        assert_eq!(
+            &feed(&[INIT, whole])[1..],
+            &[SessionEvent::ThinkingStarted, SessionEvent::BlockFinished]
+        );
+    }
+
+    #[test]
+    fn a_thinking_block_already_streamed_is_not_announced_again_by_its_record() {
+        let think_start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#;
+        let whole = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"hm","signature":"sig"}]}}"#;
+        let events = feed(&[MSG_START, think_start, whole, BLOCK_STOP, MSG_STOP]);
+        assert_eq!(
+            events,
+            vec![
+                SessionEvent::TurnStarted,
+                SessionEvent::ThinkingStarted,
+                SessionEvent::BlockFinished
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_keeps_its_header_and_option_descriptions() {
+        let input = serde_json::json!({"questions":[{
+            "question":"Which colour?","header":"Colour","multiSelect":true,
+            "options":[{"label":"Red","description":"Warm"},{"label":"Blue"}]
+        }]});
+        assert_eq!(
+            questions(&input),
+            vec![Question {
+                header: Some("Colour".into()),
+                prompt: "Which colour?".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "Red".into(),
+                        description: Some("Warm".into())
+                    },
+                    QuestionOption {
+                        label: "Blue".into(),
+                        description: None
+                    },
+                ],
+                multi_select: true,
+            }]
+        );
     }
 
     #[test]
@@ -1314,8 +1617,18 @@ mod tests {
                 id: RequestId("req_4".into()),
                 kind: UserRequestKind::Question {
                     questions: vec![Question {
+                        header: Some("Pick".into()),
                         prompt: "Which?".into(),
-                        options: vec!["A".into(), "B".into()],
+                        options: vec![
+                            QuestionOption {
+                                label: "A".into(),
+                                description: Some("a".into())
+                            },
+                            QuestionOption {
+                                label: "B".into(),
+                                description: Some("b".into())
+                            }
+                        ],
                         multi_select: false
                     }]
                 }
@@ -1344,6 +1657,44 @@ mod tests {
                 updated_input: expected,
                 updated_permissions: None
             }
+        );
+    }
+
+    #[test]
+    fn a_typed_answer_is_sent_with_the_options_chosen() {
+        let input = json!({"questions":[
+            {"question":"Which colour?","options":[{"label":"Red"},{"label":"Blue"}],"multiSelect":false},
+            {"question":"Which sizes?","options":[{"label":"S"},{"label":"M"}],"multiSelect":true},
+            {"question":"Anything else?","options":[{"label":"No"}],"multiSelect":false}]});
+        let mut t = Translator::new();
+        t.push(request(
+            "req_9",
+            "AskUserQuestion",
+            input.clone(),
+            json!(null),
+        ));
+        let answer = |prompt: &str, chosen: &[&str], free_text: Option<&str>| QuestionAnswer {
+            prompt: prompt.into(),
+            chosen: chosen.iter().map(|c| c.to_string()).collect(),
+            free_text: free_text.map(str::to_owned),
+        };
+        let reply = t
+            .answer(
+                &RequestId("req_9".into()),
+                Answer::Answers(vec![
+                    answer("Which colour?", &["Red"], Some("but darker")),
+                    answer("Which sizes?", &["S", "M"], Some("XL")),
+                    answer("Anything else?", &[], Some("Gift wrap")),
+                ]),
+            )
+            .unwrap();
+        let PermissionReply::Allow { updated_input, .. } = reply else {
+            panic!("a question is answered by allowing it: {reply:?}");
+        };
+        assert_eq!(
+            updated_input["answers"],
+            json!({"Which colour?":"Red, but darker","Which sizes?":"S, M, XL",
+                   "Anything else?":"Gift wrap"})
         );
     }
 
@@ -1670,6 +2021,59 @@ mod tests {
         );
     }
 
+    /// Tracks `t1` as a title request and feeds its reply: a success with `body` as its
+    /// `response` (none when `None`), or the refusal "no" when `body` is `"error"`.
+    fn title_reply(body: Option<&str>) -> Vec<SessionEvent> {
+        let mut t = Translator::new();
+        t.track("t1", Tracked::SuggestTitle);
+        let line = match body {
+            Some("error") => r#"{"type":"control_response","response":{"subtype":"error","request_id":"t1","error":"no"}}"#.to_string(),
+            Some(body) => format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"t1","response":{body}}}}}"#
+            ),
+            None => r#"{"type":"control_response","response":{"subtype":"success","request_id":"t1"}}"#.to_string(),
+        };
+        t.push(parse_line(&line))
+    }
+
+    #[test]
+    fn a_suggested_title_is_reported_when_there_is_one() {
+        assert_eq!(
+            title_reply(Some(r#"{"title":"Listing the folder"}"#)),
+            vec![SessionEvent::TitleChanged("Listing the folder".into())]
+        );
+        assert_eq!(
+            title_reply(Some(r#"{"title":"  Listing the folder\n"}"#)),
+            vec![SessionEvent::TitleChanged("Listing the folder".into())],
+            "reported trimmed"
+        );
+        assert_eq!(title_reply(Some(r#"{"title":null}"#)), vec![]);
+        assert_eq!(title_reply(Some(r#"{"title":"  \n "}"#)), vec![]);
+        assert_eq!(title_reply(Some(r#"{"title":""}"#)), vec![]);
+        assert_eq!(title_reply(Some(r#"{}"#)), vec![]);
+        assert_eq!(title_reply(None), vec![]);
+        assert_eq!(
+            title_reply(Some("error")),
+            vec![SessionEvent::CommandFailed {
+                what: CommandKind::SuggestTitle,
+                reason: "no".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_suggested_title_is_reported_once_whichever_record_comes_first() {
+        let changed = r#"{"type":"system","subtype":"session_title_changed","title":"Listing the folder","session_id":"s1"}"#;
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"t1","response":{"title":"Listing the folder"}}}"#;
+        let once = vec![SessionEvent::TitleChanged("Listing the folder".into())];
+        for order in [[changed, reply], [reply, changed]] {
+            let mut t = Translator::new();
+            t.track("t1", Tracked::SuggestTitle);
+            let events: Vec<_> = order.iter().flat_map(|l| t.push(parse_line(l))).collect();
+            assert_eq!(events, once, "{order:?}");
+        }
+    }
+
     #[test]
     fn a_model_change_reports_the_resolved_name() {
         let mut t = Translator::new();
@@ -1678,6 +2082,73 @@ mod tests {
         assert_eq!(
             t.push(parse_line(reply)),
             vec![SessionEvent::ModelChanged("claude-sonnet-5-5".into())]
+        );
+    }
+
+    /// Tracks `u1` as a usage request and feeds the successful reply whose
+    /// `response` is `body`.
+    fn usage_reply(body: &str) -> Vec<SessionEvent> {
+        let mut t = Translator::new();
+        t.track("u1", Tracked::Usage);
+        t.push(parse_line(&format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"u1","response":{body}}}}}"#
+        )))
+    }
+
+    #[test]
+    fn a_usage_reply_becomes_usage_limits() {
+        let body = r#"{"subscription_type":"max","rate_limits_available":true,"rate_limits":{
+            "five_hour":{"utilization":37,"resets_at":"2026-11-11T08:19:59.618411+00:00"},
+            "seven_day":{"utilization":10,"resets_at":"2026-11-15T20:59:59.618435+00:00"}}}"#;
+        assert_eq!(
+            usage_reply(body),
+            vec![SessionEvent::UsageLimits(UsageLimits {
+                session: Some(LimitWindow {
+                    used: 0.37,
+                    resets_at_unix: 1794385199
+                }),
+                weekly: Some(LimitWindow {
+                    used: 0.10,
+                    resets_at_unix: 1794776399
+                }),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_usage_reply_without_numbers_reports_nothing_as_known() {
+        assert_eq!(
+            usage_reply(r#"{"rate_limits_available":false}"#),
+            vec![SessionEvent::UsageLimits(UsageLimits {
+                session: None,
+                weekly: None
+            })]
+        );
+        let one = r#"{"rate_limits":{"five_hour":{"utilization":"lots","resets_at":"soon"},
+            "seven_day":{"utilization":101.5,"resets_at":"2026-11-15T20:59:59Z"}}}"#;
+        assert_eq!(
+            usage_reply(one),
+            vec![SessionEvent::UsageLimits(UsageLimits {
+                session: None,
+                weekly: Some(LimitWindow {
+                    used: 1.0,
+                    resets_at_unix: 1794776399
+                }),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_refused_usage_request_is_a_command_failure() {
+        let mut t = Translator::new();
+        t.track("u1", Tracked::Usage);
+        let refused = r#"{"type":"control_response","response":{"subtype":"error","request_id":"u1","error":"not signed in"}}"#;
+        assert_eq!(
+            t.push(parse_line(refused)),
+            vec![SessionEvent::CommandFailed {
+                what: CommandKind::RefreshUsage,
+                reason: "not signed in".into()
+            }]
         );
     }
 
@@ -1780,7 +2251,7 @@ mod tests {
         assert_eq!(
             t.push(refused),
             vec![SessionEvent::CommandFailed {
-                what: "model".into(),
+                what: CommandKind::SetModel,
                 reason: "unknown model".into()
             }]
         );
@@ -1846,14 +2317,14 @@ mod tests {
         t.track("e", Tracked::Rename("x".into()));
         assert!(t.push(err("o")).is_empty());
         for (id, what) in [
-            ("r", "remote access"),
-            ("d", "permission mode"),
-            ("e", "rename"),
+            ("r", CommandKind::SetRemoteAccess),
+            ("d", CommandKind::SetPermissionMode),
+            ("e", CommandKind::Rename),
         ] {
             assert_eq!(
                 t.push(err(id)),
                 vec![SessionEvent::CommandFailed {
-                    what: what.into(),
+                    what,
                     reason: "no".into()
                 }]
             );
@@ -1865,7 +2336,7 @@ mod tests {
         assert_eq!(
             t.push(err("m")),
             vec![SessionEvent::CommandFailed {
-                what: "model".into(),
+                what: CommandKind::SetModel,
                 reason: "no".into()
             }]
         );
@@ -1895,6 +2366,78 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let mut t = Translator::new();
         text.lines().flat_map(|l| t.push(parse_line(l))).collect()
+    }
+
+    /// Per turn of one recording, the text the translator streamed and the
+    /// text its `assistant` records hold. A turn ends at a `result` record.
+    fn text_per_turn(name: &str) -> (Vec<String>, Vec<String>) {
+        let path = format!(
+            "{}/tests/fixtures/live/{name}.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut t = Translator::new();
+        let (mut streamed, mut recorded) = (Vec::new(), Vec::new());
+        let (mut s, mut r) = (String::new(), String::new());
+        for line in text.lines() {
+            for event in t.push(parse_line(line)) {
+                if let SessionEvent::TextDelta(text) = event {
+                    s.push_str(&text);
+                }
+            }
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            match record.get("type").and_then(Value::as_str) {
+                Some("assistant")
+                    if record.get("parent_tool_use_id").is_none_or(Value::is_null) =>
+                {
+                    let blocks = record.pointer("/message/content").and_then(Value::as_array);
+                    for block in blocks.into_iter().flatten() {
+                        if block.get("type").and_then(Value::as_str) == Some("text") {
+                            r.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""));
+                        }
+                    }
+                }
+                Some("result") => {
+                    let stopped = record
+                        .get("terminal_reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| reason.starts_with("aborted"));
+                    // A stopped turn's stream is cut first: its text is a prefix.
+                    let (got, held) = (std::mem::take(&mut s), std::mem::take(&mut r));
+                    if stopped {
+                        assert!(
+                            held.starts_with(&got),
+                            "{name}: a stopped turn streamed {got:?}, held {held:?}"
+                        );
+                        // The prefix holds, so the caller can compare the two for equality.
+                        streamed.push(held.clone());
+                    } else {
+                        streamed.push(got);
+                    }
+                    recorded.push(held);
+                }
+                _ => {}
+            }
+        }
+        (streamed, recorded)
+    }
+
+    #[test]
+    fn every_recording_streams_exactly_the_text_its_records_hold() {
+        for name in [
+            "v1-remote",
+            "v2-permission",
+            "v4-image-model-stop",
+            "v7-question-plan",
+            "v9-control",
+            "v11-resume",
+            "v11-fork",
+        ] {
+            let (streamed, recorded) = text_per_turn(name);
+            assert_eq!(streamed, recorded, "{name}");
+        }
     }
 
     /// The properties every real recording must have.

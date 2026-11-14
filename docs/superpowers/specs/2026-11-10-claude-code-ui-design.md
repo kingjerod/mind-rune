@@ -93,6 +93,9 @@ to Jerod in the mockup or the conversation. Calls Jerod has not seen are marked 
   - Because a group can hold sessions from several folders, a row whose folder differs from
     the group's own shows the folder name in muted text. **(call)**
   - Groups collapse and expand. **(call)**
+- A session gets its title from its first message (Jerod, 2026-11-13). **(call)** The row
+  shows the start of that message at once, and the app asks Claude Code for a short title,
+  which replaces it when it arrives. This costs one small extra request per session.
 - Each session row shows a state mark and the session title:
   - **working**: a turn is in flight;
   - **needs you**: a permission request, a question from Claude or a plan approval is pending;
@@ -179,9 +182,12 @@ the rest. A group can be hidden from its context menu, and hidden groups are res
 - While a turn runs, the send button becomes a stop button. Escape in the focused tile also
   stops it. A message typed during a turn is queued and sent when the turn ends.
 - **Model picker**, always visible, showing the session's current model. Changing it applies
-  to the next turn.
-- **Permission mode picker** beside it: Ask before edits, Accept edits, Plan. **(call)**
-  Bypass mode is offered only when the user's own Claude Code settings allow it.
+  to the next turn. A choice whose label does not name a model, such as "Default
+  (recommended)", shows the model's name beside it (Jerod, 2026-11-13: the user must be able
+  to tell which model they are paying for).
+- **Permission mode picker** beside it: Ask before edits, Accept edits, Plan, Auto. Auto was
+  added on 2026-11-13 at Jerod's request and is offered when the model in use supports it.
+  **(call)** Bypass mode is offered only when the user's own Claude Code settings allow it.
 - **Attachments:**
   - pasting an image from the clipboard adds it as a chip;
   - dropping files onto the tile adds them as chips;

@@ -3,9 +3,9 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use mr_agent::{
-    Account, Agent, AgentError, Answer, ModelOption, PermissionMode, RemoteAccess, RequestId,
-    SessionCommand, SessionEvent, SessionHandle, SessionId, SessionInfo, StartSpec, ToolDetail,
-    UserRequestKind,
+    Account, Agent, AgentError, Answer, LimitWindow, ModelOption, PermissionMode, RemoteAccess,
+    RequestId, SessionCommand, SessionEvent, SessionHandle, SessionId, SessionInfo, StartSpec,
+    ToolDetail, UsageLimits, UserRequestKind,
 };
 use mr_claude::ClaudeAgent;
 
@@ -102,7 +102,9 @@ fn a_session_starts_before_any_turn_with_the_id_it_was_given() {
         ModelOption {
             id: "sonnet".into(),
             name: "Sonnet".into(),
-            resolved: "claude-sonnet-5-5".into()
+            resolved: "claude-sonnet-5-5".into(),
+            stands_for: None,
+            auto_mode: false
         }
     );
     assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
@@ -281,6 +283,43 @@ fn a_model_change_is_sent_and_confirmed() {
     );
 }
 
+#[test]
+fn a_title_is_asked_for_and_reported_once() {
+    let (handle, rx) = open_stub();
+    handle
+        .send(SessionCommand::SuggestTitle {
+            from: "What is in this folder?".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        next(&rx),
+        SessionEvent::TitleChanged("Listing the folder".into())
+    );
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the reply repeats the title, which is not reported again"
+    );
+}
+
+#[test]
+fn the_usage_limits_are_asked_for_and_reported() {
+    let (handle, rx) = open_stub();
+    handle.send(SessionCommand::RefreshUsage).unwrap();
+    assert_eq!(
+        next(&rx),
+        SessionEvent::UsageLimits(UsageLimits {
+            session: Some(LimitWindow {
+                used: 0.37,
+                resets_at_unix: 1794385199
+            }),
+            weekly: Some(LimitWindow {
+                used: 0.10,
+                resets_at_unix: 1794776399
+            }),
+        })
+    );
+}
+
 /// Whether a process with this id still exists.
 fn process_exists(pid: &str) -> bool {
     std::process::Command::new("kill")
@@ -304,6 +343,11 @@ fn read_pid(folder: &Path) -> String {
     }
 }
 
+/// How long a child that ignores the end of its input may take to be gone, and its exit
+/// reported, after `Close`: the adapter kills it after its own 2 s grace, and this leaves a
+/// loaded machine room for the kill and the exit to come through.
+const KILLED_WITHIN: Duration = Duration::from_secs(5);
+
 #[test]
 fn a_child_that_ignores_close_is_killed() {
     let folder = tempfile::tempdir().unwrap();
@@ -314,12 +358,12 @@ fn a_child_that_ignores_close_is_killed() {
     let closed_at = Instant::now();
     handle.send(SessionCommand::Close).unwrap();
     let exit = rx
-        .recv_timeout(Duration::from_secs(3))
-        .expect("Exited within 3 seconds of Close");
+        .recv_timeout(KILLED_WITHIN)
+        .expect("Exited within 5 s of Close");
     assert!(
         matches!(exit, SessionEvent::Exited { clean: false, .. }),
         "{exit:?}"
     );
-    assert!(closed_at.elapsed() < Duration::from_secs(3));
+    assert!(closed_at.elapsed() < KILLED_WITHIN);
     assert!(!process_exists(&pid), "the stub {pid} is still running");
 }

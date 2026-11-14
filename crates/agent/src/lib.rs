@@ -14,8 +14,9 @@ pub use agent::{
 };
 pub use command::{Answer, Attachment, QuestionAnswer, SessionCommand};
 pub use event::{
-    LimitWindow, ModelOption, PermissionMode, Question, RemoteAccess, SessionEvent, SessionInfo,
-    ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
+    CommandKind, LimitWindow, ModelOption, PermissionMode, Question, QuestionOption, RemoteAccess,
+    SessionEvent, SessionInfo, ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest,
+    UserRequestKind,
 };
 pub use fake::{FakeAgent, FakeStep};
 pub use ids::{RequestId, SessionId, ToolCallId};

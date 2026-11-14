@@ -22,8 +22,9 @@ use serde_json::Value;
 use crate::account::detect;
 use crate::args::build_args;
 use crate::encode::{
-    control_request, initialize, interrupt, permission_reply, remote_control, rename_session,
-    set_model, set_permission_mode, unsupported_reply, user_message,
+    control_request, generate_session_title, get_usage, initialize, interrupt, permission_reply,
+    remote_control, rename_session, set_model, set_permission_mode, unsupported_reply,
+    user_message,
 };
 use crate::env::child_env;
 use crate::history::{find_session, read_history, stored_sessions};
@@ -211,8 +212,10 @@ impl Reader {
         }
     }
 
+    /// Reports a kind of line this adapter does not read, once per kind, unless it is known to
+    /// be harmless.
     fn note_ignored(&self, kind: &str) {
-        if lock(&self.ignored).insert(kind.to_string()) {
+        if worth_reporting(kind) && lock(&self.ignored).insert(kind.to_string()) {
             eprintln!("mindrune: ignored a `{kind}` line from claude");
         }
     }
@@ -225,6 +228,20 @@ impl Reader {
         // A failed write means the child is going away, which the exit reports.
         let _ = process.write_line(&unsupported_reply(request_id));
     }
+}
+
+/// Kinds of line `claude` sends that the adapter has no use for and that are known to be
+/// harmless: hooks starting and answering, and a status line that carries no permission mode
+/// (one that carries it is read, so it is never ignored).
+const HARMLESS_KINDS: [&str; 3] = [
+    "system/hook_started",
+    "system/hook_response",
+    "system/status",
+];
+
+/// Whether an ignored line of this kind is worth a note on stderr: it is not known to be harmless.
+fn worth_reporting(kind: &str) -> bool {
+    !HARMLESS_KINDS.contains(&kind)
 }
 
 fn exit_event(info: ExitInfo) -> SessionEvent {
@@ -315,6 +332,10 @@ impl SessionHandle for ClaudeSession {
             SessionCommand::Rename(title) => {
                 self.request(Some(Tracked::Rename(title.clone())), rename_session(&title))
             }
+            SessionCommand::SuggestTitle { from } => {
+                self.request(Some(Tracked::SuggestTitle), generate_session_title(&from))
+            }
+            SessionCommand::RefreshUsage => self.request(Some(Tracked::Usage), get_usage()),
             SessionCommand::Close => self.close(),
         }
     }
@@ -355,4 +376,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_unknown_kinds_of_line_are_reported() {
+        for harmless in [
+            "system/hook_started",
+            "system/hook_response",
+            "system/status",
+        ] {
+            assert!(!worth_reporting(harmless), "{harmless}");
+        }
+        for unknown in ["system/brand_new", "not-json", "user", "system/hook"] {
+            assert!(worth_reporting(unknown), "{unknown}");
+        }
+        // A status line that carries a permission mode is read, never ignored.
+        let status =
+            r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan"}"#;
+        assert!(!matches!(parse_line(status), Incoming::Ignored { .. }));
+    }
 }

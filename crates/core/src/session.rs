@@ -1,0 +1,870 @@
+//! One session's life: its phase, the message waiting to be sent, and what the
+//! user can ask of it. Every intent returns the command to send instead of
+//! sending it, so this module stays plain data.
+
+use std::path::PathBuf;
+
+use mr_agent::{
+    Answer, CommandKind, ModelOption, PermissionMode, RequestId, SessionCommand, SessionEvent,
+    SessionId, StartSpec,
+};
+
+use crate::conversation::{Conversation, NoticeKind};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Phase {
+    /// The program is starting; nothing can be sent yet.
+    Opening,
+    Idle,
+    /// A turn is in flight.
+    Working,
+    /// A turn is in flight and at least one request waits for the user.
+    NeedsUser,
+    Ended {
+        clean: bool,
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Session {
+    pub folder: PathBuf,
+    pub id: Option<SessionId>,
+    /// The agent's name for the session or, until it gives one, a stand-in made from the first
+    /// message sent. `None` before any message.
+    pub title: Option<String>,
+    pub phase: Phase,
+    /// The full id of the model in use, once known.
+    pub model: Option<String>,
+    pub models: Vec<ModelOption>,
+    pub mode: PermissionMode,
+    pub conversation: Conversation,
+    /// A message typed while it could not be sent yet.
+    pub queued: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub context_used: Option<f32>,
+    /// The option id the user last picked, for naming the model they chose.
+    chosen_model: Option<String>,
+}
+
+impl Session {
+    pub fn opening(folder: impl Into<PathBuf>) -> Session {
+        Session {
+            folder: folder.into(),
+            id: None,
+            title: None,
+            phase: Phase::Opening,
+            model: None,
+            models: Vec::new(),
+            mode: PermissionMode::Ask,
+            conversation: Conversation::new(),
+            queued: None,
+            cost_usd: None,
+            context_used: None,
+            chosen_model: None,
+        }
+    }
+
+    /// Applies an event. Returns commands the session now wants sent: a queued message, and the
+    /// request for a title when that message is the session's first.
+    pub fn apply(&mut self, event: SessionEvent, now: f64) -> Vec<SessionCommand> {
+        self.conversation.apply(&event, now);
+        match event {
+            SessionEvent::Started(info) => {
+                if self.phase == Phase::Opening {
+                    self.id = Some(info.id);
+                    self.model = Some(info.model);
+                    self.models = info.models;
+                    self.mode = info.permission_mode;
+                    self.phase = Phase::Idle;
+                    return self.send_queued();
+                }
+            }
+            SessionEvent::TurnStarted => {
+                if !self.ended() {
+                    self.phase = if self.conversation.waiting() > 0 {
+                        Phase::NeedsUser
+                    } else {
+                        Phase::Working
+                    };
+                }
+            }
+            SessionEvent::NeedsUser(_) => {
+                if self.phase == Phase::Working {
+                    self.phase = Phase::NeedsUser;
+                }
+            }
+            SessionEvent::RequestWithdrawn { .. } => self.carry_on_when_nothing_waits(),
+            SessionEvent::TurnFinished(summary) => {
+                if self.in_turn() {
+                    self.cost_usd = Some(summary.cost_usd);
+                    if summary.context_used.is_some() {
+                        self.context_used = summary.context_used;
+                    }
+                    self.phase = Phase::Idle;
+                    return self.send_queued();
+                }
+            }
+            SessionEvent::TurnFailed { .. } => {
+                if self.in_turn() {
+                    self.phase = Phase::Idle;
+                    return self.send_queued();
+                }
+            }
+            SessionEvent::TitleChanged(title) => self.title = Some(title),
+            SessionEvent::ModelChanged(model) => self.model = Some(model),
+            SessionEvent::PermissionModeChanged(mode) => self.mode = mode,
+            SessionEvent::CommandFailed { what, reason } => {
+                let wording = match what {
+                    CommandKind::SetModel => "Could not change the model",
+                    CommandKind::SetPermissionMode => "Could not change the permission mode",
+                    CommandKind::Rename => "Could not rename the session",
+                    CommandKind::SetRemoteAccess => "Could not change Remote Control",
+                    // Asked for in the background; the stand-in title simply stays.
+                    CommandKind::RefreshUsage | CommandKind::SuggestTitle => return Vec::new(),
+                };
+                self.conversation
+                    .push_notice(NoticeKind::CommandFailed, &format!("{wording}: {reason}"));
+            }
+            SessionEvent::Exited { clean, detail } => self.phase = Phase::Ended { clean, detail },
+            SessionEvent::TextDelta(_)
+            | SessionEvent::ThinkingDelta(_)
+            | SessionEvent::ThinkingStarted
+            | SessionEvent::BlockFinished
+            | SessionEvent::ToolStarted { .. }
+            | SessionEvent::ToolFinished { .. }
+            | SessionEvent::UsageLimits(_)
+            | SessionEvent::RemoteAccess(_) => {}
+        }
+        Vec::new()
+    }
+
+    /// Sends `text`, or queues it while it cannot be sent yet. Only trailing whitespace is
+    /// dropped: a first line's indentation is part of what was typed. A message with nothing
+    /// but whitespace is neither sent nor queued. A session's first message sent also names the
+    /// session for now and asks the agent for a title.
+    pub fn submit(&mut self, text: &str) -> Vec<SessionCommand> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let text = text.trim_end();
+        match self.phase {
+            Phase::Idle => self.hand_over(text.into()),
+            Phase::Opening | Phase::Working | Phase::NeedsUser => {
+                match &mut self.queued {
+                    Some(queued) => {
+                        queued.push_str("\n\n");
+                        queued.push_str(text);
+                    }
+                    None => self.queued = Some(text.into()),
+                }
+                Vec::new()
+            }
+            Phase::Ended { .. } => Vec::new(),
+        }
+    }
+
+    pub fn stop(&self) -> Option<SessionCommand> {
+        self.in_turn().then_some(SessionCommand::Stop)
+    }
+
+    pub fn answer(&mut self, id: &RequestId, answer: Answer) -> Option<SessionCommand> {
+        if self.ended() || !self.conversation.answered(id, &answer_words(&answer)) {
+            return None;
+        }
+        self.carry_on_when_nothing_waits();
+        Some(SessionCommand::Answer {
+            id: id.clone(),
+            answer,
+        })
+    }
+
+    /// Asks for the model option `option_id`. Nothing is sent when it is already the model in
+    /// use and already the option the model is named by: the picker then only closes.
+    pub fn choose_model(&mut self, option_id: &str) -> Option<SessionCommand> {
+        if matches!(self.phase, Phase::Opening | Phase::Ended { .. }) {
+            return None;
+        }
+        let option = self.models.iter().find(|option| option.id == option_id)?;
+        let in_use = self.model.as_ref() == Some(&option.resolved);
+        if in_use && self.named_by().is_some_and(|named| named.id == option.id) {
+            return None;
+        }
+        self.chosen_model = Some(option_id.into());
+        Some(SessionCommand::SetModel(option_id.into()))
+    }
+
+    pub fn choose_mode(&self, mode: PermissionMode) -> Option<SessionCommand> {
+        if matches!(self.phase, Phase::Opening | Phase::Ended { .. }) || self.mode == mode {
+            return None;
+        }
+        Some(SessionCommand::SetPermissionMode(mode))
+    }
+
+    /// Gives the queued message back, for the input box.
+    pub fn take_queued(&mut self) -> Option<String> {
+        self.queued.take()
+    }
+
+    /// The model in use, as the picker names it: by the option it is named by (see
+    /// [`model_option_label`]), or by its id when no option names it.
+    pub fn model_label(&self) -> String {
+        let Some(model) = &self.model else {
+            return "Model".into();
+        };
+        self.named_by()
+            .map_or_else(|| model.clone(), model_option_label)
+    }
+
+    /// Whether the `Auto` permission mode can be offered: the option that names the model in
+    /// use supports it.
+    pub fn auto_mode(&self) -> bool {
+        self.named_by().is_some_and(|option| option.auto_mode)
+    }
+
+    /// The option the model in use is named by: the one the user chose while it is the model
+    /// in use, otherwise the first that resolves to it.
+    fn named_by(&self) -> Option<&ModelOption> {
+        let model = self.model.as_ref()?;
+        let chosen = self
+            .chosen_model
+            .as_ref()
+            .and_then(|id| self.models.iter().find(|option| option.id == *id))
+            .filter(|option| option.resolved == *model);
+        chosen.or_else(|| {
+            self.models
+                .iter()
+                .find(|option| option.resolved == *model || option.id == *model)
+        })
+    }
+
+    /// How to open this session again after it ended.
+    pub fn restart_spec(&self) -> Option<StartSpec> {
+        if !self.ended() {
+            return None;
+        }
+        let mut spec = StartSpec::new(self.folder.clone());
+        spec.resume = self.id.clone();
+        Some(spec)
+    }
+
+    /// Back to `Opening` for a restart, keeping the conversation.
+    pub fn reopening(&mut self) {
+        self.phase = Phase::Opening;
+    }
+
+    fn ended(&self) -> bool {
+        matches!(self.phase, Phase::Ended { .. })
+    }
+
+    fn in_turn(&self) -> bool {
+        matches!(self.phase, Phase::Working | Phase::NeedsUser)
+    }
+
+    fn carry_on_when_nothing_waits(&mut self) {
+        if self.phase == Phase::NeedsUser && self.conversation.waiting() == 0 {
+            self.phase = Phase::Working;
+        }
+    }
+
+    /// Starts a turn with the queued message, when there is one.
+    fn send_queued(&mut self) -> Vec<SessionCommand> {
+        match self.queued.take() {
+            Some(text) => self.hand_over(text),
+            None => Vec::new(),
+        }
+    }
+
+    /// Starts a turn with `text`: the `Send`, and when the session has no title yet, the title
+    /// is set at once to a stand-in made from the message and a `SuggestTitle` follows the
+    /// `Send`, so the agent can name the session. A session with a title, its own or a stand-in,
+    /// never asks, so each session asks at most once.
+    fn hand_over(&mut self, text: String) -> Vec<SessionCommand> {
+        self.conversation.push_user(&text);
+        self.phase = Phase::Working;
+        let suggest = self.title.is_none().then(|| {
+            self.title = Some(title_stand_in(&text));
+            SessionCommand::SuggestTitle {
+                from: text.chars().take(TITLE_FROM_CHARS).collect(),
+            }
+        });
+        let send = SessionCommand::Send {
+            text,
+            attachments: vec![],
+        };
+        std::iter::once(send).chain(suggest).collect()
+    }
+}
+
+/// The longest stand-in title, in characters, before its "…".
+const STAND_IN_CHARS: usize = 60;
+
+/// The most of a first message the agent is given to name its session from, in characters.
+const TITLE_FROM_CHARS: usize = 2_000;
+
+/// What a session is called until the agent names it: the message's first line that is not
+/// blank, each run of whitespace made one space, cut to 60 characters with "…" in place of
+/// the rest.
+fn title_stand_in(message: &str) -> String {
+    let line = message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let words = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.chars().count() <= STAND_IN_CHARS {
+        return words;
+    }
+    let kept: String = words.chars().take(STAND_IN_CHARS).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// How a model choice reads in the picker: its name, then the model it stands for when the
+/// name does not say it, as in "Default (recommended) · Fable 5.2".
+pub fn model_option_label(option: &ModelOption) -> String {
+    match &option.stands_for {
+        Some(model) => format!("{} · {model}", option.name),
+        None => option.name.clone(),
+    }
+}
+
+pub fn mode_label(mode: &PermissionMode) -> String {
+    match mode {
+        PermissionMode::Ask => "Ask before edits".into(),
+        PermissionMode::AcceptEdits => "Accept edits".into(),
+        PermissionMode::Plan => "Plan".into(),
+        PermissionMode::Auto => "Auto".into(),
+        PermissionMode::Bypass => "Bypass permissions".into(),
+        PermissionMode::Other(text) => text.clone(),
+    }
+}
+
+pub fn answer_words(answer: &Answer) -> String {
+    match answer {
+        Answer::Allow { always: false } => "Allowed once".into(),
+        Answer::Allow { always: true } => "Always allowed".into(),
+        Answer::Deny { .. } => "Denied".into(),
+        Answer::Answers(answers) => {
+            let words: Vec<&str> = answers
+                .iter()
+                .flat_map(|a| a.chosen.iter().chain(a.free_text.iter()))
+                .map(String::as_str)
+                .collect();
+            if words.is_empty() {
+                "Answered".into()
+            } else {
+                words.join(", ")
+            }
+        }
+        Answer::ApprovePlan => "Plan approved".into(),
+        Answer::KeepPlanning { .. } => "Kept planning".into(),
+    }
+}
+
+/// Test data shared with other modules' tests in this crate.
+#[cfg(test)]
+pub(crate) mod testing {
+    use mr_agent::{ModelOption, PermissionMode, SessionId, SessionInfo};
+
+    /// What a started session reports: id `s1`, folder `/p`, the Haiku model,
+    /// and two models to choose from.
+    pub(crate) fn info() -> SessionInfo {
+        SessionInfo {
+            id: SessionId("s1".into()),
+            folder: "/p".into(),
+            model: "claude-haiku-5-5".into(),
+            permission_mode: PermissionMode::Ask,
+            agent_version: "2.1.319".into(),
+            models: vec![
+                ModelOption {
+                    id: "default".into(),
+                    name: "Default".into(),
+                    resolved: "claude-fable-5-2".into(),
+                    stands_for: None,
+                    auto_mode: false,
+                },
+                ModelOption {
+                    id: "haiku".into(),
+                    name: "Haiku 5.5".into(),
+                    resolved: "claude-haiku-5-5".into(),
+                    stands_for: None,
+                    auto_mode: false,
+                },
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::info;
+    use super::*;
+    use crate::conversation::ItemBody;
+    use mr_agent::{QuestionAnswer, ToolDetail, TurnSummary, UserRequest, UserRequestKind};
+
+    fn started() -> Session {
+        let mut s = Session::opening("/p");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s
+    }
+
+    fn done() -> SessionEvent {
+        SessionEvent::TurnFinished(TurnSummary {
+            cost_usd: 0.25,
+            context_used: Some(0.5),
+            duration_ms: 1,
+            interrupted: false,
+        })
+    }
+
+    fn permission(id: &str) -> SessionEvent {
+        SessionEvent::NeedsUser(UserRequest {
+            id: RequestId(id.into()),
+            kind: UserRequestKind::Permission {
+                tool: "Bash".into(),
+                detail: ToolDetail::Command {
+                    command: "ls".into(),
+                },
+                always_allow_label: None,
+            },
+        })
+    }
+
+    #[test]
+    fn a_message_is_sent_when_idle_and_queued_otherwise() {
+        let mut s = Session::opening("/p");
+        assert_eq!(s.submit("early"), vec![]);
+        assert_eq!(s.queued.as_deref(), Some("early"));
+        let sent = s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(sent, vec![send("early"), suggest("early")]);
+        assert_eq!((s.phase.clone(), s.queued.clone()), (Phase::Working, None));
+        assert_eq!(s.submit("  "), vec![]);
+        assert_eq!(s.submit("two"), vec![]);
+        assert_eq!(s.submit("three"), vec![]);
+        assert_eq!(s.queued.as_deref(), Some("two\n\nthree"));
+        let sent = s.apply(done(), 0.0);
+        assert_eq!(
+            sent,
+            vec![SessionCommand::Send {
+                text: "two\n\nthree".into(),
+                attachments: vec![]
+            }]
+        );
+        assert_eq!(s.phase, Phase::Working);
+        assert_eq!(s.apply(done(), 0.0), vec![]);
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!((s.cost_usd, s.context_used), (Some(0.25), Some(0.5)));
+        let users = s
+            .conversation
+            .items()
+            .iter()
+            .filter(|i| matches!(i.body, ItemBody::User { .. }))
+            .count();
+        assert_eq!(users, 2);
+    }
+
+    #[test]
+    fn a_message_keeps_its_indentation_and_loses_only_trailing_whitespace() {
+        let mut s = started();
+        let typed = "    let x = 1;\n  done  \n\n";
+        let as_sent = "    let x = 1;\n  done";
+        assert_eq!(s.submit(typed)[0], send(as_sent));
+        let shown = s.conversation.items().iter().find_map(|i| match &i.body {
+            ItemBody::User { text } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(shown.as_deref(), Some(as_sent));
+        assert_eq!(s.submit("  - one\n"), vec![]);
+        assert_eq!(s.submit("  - two \t"), vec![]);
+        assert_eq!(s.queued.as_deref(), Some("  - one\n\n  - two"));
+        assert_eq!(s.submit(" \n\t "), vec![]);
+        assert_eq!(s.queued.as_deref(), Some("  - one\n\n  - two"));
+    }
+
+    #[test]
+    fn typing_while_a_request_waits_never_answers_it() {
+        let mut s = started();
+        s.submit("go");
+        s.apply(permission("r1"), 0.0);
+        assert_eq!(s.phase, Phase::NeedsUser);
+        assert_eq!(s.submit("yes"), vec![]);
+        assert_eq!(s.conversation.waiting(), 1);
+        assert_eq!(s.queued.as_deref(), Some("yes"));
+        let sent = s.answer(&RequestId("r1".into()), Answer::Allow { always: false });
+        assert_eq!(
+            sent,
+            Some(SessionCommand::Answer {
+                id: RequestId("r1".into()),
+                answer: Answer::Allow { always: false }
+            })
+        );
+        assert_eq!(s.phase, Phase::Working);
+        assert_eq!(
+            s.answer(&RequestId("r1".into()), Answer::Deny { message: None }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_request_lets_the_turn_carry_on() {
+        let mut s = started();
+        s.submit("go");
+        s.apply(permission("r1"), 0.0);
+        s.apply(
+            SessionEvent::RequestWithdrawn {
+                id: RequestId("r1".into()),
+            },
+            0.0,
+        );
+        assert_eq!(s.phase, Phase::Working);
+        assert_eq!(
+            s.answer(&RequestId("r1".into()), Answer::Allow { always: false }),
+            None
+        );
+    }
+
+    #[test]
+    fn nothing_is_sent_to_a_session_that_ended() {
+        let mut s = started();
+        s.submit("go");
+        s.apply(permission("r1"), 0.0);
+        s.submit("later");
+        s.apply(
+            SessionEvent::Exited {
+                clean: false,
+                detail: "killed".into(),
+            },
+            0.0,
+        );
+        assert_eq!(
+            s.phase,
+            Phase::Ended {
+                clean: false,
+                detail: "killed".into()
+            }
+        );
+        assert_eq!(
+            s.answer(&RequestId("r1".into()), Answer::Allow { always: false }),
+            None
+        );
+        assert_eq!(
+            (
+                s.submit("x"),
+                s.stop(),
+                s.choose_model("haiku"),
+                s.choose_mode(PermissionMode::Plan)
+            ),
+            (vec![], None, None, None)
+        );
+        assert_eq!(s.take_queued().as_deref(), Some("later"));
+        let spec = s.restart_spec().unwrap();
+        assert_eq!(
+            (spec.folder, spec.resume, spec.fork),
+            (PathBuf::from("/p"), Some(SessionId("s1".into())), false)
+        );
+        s.reopening();
+        assert_eq!(s.phase, Phase::Opening);
+        assert!(!s.conversation.items().is_empty());
+    }
+
+    #[test]
+    fn stop_is_offered_only_during_a_turn() {
+        let mut s = started();
+        assert_eq!(s.stop(), None);
+        s.submit("go");
+        assert_eq!(s.stop(), Some(SessionCommand::Stop));
+    }
+
+    #[test]
+    fn the_model_and_mode_follow_what_the_agent_confirms() {
+        let mut s = started();
+        assert_eq!(s.model_label(), "Haiku 5.5");
+        assert_eq!(s.choose_model("nope"), None);
+        assert_eq!(
+            s.choose_model("default"),
+            Some(SessionCommand::SetModel("default".into()))
+        );
+        assert_eq!(s.model_label(), "Haiku 5.5");
+        s.apply(SessionEvent::ModelChanged("claude-fable-5-2".into()), 0.0);
+        assert_eq!(s.model_label(), "Default");
+        s.apply(SessionEvent::ModelChanged("claude-new-9".into()), 0.0);
+        assert_eq!(s.model_label(), "claude-new-9");
+        assert_eq!(s.choose_mode(PermissionMode::Ask), None);
+        assert_eq!(
+            s.choose_mode(PermissionMode::Plan),
+            Some(SessionCommand::SetPermissionMode(PermissionMode::Plan))
+        );
+        assert_eq!(s.mode, PermissionMode::Ask);
+        s.apply(
+            SessionEvent::PermissionModeChanged(PermissionMode::Plan),
+            0.0,
+        );
+        assert_eq!(s.mode, PermissionMode::Plan);
+        assert_eq!(Session::opening("/p").model_label(), "Model");
+    }
+
+    #[test]
+    fn choosing_the_model_already_in_use_sends_nothing() {
+        let mut s = started();
+        assert_eq!(s.model_label(), "Haiku 5.5");
+        assert_eq!(s.choose_model("haiku"), None, "the model in use, as named");
+        assert_eq!(
+            s.choose_model("default"),
+            Some(SessionCommand::SetModel("default".into()))
+        );
+        s.apply(SessionEvent::ModelChanged("claude-fable-5-2".into()), 0.0);
+        assert_eq!(s.choose_model("default"), None);
+        // Another option for the same model is another choice: it names the model differently
+        // and follows a different setting.
+        s.models.push(ModelOption {
+            id: "fable".into(),
+            name: "Fable 5.2".into(),
+            resolved: "claude-fable-5-2".into(),
+            stands_for: None,
+            auto_mode: false,
+        });
+        assert_eq!(
+            s.choose_model("fable"),
+            Some(SessionCommand::SetModel("fable".into()))
+        );
+        assert_eq!(s.model_label(), "Fable 5.2");
+        assert_eq!(s.choose_model("fable"), None);
+        assert_eq!(
+            s.choose_model("haiku"),
+            Some(SessionCommand::SetModel("haiku".into()))
+        );
+    }
+
+    #[test]
+    fn a_choice_that_does_not_name_its_model_is_labelled_with_it() {
+        let mut s = started();
+        s.models[0].stands_for = Some("Fable 5.2".into());
+        assert_eq!(model_option_label(&s.models[0]), "Default · Fable 5.2");
+        assert_eq!(model_option_label(&s.models[1]), "Haiku 5.5");
+        assert_eq!(s.model_label(), "Haiku 5.5");
+        assert_eq!(
+            s.choose_model("default"),
+            Some(SessionCommand::SetModel("default".into())),
+            "chosen by its id, whatever its label"
+        );
+        s.apply(SessionEvent::ModelChanged("claude-fable-5-2".into()), 0.0);
+        assert_eq!(s.model_label(), "Default · Fable 5.2");
+    }
+
+    #[test]
+    fn auto_mode_is_offered_when_the_model_in_use_supports_it() {
+        let mut s = started();
+        assert!(!s.auto_mode(), "Haiku 5.5 does not");
+        s.models[0].auto_mode = true;
+        assert!(
+            !s.auto_mode(),
+            "only the option that names the model in use counts"
+        );
+        s.apply(SessionEvent::ModelChanged("claude-fable-5-2".into()), 0.0);
+        assert!(s.auto_mode());
+        s.apply(SessionEvent::ModelChanged("claude-unknown".into()), 0.0);
+        assert!(!s.auto_mode(), "a model no option names");
+        assert!(!Session::opening("/p").auto_mode());
+    }
+
+    #[test]
+    fn a_refused_command_is_explained_in_the_conversation() {
+        let mut s = started();
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetModel,
+                reason: "unknown model".into(),
+            },
+            0.0,
+        );
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::RefreshUsage,
+                reason: "x".into(),
+            },
+            0.0,
+        );
+        let notices: Vec<_> = s
+            .conversation
+            .items()
+            .iter()
+            .filter_map(|i| match &i.body {
+                ItemBody::Notice {
+                    kind: NoticeKind::CommandFailed,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, vec!["Could not change the model: unknown model"]);
+    }
+
+    #[test]
+    fn the_wording_is_as_written() {
+        assert_eq!(mode_label(&PermissionMode::Ask), "Ask before edits");
+        assert_eq!(mode_label(&PermissionMode::Auto), "Auto");
+        assert_eq!(mode_label(&PermissionMode::Other("auto".into())), "auto");
+        assert_eq!(
+            answer_words(&Answer::Allow { always: true }),
+            "Always allowed"
+        );
+        assert_eq!(
+            answer_words(&Answer::KeepPlanning { feedback: None }),
+            "Kept planning"
+        );
+        let answers = Answer::Answers(vec![
+            QuestionAnswer {
+                prompt: "a".into(),
+                chosen: vec!["Red".into(), "Blue".into()],
+                free_text: None,
+            },
+            QuestionAnswer {
+                prompt: "b".into(),
+                chosen: vec![],
+                free_text: Some("tall".into()),
+            },
+        ]);
+        assert_eq!(answer_words(&answers), "Red, Blue, tall");
+        assert_eq!(answer_words(&Answer::Answers(vec![])), "Answered");
+    }
+
+    fn send(text: &str) -> SessionCommand {
+        SessionCommand::Send {
+            text: text.into(),
+            attachments: vec![],
+        }
+    }
+
+    fn suggest(from: &str) -> SessionCommand {
+        SessionCommand::SuggestTitle { from: from.into() }
+    }
+
+    #[test]
+    fn a_title_stand_in_is_the_first_line_that_is_not_blank() {
+        assert_eq!(title_stand_in("Fix the parser"), "Fix the parser");
+        assert_eq!(
+            title_stand_in("\n   \n\t\n  Fix   the\tparser  \nand the tests"),
+            "Fix the parser"
+        );
+        let sixty = "a".repeat(60);
+        assert_eq!(title_stand_in(&sixty), sixty, "60 characters fit whole");
+        let long = format!("{sixty}bcd");
+        assert_eq!(title_stand_in(&long), format!("{sixty}…"));
+        // Whitespace is made one space before the cut, and none is left before the "…".
+        let spaced = format!("{}  {}", "a".repeat(59), "b".repeat(10));
+        assert_eq!(title_stand_in(&spaced), format!("{}…", "a".repeat(59)));
+        // The cut counts characters, not bytes.
+        let wide = format!("{}日本語のテキスト", "x".repeat(59));
+        assert_eq!(title_stand_in(&wide), format!("{}日…", "x".repeat(59)));
+        let accents = "é".repeat(61);
+        assert_eq!(title_stand_in(&accents), format!("{}…", "é".repeat(60)));
+    }
+
+    #[test]
+    fn the_first_message_is_sent_then_a_title_is_asked_for_once() {
+        let mut s = started();
+        assert_eq!(s.title, None);
+        let message = "  Fix the parser\nand the tests";
+        assert_eq!(
+            s.submit(message),
+            vec![send(message), suggest(message)],
+            "the Send first, then the request"
+        );
+        assert_eq!(s.title.as_deref(), Some("Fix the parser"));
+        s.apply(done(), 0.0);
+        assert_eq!(s.submit("again"), vec![send("again")], "once only");
+        s.apply(SessionEvent::TitleChanged("Fixing the parser".into()), 0.0);
+        assert_eq!(s.title.as_deref(), Some("Fixing the parser"));
+        s.apply(done(), 0.0);
+        assert_eq!(s.submit("and again"), vec![send("and again")]);
+    }
+
+    #[test]
+    fn the_title_request_carries_at_most_two_thousand_characters() {
+        let mut s = started();
+        let message = "é".repeat(2_500);
+        let sent = s.submit(&message);
+        assert_eq!(sent[0], send(&message), "the message itself is whole");
+        assert_eq!(sent[1], suggest(&"é".repeat(2_000)));
+    }
+
+    #[test]
+    fn a_queued_first_message_asks_for_the_title_when_it_is_sent() {
+        let mut s = Session::opening("/p");
+        assert_eq!(s.submit("early"), vec![]);
+        assert_eq!(s.title, None, "not while it is only queued");
+        let sent = s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(sent, vec![send("early"), suggest("early")]);
+        assert_eq!(s.title.as_deref(), Some("early"));
+        // A queue that waited behind a turn counts the same way: only the first asks.
+        s.submit("two");
+        assert_eq!(s.apply(done(), 0.0), vec![send("two")]);
+    }
+
+    #[test]
+    fn a_refused_title_request_changes_nothing() {
+        let mut s = started();
+        s.submit("Fix the parser");
+        let before = s.conversation.items().len();
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::SuggestTitle,
+                reason: "no model call allowed".into(),
+            },
+            0.0,
+        );
+        assert_eq!(s.conversation.items().len(), before, "no notice");
+        assert_eq!(s.title.as_deref(), Some("Fix the parser"));
+    }
+
+    #[test]
+    fn a_session_that_has_a_title_never_asks_for_one() {
+        let mut s = started();
+        s.apply(SessionEvent::TitleChanged("Renamed".into()), 0.0);
+        assert_eq!(s.submit("go"), vec![send("go")]);
+        assert_eq!(s.title.as_deref(), Some("Renamed"));
+        // Restarted after it ended: it keeps its title and does not ask either.
+        let mut s = started();
+        s.submit("go");
+        s.apply(
+            SessionEvent::Exited {
+                clean: false,
+                detail: "killed".into(),
+            },
+            0.0,
+        );
+        s.reopening();
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(done(), 0.0);
+        assert_eq!(s.submit("again"), vec![send("again")]);
+        assert_eq!(s.title.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn a_session_that_ended_before_any_message_asks_after_a_restart() {
+        let mut s = started();
+        s.apply(
+            SessionEvent::Exited {
+                clean: false,
+                detail: "killed".into(),
+            },
+            0.0,
+        );
+        s.reopening();
+        s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(s.submit("first"), vec![send("first"), suggest("first")]);
+    }
+
+    #[test]
+    fn a_session_that_dies_while_opening_has_nothing_to_resume() {
+        let mut s = Session::opening("/p");
+        s.apply(
+            SessionEvent::Exited {
+                clean: false,
+                detail: "bad flag".into(),
+            },
+            0.0,
+        );
+        let spec = s.restart_spec().unwrap();
+        assert_eq!((spec.folder, spec.resume), (PathBuf::from("/p"), None));
+    }
+}

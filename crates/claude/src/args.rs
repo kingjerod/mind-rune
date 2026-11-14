@@ -116,5 +116,10 @@ mod tests {
         );
         spec.permission_mode = Some(PermissionMode::Ask);
         assert_eq!(build_args(&spec, None), with(&["--model", "opus"]));
+        spec.permission_mode = Some(PermissionMode::Auto);
+        assert_eq!(
+            build_args(&spec, None),
+            with(&["--model", "opus", "--permission-mode", "auto"])
+        );
     }
 }

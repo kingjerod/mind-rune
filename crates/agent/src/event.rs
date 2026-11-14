@@ -9,13 +9,17 @@ use crate::ids::{RequestId, SessionId, ToolCallId};
 ///
 /// # Order
 ///
-/// - `Started` comes exactly once, before any turn. It is the first event,
+/// - `Started` comes at most once, before any turn. It is the first event,
 ///   except that on a resumed session `TitleChanged` can arrive before it. It
-///   may arrive before `open` has returned.
+///   may arrive before `open` has returned. If the program exits before it is
+///   ready (a session id that cannot be resumed, a bad flag), `Exited` is the
+///   only event, and `open` may also have returned an error.
 /// - Then turns: `TurnStarted`, the turn's text, thinking, tool and request
 ///   events, and one `TurnFinished` or `TurnFailed`. A turn the user stopped
 ///   ends in `TurnFinished` with `interrupted: true`, and its open text or
-///   thinking block may end without a `BlockFinished`.
+///   thinking block may end without a `BlockFinished`. A thinking phase
+///   starts with `ThinkingStarted`, before any `ThinkingDelta`, and
+///   `BlockFinished` ends it, whether or not any thinking text came.
 /// - `UsageLimits`, `RemoteAccess`, `TitleChanged`, `ModelChanged`,
 ///   `PermissionModeChanged` and `CommandFailed` can come between turns or
 ///   inside one.
@@ -28,6 +32,9 @@ pub enum SessionEvent {
     TurnStarted,
     TextDelta(String),
     ThinkingDelta(String),
+    /// A thinking phase began. `BlockFinished` ends it, also when no thinking
+    /// text was sent, except in a turn the user stopped.
+    ThinkingStarted,
     /// The current text or thinking block ended.
     BlockFinished,
     ToolStarted {
@@ -56,7 +63,7 @@ pub enum SessionEvent {
     PermissionModeChanged(PermissionMode),
     /// A SetModel, Rename etc. was refused.
     CommandFailed {
-        what: String,
+        what: CommandKind,
         reason: String,
     },
     /// The session ended. Always the last event; see the order above.
@@ -64,6 +71,17 @@ pub enum SessionEvent {
         clean: bool,
         detail: String,
     },
+}
+
+/// The commands whose refusal is reported by `SessionEvent::CommandFailed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandKind {
+    SetModel,
+    SetPermissionMode,
+    Rename,
+    SetRemoteAccess,
+    RefreshUsage,
+    SuggestTitle,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,6 +105,11 @@ pub struct ModelOption {
     pub name: String,
     /// The full model id `id` stands for now.
     pub resolved: String,
+    /// The name of the model this choice stands for now, set only when `name` does not
+    /// already say it (a name such as "Default (recommended)").
+    pub stands_for: Option<String>,
+    /// Whether the `Auto` permission mode can be used with this model.
+    pub auto_mode: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -94,6 +117,9 @@ pub enum PermissionMode {
     Ask,
     AcceptEdits,
     Plan,
+    /// The agent decides which actions need the user. Offered only with a model that supports
+    /// it (`ModelOption::auto_mode`); the agent may still refuse it.
+    Auto,
     Bypass,
     Other(String),
 }
@@ -152,9 +178,16 @@ pub enum UserRequestKind {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Question {
+    pub header: Option<String>,
     pub prompt: String,
-    pub options: Vec<String>,
+    pub options: Vec<QuestionOption>,
     pub multi_select: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -231,5 +264,41 @@ mod tests {
         assert_eq!(pct(0.456), 46);
         assert_eq!(pct(1.2), 100);
         assert_eq!(pct(-0.1), 0);
+    }
+
+    #[test]
+    fn the_new_words_survive_a_round_trip_through_json() {
+        let events = vec![
+            SessionEvent::ThinkingStarted,
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetModel,
+                reason: "no such model".into(),
+            },
+            SessionEvent::NeedsUser(UserRequest {
+                id: RequestId("r1".into()),
+                kind: UserRequestKind::Question {
+                    questions: vec![Question {
+                        header: Some("Colour".into()),
+                        prompt: "Which colour?".into(),
+                        options: vec![QuestionOption {
+                            label: "Red".into(),
+                            description: Some("Warm".into()),
+                        }],
+                        multi_select: false,
+                    }],
+                },
+            }),
+        ];
+        let text = serde_json::to_string(&events).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<SessionEvent>>(&text).unwrap(),
+            events
+        );
+        let command = crate::SessionCommand::RefreshUsage;
+        let text = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::SessionCommand>(&text).unwrap(),
+            command
+        );
     }
 }

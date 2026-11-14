@@ -1,0 +1,10 @@
+[package]
+name = "mr-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+mr-agent = { path = "../agent" }
+serde.workspace = true
+similar.workspace = true

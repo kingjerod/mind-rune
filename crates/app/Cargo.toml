@@ -5,4 +5,14 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+mr-agent = { path = "../agent" }
+mr-core = { path = "../core" }
+mr-claude = { path = "../claude" }
 rune = { git = "https://github.com/anomalyco/rune", rev = "2a44156b21d63b0342a366b26d9222a6edd4622c" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "2a44156b21d63b0342a366b26d9222a6edd4622c", features = ["markdown"] }
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "2a44156b21d63b0342a366b26d9222a6edd4622c" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

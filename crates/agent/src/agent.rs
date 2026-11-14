@@ -27,9 +27,11 @@ pub trait Agent: Send + Sync {
         modified_since_unix: Option<i64>,
     ) -> Result<Vec<StoredSession>, AgentError>;
     fn read_session(&self, id: &SessionId) -> Result<Vec<HistoryItem>, AgentError>;
-    /// Starts a session. May block for seconds. `Started` and `Exited` come
-    /// exactly once each, in the order [`SessionEvent`] describes; the first
-    /// events may reach `sink` before this returns.
+    /// Starts a session. May block for seconds. `Started` comes at most once
+    /// and `Exited` exactly once, in the order [`SessionEvent`] describes. If
+    /// the program exits before it is ready (a session id that cannot be
+    /// resumed, a bad flag), `Exited` is the only event, and this may also
+    /// return an error. The first events may reach `sink` before this returns.
     fn open(&self, spec: StartSpec, sink: EventSink) -> Result<Box<dyn SessionHandle>, AgentError>;
 }
 

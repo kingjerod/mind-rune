@@ -22,6 +22,14 @@ pub enum SessionCommand {
         on: bool,
     },
     Rename(String),
+    /// Asks the agent to name the session from this text. The answer is a `TitleChanged`
+    /// event; a refusal is `CommandFailed { what: CommandKind::SuggestTitle, .. }`. An agent
+    /// that has no title to offer may answer nothing at all.
+    SuggestTitle {
+        from: String,
+    },
+    /// Ask for the usage limits now. The answer is a `UsageLimits` event.
+    RefreshUsage,
     Close,
 }
 

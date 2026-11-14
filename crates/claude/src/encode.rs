@@ -78,8 +78,20 @@ pub fn remote_control(on: bool, name: Option<&str>) -> Value {
     body
 }
 
+pub fn get_usage() -> Value {
+    json!({"subtype": "get_usage"})
+}
+
 pub fn rename_session(title: &str) -> Value {
     json!({"subtype": "rename_session", "title": title})
+}
+
+/// Asks `claude` to name the session from `description`, and to save the name (`persist`).
+/// Read from the program (2.1.323), not yet seen on the wire: the live test prints what comes
+/// back. Its reply's body is `{"title": STRING or null}`; a `session_title_changed` line may
+/// come as well, before or after it.
+pub fn generate_session_title(description: &str) -> Value {
+    json!({"subtype": "generate_session_title", "description": description, "persist": true})
 }
 
 /// The answer to a `can_use_tool` permission request.
@@ -212,6 +224,11 @@ mod tests {
         assert_eq!(
             rename_session("New title"),
             json!({"subtype":"rename_session","title":"New title"})
+        );
+        assert_eq!(get_usage(), json!({"subtype":"get_usage"}));
+        assert_eq!(
+            generate_session_title("Fix the parser"),
+            json!({"subtype":"generate_session_title","description":"Fix the parser","persist":true})
         );
     }
 

@@ -4,6 +4,10 @@
 //! It keeps the contract the real adapter keeps: `Started` (with a fixed list
 //! of two made-up models) first, a new id for a fork and the old one for a
 //! plain resume, and `Exited` after `Close`, with every later command refused.
+//! Like the real adapter it also refuses an `Answer` whose request is not
+//! waiting, and accepts a second `Close` until the first one's `Exited` has
+//! been delivered. A `Send` plays the next reply queued with `reply`, a
+//! `SuggestTitle` the next answer queued with `title_reply`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,7 +18,7 @@ use crate::agent::{
 };
 use crate::command::SessionCommand;
 use crate::event::{ModelOption, PermissionMode, SessionEvent, SessionInfo};
-use crate::ids::SessionId;
+use crate::ids::{RequestId, SessionId};
 
 /// One event of a scripted reply, due `after` seconds after the `Send`.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,12 +46,22 @@ struct Inner {
     now: f32,
     opened: usize,
     replies: VecDeque<Vec<FakeStep>>,
+    /// Scripted answers to `SuggestTitle`, oldest first.
+    titles: VecDeque<Vec<FakeStep>>,
     /// Kept in insertion order; delivery picks the due ones by `due`, stably.
     pending: Vec<Pending>,
     sinks: HashMap<SessionId, Arc<Mutex<EventSink>>>,
     sent: Vec<(SessionId, SessionCommand)>,
-    /// Sessions that were sent `Close`.
-    closed: HashSet<SessionId>,
+    /// Sessions that were sent `Close` and whose `Exited` is not delivered yet.
+    /// They accept another `Close` and refuse everything else.
+    closing: HashSet<SessionId>,
+    /// Sessions whose `Exited` was delivered, or that died while opening. They
+    /// refuse every command until an `open` resumes the id.
+    ended: HashSet<SessionId>,
+    /// Requests delivered to the user and not yet answered or withdrawn.
+    waiting: HashMap<SessionId, HashSet<RequestId>>,
+    /// The detail the next `open` dies with, if a test asked for that.
+    fail_next_open: Option<String>,
 }
 
 impl Inner {
@@ -57,6 +71,30 @@ impl Inner {
             session: session.clone(),
             event,
         });
+    }
+
+    /// Track what the user can still be asked, and whether the session lives,
+    /// as its events are delivered.
+    fn record_delivery(&mut self, session: &SessionId, event: &SessionEvent) {
+        match event {
+            SessionEvent::NeedsUser(request) => {
+                self.waiting
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(request.id.clone());
+            }
+            SessionEvent::RequestWithdrawn { id } => {
+                if let Some(ids) = self.waiting.get_mut(session) {
+                    ids.remove(id);
+                }
+            }
+            SessionEvent::Exited { .. } => {
+                self.waiting.remove(session);
+                self.closing.remove(session);
+                self.ended.insert(session.clone());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -86,10 +124,14 @@ impl FakeAgent {
                 now: 0.0,
                 opened: 0,
                 replies: VecDeque::new(),
+                titles: VecDeque::new(),
                 pending: Vec::new(),
                 sinks: HashMap::new(),
                 sent: Vec::new(),
-                closed: HashSet::new(),
+                closing: HashSet::new(),
+                ended: HashSet::new(),
+                waiting: HashMap::new(),
+                fail_next_open: None,
             })),
         }
     }
@@ -115,6 +157,21 @@ impl FakeAgent {
         self.lock().replies.push_back(steps);
     }
 
+    /// Queue the answer to one `SuggestTitle`, as `reply` does for a `Send`: each
+    /// `SuggestTitle` consumes the oldest, its steps due `after` seconds after it. With nothing
+    /// queued a `SuggestTitle` gets no answer, as from an agent that has no title to offer.
+    pub fn title_reply(&self, steps: Vec<FakeStep>) {
+        self.lock().titles.push_back(steps);
+    }
+
+    /// Make the next `open`, and only that one, behave like a program that
+    /// exits before it is ready (a session id that cannot be resumed): `open`
+    /// returns `Ok`, the only event is `Exited { clean: false, detail }`, and
+    /// the handle refuses every command with `Closed`.
+    pub fn fail_next_open(&self, detail: &str) {
+        self.lock().fail_next_open = Some(detail.to_string());
+    }
+
     /// Deliver `event` to session `id` on the next `advance`.
     pub fn emit(&self, id: &SessionId, event: SessionEvent) {
         self.lock().schedule(0.0, id, event);
@@ -133,9 +190,15 @@ impl FakeAgent {
                 inner.pending.drain(..).partition(|p| p.due <= now);
             inner.pending = later;
             due.sort_by(|a, b| a.due.total_cmp(&b.due));
-            due.into_iter()
-                .filter_map(|p| inner.sinks.get(&p.session).cloned().map(|s| (s, p.event)))
-                .collect::<Vec<_>>()
+            let mut delivered = Vec::new();
+            for p in due {
+                let Some(sink) = inner.sinks.get(&p.session).cloned() else {
+                    continue;
+                };
+                inner.record_delivery(&p.session, &p.event);
+                delivered.push((sink, p.event));
+            }
+            delivered
         };
         for (sink, event) in due {
             let sink = sink.lock().unwrap_or_else(|e| e.into_inner());
@@ -187,7 +250,28 @@ impl Agent for FakeAgent {
                 SessionId(format!("fake-{}", inner.opened))
             }
         };
+        // A resumed id gets a new program: nothing of the old one is left.
+        if inner.closing.remove(&id) {
+            inner.pending.retain(|p| p.session != id);
+        }
+        inner.ended.remove(&id);
+        inner.waiting.remove(&id);
         inner.sinks.insert(id.clone(), Arc::new(Mutex::new(sink)));
+        if let Some(detail) = inner.fail_next_open.take() {
+            inner.ended.insert(id.clone());
+            inner.schedule(
+                0.0,
+                &id,
+                SessionEvent::Exited {
+                    clean: false,
+                    detail,
+                },
+            );
+            return Ok(Box::new(FakeHandle {
+                id,
+                agent: self.clone(),
+            }));
+        }
         let models = fake_models();
         let asked = spec.model.as_deref().unwrap_or("default");
         let model = models
@@ -210,18 +294,23 @@ impl Agent for FakeAgent {
     }
 }
 
-/// The models every fake session offers.
+/// The models every fake session offers. The first, like the real default, has a name that
+/// does not say which model it is, and supports the `Auto` mode; the second does not.
 fn fake_models() -> Vec<ModelOption> {
     vec![
         ModelOption {
             id: "default".into(),
             name: "Default".into(),
             resolved: "fake-model".into(),
+            stands_for: Some("Fake 1".into()),
+            auto_mode: true,
         },
         ModelOption {
             id: "fast".into(),
             name: "Fast".into(),
             resolved: "fake-model-fast".into(),
+            stands_for: None,
+            auto_mode: false,
         },
     ]
 }
@@ -232,19 +321,40 @@ struct FakeHandle {
 }
 
 impl SessionHandle for FakeHandle {
-    /// After `Close` every command, another `Close` too, is refused and not
-    /// recorded. `Close` drops this session's events that are not yet due, as
-    /// the real adapter's exit cuts a turn short, and schedules `Exited`.
+    /// Once `Exited` is delivered every command is refused with `Closed` and
+    /// not recorded. Between a `Close` and its `Exited` another `Close` is
+    /// accepted and ignored, and everything else is refused. `Close` drops this
+    /// session's events that are not yet due, as the real adapter's exit cuts a
+    /// turn short, and schedules `Exited`. An `Answer` is accepted only while
+    /// its request is waiting, and then it is no longer waiting.
     fn send(&self, command: SessionCommand) -> Result<(), AgentError> {
         let mut inner = self.agent.lock();
-        if inner.closed.contains(&self.id) {
+        if inner.ended.contains(&self.id) {
             return Err(AgentError::Closed);
+        }
+        if inner.closing.contains(&self.id) {
+            return match command {
+                SessionCommand::Close => Ok(()),
+                _ => Err(AgentError::Closed),
+            };
+        }
+        if let SessionCommand::Answer { id, .. } = &command {
+            let waiting = inner
+                .waiting
+                .get_mut(&self.id)
+                .is_some_and(|ids| ids.remove(id));
+            if !waiting {
+                return Err(AgentError::Protocol(format!(
+                    "fake: no request {} is waiting",
+                    id.0
+                )));
+            }
         }
         if matches!(command, SessionCommand::Close) {
             let now = inner.now;
             let id = &self.id;
             inner.pending.retain(|p| p.session != *id || p.due <= now);
-            inner.closed.insert(self.id.clone());
+            inner.closing.insert(self.id.clone());
             inner.schedule(
                 0.0,
                 &self.id,
@@ -270,6 +380,13 @@ impl SessionHandle for FakeHandle {
                 ),
             }
         }
+        if matches!(command, SessionCommand::SuggestTitle { .. })
+            && let Some(steps) = inner.titles.pop_front()
+        {
+            for step in steps {
+                inner.schedule(step.after, &self.id, step.event);
+            }
+        }
         inner.sent.push((self.id.clone(), command));
         Ok(())
     }
@@ -278,7 +395,9 @@ impl SessionHandle for FakeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::TurnSummary;
+    use crate::command::Answer;
+    use crate::event::{CommandKind, TurnSummary, UserRequest, UserRequestKind};
+    use crate::ids::RequestId;
 
     fn collect() -> (Arc<Mutex<Vec<SessionEvent>>>, EventSink) {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -457,5 +576,221 @@ mod tests {
         fake.advance(0.0);
         assert_eq!(a.lock().unwrap().len(), 1);
         assert_eq!(b.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_session_that_dies_while_opening_gives_only_exited() {
+        let fake = FakeAgent::new();
+        fake.fail_next_open("no conversation found with that id");
+        let (seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![SessionEvent::Exited {
+                clean: false,
+                detail: "no conversation found with that id".into()
+            }]
+        );
+        assert_eq!(handle.send(SessionCommand::Stop), Err(AgentError::Closed));
+        // Only the next open fails.
+        let (seen, sink) = collect();
+        fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        assert!(matches!(seen.lock().unwrap()[0], SessionEvent::Started(_)));
+    }
+
+    #[test]
+    fn a_usage_refresh_is_recorded_and_emits_nothing() {
+        let fake = FakeAgent::new();
+        let (seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        let before = seen.lock().unwrap().len();
+        assert_eq!(handle.send(SessionCommand::RefreshUsage), Ok(()));
+        fake.advance(10.0);
+        assert_eq!(seen.lock().unwrap().len(), before);
+        assert!(
+            fake.sent()
+                .iter()
+                .any(|(_, c)| *c == SessionCommand::RefreshUsage)
+        );
+    }
+
+    #[test]
+    fn a_title_suggestion_gets_the_answer_scripted_for_it_or_none() {
+        let fake = FakeAgent::new();
+        let (seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        let suggest = || SessionCommand::SuggestTitle {
+            from: "Fix the parser".into(),
+        };
+        // Nothing scripted: no answer at all, as when the agent offers no title.
+        assert_eq!(handle.send(suggest()), Ok(()));
+        fake.advance(10.0);
+        assert_eq!(seen.lock().unwrap().len(), 1, "only Started");
+        fake.title_reply(vec![FakeStep::at(
+            0.5,
+            SessionEvent::TitleChanged("Fixing the parser".into()),
+        )]);
+        fake.title_reply(vec![FakeStep::at(
+            0.0,
+            SessionEvent::CommandFailed {
+                what: CommandKind::SuggestTitle,
+                reason: "no".into(),
+            },
+        )]);
+        assert_eq!(handle.send(suggest()), Ok(()));
+        fake.advance(0.4);
+        assert_eq!(seen.lock().unwrap().len(), 1, "due half a second after");
+        fake.advance(0.1);
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&SessionEvent::TitleChanged("Fixing the parser".into()))
+        );
+        assert_eq!(handle.send(suggest()), Ok(()));
+        fake.advance(0.0);
+        assert!(matches!(
+            seen.lock().unwrap().last(),
+            Some(SessionEvent::CommandFailed {
+                what: CommandKind::SuggestTitle,
+                ..
+            })
+        ));
+        let asked = fake
+            .sent()
+            .iter()
+            .filter(|(_, c)| matches!(c, SessionCommand::SuggestTitle { .. }))
+            .count();
+        assert_eq!(asked, 3);
+    }
+
+    #[test]
+    fn a_second_close_is_accepted_until_the_exit_is_delivered() {
+        let fake = FakeAgent::new();
+        let (_seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        assert_eq!(handle.send(SessionCommand::Close), Ok(()));
+        assert_eq!(handle.send(SessionCommand::Close), Ok(()));
+        assert_eq!(handle.send(SessionCommand::Stop), Err(AgentError::Closed));
+        fake.advance(0.0);
+        assert_eq!(handle.send(SessionCommand::Close), Err(AgentError::Closed));
+        let closes = fake
+            .sent()
+            .iter()
+            .filter(|(_, c)| *c == SessionCommand::Close)
+            .count();
+        assert_eq!(closes, 1);
+    }
+
+    #[test]
+    fn an_answer_is_refused_unless_its_request_is_waiting() {
+        let fake = FakeAgent::new();
+        let (seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        let id = started(&seen).id;
+        let answer = |n: &str| SessionCommand::Answer {
+            id: RequestId(n.into()),
+            answer: Answer::Allow { always: false },
+        };
+        assert!(matches!(
+            handle.send(answer("r1")),
+            Err(AgentError::Protocol(_))
+        ));
+        let request = UserRequest {
+            id: RequestId("r1".into()),
+            kind: UserRequestKind::PlanApproval {
+                plan_markdown: "p".into(),
+            },
+        };
+        fake.emit(&id, SessionEvent::NeedsUser(request));
+        fake.advance(0.0);
+        assert_eq!(handle.send(answer("r1")), Ok(()));
+        assert!(matches!(
+            handle.send(answer("r1")),
+            Err(AgentError::Protocol(_))
+        ));
+        // A withdrawn request is no longer waiting either.
+        let again = UserRequest {
+            id: RequestId("r2".into()),
+            kind: UserRequestKind::PlanApproval {
+                plan_markdown: "p".into(),
+            },
+        };
+        fake.emit(&id, SessionEvent::NeedsUser(again));
+        fake.emit(
+            &id,
+            SessionEvent::RequestWithdrawn {
+                id: RequestId("r2".into()),
+            },
+        );
+        fake.advance(0.0);
+        assert!(matches!(
+            handle.send(answer("r2")),
+            Err(AgentError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn a_resumed_session_works_again_after_it_ended() {
+        let fake = FakeAgent::new();
+        let old = SessionId("old".into());
+        let waiting = |n: &str| {
+            SessionEvent::NeedsUser(UserRequest {
+                id: RequestId(n.into()),
+                kind: UserRequestKind::PlanApproval {
+                    plan_markdown: "p".into(),
+                },
+            })
+        };
+        let answer = |n: &str| SessionCommand::Answer {
+            id: RequestId(n.into()),
+            answer: Answer::Allow { always: false },
+        };
+        let resume = || {
+            let mut spec = StartSpec::new("/p");
+            spec.resume = Some(old.clone());
+            spec
+        };
+        // Ended by Close, with a request still waiting.
+        let (_seen, sink) = collect();
+        let handle = fake.open(resume(), sink).unwrap();
+        fake.emit(&old, waiting("r1"));
+        fake.advance(0.0);
+        handle.send(SessionCommand::Close).unwrap();
+        fake.advance(0.0);
+        assert_eq!(handle.send(SessionCommand::Stop), Err(AgentError::Closed));
+        let (seen, sink) = collect();
+        let handle = fake.open(resume(), sink).unwrap();
+        fake.advance(0.0);
+        assert_eq!(started(&seen).id, old);
+        assert_eq!(handle.send(SessionCommand::Stop), Ok(()));
+        assert!(matches!(
+            handle.send(answer("r1")),
+            Err(AgentError::Protocol(_))
+        ));
+        // Ended by an Exited delivered through emit, with a request waiting.
+        fake.emit(&old, waiting("r2"));
+        fake.emit(
+            &old,
+            SessionEvent::Exited {
+                clean: false,
+                detail: "gone".into(),
+            },
+        );
+        fake.advance(0.0);
+        assert_eq!(handle.send(SessionCommand::Stop), Err(AgentError::Closed));
+        let (seen, sink) = collect();
+        let handle = fake.open(resume(), sink).unwrap();
+        fake.advance(0.0);
+        assert_eq!(started(&seen).id, old);
+        assert_eq!(handle.send(SessionCommand::Stop), Ok(()));
+        assert!(matches!(
+            handle.send(answer("r2")),
+            Err(AgentError::Protocol(_))
+        ));
     }
 }
