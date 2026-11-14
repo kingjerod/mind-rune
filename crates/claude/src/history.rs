@@ -2,9 +2,9 @@
 //! session, at `<projects_dir>/<folder with slashes as dashes>/<session id>.jsonl`.
 //! Everything here only reads, and takes the projects directory as a parameter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -17,6 +17,10 @@ use crate::translate::tool_detail;
 const REGION_BYTES: u64 = 262_144;
 const TITLE_CHARS: usize = 80;
 const FALLBACK_TITLE_CHARS: usize = 8;
+/// What a record's `entrypoint` says of a session started through the TypeScript or the Python
+/// SDK, which a program does. A person starts one in the terminal (`cli`), in Claude Desktop
+/// (`claude-desktop`) or here (`sdk-cli`, which `claude -p` writes as well).
+const PROGRAM_ENTRYPOINTS: [&str; 2] = ["sdk-ts", "sdk-py"];
 
 /// A session file found on disk, known only by its name and metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,25 +36,44 @@ pub struct StoredEntry {
 pub struct StoredMeta {
     pub folder: Option<PathBuf>,
     pub title: Option<String>,
+    /// How the session was started: the `entrypoint` of the first record that names one, among
+    /// the lines [`describe`] reads.
+    pub entrypoint: Option<String>,
+}
+
+impl StoredMeta {
+    /// A program started the session through the SDK; no person did.
+    pub(crate) fn made_by_program(&self) -> bool {
+        self.entrypoint
+            .as_deref()
+            .is_some_and(|entrypoint| PROGRAM_ENTRYPOINTS.contains(&entrypoint))
+    }
 }
 
 /// The `*.jsonl` files directly inside each immediate subdirectory of
-/// `projects_dir`. Reads no file contents. A missing directory gives an empty list.
-pub fn list_entries(projects_dir: &Path) -> Vec<StoredEntry> {
-    let Ok(projects) = std::fs::read_dir(projects_dir) else {
-        return Vec::new();
+/// `projects_dir`. Reads no file contents. A missing directory gives an empty list; one that
+/// cannot be read, or a project's directory that cannot, is an error, so that a store that
+/// could not be read is never taken for an empty one. A project's directory or a file gone
+/// while it is listed is skipped.
+pub fn list_entries(projects_dir: &Path) -> Result<Vec<StoredEntry>, AgentError> {
+    let projects = match std::fs::read_dir(projects_dir) {
+        Ok(projects) => projects,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(unreadable(projects_dir, &e)),
     };
     let mut entries = Vec::new();
-    for project in projects.flatten() {
-        let project_path = project.path();
+    for project in projects {
+        let project_path = project.map_err(|e| unreadable(projects_dir, &e))?.path();
         if !project_path.is_dir() {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(&project_path) else {
-            continue;
+        let files = match std::fs::read_dir(&project_path) {
+            Ok(files) => files,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(unreadable(&project_path, &e)),
         };
-        for file in files.flatten() {
-            let path = file.path();
+        for file in files {
+            let path = file.map_err(|e| unreadable(&project_path, &e))?.path();
             if path.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
@@ -71,7 +94,21 @@ pub fn list_entries(projects_dir: &Path) -> Vec<StoredEntry> {
             });
         }
     }
-    entries
+    Ok(entries)
+}
+
+/// The error for a directory of the store that could not be read.
+fn unreadable(dir: &Path, error: &std::io::Error) -> AgentError {
+    AgentError::Io(format!("{}: {error}", dir.display()))
+}
+
+/// When the file at `path` last changed, in Unix seconds; `None` when the file is gone.
+pub fn modified_unix(path: &Path) -> Result<Option<i64>, AgentError> {
+    match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(time) => Ok(Some(unix_seconds(time))),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(AgentError::Io(e.to_string())),
+    }
 }
 
 fn unix_seconds(time: std::time::SystemTime) -> i64 {
@@ -81,9 +118,10 @@ fn unix_seconds(time: std::time::SystemTime) -> i64 {
     }
 }
 
-/// The folder and title of a session, read from at most the first and the last
-/// 262,144 bytes of its file, complete lines only. Never fails: a file that
-/// cannot be read describes as nothing.
+/// The folder and title of a session and how it was started, read from at most the first
+/// and the last 262,144 bytes of its file, complete lines only. The title is the last one
+/// the user gave, else the last generated one, else the first message. Never fails: a
+/// file that cannot be read describes as nothing.
 pub fn describe(path: &Path) -> StoredMeta {
     let mut scan = Scan::default();
     if let Ok(mut file) = File::open(path)
@@ -113,7 +151,8 @@ pub fn describe(path: &Path) -> StoredMeta {
     }
     StoredMeta {
         folder: scan.folder,
-        title: scan.ai_title.or(scan.first_user_text),
+        title: scan.custom_title.or(scan.ai_title).or(scan.first_user_text),
+        entrypoint: scan.entrypoint,
     }
 }
 
@@ -127,8 +166,10 @@ fn read_region(file: &mut File, start: u64, len: u64) -> Option<Vec<u8>> {
 #[derive(Default)]
 struct Scan {
     folder: Option<PathBuf>,
+    custom_title: Option<String>,
     ai_title: Option<String>,
     first_user_text: Option<String>,
+    entrypoint: Option<String>,
 }
 
 impl Scan {
@@ -141,9 +182,10 @@ impl Scan {
     fn line(&mut self, line: &[u8]) {
         // Cheap checks first: most lines are large records that tell nothing here.
         let wants_folder = self.folder.is_none() && contains(line, b"cwd");
-        let wants_title = contains(line, b"ai-title");
+        let wants_title = contains(line, b"ai-title") || contains(line, b"custom-title");
         let wants_text = self.first_user_text.is_none() && contains(line, b"user");
-        if !(wants_folder || wants_title || wants_text) {
+        let wants_entrypoint = self.entrypoint.is_none() && contains(line, b"entrypoint");
+        if !(wants_folder || wants_title || wants_text || wants_entrypoint) {
             return;
         }
         let Some(record) = parse_record(line) else {
@@ -155,12 +197,28 @@ impl Scan {
         {
             self.folder = Some(PathBuf::from(cwd));
         }
+        if wants_entrypoint
+            && let Some(entrypoint) = record.get("entrypoint").and_then(Value::as_str)
+            && !entrypoint.is_empty()
+        {
+            self.entrypoint = Some(entrypoint.to_string());
+        }
+        let title = |key: &str| {
+            record
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_string)
+        };
         match record.get("type").and_then(Value::as_str) {
             Some("ai-title") => {
-                if let Some(title) = record.get("aiTitle").and_then(Value::as_str)
-                    && !title.trim().is_empty()
-                {
-                    self.ai_title = Some(title.to_string());
+                if let Some(title) = title("aiTitle") {
+                    self.ai_title = Some(title);
+                }
+            }
+            Some("custom-title") => {
+                if let Some(title) = title("customTitle") {
+                    self.custom_title = Some(title);
                 }
             }
             Some("user") if self.first_user_text.is_none() && !is_side_or_meta(&record) => {
@@ -175,14 +233,14 @@ impl Scan {
     }
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
 }
 
 /// One line as a JSON object. Invalid UTF-8 is replaced, not fatal.
-fn parse_record(line: &[u8]) -> Option<Value> {
+pub(crate) fn parse_record(line: &[u8]) -> Option<Value> {
     match serde_json::from_str(&String::from_utf8_lossy(line)) {
         Ok(record @ Value::Object(_)) => Some(record),
         _ => None,
@@ -198,21 +256,85 @@ fn is_command_wrapper(text: &str) -> bool {
     text.starts_with("<local-command-") || text.starts_with("<command-name>")
 }
 
+/// What [`describe`] said about each session file, with the modification time
+/// and length the file had then.
+#[derive(Debug, Default)]
+pub struct DescriptionTable {
+    known: HashMap<PathBuf, Described>,
+}
+
+#[derive(Debug)]
+struct Described {
+    modified_unix: i64,
+    bytes: u64,
+    meta: StoredMeta,
+}
+
+impl DescriptionTable {
+    /// What `describe` says about the entry's file, asked again only when the file's
+    /// modification time or length changed since the table last asked.
+    fn meta(
+        &mut self,
+        entry: &StoredEntry,
+        describe: &mut impl FnMut(&Path) -> StoredMeta,
+    ) -> StoredMeta {
+        if let Some(known) = self.known.get(&entry.path)
+            && known.modified_unix == entry.modified_unix
+            && known.bytes == entry.bytes
+        {
+            return known.meta.clone();
+        }
+        let meta = describe(&entry.path);
+        self.known.insert(
+            entry.path.clone(),
+            Described {
+                modified_unix: entry.modified_unix,
+                bytes: entry.bytes,
+                meta: meta.clone(),
+            },
+        );
+        meta
+    }
+
+    /// Forgets the files not among `entries`.
+    fn keep_only(&mut self, entries: &[StoredEntry]) {
+        let listed: HashSet<&Path> = entries.iter().map(|entry| entry.path.as_path()).collect();
+        self.known.retain(|path, _| listed.contains(path.as_path()));
+    }
+}
+
 /// Every stored session at least as new as `modified_since_unix` (all of them
-/// for `None`) that names a folder, newest first.
+/// for `None`) that names a folder and that no program made (see
+/// [`StoredMeta::made_by_program`]), newest first. A file the table already
+/// describes, unchanged since, is not read again. A store that cannot be read is
+/// an error (see [`list_entries`]).
 pub fn stored_sessions(
     projects_dir: &Path,
     modified_since_unix: Option<i64>,
-) -> Vec<StoredSession> {
-    let mut entries = list_entries(projects_dir);
+    table: &mut DescriptionTable,
+) -> Result<Vec<StoredSession>, AgentError> {
+    stored_sessions_with(projects_dir, modified_since_unix, table, describe)
+}
+
+fn stored_sessions_with(
+    projects_dir: &Path,
+    modified_since_unix: Option<i64>,
+    table: &mut DescriptionTable,
+    mut describe: impl FnMut(&Path) -> StoredMeta,
+) -> Result<Vec<StoredSession>, AgentError> {
+    let mut entries = list_entries(projects_dir)?;
+    table.keep_only(&entries);
     if let Some(since) = modified_since_unix {
         entries.retain(|entry| entry.modified_unix >= since);
     }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.modified_unix));
-    entries
+    Ok(entries
         .into_iter()
         .filter_map(|entry| {
-            let meta = describe(&entry.path);
+            let meta = table.meta(&entry, &mut describe);
+            if meta.made_by_program() {
+                return None;
+            }
             Some(StoredSession {
                 title: meta
                     .title
@@ -222,7 +344,7 @@ pub fn stored_sessions(
                 id: entry.id,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// The file of the session with this id, when one exists.
@@ -239,39 +361,19 @@ pub fn find_session(projects_dir: &Path, id: &SessionId) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// A stored conversation as the UI shows it. A line that is not complete JSON,
-/// such as the cut-off last line of a file still being written, is skipped.
-pub fn read_history(path: &Path) -> Result<Vec<HistoryItem>, AgentError> {
-    let file = File::open(path).map_err(|e| AgentError::Io(e.to_string()))?;
-    let mut reader = BufReader::new(file);
-    let mut items: Vec<HistoryItem> = Vec::new();
-    let mut tool_positions: HashMap<String, usize> = HashMap::new();
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|e| AgentError::Io(e.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        // Records that matter name one of these; skip parsing the rest.
-        if !(contains(&line, b"user") || contains(&line, b"assistant")) {
-            continue;
-        }
-        if let Some(record) = parse_record(&line) {
-            add_record(&record, &mut items, &mut tool_positions);
-        }
-    }
-    Ok(items)
-}
-
-fn add_record(
+/// Adds what one record of a conversation shows to `items`. Side chains, meta
+/// records and compaction summaries show nothing. A tool result fills in the
+/// outcome of the tool at its position in `tool_positions`.
+pub(crate) fn add_record(
     record: &Value,
     items: &mut Vec<HistoryItem>,
     tool_positions: &mut HashMap<String, usize>,
 ) {
-    if is_side_or_meta(record) {
+    let compact_summary = record
+        .get("isCompactSummary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_side_or_meta(record) || compact_summary {
         return;
     }
     match record.get("type").and_then(Value::as_str) {
@@ -417,7 +519,7 @@ fn tool_outcome(block: &Value) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mr_agent::{ToolCallId, ToolDetail, ToolOutcome};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     /// Writes `lines` joined with newlines as `<dir>/<folder>/<id>.jsonl`.
@@ -431,7 +533,6 @@ mod tests {
 
     const USER: &str = r#"{"type":"user","cwd":"/home/u/proj","message":{"role":"user","content":"Fix the reconnect bug please"}}"#;
     const ASSISTANT: &str = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"On it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#;
-    const TOOL_DONE: &str = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a.txt"}]}}"#;
     const TITLE: &str = r#"{"type":"ai-title","aiTitle":"Fix flaky reconnect","sessionId":"s1"}"#;
 
     #[test]
@@ -441,10 +542,61 @@ mod tests {
         std::fs::write(dir.path().join("-home-u-proj/notes.txt"), "x").unwrap();
         std::fs::create_dir_all(dir.path().join("-home-u-proj/s1/subagents")).unwrap();
         std::fs::write(dir.path().join("-home-u-proj/s1/subagents/a.jsonl"), USER).unwrap();
-        let entries = list_entries(dir.path());
+        let entries = list_entries(dir.path()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, SessionId("s1".into()));
-        assert!(list_entries(&dir.path().join("missing")).is_empty());
+        assert!(
+            list_entries(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Takes every permission away from `dir` while `check` runs, then gives them back. Skips
+    /// `check` when `dir` can still be read without them, as it can for root.
+    #[cfg(unix)]
+    fn unreadable(dir: &Path, check: impl FnOnce()) {
+        use std::os::unix::fs::PermissionsExt;
+        let before = std::fs::metadata(dir).unwrap().permissions();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(dir).is_ok();
+        if readable {
+            eprintln!("skipped: {} can be read without permissions", dir.display());
+        } else {
+            check();
+        }
+        std::fs::set_permissions(dir, before).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_store_that_cannot_be_read_is_an_error_not_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        write(&projects, "-home-u-proj", "s1", &[USER, TITLE]);
+        write(&projects, "-home-u-other", "s2", &[USER]);
+        let mut table = DescriptionTable::default();
+        assert_eq!(
+            stored_sessions(&projects, None, &mut table).unwrap().len(),
+            2
+        );
+        unreadable(&projects.join("-home-u-other"), || {
+            assert!(matches!(list_entries(&projects), Err(AgentError::Io(_))));
+            let listed = stored_sessions(&projects, None, &mut table);
+            assert!(matches!(listed, Err(AgentError::Io(_))), "{listed:?}");
+        });
+        unreadable(&projects, || {
+            assert!(matches!(list_entries(&projects), Err(AgentError::Io(_))));
+        });
+        assert_eq!(
+            stored_sessions(&dir.path().join("missing"), None, &mut table).unwrap(),
+            vec![],
+            "a store that does not exist yet has no sessions"
+        );
+        assert_eq!(
+            stored_sessions(&projects, None, &mut table).unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -499,11 +651,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "-home-u-proj", "s1", &[USER, TITLE]);
         write(dir.path(), "-home-u-proj", "nofolder", &[TITLE]);
-        let all = stored_sessions(dir.path(), None);
+        let mut table = DescriptionTable::default();
+        let all = stored_sessions(dir.path(), None, &mut table).unwrap();
         assert_eq!(all.len(), 1, "a session with no folder is left out");
         assert_eq!(all[0].title, "Fix flaky reconnect");
         assert_eq!(all[0].folder, PathBuf::from("/home/u/proj"));
-        assert!(stored_sessions(dir.path(), Some(all[0].last_active_unix + 10)).is_empty());
+        assert!(
+            stored_sessions(dir.path(), Some(all[0].last_active_unix + 10), &mut table)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             find_session(dir.path(), &SessionId("s1".into()))
                 .unwrap()
@@ -514,81 +671,6 @@ mod tests {
         assert!(find_session(dir.path(), &SessionId("zzz".into())).is_none());
     }
 
-    #[test]
-    fn a_conversation_is_read_in_order_with_tool_outcomes_attached() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            dir.path(),
-            "-home-u-proj",
-            "s1",
-            &[USER, ASSISTANT, TOOL_DONE, TITLE],
-        );
-        assert_eq!(
-            read_history(&path).unwrap(),
-            vec![
-                HistoryItem::User {
-                    text: "Fix the reconnect bug please".into(),
-                    image_count: 0
-                },
-                HistoryItem::Thinking("hm".into()),
-                HistoryItem::AssistantText("On it.".into()),
-                HistoryItem::Tool {
-                    id: ToolCallId("t1".into()),
-                    name: "Bash".into(),
-                    detail: ToolDetail::Command {
-                        command: "ls".into()
-                    },
-                    outcome: Some(ToolOutcome::Ok {
-                        output: "a.txt".into()
-                    })
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn side_chains_meta_records_and_command_wrappers_are_left_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let side = r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"inner"}]}}"#;
-        let meta = r#"{"type":"user","isMeta":true,"message":{"content":"meta"}}"#;
-        let wrapper =
-            r#"{"type":"user","message":{"content":"<command-name>/model</command-name>"}}"#;
-        let path = write(dir.path(), "-p", "s4", &[side, meta, wrapper, USER]);
-        assert_eq!(read_history(&path).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_cut_off_last_line_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            dir.path(),
-            "-p",
-            "s5",
-            &[
-                USER,
-                r#"{"type":"assistant","message":{"content":[{"type":"te"#,
-            ],
-        );
-        assert_eq!(read_history(&path).unwrap().len(), 1);
-        assert!(matches!(
-            read_history(Path::new("/nonexistent.jsonl")),
-            Err(AgentError::Io(_))
-        ));
-    }
-
-    #[test]
-    fn images_in_a_message_are_counted() {
-        let dir = tempfile::tempdir().unwrap();
-        let with_image = r#"{"type":"user","message":{"content":[{"type":"text","text":"see"},{"type":"image","source":{}}]}}"#;
-        let path = write(dir.path(), "-p", "s6", &[with_image]);
-        assert_eq!(
-            read_history(&path).unwrap(),
-            vec![HistoryItem::User {
-                text: "see".into(),
-                image_count: 1
-            }]
-        );
-    }
     #[test]
     fn odd_lines_and_shapes_never_stop_the_reading() {
         let dir = tempfile::tempdir().unwrap();
@@ -611,19 +693,179 @@ mod tests {
         }
         std::fs::write(&path, bytes).unwrap();
         assert_eq!(
-            read_history(&path).unwrap(),
-            vec![HistoryItem::User {
-                text: "caf\u{e9}".into(),
-                image_count: 0
-            }]
-        );
-        assert_eq!(
             describe(&path),
             StoredMeta {
                 folder: None,
-                title: Some("caf\u{e9}".into())
+                title: Some("caf\u{e9}".into()),
+                entrypoint: None,
             }
         );
+    }
+
+    #[test]
+    fn a_custom_title_wins_over_a_generated_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom =
+            r#"{"type":"custom-title","customTitle":"Alex's reconnect work","sessionId":"s1"}"#;
+        let older_custom =
+            r#"{"type":"custom-title","customTitle":"An older name","sessionId":"s1"}"#;
+        let custom_first = write(
+            dir.path(),
+            "-home-u-proj",
+            "s1",
+            &[USER, older_custom, custom, ASSISTANT, TITLE],
+        );
+        let generated_first = write(dir.path(), "-home-u-proj", "s2", &[USER, TITLE, custom]);
+        for path in [custom_first, generated_first] {
+            assert_eq!(
+                describe(&path).title.as_deref(),
+                Some("Alex's reconnect work"),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_described_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write(dir.path(), "-home-u-proj", "s1", &[USER, TITLE]);
+        let second = write(dir.path(), "-home-u-proj", "s2", &[USER]);
+        let mut table = DescriptionTable::default();
+        let mut calls: HashMap<PathBuf, usize> = HashMap::new();
+        let list = |table: &mut DescriptionTable, calls: &mut HashMap<PathBuf, usize>| {
+            stored_sessions_with(dir.path(), None, table, |path| {
+                *calls.entry(path.to_path_buf()).or_default() += 1;
+                describe(path)
+            })
+            .unwrap()
+        };
+
+        let once = list(&mut table, &mut calls);
+        let twice = list(&mut table, &mut calls);
+        assert_eq!(once.len(), 2);
+        assert_eq!(once, twice);
+        assert_eq!(calls[&first], 1);
+        assert_eq!(calls[&second], 1);
+
+        let mut grown = std::fs::read_to_string(&first).unwrap();
+        grown.push_str("\n{\"type\":\"ai-title\",\"aiTitle\":\"A new name\"}");
+        std::fs::write(&first, grown).unwrap();
+        let after = list(&mut table, &mut calls);
+        assert_eq!(calls[&first], 2);
+        assert_eq!(calls[&second], 1);
+        assert!(after.iter().any(|session| session.title == "A new name"));
+    }
+
+    /// A user's first message as the store holds it, started the way `entrypoint` names.
+    fn started_by(entrypoint: &str) -> String {
+        format!(
+            r#"{{"type":"user","cwd":"/home/u/proj","entrypoint":"{entrypoint}","message":{{"role":"user","content":"Condense this"}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_session_a_program_made_through_the_sdk_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, entrypoint) in [
+            ("ts", "sdk-ts"),
+            ("py", "sdk-py"),
+            ("own", "sdk-cli"),
+            ("terminal", "cli"),
+            ("desktop", "claude-desktop"),
+            ("unknown", "something-new"),
+        ] {
+            write(dir.path(), "-home-u-proj", id, &[&started_by(entrypoint)]);
+        }
+        // Records from before the store named an entrypoint.
+        write(dir.path(), "-home-u-proj", "unnamed", &[USER]);
+        let mut table = DescriptionTable::default();
+        let mut listed: Vec<String> = stored_sessions(dir.path(), None, &mut table)
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id.0)
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["desktop", "own", "terminal", "unknown", "unnamed"]);
+        // Left out of the list only: it is still found by its id.
+        assert!(find_session(dir.path(), &SessionId("ts".into())).is_some());
+    }
+
+    #[test]
+    fn how_a_session_was_started_is_what_its_first_record_says() {
+        let dir = tempfile::tempdir().unwrap();
+        // The first records of a real file name no entrypoint at all.
+        let queued = r#"{"type":"queue-operation","operation":"enqueue"}"#;
+        let by_program = write(
+            dir.path(),
+            "-home-u-proj",
+            "program",
+            &[queued, &started_by("sdk-ts"), &started_by("cli")],
+        );
+        let by_person = write(
+            dir.path(),
+            "-home-u-proj",
+            "person",
+            &[queued, &started_by("cli"), &started_by("sdk-ts")],
+        );
+        assert_eq!(describe(&by_program).entrypoint.as_deref(), Some("sdk-ts"));
+        assert_eq!(describe(&by_person).entrypoint.as_deref(), Some("cli"));
+        assert_eq!(
+            describe(&write(dir.path(), "-p", "s", &[USER])).entrypoint,
+            None
+        );
+        let mut table = DescriptionTable::default();
+        let listed = stored_sessions(dir.path(), None, &mut table).unwrap();
+        assert!(listed.iter().any(|session| session.id.0 == "person"));
+        assert!(!listed.iter().any(|session| session.id.0 == "program"));
+    }
+
+    #[test]
+    fn how_a_large_session_was_started_is_read_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        // A record that says nothing else the listing looks for.
+        let attached = r#"{"type":"attachment","entrypoint":"sdk-ts"}"#;
+        let filler = format!(
+            r#"{{"type":"api-request-blob","message":"{}"}}"#,
+            "y".repeat(4000)
+        );
+        let mut lines = vec![attached.to_string(), USER.to_string()];
+        lines.extend(std::iter::repeat_n(filler, 300)); // about 1.2 MB
+        lines.push(started_by("cli"));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let path = write(dir.path(), "-home-u-proj", "large", &refs);
+        assert_eq!(describe(&path).entrypoint.as_deref(), Some("sdk-ts"));
+        let mut table = DescriptionTable::default();
+        assert_eq!(
+            stored_sessions(dir.path(), None, &mut table).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_session_left_out_is_not_described_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let left_out = write(dir.path(), "-home-u-proj", "ts", &[&started_by("sdk-ts")]);
+        let mut table = DescriptionTable::default();
+        let mut calls = 0;
+        for _ in 0..2 {
+            let listed = stored_sessions_with(dir.path(), None, &mut table, |path| {
+                assert_eq!(path, left_out);
+                calls += 1;
+                describe(path)
+            })
+            .unwrap();
+            assert_eq!(listed, vec![]);
+        }
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_file_that_is_gone_has_no_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "-p", "s1", &[USER]);
+        assert!(matches!(modified_unix(&path), Ok(Some(unix)) if unix > 0));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(modified_unix(&path), Ok(None));
     }
 
     #[test]
@@ -647,18 +889,6 @@ mod tests {
                 "{id:?}"
             );
         }
-    }
-
-    #[test]
-    fn a_failed_tool_and_list_shaped_output_are_recorded() {
-        let dir = tempfile::tempdir().unwrap();
-        let failed = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":[{"type":"text","text":"no"},{"type":"text","text":"way"}]}]}}"#;
-        let path = write(dir.path(), "-p", "s8", &[ASSISTANT, failed]);
-        let items = read_history(&path).unwrap();
-        assert!(matches!(
-            items.last(),
-            Some(HistoryItem::Tool { outcome: Some(ToolOutcome::Failed { output }), .. }) if output == "no\nway"
-        ));
     }
 
     #[test]

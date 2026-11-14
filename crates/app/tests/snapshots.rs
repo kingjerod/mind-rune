@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The scenes that make up the window's screens, in the order a session meets them.
+/// The scenes that make up the window's screens: one session's, in the order it meets them,
+/// then those with many sessions, the sidebar's menus and a stored session's.
 const SCENES: &[&str] = &[
     "checking",
     "signed-out",
@@ -21,6 +22,14 @@ const SCENES: &[&str] = &[
     "permission-edit",
     "question",
     "plan",
+    "sessions",
+    "group-menu",
+    "folders",
+    "empty-start",
+    "resting",
+    "history-loading",
+    "history-failed",
+    "elsewhere",
 ];
 
 /// An image smaller than this is taken to be blank.

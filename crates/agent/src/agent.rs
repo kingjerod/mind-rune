@@ -26,7 +26,12 @@ pub trait Agent: Send + Sync {
         &self,
         modified_since_unix: Option<i64>,
     ) -> Result<Vec<StoredSession>, AgentError>;
-    fn read_session(&self, id: &SessionId) -> Result<Vec<HistoryItem>, AgentError>;
+    /// The end of a stored conversation: at most its last `max_items` items,
+    /// with the model and mode it last had.
+    fn read_session(&self, id: &SessionId, max_items: usize) -> Result<StoredHistory, AgentError>;
+    /// When the stored session last changed, in Unix seconds; `None` when nothing is stored
+    /// for it. Reads no content.
+    fn last_active(&self, id: &SessionId) -> Result<Option<i64>, AgentError>;
     /// Starts a session. May block for seconds. `Started` comes at most once
     /// and `Exited` exactly once, in the order [`SessionEvent`] describes. If
     /// the program exits before it is ready (a session id that cannot be
@@ -95,6 +100,18 @@ pub struct StoredSession {
     pub last_active_unix: i64,
 }
 
+/// The end of a stored conversation, as [`Agent::read_session`] gives it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StoredHistory {
+    pub items: Vec<HistoryItem>,
+    /// The session holds more than `items`, which are its end.
+    pub earlier_left_out: bool,
+    /// The full id of the model that last answered, when the history names one.
+    pub model: Option<String>,
+    /// The mode the session was last in, when the history names one.
+    pub permission_mode: Option<PermissionMode>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HistoryItem {
     User {
@@ -109,6 +126,8 @@ pub enum HistoryItem {
         detail: ToolDetail,
         outcome: Option<ToolOutcome>,
     },
+    /// The agent summarised everything above this point to save room.
+    Compacted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

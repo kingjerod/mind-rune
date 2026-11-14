@@ -1,6 +1,248 @@
-# Notes for plans 3 and 4
+# Notes for later plans
 
-Carried over from plan 1 (foundations and the Claude adapter) and plan 2 (one session in a window). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing plan 3.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window) and plan 3 (many sessions). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+
+Plan 3's sections come first. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## Jerod's look at plan 3
+
+Plan 3 ("many sessions") is on the branch `plan-3-many-sessions`. Jerod runs, in their own terminal:
+
+```bash
+MINDRUNE_LIVE=1 cargo test -p mindrune --test live -- --ignored --nocapture
+```
+
+```bash
+cargo run --release -p mindrune
+```
+
+With no folder the window shows again the session that was on screen when it last closed, without starting its program, or says how to start one. `cargo run --release -p mindrune -- FOLDER` starts a new session in FOLDER instead.
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- One conversation is on screen at a time. Clicking a row swaps it. Side by side is plan 4.
+- A session cannot be renamed. Its title is the generated one.
+- Closing the window ends every session's program. Running in the background is plan 5.
+- Rows cannot be dragged into the middle, and groups cannot be reordered. A session moves through "Move to group" in its row's menu.
+
+Also worth knowing beforehand:
+
+- "Hide group" on the group of the session on screen seems to do nothing at first: a group stays listed while its session is shown, so it hides when another session is shown. The same holds for a group whose session shows a mark.
+- A folder that is gone starts nothing, whether it was chosen from the "New session" menu or the picker or is a folder group's own (its "+" and its menu's "New session"); a line near the button says "That folder no longer exists: {path}". A message to a stored session whose folder is gone stays in the input box, and a line under the box says "This session's folder no longer exists: {path}".
+- A stored message that had images shows "1 image" or "N images" under its text. The images themselves are not shown.
+- The plan lists fourteen decisions of its own that the design does not make, or makes differently (which sessions are listed, their order, what launch does, the look at launch, how much history is read, and so on). Jerod has not reviewed them yet; they are in the plan under "Decisions in this plan that the design does not make".
+- **Decided by Jerod on 2026-11-14: a stored session goes on with the model it was using.** The code stays as built. Two known costs remain with it: the model read is the one that last answered, which a plan-mode turn can make differ from the one selected, and a session whose model no longer exists fails on its first message until another is picked. What was put to Jerod: Today it starts with the model that last answered in it, read from its history, as the plan's decision 6 says. The whole-branch review found two costs the plan did not weigh: that model is not always the one that was selected (a plan-mode turn can be answered by another), and an old session may name a model that no longer exists, so its first message fails. The other way is to start it with no model named unless Jerod picks one in this run, as `claude --resume` in a terminal does; since the model decides what a message costs, the choice is Jerod's.
+
+### The live test
+
+It needs Claude Code installed and signed in. It runs the app twice, as the window would be opened, closed and opened again, and starts the real `claude` three times in all: the test's session, the look the first run takes at launch, and the same session resumed in the second run. The account is checked once.
+
+What it prints, in order. None of these lines fails the test:
+
+- `live: replied "ok" with <model label>`, then the title, the model label and the Auto mode lines plan 2's test printed. These are about the test's own session only.
+- `live: listed N recent sessions in X ms, M in all in Y ms`: how long the two listings of the store took, from asking to the answer.
+- `live: the look gave N models; usage known: yes|no (Z ms)`.
+- `live: read the largest of the 5 most recent histories (K items) in Z ms`. The listing gives no file sizes, so "largest" is the one with the most items among the five most recent sessions, each shown as a click on its row would show it. Lines follow if some could not be read.
+- `live: read the session back from the store (K items)`.
+- `live: the session changed N s before; the app did not ask`. The second run starts from what the first saved, and that says this app closed the session; a change no later than ten seconds after that close is the app's own, so the app does not ask whether another app has it open. Should the program have written later than that, the line ends `the app asked first, continued here` instead, and the test answers "Continue here". Neither fails the test.
+- `live: resumed with <model label> in <mode label>`.
+
+What fails it: no reply, a reply that does not say the word asked for, no usage from the session, not getting back to "Ask before edits" after trying Auto, the first message or its reply missing from the history read back, a second message that does not resume the same session, and no reply to it. Every wait has a deadline and says what it waited for.
+
+Of the other stored sessions it prints only counts and times, never a title, a folder, a message or an id. It writes nothing itself. What stays behind is what `claude` stores for the test's own session: one session in a temporary folder that is deleted when the test ends. It will appear in the window's sidebar under a group named after that folder (`.tmp` and some letters). The look runs in the test's temporary folder, which the test gives the app as its home folder: the first run restores no session, so the app asks for the look there. Should the app ask for it in another folder, the test says so and runs it in its own folder anyway.
+
+### What to try in the window
+
+1. The sidebar fills with groups, and how long that takes. Seen: not yet recorded.
+2. An old session opens at once and shows its end. Seen: not yet recorded.
+3. A message to it gets a reply, and the model shown is the one that answers. Seen: not yet recorded.
+4. Two sessions work at the same time, and their marks follow. Seen: not yet recorded.
+5. "New session" offers folders, and "Choose a folder…" opens the desktop's folder picker. Seen: not yet recorded.
+6. A session is moved to a new group, the group renamed, the app closed and opened again, and everything is where it was. Seen: not yet recorded.
+7. A session that is open in Claude Desktop asks before it is sent to. Seen: not yet recorded.
+
+A defect in something plan 3 built is fixed in plan 3.
+
+### What Jerod reported on 2026-11-14
+
+Jerod ran the live test and then the window, and sent one picture: the sidebar full of rows titled "Condense the tool payload below t…", and a conversation whose first message is a long block of text with escaped line breaks and whose only reply is "Failed to authenticate: OAuth session expired and could not be refreshed". Jerod had typed none of it. The terminal had been cleared, so what the live test printed was not seen.
+
+What was found, each from the store or the code and not from a guess:
+
+- **The live test worked as far as the store shows.** It left one session, in a temporary folder, on 2026-11-14 at 08:43. Both messages are in it, each with its reply ("ok", "again") from the model the account defaults to. Whether the test's own checks all passed was not seen.
+- **The app sent nothing.** The session in the picture is a stored one from 2026-10-20, and its file has not changed since that day. The long first message and the sign-in error are its own content, drawn as stored. The saved state names it as the session on screen; a session comes on screen only by a click or Return on its row, or by being the one shown when the app last closed (`App::show`, `App::restore_shown`).
+- **Where the rows come from.** The store holds 722 sessions in the folder `~/.claude-mem/observer-sessions`, dated 2026-10-18 to 2026-10-27. A plugin made them, not a person: each is one request to shorten a tool's output. Every one of the 722 ends in an error from the service and none has a real reply. Their records carry `"entrypoint": "sdk-ts"`; nothing else in the store does. The other values seen: `cli` (the terminal program, 30 sessions), `claude-desktop` (21), `sdk-cli` (this app, its tests and its probes, 19).
+- **Why they fill the sidebar.** All 722 are inside the 30 days of decision 1, so all are listed: 722 of the 792 rows. Their group is the last of 20 by the order of decision 2, so the top of the list is right; the list below it is not usable.
+
+Defects in what plan 3 built:
+
+1. Sessions made by a program through the SDK are listed like a person's. The plan did not foresee them. **Fixed on 2026-11-14 (`d032b8e`), as Jerod chose: they are left out.** The listing leaves out a session whose first `entrypoint` is `sdk-ts` or `sdk-py`. There is no setting to show them. Against the real store the listing went from 792 recent sessions to 70. If the saved state names such a session as the one on screen, the app starts with nothing shown. `sdk-py` is a guess: only `sdk-ts` was seen. A program that drives `claude -p` writes `sdk-cli`, as this app does, and stays listed. Three limits the review of the fix named, none changed: the rule is "started through the TypeScript or Python SDK", so a person's sessions from a tool built on that SDK would be hidden as well; a session a program started and a person went on with stays hidden; and once the complete listing has come in, the saved state drops any group placement of a hidden session, which matters only if the rule is loosened later.
+2. Each run of the live test leaves a group named after a temporary folder that no longer exists (five so far), and the probes left `target/probe-cwd` (9 sessions). The app must never write inside `~/.claude`, so the test cannot remove them. "Hide group" removes each by hand.
+3. A very long message from the user is drawn in full (the one in the picture is about 26,000 characters). Not from plan 3; noted for whoever next works on the conversation.
+
+Also found: a probe from plan 1 was still running in a terminal tab and holding a `claude` open with Remote Control failing over and over. It was stopped on 2026-11-14.
+
+None of the seven things above was reported on, so each still says "not yet recorded".
+
+Later on 2026-11-14 Jerod decided the model question (see "Before looking") and said to merge plan 3 into `main`. The seven things were still not reported on when it was merged; they stay open, and a defect found in them later is fixed on `main` or in the next plan.
+
+## What plan 4 must know
+
+Plan 4 puts several sessions on screen side by side. What plan 3 built for it, and what it did not:
+
+- **The core holds many sessions.** `App.sessions` is a store of entries keyed by `SessionKey`, the app's own number for a session, which lasts one run. Each entry has its `Session`, the number of its current open (`None` while no program runs), its activity times, and whether it was touched in this run. `App.shown` is the one session on screen. Every session intent of `App` takes the key it acts on.
+- **"Shown" has rules attached.** Showing a session marks it seen, offers it the known models, and asks for its history when it was never read. A session that stops being shown and has nothing stored (no message handed over, none queued) is closed and forgotten, unless something is typed in its input box: `App::show`, `App::new_session` and `App::new_session_in` take a `Leaving`, and the glue passes `Leaving::Keep` while the draft of the session left has anything but white space (`glue::leaving`). A kept session is forgotten later, when it is left with nothing typed. The sidebar's model is rebuilt in `App::settle` when the shown session changed. With tiles, `shown` becomes the set of sessions in tiles plus the focused one; each of these rules has to say which it means.
+- **The question is per session.** Each entry holds its own question, `Entry::prompt` (today only "may be open in another app", with the message it holds), and whether its check in the store runs, `Entry::checking`, so several sessions can be checked or asked at once. `App::prompt(key)` reads the question and `App::answer_prompt(key, choice)` answers it. Only the session asked about stops taking messages, and a session with a question waiting is marked `NeedsYou`, so its row, a collapsed header and a hidden group show it. The card is drawn in its own session's pane, so two tiles can each show their own.
+- **Opens are numbered per session.** Everything the backend sends about an open carries its number, and a number that is not the session's current open is dropped. The backend runs one thread per open, one library thread for the account, the listings, the histories and the activity checks, one at a time in order, and one thread per look.
+- **One session's window state is one `SessionView`.** `Ui.views` maps each key to a `SessionView` (in `crates/app/src/glue.rs`): the draft, the open picker, the rows the user opened or closed, the outputs shown whole, the question drafts, whether the list follows the end, the first row on screen, and the generation they were made for. `glue::view` and `glue::view_mut` find it; `glue::run` ends by dropping the views of sessions that are gone and by calling `leave` on the view of a session that stopped being shown, which shuts its picker and gives up its focus. With two tiles on screen, "left" means "no longer in any tile".
+- **The pane function.** `view::pane(ui, cx, kit, key, layer)` in `crates/app/src/view/mod.rs` draws one session's conversation area: the conversation, the "may be open in another app" card while a question waits about this session, and the input box, in the column whose width the user drags. Everything under it takes the key as an argument, and every handler captures the key when it is built. `view::view` is the one place the conversation area reads `ui.app.shown`. Other code reads it too: in `crates/app/src/view/mod.rs`, `on_key` (Escape stops the shown session's turn); in `crates/app/src/view/folder.rs`, `pick` (the picker starts in the shown session's folder), `start` (whether a new session was shown, so its box takes the focus) and `floating_error` (whether a session is on screen); in the glue, `show`, `leaving`, `tidy_views`, `Ui::shown_session` and the test-only `Ui::shown_entry_mut`; and the demo and the test kit. Each has to say what it means with tiles.
+- **Keys already per session:** the conversation's scroll `mr-conversation-{key}`, the memo ids of rows `mr-item-{id}-g{generation}-{key}`, the sidebar's rows `mr-row-{key}`, and the group headers `mr-group-{group key}`. Rune resolves a plain key window-wide and takes the first match, so these still collide with two panes:
+  - `mr-tile`, which `width::current` and `width::column` read the layout of;
+  - the pickers, `Select::new("mr-model" | "mr-mode", ..)`, which anchor to `mr-model-trigger` and `mr-mode-trigger`, and the layer keys the kit derives from them (`-scrim`, `-content`, `-menu`): two tiles would both anchor to the first tile's trigger;
+  - `tx.keep_on_screen("mr-toggle-{id}")` in `items::line`: item ids restart per session;
+  - the card's buttons `mr-elsewhere-here`, `mr-elsewhere-copy`, `mr-elsewhere-cancel`, which carry no session number;
+  - plain keys tests look up and focus: `mr-input`, `mr-send`, `mr-stop`, `mr-jump-latest`, `mr-empty-hint`, the request buttons (`mr-allow-r1` and the like), `mr-item-{id}`. `tx.focus(key)` takes an exact key, not a path, so each tile's input needs a key of its own (`mr-input-{key}`), or its `TextEdit::focused` set in state.
+- **Focus between tiles.** Rune has no per-element focus callback. Rune writes the real focus into each draft's `TextEdit::focused` on every commit, so the focused tile can be read from `view.draft.focused`; `El::focus_within_ring` draws a ring while the focus is anywhere inside an element; `El::on_key` on a tile's root hears every key while the focus is inside it. Keep the focused tile in state and draw the mark from there.
+- **The drag that is still missing.** Rune has no dragging between elements inside a window: no drop targets, no drag preview. It has to be built by hand from `El::on_drag` (the pointer is captured by the pressed element until release; check `cancelled()` on release), the targets' rectangles reported by `El::on_layout` or `drawn_rect_into`, and `Tx::element_at` to pick what is under the pointer. A held press keeps hover on the pressed element, so hover cannot light a drop target. After a release inside the pressed element its `on_press` runs too, so a drag let go over its own row also selects it. The kit's `Reorder` moves a row only within one flat list, and its `TabStrip` reorders tabs. Plan 3's decision 11 waits for plan 4's drag to move rows onto groups.
+- **Dividers.** Rune has no splitter for more than two panes: the kit's `SplitView` has a sidebar, the main element and an inspector. Tiles side by side are a row of columns with divider elements between them, each with `on_drag`, as `crates/app/src/view/width.rs` drags the conversation's edge.
+- **What is kept between runs** is one `Saved` record under the settings key `state`, version 1: the groups, where sessions were placed, the recent folders, the shown session by its id, the sidebar's width and whether it is collapsed, and `closed_by_app`, the sessions whose program the last run ran with the time it closed (only those closed within the last 130 seconds are kept). Fields have serde defaults, so a field added for tiles reads as its default from an older file. **Plan 4 must not raise `SAVED_VERSION` for added fields:** the defaults cover them, and a build reads only its own version. One malformed field still loses the whole record for that run, but a value under `state` that a build cannot read, or of another version, is first copied as it was to `state.unread`, so a newer build's state survives a run of an older one.
+- **Do not assign `App.sessions` or `App.groups` wholesale.** Each counts its own changes, and `App::settle` compares those counts with the ones it last built from. A new store put in its place can start at a count `settle` already holds and hide a change. Plan 3 builds both once, in `App::new`.
+- **Renaming a session** (plan 4) writes a `custom-title` record, which wins over every generated title. The listing reads titles only from the first and the last 256 KiB of a file, so in a large file a name given in the middle is not seen (see `docs/protocol-notes.md`).
+
+## The whole-branch review of plan 3
+
+After the fourteen tasks a final reviewer read the whole branch for problems that live between tasks. It found nothing critical: nothing loses stored data, crashes the window or leaves a program running. It found six problems a person would meet in ordinary use and ten small ones. One fix wave followed.
+
+### What was fixed
+
+- **A stored session no longer wakes in "Bypass permissions" because its file says so.** A history whose last mode is `bypassPermissions`, or a mode this app does not know, leaves the session in "Ask before edits". Plan, Accept edits and Auto are still taken from the history. Before, the program could be started with every permission check off while the only sign was the picker's label, although the input box never offers Bypass.
+- **A new session with text typed in it is kept when the user looks at another session.** Before, looking up something in another session while writing a first message threw the new session and its text away. Now it stays, row and text, while its input box holds anything but white space; one left with nothing typed is still forgotten. This holds for a click or an arrow key on a row, and for a new session from the folder menu, the picker or Ctrl+N.
+- **The "may be open in another app" question is per session.** Before, while one session's question waited, no other stored session could be sent to, and nothing on screen said why; the question could even wait in a session that was not on screen. Now each session holds its own question, several can be checked or asked at once, only the session asked about waits, and its row is marked like a session that needs the user.
+- **The look at launch runs in the restored session's folder or at home.** Before, with nothing to restore it ran in the folder of whichever session was written last, which may belong to an automated run, and in a folder that no longer existed it failed silently and left the usage unknown. Now it never runs in the newest session's folder, and a folder that is gone falls back to the home folder, for the look after a usage reset too.
+- **No question after this app's own last run.** Before, closing the window and opening it again within two minutes made the first message to the session just used ask "This session may be open in another app", although only this app had written to it. Now closing keeps, for each session whose program the run ran, its id and the closing time, and a change in the store no later than ten seconds after that time counts as the app's own.
+- **A folder group's "+" and its menu's "New session" check the folder.** A folder that is gone, such as a removed worktree, starts nothing and says so, as a folder chosen from the menu does, and no longer goes to the front of the recent folders.
+- **A message to a stored session whose folder is gone stays in the box.** Before, the program failed to start, the session ended, and the message sat in "Queued" behind a box that could not be used. Now nothing starts, the draft stays, and a line under the box says the folder no longer exists. The folder is checked when the user sends, not while the box is drawn.
+- **A store that cannot be read is not an empty store.** Before, a projects folder or a project's folder that could not be read for a moment (permissions, a mount) gave "no sessions", and the next save dropped every saved placement. Now the listing fails and the app keeps what it knows. A projects folder that does not exist yet still means no sessions.
+- **A saved state of another version is kept aside.** Before, running this build after a newer one overwrote the newer build's groups and placements at the first save. Now a value under `state` this build cannot read is copied as it was to `state.unread` first.
+
+### What was left, and why
+
+- **The model a stored session starts with** (the review's Important 2) is the plan's decision 6, which Jerod approved by name. Changing it changes what a message costs, so it is put to Jerod at the look (see "Before looking") and the code is unchanged.
+- **Work that grows with the store** (Minor 9): `App::event` finds its session by walking every entry for each streamed piece; every program start and every look copies the model list into all of about 790 entries; and the window redraws whenever a hidden session streams, though its rows are memoised. Each is small at today's sizes and has a plain fix (a map from open to key; offer models only to live and shown sessions; redraw only when the shown session or the sidebar changed).
+- **A session left "Queued:" for ever** (Minor 7): a program that exits cleanly before it started, or while a message waited behind a turn, leaves the session resting with the message still queued, and nothing sends it until the user sends something else. The fix is to hand it back to the draft, as Cancel does, or to wake the session with it.
+- **Claude Code going missing mid-run** (Minor 10) removes the session it was asked to start, until the next listing, and drops its queued message. Ending it as any other failed start does would be kinder.
+- **An unreadable session file** (Minor 8). The plan's header says it covers the design's case of a stored session file that cannot be read, which section 10 describes as listed with its id as the title and an error when opened. What is true: a file is listed only when it names its folder in its first or last 256 KiB; a file that does not is not listed at all, since it has no group to sit in. A file that names its folder there but cannot be read further on is listed, and opening it says why it could not be read.
+- **Two things the check of the fixes itself found, both small and left as they are.** First: when the app closes it notes the closing time for every session it ran in that run, also for one whose program had ended long before. If another app wrote to such a session in between, and the app is closed and opened again within two minutes, the first message to it is not asked about. Noting the program's own last report for a session that was not running at the close would settle it. Second: one project folder in the store that stays unreadable now makes every listing fail, so no stored session is listed, where before only that folder was missing. Skipping it while counting the listing as not complete would list the rest and still keep the saved placements.
+
+### What plan 5 must do first
+
+Plan 5 stops idle programs quietly. Two things the review found are rare today and become ordinary then:
+
+- **A send that fails after its program's exit leaves a message that looks sent** (Minor 6). `Exited` lets go of the open, so a `SendFailed` that comes after it reaches no session; after a clean exit the session rests with the user's message in the conversation and no reply, no spinner and no notice, and the message still counts as handed over. Keep the last open's number on the entry so the failure is found, take the message back out of the conversation (or mark it not delivered), and wake the session with it again. A title that arrives after the exit is lost the same way.
+- **Histories are never let go** (Minor 5). A history read for a session (up to 2,000 items with their whole tool outputs) stays for the run, and holding an arrow key through forty stored sessions queues forty reads on the library thread and keeps forty conversations in memory. Drop the history of a resting session that is neither shown nor run (back to "not loaded"), and skip a queued read whose session is no longer shown.
+
+## Left by plan 3
+
+Found by the per-task reviews of plan 3 and not fixed. None blocks anything.
+
+The adapter (`crates/claude`):
+
+- `list_entries` computes a file's modification time in its own line, with another fallback than `modified_unix`.
+- The history reader has no test for a walk that ends at a root inside a region cut from a larger file, for a cut region with no message, for a compaction whose earlier record lies outside the region, or for links that run in a circle.
+- The test that moved with the side-chain rule no longer proves that a side-chain record on the chain is skipped.
+- When the region read from the end of a file starts exactly at the start of a line, that whole line is dropped. The listing's `describe` reads one byte before its region to avoid this; the history reader does not.
+- A record with the same top-level link key twice is skipped as broken.
+- The listing sees titles only in the first and last 256 KiB of a file, so a name the user gave in the middle of a large file loses to a later generated one.
+
+The core (`crates/core`):
+
+- When a program's clean exit is taken in before a late failed send of the same open, the session rests although it counts as having nothing stored; it then starts afresh, which is right, but the two facts disagree.
+- A thought read from the store still carries a start time of 0 that nothing uses.
+- Two "closed" send failures of one open can arrive out of order. Nothing depends on their order.
+- Ended opens and finished looks stay as empty entries in the backend's maps until the next open, send, look or flush.
+- A test comment in `a_look_reports_and_closes` says the fake answers the usage request; the test itself does.
+- The look's two time limits have no test.
+- The backend's old `next` test helper spells out the full `std::time` names.
+- `answer_prompt` drops the held message, even for Cancel, when its session is no longer resting. No path reaches this today.
+- A new recent listing is sent even while one is still out, so an older complete listing that arrives last can remove entries a newer recent listing added, until the next listing.
+- The 30 second tick asks for the usage after a reset without checking that the agent reports usage at all, as the start of a session does.
+- No test covers "Continue as a copy" before the original's history was read, an activity answer for a session that is gone or not opening, or a listing that names one id twice.
+- A copy has no id until its program reports one, so restarting a copy whose fork failed starts afresh.
+- Every event clones the session's id, though only the start needs it.
+- `Sessions` compares its change count too when two stores are compared.
+
+What is kept between runs:
+
+- Folder groups whose folder was deleted stay in the saved record. The "New session" menu lists only folders that still exist.
+- Duplicates in a hand-edited list of recent folders survive the start.
+- A new session placed in a custom group is saved by its id only at the next save, so a crash before then loses the placement.
+- "Continue as a copy" does not put its folder among the recent ones.
+- Reading the saved state checks its version twice.
+- One malformed field loses the whole saved state for that run; the value is kept under `state.unread` until the next value that cannot be read replaces it.
+
+The conversation area:
+
+- A session's place comes back only to within a row, so a row taller than the window may come back elsewhere.
+- Handlers that run late can recreate the view of a session that is gone, until the next run of the glue drops it.
+- "This conversation could not be read." goes away once a session whose history failed has new items, and nothing then says that the earlier history is missing.
+- Cancel on the "may be open in another app" card always adds a line break before the message it puts back, which leaves a blank line when the draft already ends with one.
+
+The sidebar and its menus:
+
+- Group headers, "Show older" and "Older groups" cannot be reached with the keyboard; the kit's own header is the same.
+- When a group is created and a session moved into it, the view filters the save out of the core's effects; one core intent for both would be cleaner.
+- The "Hidden groups" menu opens at the window's top-left corner when its line has not been laid out yet.
+- After a menu opened with the pointer closes, the focus goes back to where it was (the input box), not to the row. This is Rune's behaviour for menus.
+- Escape with the focus in the "Move to group" submenu is untested; it should close the whole menu.
+
+Folders for new sessions:
+
+- The menu opened from the empty area's button appears under the sidebar's button; with the sidebar collapsed and a session shown it opens at the window's corner.
+- Ctrl+N while the folder picker is open can open the menu, and both answers then start a session.
+- Tidying the sidebar shuts the folder menu without clearing the folders it offered; they are not read while it is shut.
+- With the sidebar shown and no session shown, the same folder error is drawn twice, under both buttons.
+- The floating error line (sidebar hidden, a session shown) lies over the top left of the conversation until the next try, and no screenshot shows it.
+
+Tests:
+
+- Two fixes made during plan 3 (a stored thought claims no time and a stored message keeps its image count; a new session replaces an empty one whose program ended) had their tests written after the code, so those tests were never seen failing.
+- `a_new_session_forgets_the_old_ones_open_picker` asserts nothing that can fail now; it should check the picker of the view that was left.
+- `history_that_replaces_a_conversation_forgets_opened_rows` sets the history to loading by hand.
+- `cancel_puts_the_message_back` cannot catch a lost focus, because the box already has it.
+- `a_very_long_history_scrolls_smoothly` does not set "earlier left out", so the line "Earlier messages are not shown." is not checked there.
+- The demo's model list copies the fake agent's private one.
+- One test empties the known models and a session's models by hand, a state no backend message produces.
+- The close warning on standard error still says "the session", though every session's program is waited for.
+
+## Rulings made while plan 3 ran
+
+Calls made by the controller during the plan, where the plan or the brief did not settle a question. Each says what it costs if it was wrong.
+
+- Work went on the branch in the main checkout, not in a separate worktree, as in plan 2: a worktree would rebuild Rune from nothing. If wrong: the main checkout sat on the plan's branch while work ran; `git switch main` undoes it.
+- Every subagent (implementer, reviewer, fixer) ran on Opus 5.5 at high effort, because Jerod set that floor. The whole-branch review ran on the most capable model because the review process asks for it there. If wrong: the final review cost more than needed; it is one review.
+- `Launch` derives `Default`, and callers build it with `..Default::default()`, because two tasks add fields to it. If wrong: one derive.
+- The test that closing ends every program counts the `Close` effects, not the length of the list, because closing also asks to save. If wrong: nothing.
+- The look at launch runs in the folder of the session shown again from the last run, else of the newest session, else the home folder. If wrong: one launch's look runs the user's session-start hooks in another folder than the plan's decision 5 says. *Replaced after the whole-branch review: the look runs in the restored session's folder, else in the home folder, never in the newest session's, and a folder that is not there falls back to the home folder; the look after a usage reset follows the same rule. The newest session is whichever program last wrote to the store, an automated run's for example, so its folder decided where the user's session-start hooks ran; that contradicts decision 5, which is the sentence Jerod approves.*
+- A look runs on a thread of its own, not on the library thread, so a look that waits up to 30 seconds for the real program never holds up a stored session's history. If wrong: one short-lived thread more than planned.
+- `App` has a public `sidebar_version`, which goes up each time `settle` rebuilds the sidebar's model; the sidebar's list uses it as its version, and the model's types compare and print. If wrong: one public field.
+- The window tests' helper that adds a session hands one message over, so the app keeps that session when another is shown. If wrong: the helper is shaped differently; the tests that use it still cross the same item ids.
+- On closing, the saved state is written before the bounded wait for the programs, not after, so the groups are safe even when the desktop cuts the wait short. If wrong: nothing visible; nothing learned during the wait is saved.
+- When the part of a file read from its end does not start at the file's start, and the chain of replies ends at a record with no parent, the history says that earlier messages are not shown: the reader cannot know what the cut bytes held. If wrong: a file over 16 MiB whose whole conversation sits in its end shows that line once too often.
+- A cut region that holds no message is an empty history that says earlier messages are not shown, for the same reason. If wrong: such a file shows only that line; one line to change.
+- Choosing a row with the arrow keys leaves the focus in the sidebar's list; a click on a row, Return or Space on a focused row, or a new session focuses the input box. Return is a choice, not a move. If wrong: a keyboard user presses Tab once more or once less.
+- A thought read from the store reads "Thought", with no time: the store keeps no duration. If wrong: the wording of old thinking lines.
+- The core keeps a stored message's image count on the user's item, and the window draws it, so a message that was only an image is not an empty bubble. If wrong: one field nobody draws.
+- A session's program is started with the model option the user chose only while that option names the model in use, else with the model's id, so a refused choice is never passed to a new program. If wrong: a choice made while the program was dying is not kept across a restart.
+- "New session" keeps the shown empty session only while its program has not ended; an ended empty one is replaced, so the button never goes dead after a failed start. If wrong: one condition and one test.
+- A session placed in a folder's group stays there even when no session of that folder is left: the user's placement stands. If wrong: a group named after a folder with only sessions from elsewhere in it lingers; "Delete group" clears it.
+- "Show older" and "Older groups" ask for no save: what they change is not kept between runs. If wrong: one line each.
+- "Move to group" leaves out the older groups while their line is closed; they appear once "Older groups" is open. Listing them needs a change to the core's model. If wrong: a session cannot be moved into such a group without opening that line first.
+- Turning on Rune's native folder picker let cargo add the lock entry of `rfd`, a crate Rune names for macOS and Windows that is not built on Linux; nothing else in the lock moved. If wrong: reverting `Cargo.toml` and `Cargo.lock` undoes it.
+- Three tests in `main.rs` that build the app from the command line's launch stand in for window tests of the launch rules, because with the fake agent a look stalls the demo's pump. If wrong: the glue carrying a look out at launch is untested until the live run.
+- A folder chosen from the menu or in the picker is checked once more at the click; a folder that is gone starts nothing and says "That folder no longer exists: {path}". If wrong: one folder check per click and one line of wording Jerod has not seen. *After the whole-branch review, a folder group's "+" and its menu's "New session" are checked the same way.*
+
 
 ## Jerod's first look
 
@@ -100,20 +342,20 @@ Behaviour plan 2 left as it is:
 - **The width is saved once per drag**, when the drag ends, not on every move as plan 2's text says: writing the settings file means an fsync on the window's thread for every pointer event.
 - **Escape and the pickers.** Holding Escape sends one `Stop` per key repeat. After the stop button is pressed from the keyboard, focus is lost when it turns back into the send button.
 - **Question choices are keyed by their label**, so two options with the same label act together.
-- **Closing the window waits for one session only.** It sends `Close` to the current session and waits up to 2.5 seconds for its program to end. A session replaced earlier by "New session" whose program has not ended yet is not waited for, nor is a session still starting (the first start can spend up to 20 seconds checking the sign-in). Its wait also keeps the closing window on screen, unresponsive, for that long at most.
+- **Closing the window waits for one session only.** It sends `Close` to the current session and waits up to 2.5 seconds for its program to end. A session replaced earlier by "New session" whose program has not ended yet is not waited for, nor is a session still starting (the first start can spend up to 20 seconds checking the sign-in). Its wait also keeps the closing window on screen, unresponsive, for that long at most. *Done in plan 3: closing sends `Close` to every session whose program runs and waits up to 2.5 seconds in all.*
 
 Found by the final review of plan 2 and not fixed:
 
-- **Restart can resume a session that has nothing stored.** A session that started and died before its first message has no conversation on disk, so `claude --resume` fails and Restart fails for ever, with a different error each time. Restart should resume only when the conversation holds a user message, and otherwise start afresh in the same folder. The fake resumes anything, so no test sees it.
-- **A session that ends by itself with status 0 offers no Restart.** The Restart button lives on the "ended" notice, which is only added for an unclean exit; the input box then says "This session has ended" and only "New session" goes on.
-- **A failed send that is not `Closed` leaves the session working for ever.** `Session::submit` sets the phase to working before the send; when the send fails the app adds a notice but leaves the phase. It should return to idle when the failed command was a message.
+- **Restart can resume a session that has nothing stored.** A session that started and died before its first message has no conversation on disk, so `claude --resume` fails and Restart fails for ever, with a different error each time. Restart should resume only when the conversation holds a user message, and otherwise start afresh in the same folder. The fake resumes anything, so no test sees it. *Done in plan 3: a session resumes only when something is stored for it.*
+- **A session that ends by itself with status 0 offers no Restart.** The Restart button lives on the "ended" notice, which is only added for an unclean exit; the input box then says "This session has ended" and only "New session" goes on. *Settled in plan 3 for a session with a conversation: it rests, and the next message starts its program again. One with nothing stored still ends, and "New session" replaces it.*
+- **A failed send that is not `Closed` leaves the session working for ever.** `Session::submit` sets the phase to working before the send; when the send fails the app adds a notice but leaves the phase. It should return to idle when the failed command was a message. *Done in plan 3.*
 - **Two "ended" notices are possible** when `open` both returns an error and reports `Exited` (the adapter can); the second should be skipped when the session has already ended.
-- **The usage footer goes stale after a reset.** Usage is asked for when a session starts and otherwise arrives with turns, so after a window's reset time passes with no turn, the line keeps its old percentage with "Resets soon". The 30 second tick should ask again when it sees a reset time in the past.
-- **A queued message is lost by "New session".** Only the input box's draft survives.
+- **The usage footer goes stale after a reset.** Usage is asked for when a session starts and otherwise arrives with turns, so after a window's reset time passes with no turn, the line keeps its old percentage with "Resets soon". The 30 second tick should ask again when it sees a reset time in the past. *Done in plan 3: the tick asks the running session, or takes a look when none runs.*
+- **A queued message is lost by "New session".** Only the input box's draft survives. *Done in plan 3: the session it was queued in stays, with its message.*
 - **A question whose input could not be read** shows a card with no questions and an enabled "Send answer" that does nothing; Stop is the only way out.
 - **Claude can offer its own "Something else" option** (the question recording has one), which then sits directly above the field with the same words.
 - **Diffs are computed on the window's thread without a time limit** (`unified_diff` and `line_counts`). Edits are small in practice; `similar` has a deadline setting.
-- **Each Restart leaves the dead session's handle in the backend worker's map**, with its closed pipes, until the app quits.
+- **Each Restart leaves the dead session's handle in the backend worker's map**, with its closed pipes, until the app quits. *Done in plan 3: each open has a thread of its own, which ends with its session.*
 - **The live test uses the user's default model**, where the design asks for the cheapest; one model choice before the message would satisfy both.
 - **The window redraws for every message taken in**, including stale ones from a replaced session that change nothing (`glue::poll`).
 - **Tool lines never show a file's folder** ("Edited main.rs"); only a request card shows the whole path, where the user decides.
@@ -122,7 +364,7 @@ Found by the final review of plan 2 and not fixed:
 Left as they are, for Jerod to decide:
 
 - **(Jerod's judgment) The footer shows the account's e-mail address as the name**, because that is all the adapter has; the design says "name".
-- **(Jerod's judgment) "New session" during a turn closes the working session without asking.** Plan 3 replaces this behaviour.
+- **(Jerod's judgment) "New session" during a turn closes the working session without asking.** Plan 3 replaces this behaviour. *Done in plan 3: the working session stays in the sidebar and goes on working.*
 - **(Jerod's judgment) Stop with a message queued sends that message at once.** The design says only that a queued message is "sent when the turn ends".
 - **(Jerod's judgment) The word "Claude" appears in the window's text** ("Message Claude", "Claude has a question"). It names the program being driven; no logo, colour or font is copied.
 - **(Jerod's judgment) A command waiting for permission already reads "Ran ..."** on its tool line, with a spinner, above the card that asks whether it may run.
@@ -137,10 +379,10 @@ Left as they are, for Jerod to decide:
 Structure:
 
 - **`translate.rs` is now about 2,350 lines**, most of it tests. Split it into a `translate/` module (turns, requests, control replies) the next time it is touched.
-- **The `Backend` has one worker thread, shared by all sessions.** A slow `open` or `send` for one session holds up all the others. Plan 3, with many sessions, may want one thread per open.
+- **The `Backend` has one worker thread, shared by all sessions.** A slow `open` or `send` for one session holds up all the others. Plan 3, with many sessions, may want one thread per open. *Done in plan 3.*
 - **`Backend` edge cases.** A panic in an agent call ends the worker silently and drops its sessions without `Close`. A session that exits by itself stays in the worker's map until a send to it fails. Two opens with the same number would drop the first handle without `Close`.
 - **`FakeAgent` has no per-open identity.** An old handle of a resumed session id works again, where the real adapter's stays closed.
-- **The conversation list's version for Rune is the number of the current open.** That relies on items only ever being appended. A change that inserts or removes items in the middle of a conversation must also change that version.
+- **The conversation list's version for Rune is the number of the current open.** That relies on items only ever being appended. A change that inserts or removes items in the middle of a conversation must also change that version. *Changed in plan 3: the version is the session's key and its `generation`, which goes up whenever a conversation's items are replaced (a stored history put before them, for example).*
 - **Every item carries a change stamp (`Item::changed`).** Every new change to `Conversation` must set it, or finished rows, which are memoised, keep showing their old content.
 - **Every `App` intent a view calls must be followed by `glue::run`**, because the drafts of answered questions are dropped there.
 - **Rows that are off screen keep the heights measured at the old width** until they are shown again (Rune's virtual list).
@@ -153,24 +395,24 @@ Structure:
 
 ## Recommendations for plan 3 from the final review of plan 2
 
-- **Keep the replay.** `crates/app/tests/replay.rs` plays every recording of a real `claude` session through the adapter's translator into the core's `Session` and checks the end of every turn. It is the only automatic check of the real path that runs without `claude`. Add a recording whenever a live run shows something new, and make every demo scene something a recording could contain.
-- **Put one session's view state in one struct before plan 3.** Which rows are open, which outputs are shown whole, question drafts, the open picker, whether the list follows the end and the draft are loose fields on `Ui` today; with many sessions each must be per session anyway, and replacing a session then becomes one assignment.
-- **Carry the tool call's id on a request.** `claude`'s permission request names the tool call it is about (`tool_use_id`). With it on `UserRequest`, the window could draw a request and its tool line as one thing instead of relying on their order.
-- **Decide quitting once, in the adapter.** A process group and a kill on shutdown (plan 4 needs both anyway) would make closing the window a few lines and cover every session, not only the current one.
-- **For the reviews:** give the reviewer of each view task the adapter's recordings, and check the plan's wording tables for what the user needs to know to decide, not only for wording.
+- **Keep the replay.** `crates/app/tests/replay.rs` plays every recording of a real `claude` session through the adapter's translator into the core's `Session` and checks the end of every turn. It is the only automatic check of the real path that runs without `claude`. Add a recording whenever a live run shows something new, and make every demo scene something a recording could contain. *Done in plan 3: the replay now goes through `App`, and also plays the recordings three at a time into three sessions of one `App`, each ending as it does alone. Still open: no recording was added.*
+- **Put one session's view state in one struct before plan 3.** Which rows are open, which outputs are shown whole, question drafts, the open picker, whether the list follows the end and the draft are loose fields on `Ui` today; with many sessions each must be per session anyway, and replacing a session then becomes one assignment. *Done in plan 3: `SessionView`, one per session, in `Ui.views`.*
+- **Carry the tool call's id on a request.** `claude`'s permission request names the tool call it is about (`tool_use_id`). With it on `UserRequest`, the window could draw a request and its tool line as one thing instead of relying on their order. *Still open.*
+- **Decide quitting once, in the adapter.** A process group and a kill on shutdown (plan 4 needs both anyway) would make closing the window a few lines and cover every session, not only the current one. *Still open: plan 3 closes every session from the window and waits for all of them, without a process group.*
+- **For the reviews:** give the reviewer of each view task the adapter's recordings, and check the plan's wording tables for what the user needs to know to decide, not only for wording. *Followed in plan 3, where a task had recordings to give.*
 
 ## What plan 3 must know about the window
 
-- **Keys in use.** Enter sends the message (or queues it while a turn runs); Shift+Enter adds a line. Escape stops a running turn, from the input box or from anywhere else in the window; a picker list that is open takes Escape first and closes. Ctrl+Shift+B (Cmd+Shift+B on macOS, also Ctrl+Cmd+S there) shows and hides the sidebar; this is the kit's shortcut. Tab moves between the input box, the two pickers, the send or stop button, the sidebar toggle and the sidebar's buttons. No key answers a request: request buttons never take focus and ignore Enter and Space.
-- **One session.** `App` holds one `Option<Session>`, and `Ui` holds the state of that one session's view (the draft, which rows are open, which outputs are shown whole, question drafts, whether the list follows the end). Plan 3 needs many sessions: each of these becomes per session, and the stale-open rule (everything from the backend carries the number of its open) must become per session too.
-- **The session list grows from `mr-session-row`.** The sidebar shows one `SidebarRow` keyed `mr-session-row`, with the session's title (or "New session"), the folder name as its subtitle, a spinner while a turn runs and a dot when a request waits. The list of sessions goes there, in the kit's `Sidebar`, above the usage footer.
-- **Every key this app gives an element starts with `mr-`.** The root of the window is `mr-root`; the conversation's middle is `mr-tile`; rows are `mr-item-{id}`. The screenshot test checks every screen for `mr-root` and for Rune's duplicate-key warnings.
-- **Screens are tested from scripted scenes.** `crates/app/src/demo.rs` holds the scenes (`--demo --scene NAME`); `cargo test -p mindrune --test snapshots` writes a picture of each main screen in both themes to `target/snap/final`.
+- **Keys in use.** Enter sends the message (or queues it while a turn runs); Shift+Enter adds a line. Escape stops a running turn, from the input box or from anywhere else in the window; a picker list that is open takes Escape first and closes. Ctrl+Shift+B (Cmd+Shift+B on macOS, also Ctrl+Cmd+S there) shows and hides the sidebar; this is the kit's shortcut. Tab moves between the input box, the two pickers, the send or stop button, the sidebar toggle and the sidebar's buttons. No key answers a request: request buttons never take focus and ignore Enter and Space. *Still true after plan 3, which added: Ctrl+N opens the "New session" folder menu; the arrow keys move through the sidebar's rows, and Return or Space on a row shows it; the Menu key or Shift+F10 opens a row's menu; the buttons of the "may be open in another app" card follow the request buttons' rule; Escape stops only the shown session's turn.*
+- **One session.** `App` holds one `Option<Session>`, and `Ui` holds the state of that one session's view (the draft, which rows are open, which outputs are shown whole, question drafts, whether the list follows the end). Plan 3 needs many sessions: each of these becomes per session, and the stale-open rule (everything from the backend carries the number of its open) must become per session too. *Done in plan 3: see "What plan 4 must know".*
+- **The session list grows from `mr-session-row`.** The sidebar shows one `SidebarRow` keyed `mr-session-row`, with the session's title (or "New session"), the folder name as its subtitle, a spinner while a turn runs and a dot when a request waits. The list of sessions goes there, in the kit's `Sidebar`, above the usage footer. *Done in plan 3: `mr-session-row` is gone; the sidebar lists groups (`mr-group-{group key}`) and rows (`mr-row-{session key}`) in its own virtual list.*
+- **Every key this app gives an element starts with `mr-`.** The root of the window is `mr-root`; the conversation's middle is `mr-tile`; rows are `mr-item-{id}`. The screenshot test checks every screen for `mr-root` and for Rune's duplicate-key warnings. *Still true; plan 3 kept the rule and added the sessions' and groups' keys.*
+- **Screens are tested from scripted scenes.** `crates/app/src/demo.rs` holds the scenes (`--demo --scene NAME`); `cargo test -p mindrune --test snapshots` writes a picture of each main screen in both themes to `target/snap/final`. *Still true; plan 3 added the scenes `sessions`, `group-menu`, `folders`, `empty-start`, `resting`, `history-loading`, `history-failed` and `elsewhere`.*
 
 ## Open checks that need Jerod
 
 - **Remote Control, seen by a person.** Turning it on works at the protocol level and returns a claude.ai link. Nobody has yet confirmed the session is listed at claude.ai/code and can be driven from there. Do this before plan 4 builds the switch.
-- **Listing speed on the real history.** `stored_sessions` was never timed against the real `~/.claude/projects` (over 1,000 files). A permission check refused the run for an agent. Plan 3's sidebar assumes it finishes in well under 10 seconds. Listing reads only file metadata, and `describe` reads at most about 512 KB per file.
+- **Listing speed on the real history.** `stored_sessions` was never timed against the real `~/.claude/projects` (over 1,000 files). A permission check refused the run for an agent. Plan 3's sidebar assumes it finishes in well under 10 seconds. Listing reads only file metadata, and `describe` reads at most about 512 KB per file. *Plan 3's live test now prints how long both listings take; open until Jerod runs it.*
 - **The repository.** On 2026-11-11 Jerod had the git data removed from this folder and set the repository up again; plan 1's work is the first commit on `main`, and plan 2 is on the branch `plan-2-one-session`, not pushed. Commit ids and the branch name `plan-1-foundations` in older notes point at history that no longer exists. Keep `.gitignore`: it keeps `target/` and `.superpowers/` out of the repository, and `target/rec/` holds raw session recordings that must not be committed.
 
 ## The seam: additions the window will need
@@ -179,10 +421,10 @@ Plan 1 kept the seam to what its own tasks needed. The whole-branch review named
 
 | Needed for | Addition | Why |
 | --- | --- | --- |
-| Plan 3 | A cheap "last modified" for one session | The "live elsewhere" check in the design (5.8). |
-| Plan 3 | Paging or a limit on `list_sessions` and `read_session` | Over 1,000 sessions; histories of tens of megabytes. |
-| Plan 3 | Reading history along the `parentUuid` chain | File order would show abandoned branches and compaction summaries. |
-| Plan 3 | How a rename is stored on disk | `describe` reads only `ai-title` records. A renamed session may list under its old title. Not checked. |
+| Plan 3 | A cheap "last modified" for one session | The "live elsewhere" check in the design (5.8). *Done in plan 3: `Agent::last_active`.* |
+| Plan 3 | Paging or a limit on `list_sessions` and `read_session` | Over 1,000 sessions; histories of tens of megabytes. *Done in plan 3: a listing since a time, and a history read from the end with a limit on its items.* |
+| Plan 3 | Reading history along the `parentUuid` chain | File order would show abandoned branches and compaction summaries. *Done in plan 3.* |
+| Plan 3 | How a rename is stored on disk | `describe` reads only `ai-title` records. A renamed session may list under its old title. Not checked. *Settled in plan 3: a name the user gives is a `custom-title` record, and the listing reads it.* |
 | Plan 4 | User messages that arrive through Remote Control | `user` text records are ignored today, so the window would show a reply with no prompt. First verify what `claude` emits. |
 | Plan 4 | Bridge states other than `ready`, `connected`, `failed` | Unknown states are ignored. If the bridge drops by itself the window would keep showing "On". Not observed yet. |
 | Plan 4 | Whether Remote Control can be turned on before a session's first turn | Not exercised. The "on by default" preference depends on it. |

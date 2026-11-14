@@ -3,16 +3,27 @@
 mod app;
 mod backend;
 mod conversation;
+mod groups;
+mod saved;
 mod session;
+mod sessions;
 mod tools;
 mod usage;
 
-pub use app::{App, DEFAULT_WIDTH, Effect, MIN_WIDTH, Screen, Width};
+pub use app::{
+    App, DEFAULT_WIDTH, ELSEWHERE_SECONDS, Effect, HISTORY_ITEMS, Launch, Leaving, Listing,
+    MIN_WIDTH, OWN_EXIT_SLACK_SECONDS, PromptChoice, RECENT_DAYS, RELIST_SECONDS, Screen,
+    USAGE_RETRY_SECONDS, Width,
+};
 pub use backend::{Backend, FromBackend, ToBackend, Wake};
 pub use conversation::{
-    Conversation, DID_NOT_FINISH, Item, ItemBody, ItemId, NoticeKind, RequestState, thinking_label,
+    Conversation, DID_NOT_FINISH, Item, ItemBody, ItemId, NoticeKind, RequestState, ThinkingTime,
+    thinking_label,
 };
-pub use session::{Phase, Session, answer_words, mode_label, model_option_label};
+pub use groups::{Group, GroupId, Groups, Line, Row, Section, SidebarModel, sidebar_model};
+pub use saved::{RECENT_FOLDERS, SAVED_VERSION, Saved};
+pub use session::{HistoryState, Phase, Session, answer_words, mode_label, model_option_label};
+pub use sessions::{Entry, EntryMut, Mark, Prompt, SessionKey, Sessions};
 pub use tools::{
     Clip, OUTPUT_CHARS, OUTPUT_LINES, ToolCall, ToolFamily, ToolGroup, clip, family, fenced,
     file_name, line_counts, unified_diff,

@@ -1,11 +1,14 @@
 //! The list of things a session has said, built from its events.
 //!
-//! Three promises the view relies on: an item's id is never reused and never
-//! changes, [`Conversation::revision`] grows whenever anything a view shows
-//! has changed and stays the same otherwise, and an item's [`Item::changed`]
-//! is the revision of its own last change.
+//! Three promises the view relies on: an item's id is never reused, grows with
+//! the item's place, and changes only when [`Conversation::put_history_first`]
+//! numbers every item again; [`Conversation::revision`] grows whenever anything a
+//! view shows has changed and stays the same otherwise; and an item's
+//! [`Item::changed`] is the revision of its own last change.
 
-use mr_agent::{RequestId, SessionEvent, ToolCallId, ToolOutcome, UserRequest};
+use mr_agent::{
+    HistoryItem, RequestId, SessionEvent, StoredHistory, ToolCallId, ToolOutcome, UserRequest,
+};
 
 use crate::tools::{ToolCall, ToolGroup};
 
@@ -24,16 +27,17 @@ pub struct Item {
 pub enum ItemBody {
     User {
         text: String,
+        /// The images a stored message had; 0 for a message typed in this run.
+        image_count: usize,
     },
     Reply {
         markdown: String,
         streaming: bool,
     },
-    /// `seconds` is `None` while the thinking goes on.
     Thinking {
         text: String,
         started: f64,
-        seconds: Option<f64>,
+        time: ThinkingTime,
     },
     Tools(ToolGroup),
     Request {
@@ -44,6 +48,17 @@ pub enum ItemBody {
         kind: NoticeKind,
         text: String,
     },
+}
+
+/// How long a thought took.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThinkingTime {
+    /// It goes on.
+    Going,
+    /// It took this many seconds.
+    Took(f64),
+    /// It is over, and how long it took is not known: it came from the store.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,19 +74,28 @@ pub enum NoticeKind {
     TurnFailed,
     Ended,
     CommandFailed,
+    /// The history shown is only the end of what is stored.
+    EarlierLeftOut,
+    /// The agent summarised everything above this point.
+    Compacted,
 }
 
 const UNEXPECTED_END: &str = "The session ended unexpectedly.";
+const EARLIER_LEFT_OUT: &str = "Earlier messages are not shown.";
+const COMPACTED: &str = "Earlier messages were summarised here to save room.";
 
 /// The outcome given to a call still running when its turn ends.
 pub const DID_NOT_FINISH: &str = "Did not finish";
 
-/// "Thinking…" while it goes on, then "Thought for 4 s" or "Thought for 1 min 5 s".
+/// "Thinking…" while it goes on, then "Thought for 4 s" or "Thought for 1 min 5 s"; only
+/// "Thought" when how long it took is not known.
 ///
-/// `seconds` is rounded to whole seconds, and a thought of less than a second still took one.
-pub fn thinking_label(seconds: Option<f64>) -> String {
-    let Some(seconds) = seconds else {
-        return "Thinking…".into();
+/// The time is rounded to whole seconds, and a thought of less than a second still took one.
+pub fn thinking_label(time: ThinkingTime) -> String {
+    let seconds = match time {
+        ThinkingTime::Going => return "Thinking…".into(),
+        ThinkingTime::Unknown => return "Thought".into(),
+        ThinkingTime::Took(seconds) => seconds,
     };
     let whole = (seconds.round() as u64).max(1);
     let (minutes, rest) = (whole / 60, whole % 60);
@@ -102,6 +126,47 @@ impl Conversation {
         Self::default()
     }
 
+    /// A stored history as a finished conversation: no reply streams, no thinking goes on,
+    /// and a call that has no outcome did not finish.
+    pub fn from_history(history: &StoredHistory) -> Conversation {
+        let mut conversation = Conversation::new();
+        if history.earlier_left_out {
+            conversation.push_notice(NoticeKind::EarlierLeftOut, EARLIER_LEFT_OUT);
+        }
+        for item in &history.items {
+            conversation.push_stored(item);
+        }
+        conversation.close_calls();
+        conversation
+    }
+
+    /// Puts `history` before the items there are, which keep their order. Every item is
+    /// numbered again, so ids still grow with the place; a session marks this by raising its
+    /// `generation`. An empty history changes nothing.
+    pub fn put_history_first(&mut self, history: &StoredHistory) {
+        let earlier = Conversation::from_history(history);
+        let shift = earlier.items.len();
+        if shift == 0 {
+            return;
+        }
+        let later = std::mem::replace(&mut self.items, earlier.items);
+        self.items.extend(later);
+        self.revision += 1;
+        for item in &mut self.items {
+            item.id = ItemId(self.next_id);
+            self.next_id += 1;
+            item.changed = self.revision;
+        }
+        for at in self
+            .open
+            .iter_mut()
+            .chain(&mut self.waiting)
+            .chain(&mut self.calls)
+        {
+            *at += shift;
+        }
+    }
+
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -112,7 +177,10 @@ impl Conversation {
     }
 
     pub fn push_user(&mut self, text: &str) {
-        self.push(ItemBody::User { text: text.into() });
+        self.push(ItemBody::User {
+            text: text.into(),
+            image_count: 0,
+        });
     }
 
     pub fn push_notice(&mut self, kind: NoticeKind, text: &str) {
@@ -197,6 +265,38 @@ impl Conversation {
         self.waiting.len()
     }
 
+    /// One stored item, pushed as the live events would have left it, but closed. Thinking
+    /// keeps no time: the store does not say how long it took.
+    fn push_stored(&mut self, item: &HistoryItem) {
+        match item {
+            HistoryItem::User { text, image_count } => self.push(ItemBody::User {
+                text: text.clone(),
+                image_count: *image_count,
+            }),
+            HistoryItem::AssistantText(markdown) => self.push(ItemBody::Reply {
+                markdown: markdown.clone(),
+                streaming: false,
+            }),
+            HistoryItem::Thinking(text) => self.push(ItemBody::Thinking {
+                text: text.clone(),
+                started: 0.0,
+                time: ThinkingTime::Unknown,
+            }),
+            HistoryItem::Tool {
+                id,
+                name,
+                detail,
+                outcome,
+            } => self.tool_started(ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                detail: detail.clone(),
+                outcome: outcome.clone(),
+            }),
+            HistoryItem::Compacted => self.push_notice(NoticeKind::Compacted, COMPACTED),
+        }
+    }
+
     fn push(&mut self, body: ItemBody) {
         let id = ItemId(self.next_id);
         self.next_id += 1;
@@ -249,7 +349,7 @@ impl Conversation {
         self.push(ItemBody::Thinking {
             text,
             started: now,
-            seconds: None,
+            time: ThinkingTime::Going,
         });
     }
 
@@ -261,7 +361,7 @@ impl Conversation {
             body:
                 ItemBody::Thinking {
                     text,
-                    seconds: None,
+                    time: ThinkingTime::Going,
                     ..
                 },
             changed,
@@ -396,10 +496,10 @@ impl Conversation {
             }
             Some(ItemBody::Thinking {
                 started,
-                seconds: seconds @ None,
+                time: time @ ThinkingTime::Going,
                 ..
             }) => {
-                *seconds = Some((now - *started).max(0.0));
+                *time = ThinkingTime::Took((now - *started).max(0.0));
                 true
             }
             _ => false,
@@ -411,8 +511,8 @@ impl Conversation {
 mod tests {
     use super::*;
     use mr_agent::{
-        RequestId, SessionEvent, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UserRequest,
-        UserRequestKind,
+        HistoryItem, RequestId, SessionEvent, StoredHistory, ToolCallId, ToolDetail, ToolOutcome,
+        TurnSummary, UserRequest, UserRequestKind,
     };
 
     fn bodies(c: &Conversation) -> Vec<ItemBody> {
@@ -454,10 +554,14 @@ mod tests {
 
     #[test]
     fn thinking_is_labelled_in_whole_seconds() {
-        assert_eq!(thinking_label(None), "Thinking…");
-        assert_eq!(thinking_label(Some(0.2)), "Thought for 1 s");
-        assert_eq!(thinking_label(Some(3.5)), "Thought for 4 s");
-        assert_eq!(thinking_label(Some(65.0)), "Thought for 1 min 5 s");
+        assert_eq!(thinking_label(ThinkingTime::Going), "Thinking…");
+        assert_eq!(thinking_label(ThinkingTime::Took(0.2)), "Thought for 1 s");
+        assert_eq!(thinking_label(ThinkingTime::Took(3.5)), "Thought for 4 s");
+        assert_eq!(
+            thinking_label(ThinkingTime::Took(65.0)),
+            "Thought for 1 min 5 s"
+        );
+        assert_eq!(thinking_label(ThinkingTime::Unknown), "Thought");
     }
 
     #[test]
@@ -613,7 +717,8 @@ mod tests {
             bodies(&c),
             vec![
                 ItemBody::User {
-                    text: "**hi**".into()
+                    text: "**hi**".into(),
+                    image_count: 0
                 },
                 ItemBody::Reply {
                     markdown: "Hello".into(),
@@ -632,7 +737,7 @@ mod tests {
             vec![ItemBody::Thinking {
                 text: String::new(),
                 started: 10.0,
-                seconds: None
+                time: ThinkingTime::Going
             }]
         );
         c.apply(&SessionEvent::BlockFinished, 13.5);
@@ -641,7 +746,7 @@ mod tests {
             vec![ItemBody::Thinking {
                 text: String::new(),
                 started: 10.0,
-                seconds: Some(3.5)
+                time: ThinkingTime::Took(3.5)
             }]
         );
     }
@@ -741,7 +846,7 @@ mod tests {
                 ItemBody::Thinking {
                     text: String::new(),
                     started: 1.0,
-                    seconds: Some(1.0)
+                    time: ThinkingTime::Took(1.0)
                 },
                 ItemBody::Reply {
                     markdown: "partial".into(),
@@ -888,6 +993,187 @@ mod tests {
         assert_eq!(ids, vec![ItemId(0), ItemId(1), ItemId(2)]);
     }
 
+    fn history(items: Vec<HistoryItem>) -> StoredHistory {
+        StoredHistory {
+            items,
+            ..StoredHistory::default()
+        }
+    }
+
+    fn stored_read(id: &str, outcome: Option<ToolOutcome>) -> HistoryItem {
+        HistoryItem::Tool {
+            id: ToolCallId(id.into()),
+            name: "Read".into(),
+            detail: ToolDetail::FileRead {
+                path: format!("{id}.rs"),
+            },
+            outcome,
+        }
+    }
+
+    #[test]
+    fn a_history_is_drawn_as_a_finished_conversation() {
+        let c = Conversation::from_history(&StoredHistory {
+            items: vec![
+                HistoryItem::User {
+                    text: "Look at the parser".into(),
+                    image_count: 0,
+                },
+                HistoryItem::Thinking("hm".into()),
+                stored_read("a", Some(ToolOutcome::Ok { output: "x".into() })),
+                stored_read("b", None),
+                HistoryItem::AssistantText("It reads fine.".into()),
+            ],
+            earlier_left_out: true,
+            ..StoredHistory::default()
+        });
+        let b = bodies(&c);
+        assert_eq!(b.len(), 5, "{b:?}");
+        assert_eq!(
+            b[0],
+            ItemBody::Notice {
+                kind: NoticeKind::EarlierLeftOut,
+                text: "Earlier messages are not shown.".into()
+            }
+        );
+        assert_eq!(
+            b[2],
+            ItemBody::Thinking {
+                text: "hm".into(),
+                started: 0.0,
+                time: ThinkingTime::Unknown
+            },
+            "stored thinking is over, and claims no time"
+        );
+        let ItemBody::Tools(group) = &b[3] else {
+            panic!("{:?}", b[3])
+        };
+        assert_eq!(
+            group.summary(),
+            "Read 2 files",
+            "stored calls fold as live ones do"
+        );
+        assert_eq!(
+            group.calls[1].outcome,
+            Some(ToolOutcome::Failed {
+                output: DID_NOT_FINISH.into()
+            })
+        );
+        assert_eq!(
+            b[4],
+            ItemBody::Reply {
+                markdown: "It reads fine.".into(),
+                streaming: false
+            }
+        );
+        let ids: Vec<_> = c.items().iter().map(|i| i.id.0).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        assert!(c.items().iter().all(|i| i.changed <= c.revision()));
+    }
+
+    #[test]
+    fn a_stored_thought_reads_thought_with_no_time() {
+        let c = Conversation::from_history(&history(vec![HistoryItem::Thinking("hm".into())]));
+        let ItemBody::Thinking { time, .. } = c.items()[0].body else {
+            panic!("{:?}", c.items()[0].body)
+        };
+        assert_eq!(thinking_label(time), "Thought");
+    }
+
+    #[test]
+    fn a_stored_message_keeps_its_image_count() {
+        let c = Conversation::from_history(&history(vec![HistoryItem::User {
+            text: String::new(),
+            image_count: 2,
+        }]));
+        assert_eq!(
+            bodies(&c),
+            vec![ItemBody::User {
+                text: String::new(),
+                image_count: 2
+            }]
+        );
+        let mut typed = Conversation::new();
+        typed.push_user("hi");
+        assert!(matches!(
+            typed.items()[0].body,
+            ItemBody::User { image_count: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn a_history_put_first_leaves_what_is_open_working() {
+        let mut c = Conversation::new();
+        c.push_user("go");
+        play(&mut c, &[read("r1"), plan("p1"), text("Work")]);
+        let revision = c.revision();
+        c.put_history_first(&history(vec![
+            HistoryItem::User {
+                text: "before".into(),
+                image_count: 0,
+            },
+            HistoryItem::AssistantText("Earlier".into()),
+        ]));
+        assert!(c.revision() > revision);
+        let b = bodies(&c);
+        assert_eq!(
+            b[..3],
+            [
+                ItemBody::User {
+                    text: "before".into(),
+                    image_count: 0
+                },
+                ItemBody::Reply {
+                    markdown: "Earlier".into(),
+                    streaming: false
+                },
+                ItemBody::User {
+                    text: "go".into(),
+                    image_count: 0
+                },
+            ]
+        );
+        // Ids keep growing with the position, so a view can still look an item up by its id.
+        let ids: Vec<_> = c.items().iter().map(|i| i.id.0).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+        assert!(ids[0] >= 4, "no id is used twice: {ids:?}");
+        // The reply still streams into its own item, the request can still be answered, and
+        // ending the turn still closes the call left running.
+        play(&mut c, &[text(" goes on")]);
+        assert_eq!(c.items().len(), 6);
+        assert_eq!(
+            c.items()[5].body,
+            ItemBody::Reply {
+                markdown: "Work goes on".into(),
+                streaming: true
+            }
+        );
+        assert!(c.answered(&RequestId("p1".into()), "Plan approved"));
+        play(&mut c, &[SessionEvent::TurnFinished(summary(false))]);
+        assert_eq!(
+            group(&c, 3).calls[0].outcome,
+            Some(ToolOutcome::Failed {
+                output: DID_NOT_FINISH.into()
+            })
+        );
+        assert!(matches!(
+            c.items()[5].body,
+            ItemBody::Reply {
+                streaming: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_empty_history_changes_nothing() {
+        let mut c = Conversation::new();
+        c.push_user("go");
+        let (before, revision) = (c.items().to_vec(), c.revision());
+        c.put_history_first(&StoredHistory::default());
+        assert_eq!((c.items(), c.revision()), (&before[..], revision));
+    }
+
     #[test]
     fn thinking_text_after_a_start_joins_it_and_text_after_it_closes_it() {
         let mut c = Conversation::new();
@@ -901,7 +1187,7 @@ mod tests {
                 ItemBody::Thinking {
                     text: "hmm".into(),
                     started: 1.0,
-                    seconds: Some(2.0)
+                    time: ThinkingTime::Took(2.0)
                 },
                 ItemBody::Reply {
                     markdown: "so".into(),

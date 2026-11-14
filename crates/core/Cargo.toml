@@ -8,3 +8,6 @@ version.workspace = true
 mr-agent = { path = "../agent" }
 serde.workspace = true
 similar.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

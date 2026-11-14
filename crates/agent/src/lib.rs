@@ -10,7 +10,7 @@ mod ids;
 
 pub use agent::{
     Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, SessionHandle, StartSpec,
-    StoredSession,
+    StoredHistory, StoredSession,
 };
 pub use command::{Answer, Attachment, QuestionAnswer, SessionCommand};
 pub use event::{

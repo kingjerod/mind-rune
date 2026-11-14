@@ -1,18 +1,22 @@
-//! The shell: the sidebar, with the new-session button, the current session's row and the
+//! The shell: the sidebar, with the new-session button, the list of groups and sessions and the
 //! usage footer, beside the main area.
 
-use mr_core::{Phase, Session, UsageLine, account_line, usage_lines};
-use rune::{El, col, el, row, text};
-use rune_kit::shell::{PaneState, RowStatus, Sidebar, SidebarRow, SplitView};
+use mr_core::{UsageLine, account_line, usage_lines};
+use rune::{El, Tx, col, el, row, text};
+use rune_kit::shell::{PaneState, Sidebar, SplitView};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 pub use rune_kit::shell::is_sidebar_toggle;
 
-use crate::glue::{self, Ui};
+use crate::glue::Ui;
 use crate::theme::{self, USAGE_BAR_HEIGHT};
+use crate::view::{folder, sidebar};
+
+/// The key of the sidebar's "New session".
+pub const NEW_SESSION: &str = "mr-new-session";
 
 /// The sidebar on the left, which the user can drag wider and collapse, and `main` beside it.
-pub fn shell(ui: &Ui, kit: &Kit, main: El) -> El {
+pub fn shell(ui: &Ui, kit: &'static Kit, main: El) -> El {
     SplitView::new(main)
         .sidebar(&ui.sidebar, sidebar_pane, sidebar(ui, kit))
         .build(kit)
@@ -22,54 +26,35 @@ fn sidebar_pane(ui: &mut Ui) -> &mut PaneState {
     &mut ui.sidebar
 }
 
-/// "New session": replaces the session with a new one in the same folder.
-fn new_session(ui: &mut Ui) {
-    let effects = ui.app.new_session();
-    glue::forget_session_view(ui);
-    glue::run(ui, effects);
-    // Back to the text area, ready for the new session's first message.
-    ui.draft.focused = true;
-}
-
-fn sidebar(ui: &Ui, kit: &Kit) -> El {
+/// The sidebar: "New session", which asks for the new session's folder (`folder::ask`), with
+/// the folder picker's error under it while there is one; the groups and their sessions; and
+/// the usage footer.
+fn sidebar(ui: &Ui, kit: &'static Kit) -> El {
     let new_session = Button::new("New session")
         .icon(&rune_theme_opencode::icons::PLUS)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Large)
-        .on_press(new_session)
+        .on_press_tx(|ui: &mut Ui, tx: &mut Tx| folder::ask(ui, tx, None))
         .build(kit)
-        .key("mr-new-session")
+        .key(NEW_SESSION)
         .w_full();
-    let mut list = Sidebar::new()
+    let header = col()
+        .key("mr-sidebar-header")
+        .w_full()
+        .gap(4.0)
+        .child(new_session)
+        .children(folder::error(ui, kit));
+    Sidebar::new()
         .label("Sessions")
-        .header(new_session)
-        .footer(footer(ui, kit));
-    if let Some(session) = &ui.app.session {
-        list = list.child(session_row(session, kit));
-    }
-    list.build(kit)
-}
-
-/// The current session: its title and folder, with a mark while it works or waits for the user.
-fn session_row(session: &Session, kit: &Kit) -> El {
-    let title = session.title.as_deref().unwrap_or("New session");
-    let folder = session
-        .folder
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| session.folder.display().to_string());
-    let mut row = SidebarRow::new(title).subtitle(folder).selected(true);
-    match session.phase {
-        Phase::Opening | Phase::Working => row = row.status(RowStatus::Busy),
-        Phase::NeedsUser => row = row.status(RowStatus::Attention),
-        Phase::Idle | Phase::Ended { .. } => {}
-    }
-    row.build(kit).key("mr-session-row")
+        .header(header)
+        .child(sidebar::list(ui, kit))
+        .footer(footer(ui, kit))
+        .build(kit)
 }
 
 /// Who is signed in, then the two usage lines, each with its bar and reset wording.
 fn footer(ui: &Ui, kit: &Kit) -> El {
-    let [session, weekly] = usage_lines(&ui.app.usage, ui.now_unix);
+    let [session, weekly] = usage_lines(&ui.app.usage, ui.app.now_unix);
     let mut footer = col()
         .key("mr-footer")
         .w_full()
@@ -140,20 +125,54 @@ fn usage(line: &UsageLine, key: &str, kit: &Kit) -> El {
 
 #[cfg(test)]
 mod tests {
-    use mr_agent::{FakeStep, SessionCommand, SessionEvent, UsageLimits};
+    use mr_agent::{SessionCommand, UsageLimits};
     use rune::{Key, Mods};
 
-    use super::new_session;
-    use crate::glue::Picker;
-    use crate::{demo, testkit};
+    use mr_core::SessionKey;
+    use rune::{Runtime, Tx};
+
+    use super::super::folder;
+    use crate::glue::{Picker, Ui};
+    use crate::testkit;
+
+    /// A new session in the folder of `from`'s session, as choosing that folder starts one.
+    fn new_session(ui: &mut Ui, tx: &mut Tx, from: SessionKey) {
+        let folder = ui.app.sessions.get(from).unwrap().session.folder.clone();
+        folder::start(ui, tx, folder, None);
+    }
+
+    /// Clicks "New session" and chooses a folder that is there, the only recent one.
+    fn new_session_in_a_folder(rt: &mut Runtime<Ui>, dir: &tempfile::TempDir) {
+        rt.state.app.recent_folders = vec![dir.path().to_path_buf()];
+        testkit::click(rt, "mr-new-session");
+        testkit::step(rt);
+        testkit::click(rt, "mr-folder-item0");
+    }
 
     #[test]
     fn a_new_session_forgets_the_old_ones_open_picker() {
+        let mut rt = testkit::window("conversation");
+        let old = rt.state.app.shown.unwrap();
+        testkit::shown_view_mut(&mut rt).open_picker = Some(Picker::Mode);
+        rt.update(|ui, tx| new_session(ui, tx, old));
+        assert_eq!(testkit::shown_open(&rt), Some(2));
+        assert_eq!(testkit::shown_view(&rt).open_picker, None);
+    }
+
+    #[test]
+    fn new_session_keeps_a_session_with_nothing_said_yet() {
         let mut rt = testkit::window("empty");
-        rt.state.open_picker = Some(Picker::Mode);
-        new_session(&mut rt.state);
-        assert_eq!(rt.state.app.current_open(), 2);
-        assert_eq!(rt.state.open_picker, None);
+        let old = rt.state.app.shown.unwrap();
+        testkit::shown_view_mut(&mut rt).open_picker = Some(Picker::Mode);
+        rt.update(|ui, tx| new_session(ui, tx, old));
+        testkit::step(&mut rt);
+        assert_eq!(testkit::shown_open(&rt), Some(1));
+        assert_eq!(
+            testkit::shown_view(&rt).open_picker,
+            Some(Picker::Mode),
+            "the same session"
+        );
+        assert!(!testkit::sent(&rt).contains(&SessionCommand::Close));
     }
 
     #[test]
@@ -190,104 +209,39 @@ mod tests {
 
     #[test]
     fn new_session_replaces_the_session() {
-        let mut rt = testkit::window("empty");
-        testkit::click(&mut rt, "mr-new-session");
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window("conversation");
+        assert!(testkit::has_text(&rt, "A small Rust workspace"));
+        new_session_in_a_folder(&mut rt, &dir);
         testkit::step(&mut rt);
-        assert_eq!(rt.state.app.current_open(), 2);
-        assert!(testkit::sent(&rt).contains(&SessionCommand::Close));
+        assert_eq!(testkit::shown_open(&rt), Some(2));
+        assert!(
+            rt.find("mr-empty-hint").is_some(),
+            "the new session is shown"
+        );
+        assert!(!testkit::has_text(&rt, "A small Rust workspace"));
+        assert!(
+            !testkit::sent(&rt).contains(&SessionCommand::Close),
+            "the old session keeps its program"
+        );
     }
 
     #[test]
-    fn the_session_row_shows_the_sessions_title() {
-        let mut rt = testkit::window("empty");
-        assert!(testkit::has_text(&rt, "New session"));
-        testkit::emit(&mut rt, SessionEvent::TitleChanged("Fix the parser".into()));
-        assert!(testkit::has_text(&rt, "Fix the parser"));
-    }
-
-    #[test]
-    fn the_row_shows_the_first_message_at_once_and_then_the_title() {
-        let mut rt = testkit::window("empty");
-        let fake = rt.state.fake.clone().unwrap();
-        fake.title_reply(vec![FakeStep::at(
-            1.0,
-            SessionEvent::TitleChanged("Listing the folder".into()),
-        )]);
-        testkit::type_text(&mut rt, "  what is   in this folder?");
-        let shift = Mods {
-            shift: true,
-            ..Mods::default()
-        };
-        testkit::press_with(&mut rt, Key::Enter, shift);
-        testkit::type_text(&mut rt, "and why");
-        testkit::press(&mut rt, Key::Enter);
-        testkit::step(&mut rt);
-        // Only the row has it with one space: the message keeps what was typed.
-        assert!(testkit::has_text(&rt, "what is in this folder?"));
-        let asked: Vec<_> = testkit::sent(&rt)
+    fn a_new_session_shows_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window("conversation");
+        let reply = "A small Rust workspace";
+        assert!(testkit::has_text(&rt, reply));
+        new_session_in_a_folder(&mut rt, &dir);
+        let fading = rt
+            .elements()
             .into_iter()
-            .filter(|c| matches!(c, SessionCommand::SuggestTitle { .. }))
-            .collect();
-        assert_eq!(asked.len(), 1);
-        demo::pump(&mut rt.state, 1.0);
-        rt.invalidate();
-        testkit::step(&mut rt);
-        assert!(testkit::has_text(&rt, "Listing the folder"));
-        assert!(!testkit::has_text(&rt, "what is in this folder?"));
-    }
-
-    /// The texts shown inside the session's row.
-    fn row_texts(rt: &rune::Runtime<crate::glue::Ui>) -> Vec<String> {
-        rt.elements()
-            .into_iter()
-            .filter(|e| !e.exiting && e.path.contains("mr-session-row"))
             .filter_map(|e| e.text)
-            .collect()
-    }
-
-    #[test]
-    fn every_demo_scene_with_a_conversation_has_a_title_in_its_row() {
-        let rt = testkit::window("empty");
-        assert!(row_texts(&rt).contains(&"New session".to_string()));
-        for scene in [
-            "conversation",
-            "streaming",
-            "long",
-            "tools",
-            "working",
-            "ended",
-            "permission",
-            "permission-plain",
-            "permission-long",
-            "permission-edit",
-            "question",
-            "plan",
-        ] {
-            let rt = testkit::window(scene);
-            let session = rt.state.app.session.as_ref().unwrap();
-            let title = session
-                .title
-                .clone()
-                .unwrap_or_else(|| panic!("{scene}: no title"));
-            assert!(
-                row_texts(&rt).contains(&title),
-                "{scene}: {title:?} not in the row"
-            );
-            let first = session
-                .conversation
-                .items()
-                .iter()
-                .find_map(|i| match &i.body {
-                    mr_core::ItemBody::User { text } => Some(text.clone()),
-                    _ => None,
-                });
-            if let Some(first) = first {
-                assert!(
-                    !first.starts_with(&title),
-                    "{scene}: the agent's title, not the stand-in"
-                );
-            }
-        }
+            .any(|t| t.contains(reply));
+        assert!(
+            !fading,
+            "the old conversation does not fade out over the new one"
+        );
     }
 
     #[test]

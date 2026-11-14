@@ -14,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mr_agent::{
-    Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, SessionCommand, SessionEvent,
-    SessionHandle, SessionId, StartSpec, StoredSession,
+    Account, Agent, AgentError, Capabilities, EventSink, SessionCommand, SessionEvent,
+    SessionHandle, SessionId, StartSpec, StoredHistory, StoredSession,
 };
 use serde_json::Value;
 
@@ -27,7 +27,8 @@ use crate::encode::{
     user_message,
 };
 use crate::env::child_env;
-use crate::history::{find_session, read_history, stored_sessions};
+use crate::history::{DescriptionTable, find_session, modified_unix, stored_sessions};
+use crate::history_tail::{TAIL_BYTES, read_tail};
 use crate::process::{ClaudeProcess, ExitInfo, SpawnConfig};
 use crate::translate::{SessionStart, Tracked, Translator};
 use crate::wire::{Incoming, parse_line};
@@ -44,6 +45,8 @@ pub struct ClaudeAgent {
     parent_env: Vec<(String, String)>,
     /// Whether the last sign-in check found a saved full login.
     full_login: Mutex<Option<bool>>,
+    /// What each stored session file said about itself, so an unchanged one is not read again.
+    descriptions: Mutex<DescriptionTable>,
 }
 
 impl ClaudeAgent {
@@ -72,6 +75,7 @@ impl ClaudeAgent {
             projects_dir,
             parent_env,
             full_login: Mutex::new(None),
+            descriptions: Mutex::new(DescriptionTable::default()),
         }
     }
 
@@ -114,13 +118,25 @@ impl Agent for ClaudeAgent {
         &self,
         modified_since_unix: Option<i64>,
     ) -> Result<Vec<StoredSession>, AgentError> {
-        Ok(stored_sessions(&self.projects_dir, modified_since_unix))
+        stored_sessions(
+            &self.projects_dir,
+            modified_since_unix,
+            &mut lock(&self.descriptions),
+        )
     }
 
-    fn read_session(&self, id: &SessionId) -> Result<Vec<HistoryItem>, AgentError> {
+    fn read_session(&self, id: &SessionId, max_items: usize) -> Result<StoredHistory, AgentError> {
         let path = find_session(&self.projects_dir, id)
             .ok_or_else(|| AgentError::Protocol(format!("no stored session {}", id.0)))?;
-        read_history(&path)
+        read_tail(&path, max_items, TAIL_BYTES)
+    }
+
+    fn last_active(&self, id: &SessionId) -> Result<Option<i64>, AgentError> {
+        match find_session(&self.projects_dir, id) {
+            // A file that vanished since it was found is as good as none.
+            Some(path) => modified_unix(&path),
+            None => Ok(None),
+        }
     }
 
     /// The session id is always chosen here: a new one for a new or forked
@@ -398,5 +414,23 @@ mod tests {
         let status =
             r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan"}"#;
         assert!(!matches!(parse_line(status), Incoming::Ignored { .. }));
+    }
+
+    #[test]
+    fn a_stored_session_knows_when_it_was_last_active() {
+        let projects = tempfile::tempdir().unwrap();
+        let folder = projects.path().join("-home-alex-proj");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("s1.jsonl"),
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"message":{"content":"hello"}}"#,
+        )
+        .unwrap();
+        let agent = ClaudeAgent::with_paths("claude".into(), projects.path().to_path_buf(), vec![]);
+        assert!(matches!(
+            agent.last_active(&SessionId("s1".into())),
+            Ok(Some(unix)) if unix > 0
+        ));
+        assert_eq!(agent.last_active(&SessionId("s2".into())), Ok(None));
     }
 }

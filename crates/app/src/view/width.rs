@@ -259,12 +259,15 @@ mod tests {
         let mut rt = testkit::window_sized("long", (2400.0, 900.0));
         let [column_x, ..] = column(&rt);
         let [tile_x, ..] = rt.presented("mr-tile").unwrap().0;
-        let (_, y) = rt.find("mr-conversation").unwrap();
+        let (_, y) = rt.find(&testkit::conversation(&rt)).unwrap();
         let margin = (tile_x + column_x) / 2.0;
         assert!(margin + 20.0 < column_x);
         rt.wheel(margin, y, 600.0);
         testkit::step(&mut rt);
-        assert_eq!(rt.scroll_at_bottom("mr-conversation"), Some(false));
+        assert_eq!(
+            rt.scroll_at_bottom(&testkit::conversation(&rt)),
+            Some(false)
+        );
     }
 
     #[test]

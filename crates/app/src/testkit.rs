@@ -5,11 +5,12 @@
 
 use std::cell::RefCell;
 
-use mr_agent::{SessionCommand, SessionEvent};
+use mr_agent::{FakeStep, SessionCommand, SessionEvent, TurnSummary};
+use mr_core::{Leaving, Phase, SessionKey};
 use rune::clipboard::MemoryClipboard;
 use rune::{Env, Key, KeyEvent, Mods, Runtime};
 
-use crate::glue::{self, Ui};
+use crate::glue::{self, SessionView, Ui};
 use crate::{demo, view};
 
 /// The frame step, in seconds.
@@ -144,17 +145,122 @@ pub fn sent(rt: &Runtime<Ui>) -> Vec<SessionCommand> {
     fake(rt).sent().into_iter().map(|(_, c)| c).collect()
 }
 
-/// Emits `event` to the current session, then steps.
+/// The number of the shown session's current open.
+pub fn shown_open(rt: &Runtime<Ui>) -> Option<u64> {
+    rt.state.app.shown_entry().and_then(|entry| entry.open)
+}
+
+/// Emits `event` to the shown session, then steps.
 pub fn emit(rt: &mut Runtime<Ui>, event: SessionEvent) {
-    let id = rt
-        .state
-        .app
-        .session
-        .as_ref()
-        .and_then(|s| s.id.clone())
-        .expect("the session has started");
-    fake(rt).emit(&id, event);
+    let key = rt.state.app.shown.expect("a session is shown");
+    emit_to(rt, key, event);
+}
+
+/// Emits `event` to `key`'s session, shown or not, then steps.
+pub fn emit_to(rt: &mut Runtime<Ui>, key: SessionKey, event: SessionEvent) {
+    demo::emit_to(&rt.state, key, event);
     step(rt);
+}
+
+/// The shown session's items.
+pub fn shown_session_items(rt: &Runtime<Ui>) -> &[mr_core::Item] {
+    rt.state
+        .shown_session()
+        .map_or(&[], |s| s.conversation.items())
+}
+
+/// The key of the shown session's conversation scroll.
+pub fn conversation(rt: &Runtime<Ui>) -> String {
+    view::conversation_key(rt.state.app.shown.expect("a session is shown"))
+}
+
+/// How the shown session is shown: its draft, its open rows, its question drafts.
+pub fn shown_view(rt: &Runtime<Ui>) -> &SessionView {
+    let key = rt.state.app.shown.expect("a session is shown");
+    glue::view_of(&rt.state, key)
+}
+
+/// How the shown session is shown, lent out to change.
+pub fn shown_view_mut(rt: &mut Runtime<Ui>) -> &mut SessionView {
+    let key = rt.state.app.shown.expect("a session is shown");
+    glue::view_mut(&mut rt.state, key)
+}
+
+/// A new session in `folder`, shown as "New session" shows one, its program started and one
+/// message, "Open {folder}", handed over in a turn that ends at once with nothing said. So it is
+/// a session the app keeps when another is shown; the scene's own session, which has nothing
+/// said yet, is forgotten the first time this leaves it.
+pub fn add_session(rt: &mut Runtime<Ui>, folder: &str) -> SessionKey {
+    fake(rt).reply(vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(
+            0.0,
+            SessionEvent::TurnFinished(TurnSummary {
+                cost_usd: 0.0,
+                context_used: None,
+                duration_ms: 1,
+                interrupted: false,
+            }),
+        ),
+    ]);
+    let ui = &mut rt.state;
+    let effects = ui.app.new_session(folder.into(), Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    let key = ui.app.shown.expect("the new session is shown");
+    let idle = |ui: &Ui| {
+        ui.app
+            .sessions
+            .get(key)
+            .is_some_and(|entry| entry.session.phase == Phase::Idle)
+    };
+    pump_until(ui, idle);
+    let effects = ui.app.submit(key, &format!("Open {folder}"));
+    glue::run(ui, effects);
+    pump_until(ui, |ui| {
+        idle(ui)
+            && ui
+                .app
+                .sessions
+                .get(key)
+                .is_some_and(|entry| entry.session.is_stored())
+    });
+    rt.invalidate();
+    step(rt);
+    key
+}
+
+/// A new session in a new empty folder, started as the user starts one: "New session", then
+/// "Choose a folder…" when the folder menu opens, and the folder chosen in the picker. Then
+/// steps. The folder lasts as long as what this returns.
+pub fn new_session_elsewhere(rt: &mut Runtime<Ui>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("a temporary folder");
+    click(rt, "mr-new-session");
+    step(rt);
+    if rt.state.folder_menu.is_some() {
+        click_text(rt, "Choose a folder…");
+        step(rt);
+    }
+    rt.resolve_file_dialog(Some(dir.path().to_path_buf()))
+        .expect("the folder picker is open");
+    step(rt);
+    dir
+}
+
+/// Shows `key`'s session as a click on its row does, its input box focused, then steps.
+pub fn show(rt: &mut Runtime<Ui>, key: SessionKey) {
+    rt.update(|ui, tx| glue::show(ui, tx, key, true));
+    step(rt);
+}
+
+/// Pumps the demo's fake until `done` holds. Panics when it never does.
+fn pump_until(ui: &mut Ui, done: impl Fn(&Ui) -> bool) {
+    for _ in 0..50 {
+        if done(ui) {
+            return;
+        }
+        demo::pump(ui, 0.0);
+    }
+    assert!(done(ui), "the session never got there");
 }
 
 fn fake(rt: &Runtime<Ui>) -> &mr_agent::FakeAgent {

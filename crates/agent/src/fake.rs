@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::agent::{
-    Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, SessionHandle, StartSpec,
+    Account, Agent, AgentError, Capabilities, EventSink, SessionHandle, StartSpec, StoredHistory,
     StoredSession,
 };
 use crate::command::SessionCommand;
@@ -42,7 +42,11 @@ struct Pending {
 struct Inner {
     account: Account,
     sessions: Vec<StoredSession>,
-    history: HashMap<SessionId, Vec<HistoryItem>>,
+    /// What `read_session` gives for each id: a history, or the detail of an
+    /// `Io` error.
+    history: HashMap<SessionId, Result<StoredHistory, String>>,
+    /// Times set with `set_last_active`; they win over the stored sessions'.
+    last_active: HashMap<SessionId, Option<i64>>,
     now: f32,
     opened: usize,
     replies: VecDeque<Vec<FakeStep>>,
@@ -121,6 +125,7 @@ impl FakeAgent {
                 },
                 sessions: Vec::new(),
                 history: HashMap::new(),
+                last_active: HashMap::new(),
                 now: 0.0,
                 opened: 0,
                 replies: VecDeque::new(),
@@ -148,8 +153,24 @@ impl FakeAgent {
         self.lock().sessions = sessions;
     }
 
-    pub fn set_history(&self, id: &SessionId, items: Vec<HistoryItem>) {
-        self.lock().history.insert(id.clone(), items);
+    /// What `read_session` gives for `id`: the end of `history`, cut to the
+    /// limit asked for.
+    pub fn set_history(&self, id: &SessionId, history: StoredHistory) {
+        self.lock().history.insert(id.clone(), Ok(history));
+    }
+
+    /// Make `read_session` for `id` fail with `AgentError::Io(detail)`, until
+    /// `set_history` gives it a history again.
+    pub fn fail_history(&self, id: &SessionId, detail: &str) {
+        self.lock()
+            .history
+            .insert(id.clone(), Err(detail.to_string()));
+    }
+
+    /// What `last_active` gives for `id`, in place of the `last_active_unix`
+    /// of the session given to `set_sessions`.
+    pub fn set_last_active(&self, id: &SessionId, unix: Option<i64>) {
+        self.lock().last_active.insert(id.clone(), unix);
     }
 
     /// Queue one scripted reply; each `Send` consumes the oldest.
@@ -233,12 +254,35 @@ impl Agent for FakeAgent {
         Ok(self.lock().sessions.clone())
     }
 
-    fn read_session(&self, id: &SessionId) -> Result<Vec<HistoryItem>, AgentError> {
-        self.lock()
-            .history
-            .get(id)
-            .cloned()
-            .ok_or_else(|| AgentError::Protocol(format!("fake: no history for {}", id.0)))
+    fn read_session(&self, id: &SessionId, max_items: usize) -> Result<StoredHistory, AgentError> {
+        let mut history = match self.lock().history.get(id) {
+            Some(Ok(history)) => history.clone(),
+            Some(Err(detail)) => return Err(AgentError::Io(detail.clone())),
+            None => {
+                return Err(AgentError::Protocol(format!(
+                    "fake: no history for {}",
+                    id.0
+                )));
+            }
+        };
+        let cut = history.items.len().saturating_sub(max_items);
+        if cut > 0 {
+            history.items.drain(..cut);
+            history.earlier_left_out = true;
+        }
+        Ok(history)
+    }
+
+    fn last_active(&self, id: &SessionId) -> Result<Option<i64>, AgentError> {
+        let inner = self.lock();
+        if let Some(unix) = inner.last_active.get(id) {
+            return Ok(*unix);
+        }
+        Ok(inner
+            .sessions
+            .iter()
+            .find(|session| &session.id == id)
+            .map(|session| session.last_active_unix))
     }
 
     fn open(&self, spec: StartSpec, sink: EventSink) -> Result<Box<dyn SessionHandle>, AgentError> {
@@ -395,6 +439,7 @@ impl SessionHandle for FakeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::HistoryItem;
     use crate::command::Answer;
     use crate::event::{CommandKind, TurnSummary, UserRequest, UserRequestKind};
     use crate::ids::RequestId;
@@ -475,18 +520,92 @@ mod tests {
             title: "T".into(),
             last_active_unix: 5,
         }]);
-        fake.set_history(&id, vec![HistoryItem::AssistantText("old".into())]);
+        fake.set_history(
+            &id,
+            StoredHistory {
+                items: vec![HistoryItem::AssistantText("old".into())],
+                ..StoredHistory::default()
+            },
+        );
         fake.set_account(Account::SignedOut);
         assert_eq!(fake.list_sessions(None).unwrap().len(), 1);
         assert_eq!(
-            fake.read_session(&id).unwrap(),
+            fake.read_session(&id, usize::MAX).unwrap().items,
             vec![HistoryItem::AssistantText("old".into())]
         );
         assert_eq!(fake.account(), Account::SignedOut);
         assert!(matches!(
-            fake.read_session(&SessionId("nope".into())),
+            fake.read_session(&SessionId("nope".into()), usize::MAX),
             Err(AgentError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn the_fake_returns_the_end_of_a_long_history() {
+        let fake = FakeAgent::new();
+        let id = SessionId("s1".into());
+        let text = |n: usize| HistoryItem::AssistantText(n.to_string());
+        fake.set_history(
+            &id,
+            StoredHistory {
+                items: (0..5).map(text).collect(),
+                earlier_left_out: false,
+                model: Some("fake-model-1".into()),
+                permission_mode: Some(PermissionMode::Plan),
+            },
+        );
+
+        let end = fake.read_session(&id, 2).unwrap();
+        assert_eq!(end.items, vec![text(3), text(4)]);
+        assert!(end.earlier_left_out);
+        assert_eq!(end.model.as_deref(), Some("fake-model-1"));
+        assert_eq!(end.permission_mode, Some(PermissionMode::Plan));
+
+        let all = fake.read_session(&id, 10).unwrap();
+        assert_eq!(all.items, (0..5).map(text).collect::<Vec<_>>());
+        assert!(!all.earlier_left_out);
+        assert_eq!(all.model.as_deref(), Some("fake-model-1"));
+        assert_eq!(all.permission_mode, Some(PermissionMode::Plan));
+
+        let cut = SessionId("s2".into());
+        fake.set_history(
+            &cut,
+            StoredHistory {
+                items: vec![text(9)],
+                earlier_left_out: true,
+                ..StoredHistory::default()
+            },
+        );
+        for limit in [0, 1, 10, usize::MAX] {
+            assert!(fake.read_session(&cut, limit).unwrap().earlier_left_out);
+        }
+    }
+
+    #[test]
+    fn a_history_that_cannot_be_read_is_an_error() {
+        let fake = FakeAgent::new();
+        let id = SessionId("s1".into());
+        fake.fail_history(&id, "gone");
+        assert_eq!(
+            fake.read_session(&id, 10),
+            Err(AgentError::Io("gone".into()))
+        );
+    }
+
+    #[test]
+    fn the_fake_knows_when_a_session_was_last_active() {
+        let fake = FakeAgent::new();
+        let id = SessionId("s1".into());
+        fake.set_sessions(vec![StoredSession {
+            id: id.clone(),
+            folder: "/home/alex/p".into(),
+            title: "T".into(),
+            last_active_unix: 500,
+        }]);
+        assert_eq!(fake.last_active(&id), Ok(Some(500)));
+        fake.set_last_active(&id, Some(900));
+        assert_eq!(fake.last_active(&id), Ok(Some(900)));
+        assert_eq!(fake.last_active(&SessionId("nope".into())), Ok(None));
     }
 
     fn started(seen: &Mutex<Vec<SessionEvent>>) -> SessionInfo {

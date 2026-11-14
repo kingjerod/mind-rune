@@ -13,39 +13,54 @@
 use std::sync::Arc;
 
 use mr_agent::{
-    Account, FakeAgent, FakeStep, LimitWindow, Question, QuestionOption, RequestId, SessionEvent,
-    ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
+    Account, FakeAgent, FakeStep, HistoryItem, LimitWindow, ModelOption, PermissionMode, Question,
+    QuestionOption, RequestId, SessionEvent, SessionId, StoredHistory, StoredSession, ToolCallId,
+    ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
 };
-use mr_core::{ItemBody, Phase, Screen};
+use mr_core::{
+    Effect, FromBackend, GroupId, HistoryState, ItemBody, Launch, Leaving, Phase, Screen,
+    SessionKey, ThinkingTime,
+};
+use rune::PointerPress;
 use rune::prefs::Prefs;
 
-use crate::glue::{self, Ui};
+use crate::glue::{self, MenuTarget, SideMenu, Ui};
 
 /// The folder the demo's session is opened in.
 const FOLDER: &str = "/home/alex/project";
 
 /// The demo's fixed wall clock, in Unix seconds.
-const NOW_UNIX: i64 = 1_800_000_000;
+pub(crate) const NOW_UNIX: i64 = 1_800_000_000;
 
 /// The most pumps a scene waits for a state before it gives up.
 const MAX_PUMPS: usize = 50;
 
-/// A window state over a `FakeAgent` signed in as alex on the Max plan, with settings kept in memory.
+/// A window state over a `FakeAgent` signed in as alex on the Max plan, with settings kept in
+/// memory, started in the demo's folder.
 pub fn ui() -> Ui {
+    ui_in(Some(FOLDER))
+}
+
+/// [`ui`], started in `folder`, or as `mindrune` with no folder starts.
+fn ui_in(folder: Option<&str>) -> Ui {
     let fake = FakeAgent::new();
     fake.set_account(Account::SignedIn {
         name: "alex".into(),
         plan: Some("Max".into()),
         full_login: true,
     });
-    let mut ui = Ui::new(
-        Arc::new(fake.clone()),
-        Some(fake),
-        FOLDER.into(),
-        Prefs::memory(),
-    );
+    // No look: with the fake, a look starts only when the fake is advanced, and the demo's
+    // flush would wait for it.
+    let launch = Launch {
+        folder: folder.map(Into::into),
+        look: false,
+        home: "/home/alex".into(),
+        ..Launch::default()
+    };
+    let mut ui = Ui::new(Arc::new(fake.clone()), Some(fake), launch, Prefs::memory());
     ui.unix_clock = || NOW_UNIX;
-    ui.now_unix = NOW_UNIX;
+    ui.app.now_unix = NOW_UNIX;
+    ui.folder_exists = |_| true;
     ui
 }
 
@@ -96,6 +111,14 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("permission-edit", permission_edit),
     ("question", question),
     ("plan", plan),
+    ("sessions", sessions),
+    ("group-menu", group_menu),
+    ("folders", folders),
+    ("empty-start", empty_start),
+    ("resting", resting),
+    ("history-loading", history_loading),
+    ("history-failed", history_failed),
+    ("elsewhere", elsewhere),
 ];
 
 /// Replaces the state with a fresh demo state.
@@ -131,17 +154,24 @@ fn say(ui: &mut Ui, message: &str, title: &str) {
         0.0,
         SessionEvent::TitleChanged(title.into()),
     )]);
-    let effects = ui.app.submit(message);
+    let key = ui.app.shown.expect("a session is shown");
+    let effects = ui.app.submit(key, message);
     glue::run(ui, effects);
 }
 
-/// Emits `event` to the current session.
+/// Emits `event` to the shown session.
 fn emit(ui: &Ui, event: SessionEvent) {
+    let key = ui.app.shown.expect("a session is shown");
+    emit_to(ui, key, event);
+}
+
+/// Emits `event` to `key`'s session, shown or not. A scene may hold several sessions.
+pub(crate) fn emit_to(ui: &Ui, key: SessionKey, event: SessionEvent) {
     let id = ui
         .app
-        .session
-        .as_ref()
-        .and_then(|s| s.id.clone())
+        .sessions
+        .get(key)
+        .and_then(|entry| entry.session.id.clone())
         .expect("the session has started");
     fake(ui).emit(&id, event);
 }
@@ -174,10 +204,7 @@ fn empty(ui: &mut Ui) {
     fresh(ui);
     start(ui);
     pump_until(ui, "an idle session", |ui| {
-        ui.app
-            .session
-            .as_ref()
-            .is_some_and(|s| s.phase == Phase::Idle)
+        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle)
     });
     usage(ui, 0.37, 0.10);
 }
@@ -247,9 +274,7 @@ fn conversation(ui: &mut Ui) {
     ]);
     say(ui, USER_MESSAGE, CONVERSATION_TITLE);
     pump_until(ui, "the finished reply", |ui| {
-        ui.app
-            .session
-            .as_ref()
+        ui.shown_session()
             .is_some_and(|s| s.phase == Phase::Idle && s.conversation.items().len() == 2)
     });
 }
@@ -270,7 +295,7 @@ fn streaming(ui: &mut Ui) {
     ]);
     say(ui, USER_MESSAGE, CONVERSATION_TITLE);
     pump_until(ui, "the reply cut off in its code block", |ui| {
-        ui.app.session.as_ref().is_some_and(|s| {
+        ui.shown_session().is_some_and(|s| {
             matches!(
                 s.conversation.items().last().map(|item| &item.body),
                 Some(ItemBody::Reply {
@@ -296,9 +321,7 @@ fn long(ui: &mut Ui) {
     }
     pump(ui, 0.0);
     let items = ui
-        .app
-        .session
-        .as_ref()
+        .shown_session()
         .map_or(0, |s| s.conversation.items().len());
     assert_eq!(
         items, LONG_REPLIES,
@@ -425,19 +448,19 @@ pub(crate) fn tools_turn(ui: &mut Ui) {
     ]);
     say(ui, TOOLS_MESSAGE, "Fixing the failing tests");
     pump_until(ui, "the thinking", |ui| {
-        ui.app.session.as_ref().is_some_and(|s| {
+        ui.shown_session().is_some_and(|s| {
             matches!(
                 s.conversation.items().last().map(|item| &item.body),
-                Some(ItemBody::Thinking { seconds: None, .. })
+                Some(ItemBody::Thinking {
+                    time: ThinkingTime::Going,
+                    ..
+                })
             )
         })
     });
     pump(ui, t);
     pump_until(ui, "the finished turn", |ui| {
-        ui.app
-            .session
-            .as_ref()
-            .is_some_and(|s| s.phase == Phase::Idle)
+        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle)
     });
 }
 
@@ -468,11 +491,14 @@ fn working(ui: &mut Ui) {
         "Waiting half a minute",
     );
     pump_until(ui, "the running command and thought", |ui| {
-        ui.app.session.as_ref().is_some_and(|s| {
+        ui.shown_session().is_some_and(|s| {
             s.phase == Phase::Working
                 && matches!(
                     s.conversation.items().last().map(|item| &item.body),
-                    Some(ItemBody::Thinking { seconds: None, .. })
+                    Some(ItemBody::Thinking {
+                        time: ThinkingTime::Going,
+                        ..
+                    })
                 )
         })
     });
@@ -489,9 +515,7 @@ fn ended(ui: &mut Ui) {
     ]);
     say(ui, "Tidy up the README", "Tidying up the README");
     pump_until(ui, "the reply", |ui| {
-        ui.app
-            .session
-            .as_ref()
+        ui.shown_session()
             .is_some_and(|s| s.phase == Phase::Idle && s.conversation.items().len() == 2)
     });
     emit(
@@ -502,9 +526,7 @@ fn ended(ui: &mut Ui) {
         },
     );
     pump_until(ui, "the ended session", |ui| {
-        ui.app
-            .session
-            .as_ref()
+        ui.shown_session()
             .is_some_and(|s| matches!(s.phase, Phase::Ended { .. }))
     });
 }
@@ -525,9 +547,7 @@ fn ask(ui: &mut Ui, message: &str, title: &str, request: UserRequest) {
     fake(ui).reply(steps);
     say(ui, message, title);
     pump_until(ui, "the request waiting", |ui| {
-        ui.app
-            .session
-            .as_ref()
+        ui.shown_session()
             .is_some_and(|s| s.phase == Phase::NeedsUser && s.conversation.waiting() == 1)
     });
 }
@@ -678,19 +698,454 @@ fn plan(ui: &mut Ui) {
 /// Reports the two usage windows as `session` and `weekly` used, resetting in 2 h 14 min and
 /// in 3 d 4 h, and takes the report in.
 fn usage(ui: &mut Ui, session: f32, weekly: f32) {
-    let now = ui.now_unix;
-    emit(
-        ui,
-        SessionEvent::UsageLimits(UsageLimits {
-            session: Some(LimitWindow {
-                used: session,
-                resets_at_unix: now + 2 * 3600 + 14 * 60,
-            }),
-            weekly: Some(LimitWindow {
-                used: weekly,
-                resets_at_unix: now + 3 * 86_400 + 4 * 3600,
-            }),
-        }),
-    );
+    let limits = limits(ui.app.now_unix, session, weekly);
+    emit(ui, SessionEvent::UsageLimits(limits));
     pump(ui, 0.0);
+}
+
+/// The two usage windows as `session` and `weekly` used, resetting in 2 h 14 min and in
+/// 3 d 4 h from `now`.
+fn limits(now: i64, session: f32, weekly: f32) -> UsageLimits {
+    UsageLimits {
+        session: Some(LimitWindow {
+            used: session,
+            resets_at_unix: now + 2 * 3600 + 14 * 60,
+        }),
+        weekly: Some(LimitWindow {
+            used: weekly,
+            resets_at_unix: now + 3 * 86_400 + 4 * 3600,
+        }),
+    }
+}
+
+/// One day, in seconds.
+pub(crate) const DAY: i64 = 86_400;
+
+/// The folder of the `sessions` scene's main group.
+pub(crate) const RUNE_CLAUDE: &str = "/home/alex/rune_claude";
+
+/// The folder of the `sessions` scene's collapsed group.
+pub(crate) const SKETCHES: &str = "/home/alex/sketches";
+
+/// The stored session the `sessions` scene shows, placed in "Side projects".
+const GARDEN_ID: &str = "stored-garden";
+
+/// The stored sessions of the `sessions` scene: the id, the folder, the title and how many days
+/// before the demo's clock each was last active. Anything older than 30 days is listed only on
+/// request.
+const STORED: &[(&str, &str, &str, i64)] = &[
+    (
+        GARDEN_ID,
+        "/home/alex/garden",
+        "Planning the spring beds",
+        2,
+    ),
+    (
+        "stored-site-1",
+        "/home/alex/website",
+        "Fixing the contact form",
+        5,
+    ),
+    (
+        "stored-site-2",
+        "/home/alex/website",
+        "Moving to a static host",
+        40,
+    ),
+    (
+        "stored-site-3",
+        "/home/alex/website",
+        "Adding a dark theme",
+        45,
+    ),
+    (
+        "stored-site-4",
+        "/home/alex/website",
+        "Compressing the photos",
+        50,
+    ),
+    (
+        "stored-site-5",
+        "/home/alex/website",
+        "Writing the about page",
+        60,
+    ),
+    (
+        "stored-recipes",
+        "/home/alex/recipes",
+        "Sorting the soup recipes",
+        90,
+    ),
+    (
+        "stored-thesis",
+        "/home/alex/thesis",
+        "Formatting the bibliography",
+        120,
+    ),
+];
+
+/// Many sessions in their groups: "rune_claude" with one session working, one that needs the
+/// user and one finished out of sight; "Side projects", a custom group holding a stored
+/// session from another folder, which is shown; "sketches", collapsed, with a session working;
+/// "website", with four sessions too old to list until asked; and two older groups.
+fn sessions(ui: &mut Ui) {
+    fresh(ui);
+    let stored: Vec<StoredSession> = STORED
+        .iter()
+        .map(|&(id, folder, title, days)| StoredSession {
+            id: SessionId(id.into()),
+            folder: folder.into(),
+            title: title.into(),
+            last_active_unix: NOW_UNIX - days * DAY,
+        })
+        .collect();
+    fake(ui).set_sessions(stored);
+    fake(ui).set_history(
+        &SessionId(GARDEN_ID.into()),
+        StoredHistory {
+            items: vec![
+                HistoryItem::User {
+                    text: "Which beds get the most sun in spring?".into(),
+                    image_count: 0,
+                },
+                HistoryItem::AssistantText(
+                    "The two beds by the south fence get sun from morning to late afternoon. \
+                     Put the tomatoes and the beans there, and the lettuce in the shade of the shed."
+                        .into(),
+                ),
+            ],
+            ..StoredHistory::default()
+        },
+    );
+    start(ui);
+    pump_until(ui, "an idle session and the listing", |ui| {
+        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle) && ui.app.listed_all
+    });
+    usage(ui, 0.37, 0.10);
+
+    // Its turn ends a second from now, out of sight.
+    let finished_later = vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(
+            1.0,
+            SessionEvent::TextDelta("The keys are tidy now.".into()),
+        ),
+        FakeStep::at(1.0, SessionEvent::BlockFinished),
+        FakeStep::at(1.0, finished()),
+    ];
+    live(
+        ui,
+        RUNE_CLAUDE,
+        "Tidy the sidebar's keys",
+        "Tidying the sidebar keys",
+        finished_later,
+    );
+    let tests = UserRequest {
+        id: RequestId("r1".into()),
+        kind: UserRequestKind::Permission {
+            tool: "Bash".into(),
+            detail: ToolDetail::Command {
+                command: "cargo test -p mindrune".into(),
+            },
+            always_allow_label: Some("Always allow Bash(cargo test:*) in this project".into()),
+        },
+    };
+    let mut asking = vec![FakeStep::at(0.0, SessionEvent::TurnStarted)];
+    asking.extend(call_asked_for(&tests).map(|call| FakeStep::at(0.0, call)));
+    asking.push(FakeStep::at(0.0, SessionEvent::NeedsUser(tests)));
+    live(
+        ui,
+        RUNE_CLAUDE,
+        "Run the window tests",
+        "Running the window tests",
+        asking,
+    );
+    live(
+        ui,
+        RUNE_CLAUDE,
+        "Profile the long scene",
+        "Profiling the long scene",
+        thinking_on(),
+    );
+    live(
+        ui,
+        SKETCHES,
+        "Draw the logo again",
+        "Redrawing the logo",
+        thinking_on(),
+    );
+
+    let garden = key_of(ui, GARDEN_ID);
+    let (side, effects) = ui.app.new_group("Side projects");
+    glue::run(ui, effects);
+    let effects = ui.app.move_session(garden, &side);
+    glue::run(ui, effects);
+    let effects = ui
+        .app
+        .collapse_group(&GroupId::Folder(SKETCHES.into()), true);
+    glue::run(ui, effects);
+    let effects = ui.app.show(garden, Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    pump(ui, 1.0);
+    pump_until(ui, "the finished turn and the shown history", |ui| {
+        let marks = ui.app.sessions.iter().filter(|e| e.unseen).count();
+        marks == 1
+            && ui
+                .shown_session()
+                .is_some_and(|s| s.conversation.items().len() == 2)
+    });
+}
+
+/// Where the `group-menu` scene's menu opens: over the row of the session that needs the user,
+/// in a window of 1200 by 800, as a right-click there opens it.
+const GROUP_MENU_AT: PointerPress = PointerPress { x: 150.0, y: 154.0 };
+
+/// The `sessions` scene with the menu of the row "Running the window tests" open on "Move to
+/// group": the other groups, then "New group…".
+fn group_menu(ui: &mut Ui) {
+    sessions(ui);
+    let key = key_of_title(ui, "Running the window tests");
+    // As after a right-click: the open menu holds the focus, not the shown session's box.
+    if let Some(shown) = ui.app.shown {
+        glue::view_mut(ui, shown).draft.focused = false;
+    }
+    ui.side_menu = Some(SideMenu {
+        target: MenuTarget::Row(key),
+        at: GROUP_MENU_AT,
+        sub_open: true,
+    });
+}
+
+/// The `sessions` scene with the folder menu of "New session" open: the scene's recent folders,
+/// then the folders of its newest sessions, then "Choose a folder…". The menu offers the
+/// folders as they are: they are made up, so the check against the disk that opening it makes
+/// (`view::folder::ask`) would offer none of them.
+fn folders(ui: &mut Ui) {
+    sessions(ui);
+    // As after a press on the button: the open menu holds the focus, not the shown session's box.
+    if let Some(shown) = ui.app.shown {
+        glue::view_mut(ui, shown).draft.focused = false;
+    }
+    ui.folder_offers = ui.app.folder_choices();
+    ui.folder_menu = Some(None);
+}
+
+/// As `mindrune` with no folder starts the first time: signed in, nothing stored, so nothing is
+/// shown and the conversation area says how to start.
+fn empty_start(ui: &mut Ui) {
+    *ui = ui_in(None);
+    start(ui);
+    pump_until(ui, "the main screen and the listing", |ui| {
+        ui.app.screen == Screen::Main && ui.app.listed_all
+    });
+}
+
+/// The stored session of the `resting`, `history-loading`, `history-failed` and `elsewhere`
+/// scenes: its id, its folder and its title.
+pub(crate) const PARSER_ID: &str = "stored-parser";
+const PARSER_FOLDER: &str = "/home/alex/parser";
+const PARSER_TITLE: &str = "Reporting every parse error";
+
+/// How many days before the demo's clock the parser's session was last active.
+const PARSER_DAYS: i64 = 3;
+
+/// The first message of the parser's stored history, and the start of its first reply.
+pub(crate) const PARSER_QUESTION: &str = "Why does the parser stop at the first error?";
+pub(crate) const PARSER_REPLY: &str = "The parser returns on the first error it meets.";
+
+/// Why the `history-failed` scene's history could not be read, as the fake says it.
+pub(crate) const HISTORY_FAILURE: &str = "the session file is gone";
+
+/// The message the `elsewhere` scene sends, which waits on the user's answer.
+pub(crate) const ELSEWHERE_MESSAGE: &str = "Carry on with the error list";
+
+/// The parser's stored history: only its end is read, so it starts with the notice that earlier
+/// messages are not shown. A question, a thought (whose time the store does not keep), a read,
+/// the reply; then the summary the agent made to save room, a message with a screenshot, and
+/// the last reply. It names the model that last answered and the mode it was in.
+pub(crate) fn parser_history() -> StoredHistory {
+    StoredHistory {
+        items: vec![
+            HistoryItem::User {
+                text: PARSER_QUESTION.into(),
+                image_count: 0,
+            },
+            HistoryItem::Thinking(
+                "It returns as soon as one statement fails, so nothing after it is looked at."
+                    .into(),
+            ),
+            HistoryItem::Tool {
+                id: ToolCallId("h1".into()),
+                name: "Read".into(),
+                detail: ToolDetail::FileRead {
+                    path: "/home/alex/parser/src/parse.rs".into(),
+                },
+                outcome: Some(ToolOutcome::Ok {
+                    output: "pub fn parse(input: &str) -> Result<Ast, Error> {\n".into(),
+                }),
+            },
+            HistoryItem::AssistantText(format!(
+                "{PARSER_REPLY} Collecting the errors in a `Vec` and going on with the next \
+                 statement lets `parse` report them all at once."
+            )),
+            HistoryItem::Compacted,
+            HistoryItem::User {
+                text: "This is what it prints now.".into(),
+                image_count: 1,
+            },
+            HistoryItem::AssistantText(
+                "Three errors, each with its line: the parser goes on after each one now.".into(),
+            ),
+        ],
+        earlier_left_out: true,
+        model: Some("fake-model-fast".into()),
+        permission_mode: Some(PermissionMode::Plan),
+    }
+}
+
+/// The models a look at launch reports in the demo: the fake's own list, which every program it
+/// opens reports too (`fake_models` in `mr-agent`'s fake, which it does not export).
+fn look_models() -> Vec<ModelOption> {
+    vec![
+        ModelOption {
+            id: "default".into(),
+            name: "Default".into(),
+            resolved: "fake-model".into(),
+            stands_for: Some("Fake 1".into()),
+            auto_mode: true,
+        },
+        ModelOption {
+            id: "fast".into(),
+            name: "Fast".into(),
+            resolved: "fake-model-fast".into(),
+            stands_for: None,
+            auto_mode: false,
+        },
+    ]
+}
+
+/// As `mindrune` with no folder starts once a look has given the models and the usage: the
+/// parser's stored session listed, its history read as `history` says (a detail is a read that
+/// fails with it), nothing shown and no program opened. The demo's own look is off (see
+/// `ui_in`), so its answer is taken in here as the backend would hand it over. Returns the
+/// parser's key.
+fn parser_listed(ui: &mut Ui, history: Result<StoredHistory, &str>) -> SessionKey {
+    *ui = ui_in(None);
+    let id = SessionId(PARSER_ID.into());
+    fake(ui).set_sessions(vec![StoredSession {
+        id: id.clone(),
+        folder: PARSER_FOLDER.into(),
+        title: PARSER_TITLE.into(),
+        last_active_unix: NOW_UNIX - PARSER_DAYS * DAY,
+    }]);
+    match history {
+        Ok(history) => fake(ui).set_history(&id, history),
+        Err(detail) => fake(ui).fail_history(&id, detail),
+    }
+    start(ui);
+    pump_until(ui, "the main screen and the listing", |ui| {
+        ui.app.screen == Screen::Main && ui.app.listed_all
+    });
+    let look = FromBackend::Look {
+        models: look_models(),
+        model: None,
+        usage: Some(limits(NOW_UNIX, 0.37, 0.10)),
+    };
+    let effects = ui.app.receive(look, ui.fake_time);
+    glue::run(ui, effects);
+    key_of(ui, PARSER_ID)
+}
+
+/// Whether the shown session's history is `state`.
+fn history_is(ui: &Ui, state: &HistoryState) -> bool {
+    ui.shown_session().is_some_and(|s| s.history == *state)
+}
+
+/// A stored session shown from its history, as the app restores one at launch: its program is
+/// not started, and the pickers show the model and the mode it will start with.
+fn resting(ui: &mut Ui) {
+    let key = parser_listed(ui, Ok(parser_history()));
+    let effects = ui.app.show(key, Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    pump_until(ui, "the stored history", |ui| {
+        history_is(ui, &HistoryState::Loaded)
+    });
+}
+
+/// The same session shown while its history is being read. The read is never carried out, so
+/// the scene stays there.
+fn history_loading(ui: &mut Ui) {
+    let key = parser_listed(ui, Ok(parser_history()));
+    let mut effects = ui.app.show(key, Leaving::ForgetIfEmpty);
+    effects.retain(|effect| !matches!(effect, Effect::ReadHistory { .. }));
+    glue::run(ui, effects);
+}
+
+/// The same session shown when its history cannot be read.
+fn history_failed(ui: &mut Ui) {
+    let key = parser_listed(ui, Err(HISTORY_FAILURE));
+    let effects = ui.app.show(key, Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    pump_until(ui, "the failed read", |ui| {
+        ui.shown_session()
+            .is_some_and(|s| matches!(s.history, HistoryState::Failed(_)))
+    });
+}
+
+/// The `resting` scene after a message was sent to it while another app had just changed it:
+/// the app asks before it joins the session, holding the message.
+fn elsewhere(ui: &mut Ui) {
+    resting(ui);
+    let id = SessionId(PARSER_ID.into());
+    fake(ui).set_last_active(&id, Some(NOW_UNIX - 40));
+    let key = ui.app.shown.expect("a session is shown");
+    let effects = ui.app.submit(key, ELSEWHERE_MESSAGE);
+    glue::run(ui, effects);
+    pump_until(ui, "the question", |ui| ui.app.prompt(key).is_some());
+}
+
+/// The key of the session titled `title`.
+fn key_of_title(ui: &Ui, title: &str) -> SessionKey {
+    ui.app
+        .sessions
+        .iter()
+        .find(|entry| entry.session.title.as_deref() == Some(title))
+        .map(|entry| entry.key)
+        .unwrap_or_else(|| panic!("no session titled {title:?}"))
+}
+
+/// A turn that starts and goes on thinking; the rest of it is scripted a minute later.
+fn thinking_on() -> Vec<FakeStep> {
+    vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(0.0, SessionEvent::ThinkingStarted),
+        FakeStep::at(LATER, SessionEvent::BlockFinished),
+        FakeStep::at(LATER, finished()),
+    ]
+}
+
+/// A new session in `folder`, shown, whose first message `message` plays `steps`; Claude names
+/// it `title`. Pumps until the turn has started.
+fn live(ui: &mut Ui, folder: &str, message: &str, title: &str, steps: Vec<FakeStep>) {
+    let effects = ui.app.new_session(folder.into(), Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    pump_until(ui, "the new session started", |ui| {
+        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle)
+    });
+    fake(ui).reply(steps);
+    say(ui, message, title);
+    pump_until(ui, "its turn under way", |ui| {
+        ui.shown_session()
+            .is_some_and(|s| matches!(s.phase, Phase::Working | Phase::NeedsUser))
+    });
+}
+
+/// The key of the session the agent knows as `id`.
+fn key_of(ui: &Ui, id: &str) -> SessionKey {
+    ui.app
+        .sessions
+        .iter()
+        .find(|entry| entry.session.id.as_ref().is_some_and(|i| i.0 == id))
+        .map(|entry| entry.key)
+        .unwrap_or_else(|| panic!("no session {id}"))
 }

@@ -1,6 +1,6 @@
 # Protocol notes
 
-What the real `claude` program did when driven through `mindrune-probe` on 2026-11-10. Tasks 10 to 16 of plan 1 and plans 2 to 4 treat this file as the source of truth. Where it disagrees with an earlier assumption, this file wins.
+What the real `claude` program did when driven through `mindrune-probe` on 2026-11-10. Tasks 10 to 16 of plan 1 and plans 2 to 4 treat this file as the source of truth. Where it disagrees with an earlier assumption, this file wins. The last section, "Stored sessions", was added by plan 3 from the store on disk rather than from the probe.
 
 Lines without a prefix below are what `claude` sent. They come from the scrubbed fixtures in `crates/claude/tests/fixtures/live/`, with some fields left out for brevity and long strings cut with `…`; the fixtures hold the full records. Lines starting with `> ` are what the probe sent. Those come from the raw recordings and are in no fixture, because the scrubber keeps only what `claude` sent. In the fixtures, UUIDs are replaced with numbered placeholders, the e-mail and home path are replaced, lists longer than six entries are cut to three, the MCP server and plugin lists are cut to one, thinking signatures are replaced, the `get_usage` reply keeps only its `five_hour` and `seven_day` windows and drops its `behaviors` block, and one file path that the stream had split across two lines was fixed by hand.
 
@@ -320,3 +320,43 @@ Started again with `--resume <id> --fork`. The `init` had a **new** `session_id`
 Checked later the same day, by hand: `claude -p --resume <old> --fork-session --session-id <new>` gives the fork the id `<new>`. So a fork's id can be chosen up front, like a new session's. The adapter does this. (`--session-id` together with `--resume` is accepted only with `--fork-session`.)
 
 Fixtures: `v11-resume.jsonl`, `v11-fork.jsonl`. Differs from the plan: no for resume. For a fork, Task 5's arguments gained `--session-id`.
+
+## Stored sessions
+
+Added by plan 3 ("many sessions"), which lists the sessions Claude Code keeps on disk and reads their history. Checked on 2026-11-13 against the real store of the machine this was built on (790 files), by key names and shapes only, never by content.
+
+### Where they are
+
+Each stored session is one file of JSON lines, `~/.claude/projects/<folder>/<session id>.jsonl`, where `<folder>` is the session's working folder with every slash made a dash. The adapter only reads there; the app never writes inside `~/.claude`. A session with no message stores nothing, so a session that was started and closed without a message (a look at launch, for example) leaves no file. The file's modification time is when the session last changed: the listing orders by it, and the app treats a session whose file changed less than two minutes ago as possibly open in another app, unless the change came no later than ten seconds after this app last closed that session (the program's own last writes as it exits).
+
+### What the records say
+
+- Records that carry conversation have `type` `user` or `assistant`, a `uuid` and a `parentUuid`. Other record types (`system`, `attachment`) also have `uuid` and `parentUuid`, and a `user` or `assistant` record's parent is often one of those. So the chain must be followed through every record that has a `uuid`, not only through `user` and `assistant`.
+- A file can hold abandoned branches: two records with the same `parentUuid`. The conversation is the chain that ends at the last `user` or `assistant` record of the file that is not a side chain (`isSidechain: true`). The file's order is not the conversation's order, and a record's parent is not always the line before it.
+- Compaction writes a `system` record with `subtype: "compact_boundary"`, `parentUuid: null` and `logicalParentUuid` naming the record before it. Following `logicalParentUuid` keeps the chain whole across it. It is followed by a `user` record with `isCompactSummary: true` (also `isVisibleInTranscriptOnly: true`) whose text is the summary; that record must give no item, or the summary would appear as something the user typed. The app shows "Earlier messages were summarised here to save room." in its place.
+- The model that answered is `message.model` on an `assistant` record. A program-made message (for example after an interrupted turn) has the model `<synthetic>`, which is skipped when the session's model is read from its history.
+- A record `{"type":"permission-mode","permissionMode":"auto","sessionId":…}` is written when the mode changes. The names are the wire names (`default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`). These records have no `uuid`. The app takes Plan, Accept edits and Auto from a history, but never `bypassPermissions` or a name it does not know: such a session wakes in the program's default mode.
+- Records written during a turn carry `entrypoint`: how the program was started. Seen in the real store on 2026-11-14: `cli` (the terminal program), `claude-desktop`, `sdk-cli` (this app, and `claude -p`), and `sdk-ts` (a program driving the TypeScript SDK; here a plugin, 722 one-request sessions). The first records of a file (`queue-operation`, `session-owner`) name none. `sdk-py` was not seen and is assumed by analogy.
+- A generated title is `{"type":"ai-title","aiTitle":…}`. A title the user gave is `{"type":"custom-title","customTitle":…}`. Both can appear many times; the last one counts, and a custom title wins over any generated one.
+
+### How the adapter reads them
+
+- **Listing.** The listing reads only the files' metadata, then describes each file from at most its first and its last 256 KiB, complete lines only: its folder (`cwd`), its title (the last custom title, else the last generated one, else the first message) and how it was started (the first `entrypoint`). A description is kept and asked again only when the file's modification time or length changed. A session whose first `entrypoint` is `sdk-ts` or `sdk-py` was made by a program and is left out of the listing; it is still found by its id. A listing can ask only for files changed since a time; the app asks for the last 30 days first and for all of them after. A projects folder, or a project's folder, that cannot be read for a reason other than not existing makes the listing fail, so the app keeps what it knows; a projects folder that does not exist yet means no sessions.
+- **History.** A history is read from the end of the file: at most the last 16 MiB, at most 2,000 items, along the chain of replies that leads to the last message. When more is stored than is shown, the history says so, and the app shows "Earlier messages are not shown." On a hand-made file of 261 MB, reading the end took about 60 ms in a release build and about 580 ms in a debug build.
+- **Last change.** The time a session last changed is its file's modification time; a file that is gone has none.
+
+What reading them taught:
+
+- `"uuid"` (with its quotes) is a good word to look for before parsing a line: it never matches inside `"parentUuid"` or `"logicalParentUuid"` (capital U), so a line that has it almost always has a top-level `uuid` key. `permission-mode` records have no `uuid` and need their own word.
+- When reading from the middle of a file, the first, partial line must be dropped. A walk along the chain that then ends at a record with no parent cannot know whether that record was the file's first, so the history says that earlier messages are not shown. The same holds for a cut region that holds no message at all.
+- The walk guards against links that run in a circle, which a broken or hand-edited file could hold. It costs one flag per record.
+- Parsing only the top-level link fields of every record, and fully parsing only the records on the chain, keeps a 16 MiB region at about 60 ms in a release build.
+
+### Known limits
+
+- **Titles are looked for only at the start and the end of a large file.** A file over 512 KiB is described from its first and last 256 KiB. A title the user gave in the middle of such a file is not seen, so a later generated title, or the first message, names the session in the list instead.
+- **A file that names no folder in its first or last 256 KiB is not listed.** It has no group to sit in. A file that names its folder there and cannot be read further on is listed, and opening it says why it could not be read.
+- **A region that starts exactly at the start of a line loses that line.** The history reader drops everything up to the first line break of a region that does not start at the file's start, even when the cut fell on a line's start. The listing's reader reads one byte before its region to avoid this; the history reader does not.
+- **A record with the same top-level link key twice** (`uuid`, `parentUuid` and the like) is skipped as broken. Not seen in the store.
+- **The same session id in two project folders** gives whichever file is found first.
+- **A rewrite of a file within the same second that keeps its exact length** would not be described again. Session files only grow by appending, so this does not happen in practice.

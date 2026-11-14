@@ -1,15 +1,16 @@
-//! The conversation: the current session's items as virtual rows in a scroll that follows the
-//! newest text until the user scrolls up.
+//! The conversation: a session's items as virtual rows in a scroll that follows the newest
+//! text until the user scrolls up.
 
 use std::borrow::Cow;
+use std::path::Path;
 
-use mr_core::{Item, ItemBody};
+use mr_core::{Item, ItemBody, SessionKey};
 use rune::{El, GrowthSpec, ScrollSpec, col, memo, row, text};
 use rune_kit::{Button, ButtonVariant, Kit};
 use rune_theme_opencode::icons::ARROW_DOWN_TO_LINE;
 
-use crate::glue::Ui;
-use crate::view::items;
+use crate::glue::{self, Ui};
+use crate::view::{items, resting};
 
 /// The height a row is taken to have until it is first laid out.
 const ESTIMATED_ROW_HEIGHT: f32 = 64.0;
@@ -20,9 +21,15 @@ const LIST_PAD_TOP: f32 = 16.0;
 /// How far above the list's bottom edge "Jump to latest" floats.
 const JUMP_INSET: f32 = 16.0;
 
-/// The current session's conversation: a scroll keyed `mr-conversation` taking the height left
-/// in its column, holding one virtual row per item, with the empty hint or "Jump to latest"
-/// floating over it.
+/// The key of `key`'s conversation scroll, so that each session keeps its own place.
+pub fn conversation_key(key: SessionKey) -> String {
+    format!("mr-conversation-{}", key.0)
+}
+
+/// `key`'s conversation: a scroll keyed [`conversation_key`] taking the height left in its
+/// column, holding one virtual row per item, with "Jump to latest" floating over it. Over an
+/// empty one floats, in its middle, what a stored session says of its history while it is not
+/// in (see [`resting::history`]), or else the empty hint.
 ///
 /// The scroll spans the tile, so the wheel works over the margins too; its rows are `width`
 /// points wide and centred (the whole width while the tile's width is not known yet).
@@ -31,8 +38,11 @@ const JUMP_INSET: f32 = 16.0;
 /// it draws from changes, so the cost of a frame does not grow with the conversation. The width
 /// reaches the rows through the list's own width alone, so a new width lays the built rows out
 /// again without building them again.
-pub fn conversation(ui: &Ui, kit: &'static Kit, width: Option<f32>) -> El {
-    let count = items_of(ui).len();
+pub fn conversation(ui: &Ui, kit: &'static Kit, key: SessionKey, width: Option<f32>) -> El {
+    let session = ui.app.sessions.get(key).map(|entry| &entry.session);
+    let view = glue::view_of(ui, key);
+    let count = items_of(ui, key).len();
+    let generation = session.map_or(0, |s| s.generation);
     let rows = col().key("mr-rows");
     let rows = match width {
         Some(width) => rows.w(width).self_center(),
@@ -44,19 +54,25 @@ pub fn conversation(ui: &Ui, kit: &'static Kit, width: Option<f32>) -> El {
         .virtual_rows(
             count,
             ESTIMATED_ROW_HEIGHT,
-            |ui: &Ui, i| Cow::Owned(items::row_key(items_of(ui)[i].id)),
-            move |ui: &Ui, i| build_row(ui, &items_of(ui)[i], kit),
+            move |ui: &Ui, i| Cow::Owned(items::row_key(items_of(ui, key)[i].id)),
+            move |ui: &Ui, i| build_row(ui, key, &items_of(ui, key)[i], kit),
         )
-        // Keys come from item ids, which never change and are only appended, so they change
-        // only with the row count (which Rune always checks) or with a new session.
-        .virtual_rows_version(ui.app.current_open());
+        // Keys come from item ids, which only grow, so they change with the row count (which
+        // Rune always checks), with another session drawn here, or when its items are
+        // numbered again.
+        .virtual_rows_version((key.0, generation))
+        .on_visible_rows(move |ui: &mut Ui, shown| {
+            let first = items_of(ui, key).get(shown.start).map(|item| item.id);
+            glue::view_mut(ui, key).first_seen = first;
+            false
+        });
     let list = col()
-        .key("mr-conversation")
+        .key(conversation_key(key))
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom: true })
-        .on_at_bottom(|ui: &mut Ui, at: bool| ui.following = at)
+        .on_at_bottom(move |ui: &mut Ui, at: bool| glue::view_mut(ui, key).following = at)
         .child(rows);
     let mut frame = col()
         .key("mr-conversation-frame")
@@ -65,16 +81,21 @@ pub fn conversation(ui: &Ui, kit: &'static Kit, width: Option<f32>) -> El {
         .min_h(0.0)
         .child(list);
     if count == 0 {
-        frame = frame.child(empty_hint(ui, kit));
-    } else if !ui.following {
-        frame = frame.child(jump_to_latest(kit));
+        if let Some(session) = session {
+            let over =
+                resting::history(session, kit).unwrap_or_else(|| empty_hint(&session.folder, kit));
+            frame = frame.child(over);
+        }
+    } else if !view.following {
+        frame = frame.child(jump_to_latest(key, kit));
     }
     frame
 }
 
 /// A streaming reply grows in place, marked as the stack's streaming row; any other row is
-/// kept by `memo` until what it draws from changes.
-fn build_row(ui: &Ui, item: &Item, kit: &'static Kit) -> El {
+/// kept by `memo` until what it draws from changes. The memo is named by the session and its
+/// generation as well as the item, since every session numbers its items from 0.
+fn build_row(ui: &Ui, key: SessionKey, item: &Item, kit: &'static Kit) -> El {
     if matches!(
         item.body,
         ItemBody::Reply {
@@ -82,27 +103,43 @@ fn build_row(ui: &Ui, item: &Item, kit: &'static Kit) -> El {
             ..
         }
     ) {
-        return items::row(ui, item, kit).streaming(true);
+        return items::row(ui, key, item, kit).streaming(true);
     }
-    memo(items::row_key(item.id), items::version(ui, item), || {
-        items::row(ui, item, kit)
+    let generation = ui
+        .app
+        .sessions
+        .get(key)
+        .map_or(0, |entry| entry.session.generation);
+    let id = items::memo_id(key, generation, item.id);
+    // The row's own key is the list's (`items::row_key`), which Rune gives every row it builds.
+    memo(id.clone(), items::version(ui, key, item), move || {
+        #[cfg(test)]
+        ROW_BUILDS.with(|n| n.set(n.get() + 1));
+        items::row(ui, key, item, kit).key(id)
     })
 }
 
-fn items_of(ui: &Ui) -> &[Item] {
-    ui.app
-        .session
-        .as_ref()
-        .map_or(&[], |session| session.conversation.items())
+#[cfg(test)]
+thread_local! {
+    /// How many memoised rows were built on this thread: each test runs on its own.
+    static ROW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// One centred line over the empty list, naming the session's folder.
-fn empty_hint(ui: &Ui, kit: &Kit) -> El {
-    let folder = ui
-        .app
-        .session
-        .as_ref()
-        .map_or(ui.app.folder.as_path(), |session| session.folder.as_path());
+/// How many memoised rows have been built, rather than reused, on this thread.
+#[cfg(test)]
+pub(crate) fn row_builds() -> usize {
+    ROW_BUILDS.with(std::cell::Cell::get)
+}
+
+fn items_of(ui: &Ui, key: SessionKey) -> &[Item] {
+    ui.app
+        .sessions
+        .get(key)
+        .map_or(&[], |entry| entry.session.conversation.items())
+}
+
+/// One centred line over the empty list, naming the session's `folder`.
+fn empty_hint(folder: &Path, kit: &Kit) -> El {
     let name = folder
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -120,12 +157,12 @@ fn empty_hint(ui: &Ui, kit: &Kit) -> El {
         )
 }
 
-/// "Jump to latest", floating over the bottom of the list while the user reads further up.
-fn jump_to_latest(kit: &Kit) -> El {
+/// "Jump to latest", floating over the bottom of `key`'s list while the user reads further up.
+fn jump_to_latest(key: SessionKey, kit: &Kit) -> El {
     let button = Button::new("Jump to latest")
         .icon(&ARROW_DOWN_TO_LINE)
         .variant(ButtonVariant::Neutral)
-        .on_press_tx(|_: &mut Ui, tx| tx.scroll_to_bottom("mr-conversation"))
+        .on_press_tx(move |_: &mut Ui, tx| tx.scroll_to_bottom(conversation_key(key)))
         .build(kit)
         .key("mr-jump-latest");
     row()
@@ -190,27 +227,30 @@ mod tests {
     #[test]
     fn the_list_follows_new_text_until_the_user_scrolls_up() {
         let mut rt = testkit::window("long");
-        assert_eq!(rt.scroll_at_bottom("mr-conversation"), Some(true));
+        assert_eq!(rt.scroll_at_bottom(&testkit::conversation(&rt)), Some(true));
         assert!(rt.find("mr-jump-latest").is_none());
         testkit::emit(
             &mut rt,
             SessionEvent::TextDelta("A new line at the end".into()),
         );
-        assert_eq!(rt.scroll_at_bottom("mr-conversation"), Some(true));
+        assert_eq!(rt.scroll_at_bottom(&testkit::conversation(&rt)), Some(true));
         assert!(testkit::has_text(&rt, "A new line at the end"));
-        let (x, y) = rt.find("mr-conversation").unwrap();
+        let (x, y) = rt.find(&testkit::conversation(&rt)).unwrap();
         rt.wheel(x, y, 600.0);
         testkit::step(&mut rt);
-        assert_eq!(rt.scroll_at_bottom("mr-conversation"), Some(false));
+        assert_eq!(
+            rt.scroll_at_bottom(&testkit::conversation(&rt)),
+            Some(false)
+        );
         testkit::emit(&mut rt, SessionEvent::TextDelta(" and more".into()));
         assert_eq!(
-            rt.scroll_at_bottom("mr-conversation"),
+            rt.scroll_at_bottom(&testkit::conversation(&rt)),
             Some(false),
             "new text must not pull the view down"
         );
         testkit::click(&mut rt, "mr-jump-latest");
         rt.settle_all();
         testkit::step(&mut rt);
-        assert_eq!(rt.scroll_at_bottom("mr-conversation"), Some(true));
+        assert_eq!(rt.scroll_at_bottom(&testkit::conversation(&rt)), Some(true));
     }
 }

@@ -7,6 +7,7 @@ mod args;
 mod encode;
 mod env;
 mod history;
+mod history_tail;
 mod mode;
 mod process;
 mod time;
@@ -23,8 +24,10 @@ pub use encode::{
 };
 pub use env::child_env;
 pub use history::{
-    StoredEntry, StoredMeta, describe, find_session, list_entries, read_history, stored_sessions,
+    DescriptionTable, StoredEntry, StoredMeta, describe, find_session, list_entries,
+    stored_sessions,
 };
+pub use history_tail::{TAIL_BYTES, read_tail};
 pub use mode::{mode_from_wire, mode_to_wire};
 pub use process::{ClaudeProcess, ExitInfo, SpawnConfig};
 pub use translate::{SessionStart, Tracked, Translator, always_allow_label, tool_detail};

@@ -7,9 +7,10 @@ use std::hash::Hash;
 use mr_agent::{ToolDetail, ToolOutcome};
 use mr_core::{
     Item, ItemBody, ItemId, NoticeKind, OUTPUT_CHARS, OUTPUT_LINES, Phase, RequestState,
-    ToolFamily, ToolGroup, clip, fenced, file_name, line_counts, thinking_label, unified_diff,
+    SessionKey, ThinkingTime, ToolFamily, ToolGroup, clip, fenced, file_name, line_counts,
+    thinking_label, unified_diff,
 };
-use rune::{Color, Cursor, El, Icon, Span, col, el, icon, rich, text};
+use rune::{Align, Color, Cursor, El, Icon, Span, col, el, icon, rich, text};
 use rune_kit::{
     Button, ButtonVariant, CodeFrame, IconButton, IconButtonVariant, Kit, Markdown, Spinner,
 };
@@ -17,7 +18,7 @@ use rune_theme_opencode::icons::{
     BRAIN, CUBE, FILE_DOCUMENT, MAGNIFYING_GLASS, PENCIL_LINE, TERMINAL, WARNING,
 };
 
-use crate::glue::{self, QuestionDraft, Ui};
+use crate::glue::{self, QuestionDraft, SessionView, Ui};
 use crate::view::requests;
 
 /// The space below each row's content, inside the row. None goes above it, so a streaming
@@ -47,26 +48,46 @@ pub fn row_key(id: ItemId) -> String {
     format!("mr-item-{}", id.0)
 }
 
-/// One item as a row keyed `mr-item-{id}`, its spacing as padding inside it.
-pub fn row(ui: &Ui, item: &Item, kit: &'static Kit) -> El {
+/// The `rune::memo` id of the row that shows item `id` of `key`'s session, its items numbered in
+/// `generation`. Every session numbers its items from 0, and a generation numbers them again,
+/// so the item's id alone could name another session's row, or an older one.
+pub fn memo_id(key: SessionKey, generation: u64, id: ItemId) -> String {
+    format!("mr-item-{}-g{generation}-{}", id.0, key.0)
+}
+
+/// One item of `key`'s session as a row keyed `mr-item-{id}`, its spacing as padding inside it.
+pub fn row(ui: &Ui, key: SessionKey, item: &Item, kit: &'static Kit) -> El {
     let id = item.id;
+    let view = glue::view_of(ui, key);
     let folds = matches!(item.body, ItemBody::Thinking { .. } | ItemBody::Tools(_));
     let (content, pad_bottom) = match &item.body {
-        ItemBody::User { text } => (Some(user_message(id, text, kit)), ROW_PAD_BOTTOM),
+        ItemBody::User { text, image_count } => (
+            Some(user_message(id, text, *image_count, kit)),
+            ROW_PAD_BOTTOM,
+        ),
         ItemBody::Reply {
             markdown,
             streaming,
-        } => (Some(reply(id, markdown, *streaming, kit)), ROW_PAD_BOTTOM),
-        ItemBody::Thinking { text, seconds, .. } => (
-            Some(thinking(id, text, *seconds, ui.toggled.contains(&id), kit)),
-            LINE_PAD_BOTTOM,
-        ),
-        ItemBody::Tools(group) => (Some(tools(ui, id, group, kit)), LINE_PAD_BOTTOM),
-        ItemBody::Notice { kind, text } => (
-            Some(notice(id, *kind, text, offers_restart(ui, item), kit)),
+        } => (
+            Some(reply(key, id, markdown, *streaming, kit)),
             ROW_PAD_BOTTOM,
         ),
-        ItemBody::Request { .. } => (Some(requests::card(ui, item, kit)), ROW_PAD_BOTTOM),
+        ItemBody::Thinking { text, time, .. } => {
+            let open = view.toggled.contains(&id);
+            (
+                Some(thinking(key, id, text, *time, open, kit)),
+                LINE_PAD_BOTTOM,
+            )
+        }
+        ItemBody::Tools(group) => (Some(tools(view, key, id, group, kit)), LINE_PAD_BOTTOM),
+        ItemBody::Notice { kind, text } => {
+            let restart = offers_restart(ui, key, item);
+            (
+                Some(notice(key, id, *kind, text, restart, kit)),
+                ROW_PAD_BOTTOM,
+            )
+        }
+        ItemBody::Request { .. } => (Some(requests::card(ui, key, item, kit)), ROW_PAD_BOTTOM),
     };
     let r = col()
         .key(row_key(id))
@@ -86,8 +107,11 @@ pub fn row(ui: &Ui, item: &Item, kit: &'static Kit) -> El {
 /// costs the same for a megabyte of output as for one line.
 #[derive(Hash)]
 struct RowVersion {
-    /// The session the conversation belongs to: a new one starts its ids and stamps again.
-    open: u64,
+    /// The key number of the session the conversation belongs to: each session has its own
+    /// ids and stamps.
+    session: u64,
+    /// The session's `generation`: its items were numbered again when it went up.
+    generation: u64,
     /// The item's own change stamp: its body, as every kind of row draws it.
     changed: u64,
     /// The user opened or closed it against its kind's default (thinking, tool groups).
@@ -97,45 +121,67 @@ struct RowVersion {
     /// It is the notice that offers Restart: read from the session's phase and the
     /// conversation's later items.
     restart: bool,
-    /// A waiting request's drafts in `ui.answers`: the options chosen and the "Something else"
-    /// text with its caret and focus. `None` for every other item.
+    /// A waiting request's drafts in its session's view: the options chosen and the
+    /// "Something else" text with its caret and focus. `None` for every other item.
     draft: Option<Vec<QuestionDraft>>,
 }
 
-/// The version of `item`'s row. A kind of row that reads anything else from `Ui` or the
-/// session adds it here.
-pub fn version(ui: &Ui, item: &Item) -> impl Hash + use<> {
+/// The version of the row of `item`, of `key`'s session. A kind of row that reads anything else
+/// from `Ui` or the session adds it here.
+pub fn version(ui: &Ui, key: SessionKey, item: &Item) -> impl Hash + use<> {
+    let view = glue::view_of(ui, key);
     RowVersion {
-        open: ui.app.current_open(),
+        session: key.0,
+        generation: ui
+            .app
+            .sessions
+            .get(key)
+            .map_or(0, |entry| entry.session.generation),
         changed: item.changed,
-        toggled: ui.toggled.contains(&item.id),
-        whole: ui.whole.contains(&item.id),
-        restart: offers_restart(ui, item),
-        draft: waiting_draft(ui, item),
+        toggled: view.toggled.contains(&item.id),
+        whole: view.whole.contains(&item.id),
+        restart: offers_restart(ui, key, item),
+        draft: waiting_draft(view, item),
     }
 }
 
 /// What the user has drafted for `item`, when it is a request still waiting.
-fn waiting_draft(ui: &Ui, item: &Item) -> Option<Vec<QuestionDraft>> {
+fn waiting_draft(view: &SessionView, item: &Item) -> Option<Vec<QuestionDraft>> {
     match &item.body {
         ItemBody::Request {
             request,
             state: RequestState::Waiting,
-        } => ui.answers.get(&request.id).cloned(),
+        } => view.answers.get(&request.id).cloned(),
         _ => None,
     }
 }
 
 /// The user's message as typed, never read as Markdown: plain selectable text in a filled,
-/// rounded box at the right of the column.
-fn user_message(id: ItemId, message: &str, kit: &Kit) -> El {
-    let bubble = text(message.to_owned())
+/// rounded box at the right of the column. A stored message that had images says how many under
+/// its text, in muted text (keyed `mr-user-images-{id}`); one with images and no text shows only
+/// that. The images themselves are not drawn.
+fn user_message(id: ItemId, message: &str, image_count: usize, kit: &Kit) -> El {
+    let words = text(message.to_owned())
         .key(format!("mr-user-{}", id.0))
         .font(kit.ty.body)
         .color(kit.c.text_base)
         .wrap()
-        .selectable(true)
-        .max_w(USER_MAX_WIDTH)
+        .selectable(true);
+    let bubble = if image_count == 0 {
+        words.max_w(USER_MAX_WIDTH)
+    } else {
+        let images = text(images_line(image_count))
+            .key(format!("mr-user-images-{}", id.0))
+            .font(kit.ty.ui)
+            .color(kit.c.text_muted)
+            .wrap();
+        col()
+            .max_w(USER_MAX_WIDTH)
+            .gap(4.0)
+            .children((!message.is_empty()).then_some(words))
+            .child(images)
+    };
+    let bubble = bubble
         .px(14.0)
         .py(10.0)
         .radius(kit.radius.xl)
@@ -143,9 +189,18 @@ fn user_message(id: ItemId, message: &str, kit: &Kit) -> El {
     rune::row().w_full().justify_end().child(bubble)
 }
 
+/// How many images a stored message had: "1 image", "3 images".
+fn images_line(count: usize) -> String {
+    if count == 1 {
+        "1 image".to_owned()
+    } else {
+        format!("{count} images")
+    }
+}
+
 /// Claude's reply: Markdown over the whole text so far, each finished code block with a copy
 /// button, and once the reply has finished, a copy button for its source beneath it.
-fn reply(id: ItemId, markdown: &str, streaming: bool, kit: &'static Kit) -> El {
+fn reply(key: SessionKey, id: ItemId, markdown: &str, streaming: bool, kit: &'static Kit) -> El {
     let body = Markdown::new(markdown)
         .streaming(streaming)
         .selectable(true)
@@ -160,7 +215,8 @@ fn reply(id: ItemId, markdown: &str, streaming: bool, kit: &'static Kit) -> El {
         .variant(IconButtonVariant::GhostMuted)
         .help("Copy")
         .on_press_tx(move |ui: &mut Ui, tx| {
-            if let Some(ItemBody::Reply { markdown, .. }) = find(ui, id).map(|item| &item.body) {
+            let item = find(ui, key, id);
+            if let Some(ItemBody::Reply { markdown, .. }) = item.map(|item| &item.body) {
                 tx.copy(markdown.clone());
             }
         })
@@ -196,17 +252,23 @@ fn code_block(id: ItemId, card: El, frame: &CodeFrame<'_>, kit: &Kit) -> El {
 
 /// A thought: one muted line, with a spinner while it goes on. When it has text, the line
 /// opens and closes it, beneath; when it has none, the line does not react.
-fn thinking(id: ItemId, thought: &str, seconds: Option<f64>, open: bool, kit: &Kit) -> El {
-    let status = seconds
-        .is_none()
-        .then(|| spinner(kit).key(format!("mr-running-{}", id.0)));
-    let label = thinking_label(seconds);
+fn thinking(
+    key: SessionKey,
+    id: ItemId,
+    thought: &str,
+    time: ThinkingTime,
+    open: bool,
+    kit: &Kit,
+) -> El {
+    let status =
+        (time == ThinkingTime::Going).then(|| spinner(kit).key(format!("mr-running-{}", id.0)));
+    let label = thinking_label(time);
     if thought.is_empty() {
-        return line(id, &BRAIN, &label, status, None, None, kit);
+        return line(key, id, &BRAIN, &label, status, None, None, kit);
     }
     let mut c = col()
         .w_full()
-        .child(line(id, &BRAIN, &label, status, Some(open), None, kit));
+        .child(line(key, id, &BRAIN, &label, status, Some(open), None, kit));
     if open {
         c = c.child(
             col()
@@ -232,8 +294,8 @@ fn thinking(id: ItemId, thought: &str, seconds: Option<f64>, open: bool, kit: &K
 /// starts open once one of its calls has an outcome, and every other family closed. Before
 /// that an edit may be waiting for permission, and its card shows the diff. Closed details
 /// are not built.
-fn tools(ui: &Ui, id: ItemId, group: &ToolGroup, kit: &Kit) -> El {
-    let open = starts_open(group) != ui.toggled.contains(&id);
+fn tools(view: &SessionView, key: SessionKey, id: ItemId, group: &ToolGroup, kit: &Kit) -> El {
+    let open = starts_open(group) != view.toggled.contains(&id);
     let status = if group.running() {
         Some(spinner(kit).key(format!("mr-running-{}", id.0)))
     } else if group.failed() {
@@ -250,9 +312,9 @@ fn tools(ui: &Ui, id: ItemId, group: &ToolGroup, kit: &Kit) -> El {
     let summary = group.summary();
     let icon = family_icon(group.family);
     if !open {
-        return line(id, icon, &summary, status, Some(false), None, kit);
+        return line(key, id, icon, &summary, status, Some(false), None, kit);
     }
-    let whole = ui.whole.contains(&id);
+    let whole = view.whole.contains(&id);
     let mut hidden: Option<usize> = None;
     let mut details = col()
         .key(format!("mr-details-{}", id.0))
@@ -270,10 +332,19 @@ fn tools(ui: &Ui, id: ItemId, group: &ToolGroup, kit: &Kit) -> El {
     }
     // On the line, not under the output: the line is on screen the moment the details start
     // to open, and stays put while they glide open beneath it.
-    let action = hidden.map(|lines| show_all(id, lines, kit));
+    let action = hidden.map(|lines| show_all(key, id, lines, kit));
     col()
         .w_full()
-        .child(line(id, icon, &summary, status, Some(true), action, kit))
+        .child(line(
+            key,
+            id,
+            icon,
+            &summary,
+            status,
+            Some(true),
+            action,
+            kit,
+        ))
         .child(details)
 }
 
@@ -381,9 +452,9 @@ pub fn call_details(
 }
 
 /// "Show all (N more lines)", or "Show all" when no line was left out whole, keyed
-/// `mr-show-all-{id}`: pressing it adds `id` to `ui.whole`, so the row shows its text whole.
-/// A tool group puts it at the right end of its line.
-pub fn show_all(id: ItemId, hidden_lines: usize, kit: &Kit) -> El {
+/// `mr-show-all-{id}`: pressing it adds `id` to the `whole` of `key`'s view, so the row shows
+/// its text whole. A tool group puts it at the right end of its line.
+pub fn show_all(key: SessionKey, id: ItemId, hidden_lines: usize, kit: &Kit) -> El {
     let label = if hidden_lines == 0 {
         "Show all".to_owned()
     } else {
@@ -392,36 +463,51 @@ pub fn show_all(id: ItemId, hidden_lines: usize, kit: &Kit) -> El {
     Button::new(label)
         .variant(ButtonVariant::GhostMuted)
         .on_press(move |ui: &mut Ui| {
-            ui.whole.insert(id);
+            glue::view_mut(ui, key).whole.insert(id);
         })
         .build(kit)
         .key(format!("mr-show-all-{}", id.0))
 }
 
 /// A notice: muted when the user stopped the turn, in the danger colour when a turn failed or
-/// the session ended, in the warning colour when a command was refused. The notice that says
-/// why the session ended offers Restart while it stays ended.
-fn notice(id: ItemId, kind: NoticeKind, words: &str, restart: bool, kit: &Kit) -> El {
+/// the session ended, in the warning colour when a command was refused. The two notices of a
+/// stored history (earlier messages left out, or summarised) are muted and centred: they mark a
+/// place in the conversation rather than say what happened in it. The notice that says why the
+/// session ended offers Restart while it stays ended.
+fn notice(
+    key: SessionKey,
+    id: ItemId,
+    kind: NoticeKind,
+    words: &str,
+    restart: bool,
+    kit: &Kit,
+) -> El {
     let ink = match kind {
-        NoticeKind::Stopped => kit.c.text_muted,
+        NoticeKind::Stopped | NoticeKind::EarlierLeftOut | NoticeKind::Compacted => {
+            kit.c.text_muted
+        }
         NoticeKind::TurnFailed | NoticeKind::Ended => kit.c.danger.fg,
         NoticeKind::CommandFailed => kit.c.warning.fg,
     };
-    let mut c = col().w_full().gap(8.0).child(
-        text(words.to_owned())
-            .key(format!("mr-notice-{}", id.0))
-            .font(kit.ty.ui)
-            .color(ink)
-            .wrap()
-            .selectable(true)
-            .w_full(),
-    );
+    let words = text(words.to_owned())
+        .key(format!("mr-notice-{}", id.0))
+        .font(kit.ty.ui)
+        .color(ink)
+        .wrap()
+        .selectable(true);
+    if matches!(kind, NoticeKind::EarlierLeftOut | NoticeKind::Compacted) {
+        return rune::row()
+            .w_full()
+            .justify_center()
+            .child(words.align(Align::Center).shrink().min_w(0.0));
+    }
+    let mut c = col().w_full().gap(8.0).child(words.w_full());
     if restart {
         c = c.child(
             rune::row().child(
                 Button::new("Restart")
-                    .on_press(|ui: &mut Ui| {
-                        let effects = ui.app.restart();
+                    .on_press(move |ui: &mut Ui| {
+                        let effects = ui.app.restart(key);
                         glue::run(ui, effects);
                     })
                     .build(kit)
@@ -432,9 +518,9 @@ fn notice(id: ItemId, kind: NoticeKind, words: &str, restart: bool, kit: &Kit) -
     c
 }
 
-/// Whether `item` is the notice that offers Restart: the last `Ended` notice, while the
-/// session's phase is `Ended`. Only the items after it are looked at.
-fn offers_restart(ui: &Ui, item: &Item) -> bool {
+/// Whether `item` is the notice that offers Restart: the last `Ended` notice, while the phase of
+/// `key`'s session is `Ended`. Only the items after it are looked at.
+fn offers_restart(ui: &Ui, key: SessionKey, item: &Item) -> bool {
     let is_ended = |item: &Item| {
         matches!(
             item.body,
@@ -447,7 +533,7 @@ fn offers_restart(ui: &Ui, item: &Item) -> bool {
     if !is_ended(item) {
         return false;
     }
-    let Some(session) = &ui.app.session else {
+    let Some(session) = ui.app.sessions.get(key).map(|entry| &entry.session) else {
         return false;
     };
     if !matches!(session.phase, Phase::Ended { .. }) {
@@ -460,19 +546,21 @@ fn offers_restart(ui: &Ui, item: &Item) -> bool {
     }
 }
 
-/// The current session's item `id`. Ids grow in the order items are pushed.
-pub(super) fn find(ui: &Ui, id: ItemId) -> Option<&Item> {
-    let items = ui.app.session.as_ref()?.conversation.items();
+/// Item `id` of `key`'s session. Ids grow in the order items are pushed.
+pub(super) fn find(ui: &Ui, key: SessionKey, id: ItemId) -> Option<&Item> {
+    let items = ui.app.sessions.get(key)?.session.conversation.items();
     let at = items.binary_search_by_key(&id.0, |i| i.id.0).ok()?;
     items.get(at)
 }
 
-/// A thinking or tool line: icon, label, status and, at its right end, `action`. With
-/// `toggle`, the line is keyed
-/// `mr-toggle-{id}`, shows whether it is open and flips the item in `ui.toggled`, holding the
-/// line where it is on screen while its details open or shut beneath; without, it is keyed
-/// `mr-line-{id}` and does not react.
+/// A thinking or tool line of item `id` of `key`'s session: icon, label, status and, at its
+/// right end, `action`. With `toggle`, the line is keyed `mr-toggle-{id}`, shows whether it is
+/// open and flips the item in the `toggled` of the session's view, holding the line where it is
+/// on screen while its details open or shut beneath; without, it is keyed `mr-line-{id}` and
+/// does not react.
+#[expect(clippy::too_many_arguments, reason = "one line's place and look")]
 fn line(
+    key: SessionKey,
     id: ItemId,
     glyph: &'static Icon,
     label: &str,
@@ -513,19 +601,20 @@ fn line(
     match toggle {
         None => r.key(format!("mr-line-{}", id.0)),
         Some(open) => {
-            let key = format!("mr-toggle-{}", id.0);
+            let toggle_key = format!("mr-toggle-{}", id.0);
             r = r
-                .key(key.clone())
+                .key(toggle_key.clone())
                 .role("button")
                 .label(label.to_owned())
                 .expanded(open)
                 .cursor(Cursor::Pointer)
                 .radius(kit.radius.md)
                 .on_press_tx(move |ui: &mut Ui, tx| {
-                    if !ui.toggled.remove(&id) {
-                        ui.toggled.insert(id);
+                    let toggled = &mut glue::view_mut(ui, key).toggled;
+                    if !toggled.remove(&id) {
+                        toggled.insert(id);
                     }
-                    tx.keep_on_screen(key.clone());
+                    tx.keep_on_screen(toggle_key.clone());
                 });
             kit.interactive(r)
         }
@@ -719,9 +808,8 @@ mod tests {
         testkit::step(&mut rt);
         assert!(testkit::has_text(&rt, "line 500"), "shown whole");
         assert!(!testkit::has_text(&rt, "+3 −2"), "the edit was closed");
-        testkit::click(&mut rt, "mr-new-session");
-        testkit::step(&mut rt);
-        assert_eq!(rt.state.app.current_open(), 2);
+        let _folder = testkit::new_session_elsewhere(&mut rt);
+        assert_eq!(testkit::shown_open(&rt), Some(2));
         // The same turn again: its items get the same ids in the new conversation.
         crate::demo::tools_turn(&mut rt.state);
         rt.settle_all();
@@ -732,7 +820,10 @@ mod tests {
             "the command starts closed"
         );
         assert!(testkit::has_text(&rt, "+3 −2"), "the edit starts open");
-        assert!(rt.state.toggled.is_empty() && rt.state.whole.is_empty());
+        assert!(
+            testkit::shown_view(&rt).toggled.is_empty()
+                && testkit::shown_view(&rt).whole.is_empty()
+        );
     }
 
     #[test]
@@ -790,8 +881,8 @@ mod tests {
         assert!(testkit::has_text(&rt, "claude exited with status 1"));
         testkit::click(&mut rt, "mr-restart");
         testkit::step(&mut rt);
-        assert_eq!(rt.state.app.current_open(), 2);
-        assert_eq!(rt.state.app.session.as_ref().unwrap().phase, Phase::Idle);
+        assert_eq!(testkit::shown_open(&rt), Some(2));
+        assert_eq!(rt.state.shown_session().unwrap().phase, Phase::Idle);
         assert!(rt.find("mr-restart").is_none());
     }
 

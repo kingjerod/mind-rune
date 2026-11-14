@@ -6,13 +6,15 @@ use std::path::PathBuf;
 
 use mr_agent::{
     Answer, CommandKind, ModelOption, PermissionMode, RequestId, SessionCommand, SessionEvent,
-    SessionId, StartSpec,
+    SessionId, StartSpec, StoredHistory, StoredSession,
 };
 
 use crate::conversation::{Conversation, NoticeKind};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Phase {
+    /// No program runs for it; its conversation is on disk. The next message starts one.
+    Resting,
     /// The program is starting; nothing can be sent yet.
     Opening,
     Idle,
@@ -26,12 +28,22 @@ pub enum Phase {
     },
 }
 
+/// How much of a stored conversation the session holds.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HistoryState {
+    NotLoaded,
+    Loading,
+    /// The history is in the conversation, or there was none to read.
+    Loaded,
+    Failed(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
     pub folder: PathBuf,
     pub id: Option<SessionId>,
     /// The agent's name for the session or, until it gives one, a stand-in made from the first
-    /// message sent. `None` before any message.
+    /// message sent; for a stored session, the store's title. `None` before any message.
     pub title: Option<String>,
     pub phase: Phase,
     /// The full id of the model in use, once known.
@@ -39,12 +51,24 @@ pub struct Session {
     pub models: Vec<ModelOption>,
     pub mode: PermissionMode,
     pub conversation: Conversation,
+    pub history: HistoryState,
+    /// Goes up whenever the conversation's items are replaced, not appended to.
+    pub generation: u64,
     /// A message typed while it could not be sent yet.
     pub queued: Option<String>,
     pub cost_usd: Option<f64>,
     pub context_used: Option<f32>,
     /// The option id the user last picked, for naming the model they chose.
     chosen_model: Option<String>,
+    /// The mode is known from the program or from the user, so a history that arrives later
+    /// does not change it.
+    mode_known: bool,
+    /// `models` came from the session's own program, not from a list it was offered.
+    own_models: bool,
+    /// It came from the store.
+    from_store: bool,
+    /// Messages handed over in this run, less those that could not be.
+    handed_over: usize,
 }
 
 impl Session {
@@ -58,10 +82,121 @@ impl Session {
             models: Vec::new(),
             mode: PermissionMode::Ask,
             conversation: Conversation::new(),
+            history: HistoryState::Loaded,
+            generation: 0,
             queued: None,
             cost_usd: None,
             context_used: None,
             chosen_model: None,
+            mode_known: false,
+            own_models: false,
+            from_store: false,
+            handed_over: 0,
+        }
+    }
+
+    /// A stored session, resting: its id, folder and title, and no history yet.
+    pub fn resting(stored: &StoredSession) -> Session {
+        let mut session = Session::opening(stored.folder.clone());
+        session.id = Some(stored.id.clone());
+        session.title = Some(stored.title.clone()).filter(|title| !title.is_empty());
+        session.phase = Phase::Resting;
+        session.history = HistoryState::NotLoaded;
+        session.from_store = true;
+        session
+    }
+
+    /// Puts the stored history before what this run added to the conversation. The history's
+    /// model and mode are taken when neither the user nor the program has named them yet,
+    /// except Bypass or an unknown mode, which leave the mode as it is. A history that is
+    /// already loaded is not loaded again.
+    pub fn load_history(&mut self, history: StoredHistory) {
+        if self.history == HistoryState::Loaded {
+            return;
+        }
+        let revision = self.conversation.revision();
+        self.conversation.put_history_first(&history);
+        if self.conversation.revision() != revision {
+            self.generation += 1;
+        }
+        if self.model.is_none() {
+            self.model = history.model;
+        }
+        // A file never turns permission checks off: Bypass, and any mode this app does not
+        // know, would start the program with less asked of the user than the picker offers.
+        if !self.mode_known
+            && let Some(mode) = history.permission_mode
+            && !matches!(mode, PermissionMode::Bypass | PermissionMode::Other(_))
+        {
+            self.mode = mode;
+        }
+        self.history = HistoryState::Loaded;
+    }
+
+    /// The history could not be read: `reason` says why. A history already loaded stays.
+    pub fn history_failed(&mut self, reason: &str) {
+        if self.history != HistoryState::Loaded {
+            self.history = HistoryState::Failed(reason.into());
+        }
+    }
+
+    /// Whether the agent has anything stored for it: it came from the store, or a message
+    /// was handed over in this run.
+    pub fn is_stored(&self) -> bool {
+        self.from_store || self.handed_over > 0
+    }
+
+    /// Resting to Opening, with `text` queued for when the program is ready. Trimmed as
+    /// [`Session::submit`] trims; a resting session is not woken by whitespace alone.
+    pub fn wake(&mut self, text: &str) {
+        if self.phase != Phase::Resting || text.trim().is_empty() {
+            return;
+        }
+        self.phase = Phase::Opening;
+        self.queue(text.trim_end());
+    }
+
+    /// Undoes `wake` before a program was opened: back to Resting, giving the text back.
+    pub fn unwake(&mut self) -> Option<String> {
+        if self.phase != Phase::Opening || !self.is_stored() {
+            return None;
+        }
+        self.phase = Phase::Resting;
+        self.queued.take()
+    }
+
+    /// How to start its program: resuming when `is_stored`, afresh otherwise; with the model
+    /// and mode it shows. The model is the option the user chose while it names the model in
+    /// use, else the model's id; the mode is passed unless it is Ask, the program's default.
+    pub fn start_spec(&self) -> StartSpec {
+        let mut spec = StartSpec::new(self.folder.clone());
+        if self.is_stored() {
+            spec.resume = self.id.clone();
+        }
+        let chosen = self
+            .named_by()
+            .filter(|option| self.chosen_model.as_ref() == Some(&option.id));
+        spec.model = chosen
+            .map(|option| option.id.clone())
+            .or_else(|| self.model.clone());
+        if self.mode != PermissionMode::Ask {
+            spec.permission_mode = Some(self.mode.clone());
+        }
+        spec
+    }
+
+    /// A message could not be handed over: Working goes back to Idle.
+    pub fn send_failed(&mut self) {
+        self.handed_over = self.handed_over.saturating_sub(1);
+        if self.phase == Phase::Working {
+            self.phase = Phase::Idle;
+        }
+    }
+
+    /// Gives the session models to choose from when it has none of its own yet.
+    pub fn offer_models(&mut self, models: &[ModelOption]) {
+        if !self.own_models {
+            self.models = models.to_vec();
         }
     }
 
@@ -75,13 +210,15 @@ impl Session {
                     self.id = Some(info.id);
                     self.model = Some(info.model);
                     self.models = info.models;
+                    self.own_models = true;
                     self.mode = info.permission_mode;
+                    self.mode_known = true;
                     self.phase = Phase::Idle;
                     return self.send_queued();
                 }
             }
             SessionEvent::TurnStarted => {
-                if !self.ended() {
+                if !self.at_rest() {
                     self.phase = if self.conversation.waiting() > 0 {
                         Phase::NeedsUser
                     } else {
@@ -113,7 +250,10 @@ impl Session {
             }
             SessionEvent::TitleChanged(title) => self.title = Some(title),
             SessionEvent::ModelChanged(model) => self.model = Some(model),
-            SessionEvent::PermissionModeChanged(mode) => self.mode = mode,
+            SessionEvent::PermissionModeChanged(mode) => {
+                self.mode = mode;
+                self.mode_known = true;
+            }
             SessionEvent::CommandFailed { what, reason } => {
                 let wording = match what {
                     CommandKind::SetModel => "Could not change the model",
@@ -126,7 +266,14 @@ impl Session {
                 self.conversation
                     .push_notice(NoticeKind::CommandFailed, &format!("{wording}: {reason}"));
             }
-            SessionEvent::Exited { clean, detail } => self.phase = Phase::Ended { clean, detail },
+            // A clean end leaves a stored conversation that the next message carries on.
+            SessionEvent::Exited { clean, detail } => {
+                self.phase = if clean && self.is_stored() {
+                    Phase::Resting
+                } else {
+                    Phase::Ended { clean, detail }
+                };
+            }
             SessionEvent::TextDelta(_)
             | SessionEvent::ThinkingDelta(_)
             | SessionEvent::ThinkingStarted
@@ -142,7 +289,8 @@ impl Session {
     /// Sends `text`, or queues it while it cannot be sent yet. Only trailing whitespace is
     /// dropped: a first line's indentation is part of what was typed. A message with nothing
     /// but whitespace is neither sent nor queued. A session's first message sent also names the
-    /// session for now and asks the agent for a title.
+    /// session for now and asks the agent for a title. A resting session takes nothing here:
+    /// it is woken with [`Session::wake`], since its program must be started first.
     pub fn submit(&mut self, text: &str) -> Vec<SessionCommand> {
         if text.trim().is_empty() {
             return Vec::new();
@@ -151,16 +299,21 @@ impl Session {
         match self.phase {
             Phase::Idle => self.hand_over(text.into()),
             Phase::Opening | Phase::Working | Phase::NeedsUser => {
-                match &mut self.queued {
-                    Some(queued) => {
-                        queued.push_str("\n\n");
-                        queued.push_str(text);
-                    }
-                    None => self.queued = Some(text.into()),
-                }
+                self.queue(text);
                 Vec::new()
             }
-            Phase::Ended { .. } => Vec::new(),
+            Phase::Resting | Phase::Ended { .. } => Vec::new(),
+        }
+    }
+
+    /// Adds `text` to the queued message, after a blank line.
+    fn queue(&mut self, text: &str) {
+        match &mut self.queued {
+            Some(queued) => {
+                queued.push_str("\n\n");
+                queued.push_str(text);
+            }
+            None => self.queued = Some(text.into()),
         }
     }
 
@@ -169,7 +322,7 @@ impl Session {
     }
 
     pub fn answer(&mut self, id: &RequestId, answer: Answer) -> Option<SessionCommand> {
-        if self.ended() || !self.conversation.answered(id, &answer_words(&answer)) {
+        if self.at_rest() || !self.conversation.answered(id, &answer_words(&answer)) {
             return None;
         }
         self.carry_on_when_nothing_waits();
@@ -180,7 +333,8 @@ impl Session {
     }
 
     /// Asks for the model option `option_id`. Nothing is sent when it is already the model in
-    /// use and already the option the model is named by: the picker then only closes.
+    /// use and already the option the model is named by: the picker then only closes. A
+    /// resting session takes the choice at once, sending nothing: its program starts with it.
     pub fn choose_model(&mut self, option_id: &str) -> Option<SessionCommand> {
         if matches!(self.phase, Phase::Opening | Phase::Ended { .. }) {
             return None;
@@ -191,11 +345,21 @@ impl Session {
             return None;
         }
         self.chosen_model = Some(option_id.into());
+        if self.phase == Phase::Resting {
+            self.model = Some(option.resolved.clone());
+            return None;
+        }
         Some(SessionCommand::SetModel(option_id.into()))
     }
 
-    pub fn choose_mode(&self, mode: PermissionMode) -> Option<SessionCommand> {
+    /// Asks for `mode`. A resting session takes it at once, sending nothing.
+    pub fn choose_mode(&mut self, mode: PermissionMode) -> Option<SessionCommand> {
         if matches!(self.phase, Phase::Opening | Phase::Ended { .. }) || self.mode == mode {
+            return None;
+        }
+        if self.phase == Phase::Resting {
+            self.mode = mode;
+            self.mode_known = true;
             return None;
         }
         Some(SessionCommand::SetPermissionMode(mode))
@@ -238,23 +402,20 @@ impl Session {
         })
     }
 
-    /// How to open this session again after it ended.
-    pub fn restart_spec(&self) -> Option<StartSpec> {
-        if !self.ended() {
-            return None;
-        }
-        let mut spec = StartSpec::new(self.folder.clone());
-        spec.resume = self.id.clone();
-        Some(spec)
-    }
-
     /// Back to `Opening` for a restart, keeping the conversation.
     pub fn reopening(&mut self) {
         self.phase = Phase::Opening;
     }
 
-    fn ended(&self) -> bool {
-        matches!(self.phase, Phase::Ended { .. })
+    /// It can be sent a message: its program runs or starts, or it rests and a message wakes
+    /// it. An ended one takes none until it is restarted.
+    pub fn takes_messages(&self) -> bool {
+        !matches!(self.phase, Phase::Ended { .. })
+    }
+
+    /// No program runs for it: it rests or has ended.
+    pub fn at_rest(&self) -> bool {
+        matches!(self.phase, Phase::Resting | Phase::Ended { .. })
     }
 
     fn in_turn(&self) -> bool {
@@ -282,6 +443,7 @@ impl Session {
     fn hand_over(&mut self, text: String) -> Vec<SessionCommand> {
         self.conversation.push_user(&text);
         self.phase = Phase::Working;
+        self.handed_over += 1;
         let suggest = self.title.is_none().then(|| {
             self.title = Some(title_stand_in(&text));
             SessionCommand::SuggestTitle {
@@ -398,8 +560,12 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::info;
     use super::*;
-    use crate::conversation::ItemBody;
-    use mr_agent::{QuestionAnswer, ToolDetail, TurnSummary, UserRequest, UserRequestKind};
+    use crate::conversation::{DID_NOT_FINISH, ItemBody};
+    use crate::tools::{ToolCall, ToolGroup};
+    use mr_agent::{
+        HistoryItem, QuestionAnswer, StoredHistory, StoredSession, ToolCallId, ToolDetail,
+        ToolOutcome, TurnSummary, UserRequest, UserRequestKind,
+    };
 
     fn started() -> Session {
         let mut s = Session::opening("/p");
@@ -469,7 +635,7 @@ mod tests {
         let as_sent = "    let x = 1;\n  done";
         assert_eq!(s.submit(typed)[0], send(as_sent));
         let shown = s.conversation.items().iter().find_map(|i| match &i.body {
-            ItemBody::User { text } => Some(text.clone()),
+            ItemBody::User { text, .. } => Some(text.clone()),
             _ => None,
         });
         assert_eq!(shown.as_deref(), Some(as_sent));
@@ -556,7 +722,7 @@ mod tests {
             (vec![], None, None, None)
         );
         assert_eq!(s.take_queued().as_deref(), Some("later"));
-        let spec = s.restart_spec().unwrap();
+        let spec = s.start_spec();
         assert_eq!(
             (spec.folder, spec.resume, spec.fork),
             (PathBuf::from("/p"), Some(SessionId("s1".into())), false)
@@ -854,17 +1020,489 @@ mod tests {
         assert_eq!(s.submit("first"), vec![send("first"), suggest("first")]);
     }
 
+    fn stored() -> StoredSession {
+        StoredSession {
+            id: SessionId("s9".into()),
+            folder: "/home/alex/project".into(),
+            title: "Fix the parser".into(),
+            last_active_unix: 1_700_000_000,
+        }
+    }
+
+    /// Models known before the session's program runs: Opus, which offers Auto, and `m-2`.
+    fn offered() -> Vec<ModelOption> {
+        vec![
+            ModelOption {
+                id: "opus".into(),
+                name: "Opus 5.5".into(),
+                resolved: "claude-opus-5-5".into(),
+                stands_for: None,
+                auto_mode: true,
+            },
+            ModelOption {
+                id: "m-2".into(),
+                name: "Model 2".into(),
+                resolved: "m-2".into(),
+                stands_for: None,
+                auto_mode: false,
+            },
+        ]
+    }
+
+    fn said(text: &str) -> HistoryItem {
+        HistoryItem::User {
+            text: text.into(),
+            image_count: 0,
+        }
+    }
+
+    fn clean_exit() -> SessionEvent {
+        SessionEvent::Exited {
+            clean: true,
+            detail: String::new(),
+        }
+    }
+
+    fn killed() -> SessionEvent {
+        SessionEvent::Exited {
+            clean: false,
+            detail: "killed".into(),
+        }
+    }
+
+    fn bodies(s: &Session) -> Vec<ItemBody> {
+        s.conversation
+            .items()
+            .iter()
+            .map(|i| i.body.clone())
+            .collect()
+    }
+
     #[test]
-    fn a_session_that_dies_while_opening_has_nothing_to_resume() {
+    fn a_stored_session_rests() {
+        let s = Session::resting(&stored());
+        assert_eq!(s.id, Some(SessionId("s9".into())));
+        assert_eq!(s.title.as_deref(), Some("Fix the parser"));
+        assert_eq!(s.folder, PathBuf::from("/home/alex/project"));
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.history, HistoryState::NotLoaded);
+        assert!(s.conversation.items().is_empty());
+        assert!(s.is_stored());
+        let mut untitled = stored();
+        untitled.title = String::new();
+        assert_eq!(
+            Session::resting(&untitled).title,
+            None,
+            "an empty title is none"
+        );
+        let new = Session::opening("/p");
+        assert_eq!(
+            new.history,
+            HistoryState::Loaded,
+            "a new session has no history to read"
+        );
+        assert!(!new.is_stored());
+    }
+
+    #[test]
+    fn history_becomes_the_conversation() {
+        let mut s = Session::resting(&stored());
+        let generation = s.generation;
+        let ls = ToolDetail::Command {
+            command: "ls".into(),
+        };
+        s.load_history(StoredHistory {
+            items: vec![
+                said("one"),
+                HistoryItem::AssistantText("Sure.".into()),
+                HistoryItem::Tool {
+                    id: ToolCallId("t1".into()),
+                    name: "Bash".into(),
+                    detail: ls.clone(),
+                    outcome: None,
+                },
+                HistoryItem::Compacted,
+                said("two"),
+            ],
+            earlier_left_out: true,
+            model: None,
+            permission_mode: None,
+        });
+        let closed = ToolCall {
+            id: ToolCallId("t1".into()),
+            name: "Bash".into(),
+            detail: ls,
+            outcome: Some(ToolOutcome::Failed {
+                output: DID_NOT_FINISH.into(),
+            }),
+        };
+        assert_eq!(
+            bodies(&s),
+            vec![
+                ItemBody::Notice {
+                    kind: NoticeKind::EarlierLeftOut,
+                    text: "Earlier messages are not shown.".into()
+                },
+                ItemBody::User {
+                    text: "one".into(),
+                    image_count: 0
+                },
+                ItemBody::Reply {
+                    markdown: "Sure.".into(),
+                    streaming: false
+                },
+                ItemBody::Tools(ToolGroup::start(closed)),
+                ItemBody::Notice {
+                    kind: NoticeKind::Compacted,
+                    text: "Earlier messages were summarised here to save room.".into()
+                },
+                ItemBody::User {
+                    text: "two".into(),
+                    image_count: 0
+                },
+            ]
+        );
+        assert_eq!(s.history, HistoryState::Loaded);
+        assert_eq!(s.generation, generation + 1);
+        assert_eq!(s.phase, Phase::Resting);
+    }
+
+    #[test]
+    fn history_names_the_model_and_the_mode() {
+        let named = || StoredHistory {
+            items: vec![said("one")],
+            model: Some("m-2".into()),
+            permission_mode: Some(PermissionMode::Plan),
+            ..StoredHistory::default()
+        };
+        let mut s = Session::resting(&stored());
+        s.load_history(named());
+        assert_eq!(
+            (s.model.as_deref(), &s.mode),
+            (Some("m-2"), &PermissionMode::Plan)
+        );
+        // What the user chose while the history was on its way is kept.
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered());
+        s.history = HistoryState::Loading;
+        assert_eq!(s.choose_mode(PermissionMode::AcceptEdits), None);
+        assert_eq!(s.choose_model("opus"), None);
+        s.load_history(named());
+        assert_eq!(
+            (s.model.as_deref(), &s.mode),
+            (Some("claude-opus-5-5"), &PermissionMode::AcceptEdits)
+        );
+        assert_eq!(s.model_label(), "Opus 5.5");
+    }
+
+    #[test]
+    fn a_history_never_turns_permission_checks_off() {
+        for mode in [
+            PermissionMode::Bypass,
+            PermissionMode::Other("dontAsk".into()),
+        ] {
+            let mut s = Session::resting(&stored());
+            s.load_history(StoredHistory {
+                items: vec![said("one")],
+                permission_mode: Some(mode.clone()),
+                ..StoredHistory::default()
+            });
+            assert_eq!(
+                s.mode,
+                PermissionMode::Ask,
+                "{mode:?} is not taken from a file"
+            );
+            assert_eq!(s.start_spec().permission_mode, None, "{mode:?}");
+        }
+        for mode in [
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+        ] {
+            let mut s = Session::resting(&stored());
+            s.load_history(StoredHistory {
+                items: vec![said("one")],
+                permission_mode: Some(mode.clone()),
+                ..StoredHistory::default()
+            });
+            assert_eq!(s.mode, mode, "{mode:?} is carried");
+            assert_eq!(s.start_spec().permission_mode, Some(mode));
+        }
+    }
+
+    #[test]
+    fn history_that_arrives_late_goes_first() {
+        let mut s = Session::resting(&stored());
+        s.wake("hi");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(SessionEvent::TextDelta("Hello.".into()), 0.0);
+        s.apply(done(), 0.0);
+        let generation = s.generation;
+        s.load_history(StoredHistory {
+            items: vec![
+                said("before"),
+                HistoryItem::AssistantText("Earlier.".into()),
+            ],
+            model: Some("m-2".into()),
+            permission_mode: Some(PermissionMode::Plan),
+            earlier_left_out: false,
+        });
+        assert_eq!(
+            bodies(&s),
+            vec![
+                ItemBody::User {
+                    text: "before".into(),
+                    image_count: 0
+                },
+                ItemBody::Reply {
+                    markdown: "Earlier.".into(),
+                    streaming: false
+                },
+                ItemBody::User {
+                    text: "hi".into(),
+                    image_count: 0
+                },
+                ItemBody::Reply {
+                    markdown: "Hello.".into(),
+                    streaming: false
+                },
+            ]
+        );
+        assert_eq!(s.generation, generation + 1);
+        assert_eq!(s.history, HistoryState::Loaded);
+        // The running program's model and mode are newer than the history's.
+        assert_eq!(
+            (s.model.as_deref(), &s.mode),
+            (Some("claude-haiku-5-5"), &PermissionMode::Ask)
+        );
+        // A history read again changes nothing more.
+        s.load_history(StoredHistory {
+            items: vec![said("again")],
+            ..StoredHistory::default()
+        });
+        assert_eq!(
+            (s.conversation.items().len(), s.generation),
+            (4, generation + 1)
+        );
+    }
+
+    #[test]
+    fn a_history_that_cannot_be_read_says_why() {
+        let mut s = Session::resting(&stored());
+        s.history = HistoryState::Loading;
+        s.history_failed("i/o error: gone");
+        assert_eq!(s.history, HistoryState::Failed("i/o error: gone".into()));
+        assert_eq!(s.phase, Phase::Resting);
+        assert!(s.conversation.items().is_empty());
+    }
+
+    #[test]
+    fn the_pickers_work_before_the_program_starts() {
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered());
+        assert_eq!(s.choose_mode(PermissionMode::Auto), None);
+        assert_eq!(s.mode, PermissionMode::Auto);
+        assert_eq!(s.choose_model("opus"), None);
+        assert_eq!(s.model_label(), "Opus 5.5");
+        assert!(s.auto_mode());
+        assert_eq!(s.choose_model("nope"), None);
+        assert_eq!(s.model_label(), "Opus 5.5");
+        assert_eq!(
+            s.start_spec(),
+            StartSpec {
+                folder: "/home/alex/project".into(),
+                resume: Some(SessionId("s9".into())),
+                fork: false,
+                model: Some("opus".into()),
+                permission_mode: Some(PermissionMode::Auto),
+            }
+        );
+    }
+
+    #[test]
+    fn a_session_with_nothing_stored_starts_afresh() {
         let mut s = Session::opening("/p");
+        s.apply(killed(), 0.0);
+        let spec = s.start_spec();
+        assert_eq!((spec.folder, spec.resume), (PathBuf::from("/p"), None));
+        // Started, so it has an id, but it died before any message.
+        let mut s = started();
+        s.apply(killed(), 0.0);
+        let spec = s.start_spec();
+        assert_eq!((spec.folder, spec.resume), (PathBuf::from("/p"), None));
+        // Its only message could not be handed over.
+        let mut s = started();
+        s.submit("go");
+        s.send_failed();
+        s.apply(killed(), 0.0);
+        assert_eq!(s.start_spec().resume, None);
+    }
+
+    #[test]
+    fn a_restart_keeps_the_model_and_the_mode() {
+        let mut s = started();
+        s.models[0].auto_mode = true;
+        s.submit("go");
+        s.apply(done(), 0.0);
+        assert_eq!(
+            s.choose_model("default"),
+            Some(SessionCommand::SetModel("default".into()))
+        );
+        s.apply(SessionEvent::ModelChanged("claude-fable-5-2".into()), 0.0);
+        assert_eq!(
+            s.choose_mode(PermissionMode::Auto),
+            Some(SessionCommand::SetPermissionMode(PermissionMode::Auto))
+        );
         s.apply(
-            SessionEvent::Exited {
-                clean: false,
-                detail: "bad flag".into(),
+            SessionEvent::PermissionModeChanged(PermissionMode::Auto),
+            0.0,
+        );
+        s.apply(killed(), 0.0);
+        let spec = s.start_spec();
+        assert_eq!(
+            (spec.resume, spec.model, spec.permission_mode),
+            (
+                Some(SessionId("s1".into())),
+                Some("default".into()),
+                Some(PermissionMode::Auto)
+            )
+        );
+        // Without a choice, the model in use is named by its id; Ask is the program's own
+        // default and is not passed.
+        let mut s = started();
+        s.submit("go");
+        s.apply(killed(), 0.0);
+        let spec = s.start_spec();
+        assert_eq!(
+            (spec.model, spec.permission_mode),
+            (Some("claude-haiku-5-5".into()), None)
+        );
+        // A choice the agent refused is not what the session shows, so it is not passed.
+        let mut s = started();
+        s.submit("go");
+        s.apply(done(), 0.0);
+        s.choose_model("default");
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetModel,
+                reason: "unknown model".into(),
             },
             0.0,
         );
-        let spec = s.restart_spec().unwrap();
-        assert_eq!((spec.folder, spec.resume), (PathBuf::from("/p"), None));
+        s.apply(killed(), 0.0);
+        assert_eq!(s.start_spec().model, Some("claude-haiku-5-5".into()));
+        assert_eq!(Session::resting(&stored()).start_spec().model, None);
+    }
+
+    #[test]
+    fn waking_queues_the_message() {
+        let mut s = Session::resting(&stored());
+        s.wake("hi");
+        assert_eq!(s.phase, Phase::Opening);
+        assert_eq!(s.queued.as_deref(), Some("hi"));
+        assert_eq!(
+            s.apply(SessionEvent::Started(info()), 0.0),
+            vec![send("hi")],
+            "a stored session has a title, so none is asked for"
+        );
+        let mut s = Session::resting(&stored());
+        s.wake("hi");
+        assert_eq!(s.unwake().as_deref(), Some("hi"));
+        assert_eq!((s.phase.clone(), s.queued.clone()), (Phase::Resting, None));
+        // Nothing is woken by whitespace, and nothing but a waking session is put back to rest.
+        s.wake(" \n ");
+        assert_eq!(s.phase, Phase::Resting);
+        let mut live = started();
+        assert_eq!(live.unwake(), None);
+        assert_eq!(live.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn a_resting_session_takes_no_command() {
+        let mut s = Session::resting(&stored());
+        assert_eq!(s.submit("hi"), vec![], "the app wakes it instead");
+        assert_eq!((s.phase.clone(), s.queued.clone()), (Phase::Resting, None));
+        assert_eq!(s.stop(), None);
+        assert_eq!(
+            s.answer(&RequestId("r1".into()), Answer::Allow { always: false }),
+            None
+        );
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+    }
+
+    #[test]
+    fn a_clean_end_puts_a_stored_session_to_rest() {
+        let mut s = started();
+        s.submit("go");
+        s.apply(done(), 0.0);
+        let items = s.conversation.items().len();
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.conversation.items().len(), items, "no notice");
+        let mut s = started();
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(
+            s.phase,
+            Phase::Ended {
+                clean: true,
+                detail: String::new()
+            }
+        );
+        for mut s in [started(), Session::resting(&stored())] {
+            if s.phase == Phase::Resting {
+                s.wake("go");
+                s.apply(SessionEvent::Started(info()), 0.0);
+            } else {
+                s.submit("go");
+            }
+            s.apply(killed(), 0.0);
+            assert!(matches!(s.phase, Phase::Ended { clean: false, .. }));
+        }
+        // A stored session that was woken rests again after a clean end.
+        let mut s = Session::resting(&stored());
+        s.wake("go");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(done(), 0.0);
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+    }
+
+    #[test]
+    fn a_failed_message_returns_to_idle() {
+        let mut s = started();
+        s.submit("go");
+        assert_eq!(s.phase, Phase::Working);
+        s.send_failed();
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(
+            bodies(&s),
+            vec![ItemBody::User {
+                text: "go".into(),
+                image_count: 0
+            }]
+        );
+        let mut s = started();
+        s.send_failed();
+        assert_eq!(s.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn offered_models_do_not_replace_the_sessions_own() {
+        let mut s = started();
+        let own = s.models.clone();
+        s.offer_models(&offered());
+        assert_eq!(s.models, own);
+        let mut r = Session::resting(&stored());
+        r.offer_models(&offered());
+        assert_eq!(r.models, offered());
+        // A newer list replaces one that was only offered.
+        let newer = offered()[..1].to_vec();
+        r.offer_models(&newer);
+        assert_eq!(r.models, newer);
+        r.wake("hi");
+        r.apply(SessionEvent::Started(info()), 0.0);
+        r.offer_models(&offered());
+        assert_eq!(r.models, info().models);
     }
 }

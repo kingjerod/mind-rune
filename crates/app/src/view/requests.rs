@@ -6,7 +6,7 @@ use mr_agent::{
     Answer, Question, QuestionAnswer, QuestionOption, RequestId, ToolDetail, UserRequest,
     UserRequestKind,
 };
-use mr_core::{Item, ItemBody, ItemId, RequestState, file_name};
+use mr_core::{Item, ItemBody, ItemId, RequestState, SessionKey, file_name};
 use rune::{Color, Cursor, El, TextEdit, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Kit, Markdown, TextInput};
 
@@ -34,16 +34,16 @@ const ALWAYS_MIN_HEIGHT: f32 = 24.0;
 /// What a withdrawn request says in place of an answer.
 const NO_LONGER_NEEDED: &str = "No longer needed";
 
-/// A request as a card. While it waits, a card bordered in the warning colour under the label
-/// "Needs you", with its buttons; once answered or withdrawn, one line: its title, then what
-/// became of it. No button on it ever takes keyboard focus.
-pub fn card(ui: &Ui, item: &Item, kit: &Kit) -> El {
+/// A request of `key`'s session as a card. While it waits, a card bordered in the warning colour
+/// under the label "Needs you", with its buttons; once answered or withdrawn, one line: its
+/// title, then what became of it. No button on it ever takes keyboard focus.
+pub fn card(ui: &Ui, key: SessionKey, item: &Item, kit: &Kit) -> El {
     let ItemBody::Request { request, state } = &item.body else {
         return col();
     };
     let title = title(&request.kind);
     match state {
-        RequestState::Waiting => waiting(ui, item.id, request, &title, kit),
+        RequestState::Waiting => waiting(ui, key, item.id, request, &title, kit),
         RequestState::Answered(words) => settled(&request.id, &title, words, true, kit),
         RequestState::Withdrawn => settled(&request.id, &title, NO_LONGER_NEEDED, false, kit),
     }
@@ -152,10 +152,18 @@ fn settled(id: &RequestId, title: &str, words: &str, answered: bool, kit: &Kit) 
         )
 }
 
-/// A request waiting for the user: "Needs you", its title, what it is about, and its buttons,
-/// in a card bordered in the warning colour.
-fn waiting(ui: &Ui, item: ItemId, request: &UserRequest, title: &str, kit: &Kit) -> El {
+/// A request of `key`'s session waiting for the user: "Needs you", its title, what it is about,
+/// and its buttons, in a card bordered in the warning colour.
+fn waiting(
+    ui: &Ui,
+    key: SessionKey,
+    item: ItemId,
+    request: &UserRequest,
+    title: &str,
+    kit: &Kit,
+) -> El {
     let id = &request.id;
+    let view = glue::view_of(ui, key);
     let mut action = None;
     let (body, buttons): (Vec<El>, Vec<El>) = match &request.kind {
         UserRequestKind::Permission {
@@ -163,9 +171,10 @@ fn waiting(ui: &Ui, item: ItemId, request: &UserRequest, title: &str, kit: &Kit)
             always_allow_label,
             ..
         } => {
-            let shown = call_details(kit, detail, None, ui.whole.contains(&item));
-            action = shown.cut.map(|lines| show_all(item, lines, kit));
+            let shown = call_details(kit, detail, None, view.whole.contains(&item));
+            action = shown.cut.map(|lines| show_all(key, item, lines, kit));
             let mut buttons = vec![answer_button(
+                key,
                 id,
                 "Allow once",
                 "mr-allow-",
@@ -174,9 +183,10 @@ fn waiting(ui: &Ui, item: ItemId, request: &UserRequest, title: &str, kit: &Kit)
                 kit,
             )];
             if let Some(label) = always_allow_label {
-                buttons.push(always_button(id, label, kit));
+                buttons.push(always_button(key, id, label, kit));
             }
             buttons.push(answer_button(
+                key,
                 id,
                 "Deny",
                 "mr-deny-",
@@ -188,22 +198,24 @@ fn waiting(ui: &Ui, item: ItemId, request: &UserRequest, title: &str, kit: &Kit)
             (vec![body], buttons)
         }
         UserRequestKind::Question { questions } => {
-            let drafts = ui.answers.get(id).map_or(&[][..], Vec::as_slice);
+            let drafts = view.answers.get(id).map_or(&[][..], Vec::as_slice);
             let body = questions
                 .iter()
                 .enumerate()
-                .map(|(q, question)| question_part(item, id, questions, q, question, drafts, kit))
+                .map(|(q, question)| {
+                    question_part(key, item, id, questions, q, question, drafts, kit)
+                })
                 .collect();
             let complete = question_answers(questions, drafts).is_some();
             let send = {
-                let key = format!("mr-answer-{}", id.0);
+                let button_key = format!("mr-answer-{}", id.0);
                 let (id, questions) = (id.clone(), questions.clone());
                 request_button(
                     Button::new("Send answer")
                         .variant(ButtonVariant::Contrast)
                         .disabled(!complete)
-                        .on_press(move |ui: &mut Ui| send_answers(ui, &id, &questions)),
-                    key,
+                        .on_press(move |ui: &mut Ui| send_answers(ui, key, &id, &questions)),
+                    button_key,
                     kit,
                 )
             };
@@ -217,6 +229,7 @@ fn waiting(ui: &Ui, item: ItemId, request: &UserRequest, title: &str, kit: &Kit)
                 .w_full();
             let buttons = vec![
                 answer_button(
+                    key,
                     id,
                     "Approve",
                     "mr-approve-",
@@ -225,6 +238,7 @@ fn waiting(ui: &Ui, item: ItemId, request: &UserRequest, title: &str, kit: &Kit)
                     kit,
                 ),
                 answer_button(
+                    key,
                     id,
                     "Keep planning",
                     "mr-keep-",
@@ -302,9 +316,12 @@ fn changed_file(kind: &UserRequestKind) -> Option<&str> {
     }
 }
 
-/// One question of a question card: its header, its prompt, one choice per option and a
-/// "Something else" field. Enter in the field sends the answer once every question has one.
+/// One question of a question card of `key`'s session: its header, its prompt, one choice per
+/// option and a "Something else" field. Enter in the field sends the answer once every question
+/// has one.
+#[expect(clippy::too_many_arguments, reason = "one question's place and look")]
 fn question_part(
+    key: SessionKey,
     item: ItemId,
     id: &RequestId,
     questions: &[Question],
@@ -334,25 +351,25 @@ fn question_part(
     let mut choices = col().w_full().max_w(OPTIONS_MAX_WIDTH).gap(6.0);
     for (o, option) in question.options.iter().enumerate() {
         let chosen = draft.is_some_and(|d| d.chosen.contains(&option.label));
-        choices = choices.child(choice(item, id, questions, q, o, option, chosen, kit));
+        choices = choices.child(choice(key, item, id, questions, q, o, option, chosen, kit));
     }
     let empty = TextEdit::new("");
     let edit = draft.map_or(&empty, |d| &d.other);
     let count = questions.len();
     let field = {
-        let key = format!("mr-other-{}-{q}", id.0);
+        let field_key = format!("mr-other-{}-{q}", id.0);
         let (id, change_id, submit_id) = (id.clone(), id.clone(), id.clone());
         let (question, questions) = (question.clone(), questions.to_vec());
         TextInput::new(edit)
             .placeholder("Something else")
             .width(None)
-            .on_edit(move |ui: &mut Ui| &mut drafts_mut(ui, &id, count)[q].other)
+            .on_edit(move |ui: &mut Ui| &mut drafts_mut(ui, key, &id, count)[q].other)
             .on_change(move |ui: &mut Ui, _tx| {
-                typed(&mut drafts_mut(ui, &change_id, count)[q], &question);
+                typed(&mut drafts_mut(ui, key, &change_id, count)[q], &question);
             })
-            .on_submit(move |ui: &mut Ui, _tx| send_answers(ui, &submit_id, &questions))
+            .on_submit(move |ui: &mut Ui, _tx| send_answers(ui, key, &submit_id, &questions))
             .build(kit)
-            .key(key)
+            .key(field_key)
     };
     part.child(choices.child(field))
 }
@@ -361,6 +378,7 @@ fn question_part(
 /// Pressing it chooses or un-chooses it.
 #[expect(clippy::too_many_arguments, reason = "one option's place and look")]
 fn choice(
+    key: SessionKey,
     item: ItemId,
     id: &RequestId,
     questions: &[Question],
@@ -394,8 +412,8 @@ fn choice(
         let (id, question, label) = (id.clone(), questions[q].clone(), option.label.clone());
         let count = questions.len();
         move |ui: &mut Ui| {
-            if is_waiting(ui, item) {
-                choose(&mut drafts_mut(ui, &id, count)[q], &question, &label);
+            if is_waiting(ui, key, item) {
+                choose(&mut drafts_mut(ui, key, &id, count)[q], &question, &label);
             }
         }
     };
@@ -448,8 +466,9 @@ fn unchosen_ring(kit: &Kit) -> Color {
     kit.c.icon_muted
 }
 
-/// A button that sends `answer` to request `id`, keyed `{prefix}{id}`.
+/// A button that sends `answer` to request `id` of `key`'s session, keyed `{prefix}{id}`.
 fn answer_button(
+    session: SessionKey,
     id: &RequestId,
     label: &str,
     prefix: &str,
@@ -463,7 +482,7 @@ fn answer_button(
         Button::new(label)
             .variant(variant)
             .on_press(move |ui: &mut Ui| {
-                let effects = ui.app.answer(&id, answer.clone());
+                let effects = ui.app.answer(session, &id, answer.clone());
                 glue::run(ui, effects);
             }),
         key,
@@ -475,7 +494,7 @@ fn answer_button(
 /// like a Neutral kit button, but its label wraps: the end of the rule is its scope ("in this
 /// project"), so the whole of it must be readable before the click. A kit `Button` keeps one
 /// line and a fixed height, so a long rule would run out of the card.
-fn always_button(id: &RequestId, label: &str, kit: &Kit) -> El {
+fn always_button(key: SessionKey, id: &RequestId, label: &str, kit: &Kit) -> El {
     let rid = id.clone();
     let font = kit.ty.ui_medium;
     // One line is exactly as tall as the kit buttons beside it; more lines add their height.
@@ -502,14 +521,15 @@ fn always_button(id: &RequestId, label: &str, kit: &Kit) -> El {
         .cursor(Cursor::Pointer)
         .child(words)
         .on_press(move |ui: &mut Ui| {
-            let effects = ui.app.answer(&rid, Answer::Allow { always: true });
+            let effects = ui.app.answer(key, &rid, Answer::Allow { always: true });
             glue::run(ui, effects);
         });
     unfocusable(kit.interactive(kit.elevate(r, &kit.elevation.button_neutral)))
 }
 
-/// A request's button, keyed `key`: pressed by a click only.
-fn request_button(button: Button, key: String, kit: &Kit) -> El {
+/// A request's button, keyed `key`: pressed by a click only. The card that asks before joining a
+/// session open elsewhere has its buttons made here too.
+pub(super) fn request_button(button: Button, key: String, kit: &Kit) -> El {
     unfocusable(button.build(kit).key(key))
 }
 
@@ -520,31 +540,41 @@ fn unfocusable(e: El) -> El {
     e.focusable(false).preserve_focus_on_press(true)
 }
 
-/// Sends the answers drafted for question request `id`, once every question has one.
-fn send_answers(ui: &mut Ui, id: &RequestId, questions: &[Question]) {
-    let Some(answers) = ui
+/// Sends the answers drafted for question request `id` of `key`'s session, once every question
+/// has one.
+fn send_answers(ui: &mut Ui, key: SessionKey, id: &RequestId, questions: &[Question]) {
+    let Some(answers) = glue::view_of(ui, key)
         .answers
         .get(id)
         .and_then(|drafts| question_answers(questions, drafts))
     else {
         return;
     };
-    let effects = ui.app.answer(id, Answer::Answers(answers));
+    let effects = ui.app.answer(key, id, Answer::Answers(answers));
     glue::run(ui, effects);
 }
 
-/// The drafts of request `id`, one per question, made empty when there are none yet.
-fn drafts_mut<'a>(ui: &'a mut Ui, id: &RequestId, count: usize) -> &'a mut Vec<QuestionDraft> {
-    let drafts = ui.answers.entry(id.clone()).or_default();
+/// The drafts of request `id` of `key`'s session, one per question, made empty when there are
+/// none yet.
+fn drafts_mut<'a>(
+    ui: &'a mut Ui,
+    key: SessionKey,
+    id: &RequestId,
+    count: usize,
+) -> &'a mut Vec<QuestionDraft> {
+    let drafts = glue::view_mut(ui, key)
+        .answers
+        .entry(id.clone())
+        .or_default();
     if drafts.len() < count {
         drafts.resize_with(count, QuestionDraft::default);
     }
     drafts
 }
 
-/// Whether item `item` of the current session is a request still waiting.
-fn is_waiting(ui: &Ui, item: ItemId) -> bool {
-    items::find(ui, item).is_some_and(|item| {
+/// Whether item `item` of `key`'s session is a request still waiting.
+fn is_waiting(ui: &Ui, key: SessionKey, item: ItemId) -> bool {
+    items::find(ui, key, item).is_some_and(|item| {
         matches!(
             item.body,
             ItemBody::Request {
@@ -565,7 +595,7 @@ mod tests {
     use rune::{Key, Runtime, TextEdit};
 
     use super::{choose, permission_title, question_answers, typed, unchosen_ring};
-    use crate::glue::{QuestionDraft, Ui};
+    use crate::glue::{self, QuestionDraft, Ui};
     use crate::testkit;
     use crate::theme;
 
@@ -594,7 +624,7 @@ mod tests {
     }
     /// Whether the keyboard walks leave the focused control unpressed, because pressing it does
     /// that control's own job, which has nothing to do with requests: Space on "New session"
-    /// replaces the session, and Enter on a picker's trigger opens its list, which then holds
+    /// asks for a new session's folder, and Enter on a picker's trigger opens its list, which then holds
     /// focus (Enter there picks the first option and sends focus back to the text area), so
     /// the walk would go round the picker for good and never reach the controls after it.
     fn leave_unpressed(rt: &Runtime<Ui>) -> bool {
@@ -626,10 +656,7 @@ mod tests {
         ] {
             assert!(testkit::has_text(&rt, part), "{part}");
         }
-        assert_eq!(
-            rt.state.app.session.as_ref().unwrap().phase,
-            Phase::NeedsUser
-        );
+        assert_eq!(rt.state.shown_session().unwrap().phase, Phase::NeedsUser);
         testkit::click(&mut rt, "mr-always-r1");
         testkit::step(&mut rt);
         assert_eq!(answers(&rt), vec![Answer::Allow { always: true }]);
@@ -662,16 +689,7 @@ mod tests {
         }
         testkit::step(&mut rt);
         assert_eq!(answers(&rt), vec![]);
-        assert_eq!(
-            rt.state
-                .app
-                .session
-                .as_ref()
-                .unwrap()
-                .conversation
-                .waiting(),
-            1
-        );
+        assert_eq!(rt.state.shown_session().unwrap().conversation.waiting(), 1);
     }
 
     #[test]
@@ -854,7 +872,7 @@ mod tests {
         testkit::click(&mut rt, "mr-option-q1-0-0");
         assert!(chosen(&rt, 0, 0));
         assert_eq!(
-            rt.state.answers[&q1()][0].other.text,
+            testkit::shown_view(&rt).answers[&q1()][0].other.text,
             "",
             "choosing Red cleared the field"
         );
@@ -996,7 +1014,7 @@ mod tests {
         );
         assert!(testkit::has_text(&rt, "Red, extra large"));
         assert!(
-            rt.state.answers.is_empty(),
+            testkit::shown_view(&rt).answers.is_empty(),
             "an answered request's drafts are dropped"
         );
     }
@@ -1005,34 +1023,30 @@ mod tests {
     fn a_withdrawn_question_drops_its_drafts() {
         let mut rt = testkit::window("question");
         testkit::click(&mut rt, "mr-option-q1-0-0");
-        assert!(rt.state.answers.contains_key(&q1()));
+        assert!(testkit::shown_view(&rt).answers.contains_key(&q1()));
         testkit::emit(&mut rt, SessionEvent::RequestWithdrawn { id: q1() });
-        assert!(rt.state.answers.is_empty());
+        assert!(testkit::shown_view(&rt).answers.is_empty());
         assert!(testkit::has_text(&rt, "No longer needed"));
     }
 
     #[test]
     fn a_new_session_that_reuses_a_request_id_starts_from_an_empty_draft() {
         let mut rt = testkit::window("question");
+        let asking = rt.state.app.shown.unwrap();
         testkit::click(&mut rt, "mr-option-q1-0-0");
         testkit::click(&mut rt, "mr-other-q1-1");
         testkit::type_text(&mut rt, "XL");
-        testkit::click(&mut rt, "mr-new-session");
-        testkit::step(&mut rt);
-        assert_eq!(rt.state.app.current_open(), 2);
+        let _folder = testkit::new_session_elsewhere(&mut rt);
+        assert_eq!(testkit::shown_open(&rt), Some(2));
         assert!(
-            rt.state.answers.is_empty(),
-            "the old session's drafts are gone"
+            testkit::shown_view(&rt).answers.is_empty(),
+            "the new session has no drafts"
         );
-        let asked = rt
-            .state
-            .app
-            .session
-            .as_ref()
-            .unwrap()
-            .conversation
-            .items()
-            .len();
+        assert!(
+            glue::view_of(&rt.state, asking).answers.contains_key(&q1()),
+            "the old session still asks, and keeps its own"
+        );
+        let asked = rt.state.shown_session().unwrap().conversation.items().len();
         assert_eq!(asked, 0);
         let same = SessionEvent::NeedsUser(UserRequest {
             id: q1(),
@@ -1057,7 +1071,10 @@ mod tests {
         testkit::emit(&mut rt, same);
         assert!(rt.find("mr-answer-q1").is_some());
         // Drawing the field makes an empty draft (Rune syncs focus into it): empty is the point.
-        let drafts = rt.state.answers.get(&q1()).map_or(&[][..], Vec::as_slice);
+        let drafts = testkit::shown_view(&rt)
+            .answers
+            .get(&q1())
+            .map_or(&[][..], Vec::as_slice);
         assert!(
             drafts
                 .iter()
@@ -1082,7 +1099,7 @@ mod tests {
         }
         testkit::step(&mut rt);
         assert_eq!(answers(&rt), vec![]);
-        let session = rt.state.app.session.as_ref().unwrap();
+        let session = rt.state.shown_session().unwrap();
         assert_eq!(session.conversation.waiting(), 1);
     }
 
