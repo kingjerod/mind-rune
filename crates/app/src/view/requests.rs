@@ -375,7 +375,7 @@ fn question_part(
 }
 
 /// One option of a question: its label with its description beneath, marked when chosen.
-/// Pressing it chooses or un-chooses it.
+/// Pressing it chooses or un-chooses it, and focuses the tile.
 #[expect(clippy::too_many_arguments, reason = "one option's place and look")]
 fn choice(
     key: SessionKey,
@@ -413,6 +413,7 @@ fn choice(
         let count = questions.len();
         move |ui: &mut Ui| {
             if is_waiting(ui, key, item) {
+                glue::focus_tile(ui, key, false);
                 choose(&mut drafts_mut(ui, key, &id, count)[q], &question, &label);
             }
         }
@@ -535,8 +536,9 @@ pub(super) fn request_button(button: Button, key: String, kit: &Kit) -> El {
 
 /// Never a keyboard focus stop, so neither Tab, Enter nor Space can reach it, and a click on it
 /// leaves whatever field has focus focused. It is never the window's default button either:
-/// nothing here calls `default_button`.
-fn unfocusable(e: El) -> El {
+/// nothing here calls `default_button`. A request's buttons and a tile's close button are made
+/// so.
+pub(super) fn unfocusable(e: El) -> El {
     e.focusable(false).preserve_focus_on_press(true)
 }
 
@@ -628,10 +630,12 @@ mod tests {
     /// focus (Enter there picks the first option and sends focus back to the text area), so
     /// the walk would go round the picker for good and never reach the controls after it.
     fn leave_unpressed(rt: &Runtime<Ui>) -> bool {
-        matches!(
-            focused_key(rt).as_deref(),
-            Some("mr-new-session" | "mr-model-trigger" | "mr-mode-trigger")
-        )
+        let controls = [
+            "mr-new-session".to_string(),
+            testkit::model_key(rt, "trigger"),
+            testkit::mode_key(rt, "trigger"),
+        ];
+        focused_key(rt).is_some_and(|key| controls.contains(&key))
     }
     fn answers(rt: &Runtime<Ui>) -> Vec<Answer> {
         testkit::sent(rt)
@@ -656,7 +660,7 @@ mod tests {
         ] {
             assert!(testkit::has_text(&rt, part), "{part}");
         }
-        assert_eq!(rt.state.shown_session().unwrap().phase, Phase::NeedsUser);
+        assert_eq!(rt.state.focused_session().unwrap().phase, Phase::NeedsUser);
         testkit::click(&mut rt, "mr-always-r1");
         testkit::step(&mut rt);
         assert_eq!(answers(&rt), vec![Answer::Allow { always: true }]);
@@ -689,7 +693,10 @@ mod tests {
         }
         testkit::step(&mut rt);
         assert_eq!(answers(&rt), vec![]);
-        assert_eq!(rt.state.shown_session().unwrap().conversation.waiting(), 1);
+        assert_eq!(
+            rt.state.focused_session().unwrap().conversation.waiting(),
+            1
+        );
     }
 
     #[test]
@@ -1032,7 +1039,7 @@ mod tests {
     #[test]
     fn a_new_session_that_reuses_a_request_id_starts_from_an_empty_draft() {
         let mut rt = testkit::window("question");
-        let asking = rt.state.app.shown.unwrap();
+        let asking = testkit::focused(&rt).unwrap();
         testkit::click(&mut rt, "mr-option-q1-0-0");
         testkit::click(&mut rt, "mr-other-q1-1");
         testkit::type_text(&mut rt, "XL");
@@ -1046,7 +1053,13 @@ mod tests {
             glue::view_of(&rt.state, asking).answers.contains_key(&q1()),
             "the old session still asks, and keeps its own"
         );
-        let asked = rt.state.shown_session().unwrap().conversation.items().len();
+        let asked = rt
+            .state
+            .focused_session()
+            .unwrap()
+            .conversation
+            .items()
+            .len();
         assert_eq!(asked, 0);
         let same = SessionEvent::NeedsUser(UserRequest {
             id: q1(),
@@ -1099,7 +1112,7 @@ mod tests {
         }
         testkit::step(&mut rt);
         assert_eq!(answers(&rt), vec![]);
-        let session = rt.state.shown_session().unwrap();
+        let session = rt.state.focused_session().unwrap();
         assert_eq!(session.conversation.waiting(), 1);
     }
 
@@ -1171,8 +1184,10 @@ mod tests {
             testkit::step(&mut rt);
             assert_eq!(answers(&rt), vec![Answer::Allow { always: true }]);
             // At the smallest size the card is taller than the conversation's viewport (the
-            // input box takes the rest), so its settled line starts above the viewport and comes
-            // into view as the card's buttons finish leaving: one more step.
+            // tile's header and the input box take the rest), so its settled line starts above
+            // the viewport and comes into view as the card's buttons finish leaving: the window
+            // settles first.
+            rt.settle_all();
             testkit::step(&mut rt);
             assert!(testkit::has_text(&rt, "Always allowed"));
         }

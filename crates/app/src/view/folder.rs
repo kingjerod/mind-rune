@@ -4,6 +4,10 @@
 //! picker. A custom group's "New session" and "+" open the same menu, and the session started
 //! is placed in that group. With no session shown, the conversation area says how to start one.
 //!
+//! A new session takes the focused tile's place. One whose folder is chosen with Ctrl held (Cmd
+//! on macOS), in the menu or as "Choose a folder…", and every one of the menu Ctrl+Shift+N opens,
+//! opens to the side instead: in a new tile right of the focused one, when there is room.
+//!
 //! When the picker fails, or a folder chosen is gone, a line says so under "New session": in
 //! the sidebar while it shows, in the empty conversation area while that is drawn, and when
 //! neither is on screen (the sidebar hidden and a session shown), floating under the sidebar's
@@ -11,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mr_core::GroupId;
+use mr_core::{GroupId, Place};
 use rune::{Cx, El, FileDialogOptions, KeyEvent, Tx, col, el, text};
 use rune_kit::{Button, ButtonVariant, Kit, Menu, MenuItem};
 use rune_theme_opencode::icons::PLUS;
@@ -50,10 +54,16 @@ pub fn is_new_session_key(ev: &KeyEvent) -> bool {
     ev.is_command('n') && !m.shift && !m.alt && !(cfg!(target_os = "macos") && m.ctrl)
 }
 
-/// Asks for the folder of a new session, placed in `group` when one is named: opens the folder
-/// menu with the app's choices that are folders on the disk now, or, with none, the folder
-/// picker. This is a new try, so the picker's last error goes.
-pub fn ask(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>) {
+/// Ctrl+Shift+N (Cmd+Shift+N on macOS): a new session to the side.
+pub fn is_side_session_key(ev: &KeyEvent) -> bool {
+    let m = ev.mods;
+    ev.is_command('n') && m.shift && !m.alt && !(cfg!(target_os = "macos") && m.ctrl)
+}
+
+/// Asks for the folder of a new session, placed in `group` when one is named, and to the side
+/// with `side`: opens the folder menu with the app's choices that are folders on the disk now,
+/// or, with none, the folder picker. This is a new try, so the picker's last error goes.
+pub fn ask(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>, side: bool) {
     ui.folder_error = None;
     let offers: Vec<PathBuf> = ui
         .app
@@ -63,24 +73,40 @@ pub fn ask(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>) {
         .collect();
     if offers.is_empty() {
         close(ui);
-        pick(ui, tx, group);
+        pick(ui, tx, group, side_or_focused(side));
         return;
     }
     ui.folder_offers = offers;
+    // The menu takes the pointer: a row being dragged never hears its release.
+    ui.drag = None;
     ui.folder_menu = Some(group);
+    ui.folder_side = side;
 }
 
-/// Shuts the folder menu.
+/// Shuts the folder menu, and with it its asking for a session to the side.
 pub fn close(ui: &mut Ui) {
     ui.folder_menu = None;
     ui.folder_offers.clear();
+    ui.folder_side = false;
 }
 
-/// The desktop's folder picker, starting in the shown session's folder or else the home folder.
-/// The folder chosen gets a new session, placed in `group` when one is named. A cancel does
-/// nothing; an error is kept, to be shown under the button.
-fn pick(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>) {
-    let directory = ui.app.shown_entry().map_or_else(
+/// To the side when `side`, else in the focused tile.
+pub(super) fn side_or_focused(side: bool) -> Place {
+    if side { Place::Side } else { Place::Focused }
+}
+
+/// Where the session of a choice made in the open folder menu goes: to the side when the menu
+/// was opened for that or Ctrl is held as it is chosen.
+fn chosen_place(ui: &Ui, tx: &Tx) -> Place {
+    side_or_focused(ui.folder_side || tx.mods().cmd)
+}
+
+/// The desktop's folder picker, starting in the focused session's folder or else the home
+/// folder.
+/// The folder chosen gets a new session at `place`, placed in `group` when one is named. A
+/// cancel does nothing; an error is kept, to be shown under the button.
+fn pick(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>, place: Place) {
+    let directory = ui.app.focused_entry().map_or_else(
         || ui.app.home().to_path_buf(),
         |entry| entry.session.folder.clone(),
     );
@@ -92,7 +118,7 @@ fn pick(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>) {
     tx.open_folder(
         options,
         move |ui: &mut Ui, result, tx: &mut Tx| match result {
-            Ok(Some(folder)) => start_chosen(ui, tx, folder, group.as_ref()),
+            Ok(Some(folder)) => start_chosen(ui, tx, folder, group.as_ref(), place),
             Ok(None) => {}
             Err(error) => {
                 ui.folder_error = Some(format!("The folder picker could not be opened: {error}"));
@@ -105,7 +131,13 @@ fn pick(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>) {
 /// own, when it is still a folder. This is a new try, so an earlier error goes. When it is
 /// gone, nothing starts, the recent folders stay as they are, and a line says so where the
 /// picker's error goes.
-pub(super) fn start_chosen(ui: &mut Ui, tx: &mut Tx, folder: PathBuf, group: Option<&GroupId>) {
+pub(super) fn start_chosen(
+    ui: &mut Ui,
+    tx: &mut Tx,
+    folder: PathBuf,
+    group: Option<&GroupId>,
+    place: Place,
+) {
     ui.folder_error = None;
     if !folder.is_dir() {
         ui.folder_error = Some(format!(
@@ -114,26 +146,27 @@ pub(super) fn start_chosen(ui: &mut Ui, tx: &mut Tx, folder: PathBuf, group: Opt
         ));
         return;
     }
-    start(ui, tx, folder, group);
+    start(ui, tx, folder, group, place);
 }
 
-/// Starts a new session in `folder`, placed in `group` when one is named, and shows it at once,
-/// as `glue::show` shows one (the conversation left does not fade out over it, and it stays
-/// while text is typed in it), with its input box focused. When the shown session is an empty
-/// one in that folder already, it stays, and its box takes the focus.
-pub fn start(ui: &mut Ui, tx: &mut Tx, folder: PathBuf, group: Option<&GroupId>) {
-    let before = ui.app.shown;
-    let leaving = glue::leaving(ui);
+/// Starts a new session in `folder`, placed in `group` when one is named, and shows it at once
+/// at `place`, as `glue::show` shows one (the conversation left does not fade out over it, and
+/// it stays while text is typed in it). The session focused afterwards has its tile and its
+/// input box focused: the new one, or, when the focused session is an empty one in that folder
+/// already, that one, which stays.
+pub fn start(ui: &mut Ui, tx: &mut Tx, folder: PathBuf, group: Option<&GroupId>, place: Place) {
+    let before = ui.app.focused();
+    let leaving = glue::leaving(ui, place);
     let effects = match group {
-        Some(group) => ui.app.new_session_in(folder, group, leaving),
-        None => ui.app.new_session(folder, leaving),
+        Some(group) => ui.app.new_session_in(folder, group, place, leaving),
+        None => ui.app.new_session(folder, place, leaving),
     };
     glue::run(ui, effects);
-    if ui.app.shown != before {
+    if ui.app.focused() != before {
         tx.instant();
     }
-    if let Some(key) = ui.app.shown {
-        glue::view_mut(ui, key).draft.focused = true;
+    if let Some(key) = ui.app.focused() {
+        glue::focus_tile(ui, key, true);
     }
 }
 
@@ -155,15 +188,17 @@ pub fn menu(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, layer: &mut Vec<El>) {
         let item = MenuItem::new(name(folder))
             .description(folder.display().to_string())
             .on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
+                let place = chosen_place(ui, tx);
                 close(ui);
-                start_chosen(ui, tx, chosen.clone(), group.as_ref());
+                start_chosen(ui, tx, chosen.clone(), group.as_ref(), place);
             });
         menu = menu.item(item);
     }
     let group = group.clone();
     let choose = MenuItem::new("Choose a folder…").on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
+        let place = chosen_place(ui, tx);
         close(ui);
-        pick(ui, tx, group.clone());
+        pick(ui, tx, group.clone(), place);
     });
     // What it hands back is its trigger's empty wrapper: nothing to draw.
     drop(menu.separator().item(choose).build(kit, layer));
@@ -217,12 +252,12 @@ pub fn error(ui: &Ui, kit: &Kit) -> Option<El> {
 }
 
 /// The error line, while there is one and neither "New session" is on screen (the sidebar is
-/// hidden and a session is shown): into `layer`, floating under the sidebar's toggle.
+/// hidden and a tile is shown): into `layer`, floating under the sidebar's toggle.
 pub fn floating_error(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, layer: &mut Vec<El>) {
     let Some(error) = &ui.folder_error else {
         return;
     };
-    if ui.sidebar.is_open() || ui.app.shown.is_none() {
+    if ui.sidebar.is_open() || ui.app.focused().is_none() {
         return;
     }
     let (x, y) = under(cx, SIDEBAR_TOGGLE).unwrap_or(CORNER);
@@ -245,7 +280,7 @@ pub fn empty(ui: &Ui, kit: &Kit) -> El {
     let new_session = Button::new("New session")
         .icon(&PLUS)
         .variant(ButtonVariant::Neutral)
-        .on_press_tx(|ui: &mut Ui, tx: &mut Tx| ask(ui, tx, None))
+        .on_press_tx(|ui: &mut Ui, tx: &mut Tx| ask(ui, tx, None, false))
         .build(kit)
         .key(EMPTY_NEW)
         .mt(10.0);
@@ -284,10 +319,11 @@ mod tests {
 
     use mr_agent::SessionCommand;
     use mr_core::{GroupId, Phase, SessionKey};
-    use rune::{FileDialogKind, Key, Mods, Runtime};
+    use rune::{FileDialogKind, Key, Mods, PhysicalInput, Runtime};
 
+    use crate::demo;
     use crate::glue::{self, Ui};
-    use crate::{demo, testkit};
+    use crate::testkit::{self, box_focused, group_of, tile_keys};
 
     /// The folder menu's surface, as the kit keys it.
     const MENU: &str = "mr-folder-menu";
@@ -342,7 +378,7 @@ mod tests {
     }
 
     fn shown(rt: &Runtime<Ui>) -> SessionKey {
-        rt.state.app.shown.expect("a session is shown")
+        testkit::focused(rt).expect("a session is shown")
     }
 
     fn folder_of(rt: &Runtime<Ui>, key: SessionKey) -> PathBuf {
@@ -356,11 +392,6 @@ mod tests {
             .clone()
     }
 
-    fn group_of(rt: &Runtime<Ui>, key: SessionKey) -> GroupId {
-        let entry = rt.state.app.sessions.get(key).unwrap();
-        rt.state.app.groups.group_of(entry)
-    }
-
     /// `key`'s session was shown with its program asked for, and the program started.
     fn started(rt: &mut Runtime<Ui>, key: SessionKey) {
         assert!(rt.state.app.sessions.get(key).unwrap().open.is_some());
@@ -369,14 +400,9 @@ mod tests {
         assert_eq!(entry.session.phase, Phase::Idle, "its program started");
     }
 
-    /// Ctrl+N, as it arrives off macOS.
+    /// Ctrl+N (Cmd+N on macOS).
     fn ctrl_n(rt: &mut Runtime<Ui>) {
-        let mods = Mods {
-            cmd: true,
-            ctrl: !cfg!(target_os = "macos"),
-            ..Mods::default()
-        };
-        testkit::press_with(rt, Key::Command('n'), mods);
+        testkit::press_with(rt, Key::Command('n'), testkit::ctrl());
         testkit::step(rt);
     }
 
@@ -539,7 +565,7 @@ mod tests {
             below[0] + below[2] <= rt.state.sidebar.width() + 0.5,
             "in the sidebar"
         );
-        assert!(rt.state.app.shown.is_none(), "nothing started");
+        assert!(testkit::focused(&rt).is_none(), "nothing started");
         // Until the next try.
         rt.resolve_file_dialog(None).unwrap();
         testkit::step(&mut rt);
@@ -610,7 +636,7 @@ mod tests {
         testkit::add_session(&mut rt, gone.to_str().unwrap());
         fs::remove_dir(&gone).unwrap();
         hide_sidebar(&mut rt);
-        assert!(rt.state.app.shown.is_some());
+        assert!(testkit::focused(&rt).is_some());
         ctrl_n(&mut rt);
         assert!(rt.file_dialog().is_some());
         ctrl_n(&mut rt);
@@ -827,7 +853,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let [notes] = folders(&dir, ["notes"]);
         let mut rt = testkit::window("empty-start");
-        assert_eq!(rt.state.app.shown, None);
+        assert_eq!(testkit::focused(&rt), None);
         assert_eq!(
             texts_in(&rt, "mr-empty"),
             [
@@ -847,5 +873,127 @@ mod tests {
         assert_eq!(folder_of(&rt, key), notes);
         assert!(rt.find("mr-empty").is_none());
         assert!(input_focused(&rt));
+    }
+
+    // Open to the side: Task 9 of plan 4.
+
+    /// A window wide enough for a second tile beside the first.
+    const WIDE: (f32, f32) = (1800.0, 900.0);
+
+    /// Holds Ctrl (Cmd on macOS), or lets it go, and steps.
+    fn hold_ctrl(rt: &mut Runtime<Ui>, held: bool) {
+        let mods = if held {
+            testkit::ctrl()
+        } else {
+            Mods::default()
+        };
+        rt.physical_input(PhysicalInput::Modifiers(mods));
+        testkit::step(rt);
+    }
+
+    #[test]
+    fn a_new_session_opens_to_the_side_with_ctrl() {
+        let dir = tempfile::tempdir().unwrap();
+        let [notes] = folders(&dir, ["notes"]);
+        let mut rt = testkit::window_sized("conversation", WIDE);
+        let old = shown(&rt);
+        rt.state.app.recent_folders = vec![notes.clone()];
+        testkit::click(&mut rt, "mr-new-session");
+        testkit::step(&mut rt);
+        hold_ctrl(&mut rt, true);
+        testkit::click(&mut rt, "mr-folder-item0");
+        hold_ctrl(&mut rt, false);
+        let new = shown(&rt);
+        assert_ne!(new, old);
+        assert_eq!(folder_of(&rt, new), notes);
+        assert_eq!(tile_keys(&rt), [old, new], "beside the one there");
+        assert_eq!(rt.state.folder_menu, None);
+        assert!(box_focused(&rt, new), "its input box has the focus");
+        assert!(!box_focused(&rt, old));
+        started(&mut rt, new);
+    }
+
+    #[test]
+    fn a_new_session_with_ctrl_and_no_room_takes_the_focused_tile() {
+        let dir = tempfile::tempdir().unwrap();
+        let [notes] = folders(&dir, ["notes"]);
+        let mut rt = testkit::window_sized("conversation", (1000.0, 800.0));
+        let old = shown(&rt);
+        assert_eq!(tile_keys(&rt), [old]);
+        assert!(!rt.state.app.room_for_tile());
+        rt.state.app.recent_folders = vec![notes.clone()];
+        testkit::click(&mut rt, "mr-new-session");
+        testkit::step(&mut rt);
+        hold_ctrl(&mut rt, true);
+        testkit::click(&mut rt, "mr-folder-item0");
+        hold_ctrl(&mut rt, false);
+        let new = shown(&rt);
+        assert_ne!(new, old);
+        assert_eq!(folder_of(&rt, new), notes);
+        assert_eq!(tile_keys(&rt), [new], "one tile, holding the new session");
+        assert!(box_focused(&rt, new));
+        started(&mut rt, new);
+    }
+
+    #[test]
+    fn a_folder_picked_with_ctrl_opens_to_the_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let [notes, picked] = folders(&dir, ["notes", "picked"]);
+        let mut rt = testkit::window_sized("conversation", WIDE);
+        let old = shown(&rt);
+        rt.state.app.recent_folders = vec![notes];
+        testkit::click(&mut rt, "mr-new-session");
+        testkit::step(&mut rt);
+        hold_ctrl(&mut rt, true);
+        testkit::click_text(&mut rt, "Choose a folder…");
+        hold_ctrl(&mut rt, false);
+        assert_eq!(rt.state.folder_menu, None, "the menu shuts");
+        assert!(!rt.state.folder_side);
+        rt.resolve_file_dialog(Some(picked.clone())).unwrap();
+        testkit::step(&mut rt);
+        let new = shown(&rt);
+        assert_eq!(folder_of(&rt, new), picked);
+        assert_eq!(tile_keys(&rt), [old, new]);
+        assert!(box_focused(&rt, new));
+        started(&mut rt, new);
+    }
+
+    /// Ctrl+Shift+N (Cmd+Shift+N on macOS).
+    fn ctrl_shift_n(rt: &mut Runtime<Ui>) {
+        testkit::press_with(rt, Key::Command('n'), testkit::ctrl_shift());
+        testkit::step(rt);
+    }
+
+    #[test]
+    fn a_cancelled_side_menu_does_not_stick() {
+        let dir = tempfile::tempdir().unwrap();
+        let [notes] = folders(&dir, ["notes"]);
+        let mut rt = testkit::window_sized("conversation", WIDE);
+        let old = shown(&rt);
+        rt.state.app.recent_folders = vec![notes.clone()];
+        ctrl_shift_n(&mut rt);
+        assert_eq!(rt.state.folder_menu, Some(None));
+        assert!(rt.state.folder_side, "for a session to the side");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.folder_menu, None);
+        assert!(!rt.state.folder_side, "gone with the menu");
+        // The picker it opens, cancelled, leaves nothing behind either.
+        ctrl_shift_n(&mut rt);
+        testkit::click_text(&mut rt, "Choose a folder…");
+        testkit::step(&mut rt);
+        rt.resolve_file_dialog(None).unwrap();
+        testkit::step(&mut rt);
+        assert!(!rt.state.folder_side);
+        assert_eq!(tile_keys(&rt), [old], "cancel starts nothing");
+        // A plain new session afterwards takes the focused tile.
+        testkit::click(&mut rt, "mr-new-session");
+        testkit::step(&mut rt);
+        assert!(!rt.state.folder_side);
+        testkit::click(&mut rt, "mr-folder-item0");
+        testkit::step(&mut rt);
+        let new = shown(&rt);
+        assert_ne!(new, old);
+        assert_eq!(tile_keys(&rt), [new], "one tile");
     }
 }

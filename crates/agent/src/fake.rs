@@ -7,7 +7,8 @@
 //! Like the real adapter it also refuses an `Answer` whose request is not
 //! waiting, and accepts a second `Close` until the first one's `Exited` has
 //! been delivered. A `Send` plays the next reply queued with `reply`, a
-//! `SuggestTitle` the next answer queued with `title_reply`.
+//! `SuggestTitle` the next answer queued with `title_reply`, and a `Rename` is
+//! answered with `TitleChanged`, as the real program answers it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -424,6 +425,9 @@ impl SessionHandle for FakeHandle {
                 ),
             }
         }
+        if let SessionCommand::Rename(title) = &command {
+            inner.schedule(0.0, &self.id, SessionEvent::TitleChanged(title.clone()));
+        }
         if matches!(command, SessionCommand::SuggestTitle { .. })
             && let Some(steps) = inner.titles.pop_front()
         {
@@ -783,6 +787,25 @@ mod tests {
             .filter(|(_, c)| matches!(c, SessionCommand::SuggestTitle { .. }))
             .count();
         assert_eq!(asked, 3);
+    }
+
+    #[test]
+    fn a_rename_is_answered_with_the_new_title() {
+        let fake = FakeAgent::new();
+        let (seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        assert_eq!(handle.send(SessionCommand::Rename("Garden".into())), Ok(()));
+        fake.advance(0.0);
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&SessionEvent::TitleChanged("Garden".into()))
+        );
+        assert!(
+            fake.sent()
+                .iter()
+                .any(|(_, c)| *c == SessionCommand::Rename("Garden".into()))
+        );
     }
 
     #[test]

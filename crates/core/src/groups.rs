@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::RECENT_DAYS;
 use crate::saved::Saved;
 use crate::sessions::{Entry, Mark, SessionKey, Sessions};
+use crate::tiles::Tiles;
 
 /// A group: a folder's own, or one the user created.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -336,8 +337,10 @@ pub struct Row {
     /// The session's folder, when the row is not in that folder's group.
     pub folder_label: Option<String>,
     pub mark: Mark,
-    /// The window shows this session.
+    /// The session is in a tile.
     pub shown: bool,
+    /// The session is in the focused tile.
+    pub focused: bool,
 }
 
 /// One group as the sidebar lists it.
@@ -384,12 +387,12 @@ pub struct SidebarModel {
     pub loading: bool,
 }
 
-/// What the sidebar shows of `sessions` in `groups`, with `shown` the session the window shows,
-/// at `now_unix`, `loading` while the first listing has not arrived.
+/// What the sidebar shows of `sessions` in `groups`, with `tiles` the tiles the window shows
+/// sessions in, at `now_unix`, `loading` while the first listing has not arrived.
 pub fn sidebar_model(
     sessions: &Sessions,
     groups: &Groups,
-    shown: Option<SessionKey>,
+    tiles: &Tiles,
     now_unix: i64,
     loading: bool,
 ) -> SidebarModel {
@@ -399,7 +402,7 @@ pub fn sidebar_model(
         let section = building
             .entry(id)
             .or_insert_with_key(|id| Building::new(id, groups));
-        section.add(entry, shown, now_unix);
+        section.add(entry, tiles, now_unix);
     }
     for id in groups.records.keys() {
         if matches!(id, GroupId::Custom(_)) && !building.contains_key(id) {
@@ -493,16 +496,16 @@ impl Building {
         }
     }
 
-    /// Counts `entry` in, with a row when it is live, shown, touched in this run, recent, or
-    /// its group lists old sessions too.
-    fn add(&mut self, entry: &Entry, shown: Option<SessionKey>, now_unix: i64) {
+    /// Counts `entry` in, with a row when it is live, in a tile, touched in this run, recent,
+    /// or its group lists old sessions too.
+    fn add(&mut self, entry: &Entry, tiles: &Tiles, now_unix: i64) {
         self.newest = self.newest.max(Some(entry.last_active_unix));
         let home = match &self.id {
             GroupId::Folder(path) => *path == entry.session.folder,
             GroupId::Custom(_) => false,
         };
         self.guests |= !home && matches!(self.id, GroupId::Folder(_));
-        let shown = shown == Some(entry.key);
+        let shown = tiles.contains(entry.key);
         let listed = entry.live()
             || shown
             || entry.touched
@@ -522,6 +525,7 @@ impl Building {
             folder_label: (!home).then(|| folder_name(&entry.session.folder)),
             mark: entry.mark(),
             shown,
+            focused: tiles.focused() == Some(entry.key),
         };
         self.rows.push((entry.last_active_unix, row));
     }
@@ -617,6 +621,7 @@ mod tests {
 
     use super::*;
     use crate::session::{Phase, Session};
+    use crate::tiles::Place;
 
     const NOW: i64 = 1_800_000_000;
     const DAY: i64 = 86_400;
@@ -644,7 +649,16 @@ mod tests {
     }
 
     fn model(sessions: &Sessions, groups: &Groups) -> SidebarModel {
-        sidebar_model(sessions, groups, None, NOW, false)
+        sidebar_model(sessions, groups, &Tiles::default(), NOW, false)
+    }
+
+    /// A row of tiles holding `keys`, left to right, the last one focused.
+    fn tiles(keys: &[SessionKey]) -> Tiles {
+        let mut tiles = Tiles::default();
+        for &key in keys {
+            tiles.put(key, Place::Side, None);
+        }
+        tiles
     }
 
     fn names(model: &SidebarModel) -> Vec<&str> {
@@ -690,6 +704,7 @@ mod tests {
                 folder_label: None,
                 mark: Mark::None,
                 shown: false,
+                focused: false,
             }
         );
         assert_eq!(keys(&model.sections[1]), vec![b]);
@@ -898,7 +913,7 @@ mod tests {
         assert_eq!((keys(home), home.older), (vec![young, old], 0));
 
         let groups = Groups::default();
-        let shown = sidebar_model(&sessions, &groups, Some(old), NOW, false);
+        let shown = sidebar_model(&sessions, &groups, &tiles(&[old]), NOW, false);
         let home = section(&shown, &folder(MINDRUNE));
         assert_eq!((keys(home), home.older), (vec![young, old], 0), "shown");
         assert!(row(home, old).shown && !row(home, young).shown);
@@ -919,6 +934,36 @@ mod tests {
             2,
             "live"
         );
+    }
+
+    #[test]
+    fn rows_know_their_tile() {
+        let mut sessions = Sessions::default();
+        let a = stored(&mut sessions, "a1", MINDRUNE, 60);
+        let old = stored(&mut sessions, "a2", MINDRUNE, 31 * DAY);
+        let b = stored(&mut sessions, "b1", NOTES, 120);
+        let mut groups = Groups::default();
+        groups.set_hidden(&folder(NOTES), true);
+        let model_now = sidebar_model(&sessions, &groups, &tiles(&[old, b]), NOW, false);
+        assert_eq!(
+            names(&model_now),
+            vec!["rune_claude", "notes"],
+            "a hidden group with a session in a tile is listed"
+        );
+        let home = section(&model_now, &folder(MINDRUNE));
+        assert_eq!(
+            (keys(home), home.older),
+            (vec![a, old], 0),
+            "an old session in a tile is listed"
+        );
+        let notes = section(&model_now, &folder(NOTES));
+        let tiled = |section: &Section, key| {
+            let row = row(section, key);
+            (row.shown, row.focused)
+        };
+        assert_eq!(tiled(home, old), (true, false));
+        assert_eq!(tiled(notes, b), (true, true));
+        assert_eq!(tiled(home, a), (false, false));
     }
 
     #[test]
@@ -987,7 +1032,7 @@ mod tests {
         assert_eq!(names(&model_now), vec!["rune_claude"]);
         assert_eq!(model_now.hidden.len(), 1);
 
-        let shown = sidebar_model(&sessions, &groups, Some(b), NOW, false);
+        let shown = sidebar_model(&sessions, &groups, &tiles(&[b]), NOW, false);
         assert_eq!(names(&shown), vec!["rune_claude", "notes"], "shown");
 
         groups.set_hidden(&folder(NOTES), false);
@@ -1063,7 +1108,7 @@ mod tests {
         );
         assert_eq!(model_now.hidden, vec![(archive, "Archive".to_string())]);
 
-        let loading = sidebar_model(&sessions, &groups, None, NOW, true);
+        let loading = sidebar_model(&sessions, &groups, &Tiles::default(), NOW, true);
         assert!(loading.loading);
         assert_eq!(
             loading.lines[4..],

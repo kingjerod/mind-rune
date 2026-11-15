@@ -34,7 +34,7 @@ fn sidebar(ui: &Ui, kit: &'static Kit) -> El {
         .icon(&rune_theme_opencode::icons::PLUS)
         .variant(ButtonVariant::Ghost)
         .control_size(ControlSize::Large)
-        .on_press_tx(|ui: &mut Ui, tx: &mut Tx| folder::ask(ui, tx, None))
+        .on_press_tx(|ui: &mut Ui, tx: &mut Tx| folder::ask(ui, tx, None, false))
         .build(kit)
         .key(NEW_SESSION)
         .w_full();
@@ -126,9 +126,9 @@ fn usage(line: &UsageLine, key: &str, kit: &Kit) -> El {
 #[cfg(test)]
 mod tests {
     use mr_agent::{SessionCommand, UsageLimits};
-    use rune::{Key, Mods};
+    use rune::Key;
 
-    use mr_core::SessionKey;
+    use mr_core::{Place, SessionKey};
     use rune::{Runtime, Tx};
 
     use super::super::folder;
@@ -138,7 +138,7 @@ mod tests {
     /// A new session in the folder of `from`'s session, as choosing that folder starts one.
     fn new_session(ui: &mut Ui, tx: &mut Tx, from: SessionKey) {
         let folder = ui.app.sessions.get(from).unwrap().session.folder.clone();
-        folder::start(ui, tx, folder, None);
+        folder::start(ui, tx, folder, None, Place::Focused);
     }
 
     /// Clicks "New session" and chooses a folder that is there, the only recent one.
@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn a_new_session_forgets_the_old_ones_open_picker() {
         let mut rt = testkit::window("conversation");
-        let old = rt.state.app.shown.unwrap();
+        let old = testkit::focused(&rt).unwrap();
         testkit::shown_view_mut(&mut rt).open_picker = Some(Picker::Mode);
         rt.update(|ui, tx| new_session(ui, tx, old));
         assert_eq!(testkit::shown_open(&rt), Some(2));
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn new_session_keeps_a_session_with_nothing_said_yet() {
         let mut rt = testkit::window("empty");
-        let old = rt.state.app.shown.unwrap();
+        let old = testkit::focused(&rt).unwrap();
         testkit::shown_view_mut(&mut rt).open_picker = Some(Picker::Mode);
         rt.update(|ui, tx| new_session(ui, tx, old));
         testkit::step(&mut rt);
@@ -247,12 +247,7 @@ mod tests {
     #[test]
     fn the_kits_shortcut_hides_and_shows_the_sidebar() {
         let mut rt = testkit::window("empty");
-        let toggle = Mods {
-            shift: true,
-            cmd: true,
-            ctrl: !cfg!(target_os = "macos"),
-            ..Mods::default()
-        };
+        let toggle = testkit::ctrl_shift();
         testkit::press_with(&mut rt, Key::Command('b'), toggle);
         assert!(!rt.state.sidebar.is_open());
         testkit::press_with(&mut rt, Key::Command('b'), toggle);

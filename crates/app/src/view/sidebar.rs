@@ -1,19 +1,20 @@
 //! The sidebar's list: every group's header with its sessions' rows under it, as one flat list
 //! of virtual rows drawn from the core's model (`App::sidebar`); and its menus, a row's and a
-//! header's, with renaming a group in place.
+//! header's, with renaming a group or a session in place.
 //!
 //! Every line is one row of the list, all of one height, headers included. Only the rows near
 //! the viewport are built, and a built row is built again only when the model is rebuilt: the
 //! model's version (`App::sidebar_version`) is the list's version and each row's, so nothing
 //! here is redone while a reply merely streams. The one line drawn from more than the model is
-//! the header whose name is being edited: its version holds the field too ([`line_version`]).
+//! the header or the row whose name is being edited: its version holds the field too
+//! ([`line_version`]).
 
 use std::borrow::Cow;
 
-use mr_core::{Effect, GroupId, Line, Mark, Section, SessionKey, SidebarModel};
+use mr_core::{Effect, GroupId, Line, Mark, Place, Row, Section, SessionKey, SidebarModel};
 use rune::{
-    Anim, Cx, El, GrowthSpec, Key, KeyEvent, PointerPress, TextEdit, Tx, col, el, icon, memo, row,
-    text, text_input,
+    Anim, Color, Cx, El, GrowthSpec, Key, KeyEvent, PointerPress, Spring, TextEdit, TextStyle,
+    Transition, Tx, col, el, icon, memo, row, text, text_input,
 };
 use rune_kit::shell::{ROW_HEIGHT, RowStatus, SidebarRow};
 use rune_kit::{
@@ -21,8 +22,8 @@ use rune_kit::{
 };
 use rune_theme_opencode::icons::PLUS;
 
-use crate::glue::{self, MenuTarget, SideMenu, Ui};
-use crate::view::folder;
+use crate::glue::{self, DropTarget, MenuTarget, Renaming, SideMenu, Ui};
+use crate::view::{drag, folder};
 
 /// Rows and headers sit this far in from the list's sides, as the kit's do.
 const INSET: f32 = 8.0;
@@ -36,6 +37,13 @@ const SUBMENU: &str = "mr-side-menu-item0-sub-menu";
 
 /// The field a group's name is edited in, in its header.
 const RENAME: &str = "mr-group-rename";
+
+/// The field a session's name is edited in, in its row.
+const ROW_RENAME: &str = "mr-row-rename";
+
+/// The mark on the header of the group a dragged row would drop into, and how thick it is.
+const TARGET: &str = "mr-group-target";
+const TARGET_WIDTH: f32 = 2.0;
 
 /// The list of groups and sessions, for the kit's `Sidebar`, whose list it goes in: one row of
 /// [`ROW_HEIGHT`] per line of the model.
@@ -65,14 +73,65 @@ pub fn list(ui: &Ui, kit: &'static Kit) -> El {
         .virtual_rows_version(ui.app.sidebar_version)
 }
 
-/// What `line` is drawn from: the model, and for the header whose name is being edited, the
-/// field, which changes with every key while the model holds the old name until it is kept.
-fn line_version(ui: &Ui, line: Line) -> (u64, Option<&TextEdit>) {
-    let editing = match line {
-        Line::Header(s) => ui.renaming.as_ref() == Some(&ui.app.sidebar.sections[s].id),
+/// What `line` is drawn from: the model; for the header or the row whose name is being
+/// edited, the field, which changes with every key while the model holds the old name until it
+/// is kept; and for a header, whether a dragged row would drop into its group ([`drop_group`]),
+/// so that a drag moving over the list rebuilds only the headers it marks.
+fn line_version(ui: &Ui, line: Line) -> (u64, Option<&TextEdit>, bool, bool) {
+    let sections = &ui.app.sidebar.sections;
+    let editing = match (line, &ui.renaming) {
+        (Line::Header(s), Some(Renaming::Group(id))) => *id == sections[s].id,
+        (Line::Row(s, r), Some(Renaming::Row(key))) => *key == sections[s].rows[r].key,
         _ => false,
     };
-    (ui.app.sidebar_version, editing.then_some(&ui.rename))
+    let target = matches!(line, Line::Header(s) if drop_group(ui) == Some(&sections[s].id));
+    let selected = matches!(line, Line::Row(s, r) if is_selected(ui, &sections[s].rows[r]));
+    (
+        ui.app.sidebar_version,
+        editing.then_some(&ui.rename),
+        target,
+        selected,
+    )
+}
+
+/// The row the arrow keys passed onto (see [`select`]), while no tile came, went or took the
+/// focus since.
+fn selected_row(ui: &Ui) -> Option<SessionKey> {
+    let (key, placement) = ui.passed_row?;
+    (ui.app.tiles.placement() == placement).then_some(key)
+}
+
+/// Whether `row` is the list's selected one: the row the arrow keys passed onto, else the
+/// focused tile's.
+fn is_selected(ui: &Ui, row: &Row) -> bool {
+    selected_row(ui).map_or(row.focused, |key| key == row.key)
+}
+
+/// The group a dragged row would go into if it were let go now (`view::drag`).
+fn drop_group(ui: &Ui) -> Option<&GroupId> {
+    match ui.drag.as_ref()?.over.as_ref()? {
+        DropTarget::Group(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// The colour of the mark on `id`'s header while a dragged row would drop into its group: the
+/// accent of the drop line and of the outline of a tile a drop would take (ruling R10).
+pub(super) fn target_mark(ui: &Ui, id: &GroupId, kit: &Kit) -> Option<Color> {
+    (drop_group(ui) == Some(id)).then_some(kit.c.bg_accent)
+}
+
+/// The mark on the header a drop would go into: a border over the header's whole line, with
+/// its corners, taking no room in it, so nothing in the list moves as it comes and goes. It
+/// comes and goes at once, as the drop line does.
+fn target_ring(color: Color, kit: &Kit) -> El {
+    el().key(TARGET)
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .radius(kit.radius.md)
+        .border(TARGET_WIDTH, color)
+        .transition(Transition::none())
+        .motion(Spring::NONE)
+        .a11y_hidden()
 }
 
 /// A line's key, which names its session or its group.
@@ -93,23 +152,37 @@ fn header_key(id: &GroupId) -> String {
 }
 
 fn build_line(ui: &Ui, line: Line, kit: &Kit) -> El {
+    #[cfg(test)]
+    LINE_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let model = &ui.app.sidebar;
     match line {
         Line::Header(s) => header(ui, &model.sections[s], kit),
         Line::Row(s, r) => {
             let row = &model.sections[s].rows[r];
-            let mut built = SidebarRow::new(row.title.clone()).selected(row.shown);
+            if ui.renaming == Some(Renaming::Row(row.key)) {
+                return renaming_row(ui, row, kit);
+            }
+            // The focused tile's row is the selected one, unless the arrow keys passed onto
+            // another tile's; the other tiles' rows carry the hover fill at rest, so they read
+            // as open and not as selected.
+            let selected = is_selected(ui, row);
+            let mut built = SidebarRow::new(row.title.clone()).selected(selected);
             if let Some(folder) = &row.folder_label {
                 built = built.detail(folder.clone());
             }
             if let Some(status) = status(row.mark) {
                 built = built.status(status);
             }
+            let built = built.on_select(select(row.key)).build(kit);
+            let built = if row.shown && !selected {
+                built.fill(kit.c.hover)
+            } else {
+                built
+            };
             built
-                .on_select(select(row.key))
-                .build(kit)
                 .on_key(choose(row.key))
                 .on_secondary_press(open_menu(MenuTarget::Row(row.key)))
+                .on_drag(drag::row(row.key))
         }
         Line::ShowOlder(s) => {
             let section = &model.sections[s];
@@ -136,7 +209,7 @@ fn build_line(ui: &Ui, line: Line, kit: &Kit) -> El {
         Line::NewGroup => new_group_line(kit).on_press_tx(|ui: &mut Ui, tx: &mut Tx| {
             let (id, effects) = ui.app.new_group("");
             glue::run(ui, effects);
-            start_rename(ui, tx, id);
+            start_rename(ui, tx, Renaming::Group(id));
         }),
         Line::HiddenGroups => press_line(format!("Hidden groups ({})", model.hidden.len()), kit)
             .on_press_tx(|ui: &mut Ui, _: &mut Tx| {
@@ -150,21 +223,54 @@ fn build_line(ui: &Ui, line: Line, kit: &Kit) -> El {
     }
 }
 
-/// What a row's press does: shows its session. A click also focuses the session's input box.
-/// Moving with the arrow keys, which press each row they reach, leaves the focus in the list,
-/// so the next one moves on. (Return and Space never get here: see [`choose`].)
+#[cfg(test)]
+thread_local! {
+    /// How many lines of the list were built on this thread: each test runs on its own.
+    static LINE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many lines of the list have been built, rather than reused, on this thread.
+#[cfg(test)]
+pub(crate) fn line_builds() -> usize {
+    LINE_BUILDS.with(std::cell::Cell::get)
+}
+
+/// What a row's press does: shows its session in the focused tile, or with Ctrl held (Cmd on
+/// macOS) in a new tile right of it while there is room. A click also focuses the session's
+/// input box. Moving with the arrow keys, which press each row they reach, leaves the focus in
+/// the list, so the next one moves on, always in the focused tile. One that reaches the row of
+/// a session in another tile only selects that row ([`Ui::passed_row`]): no tile takes the
+/// focus, and the next one moves on in the tile being browsed. (Return and Space never get
+/// here: see [`choose`].) The press Rune runs after a drag's release, when it holds the
+/// pointer inside the row, does nothing (`drag::row`).
 fn select(key: SessionKey) -> impl Fn(&mut Ui, &mut Tx) + 'static {
     move |ui: &mut Ui, tx: &mut Tx| {
+        if std::mem::take(&mut ui.swallow_row_press) && !tx.by_keys() {
+            return;
+        }
+        ui.passed_row = None;
+        if tx.by_keys() && ui.app.tiles.contains(key) && ui.app.focused() != Some(key) {
+            ui.passed_row = Some((key, ui.app.tiles.placement()));
+            return;
+        }
         let focus = !tx.by_keys();
-        glue::show(ui, tx, key, focus);
+        let place = folder::side_or_focused(focus && tx.mods().cmd);
+        glue::show(ui, tx, key, place, focus);
     }
 }
 
 /// Return or Space on a focused row chooses its session, as a click does: it is shown and its
 /// input box takes the focus. The row's own key handler hears them before the list's focus
 /// group would press the row (`El::on_key`), so they are told apart from the arrows there.
+///
+/// While a row is dragged the rows' keys do nothing (ruling R8): this takes Return, Space and
+/// the keys the focus group would move and press with, before the focus group or the window
+/// hear them. Escape goes on to the window, which ends the drag (`view::on_key`).
 fn choose(key: SessionKey) -> impl Fn(&mut Ui, &KeyEvent, &mut Tx) -> bool + 'static {
     move |ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx| {
+        if ui.drag.is_some() {
+            return moves_or_chooses(ev);
+        }
         let m = ev.mods;
         let plain = !(m.shift || m.cmd || m.ctrl || m.alt || m.logo);
         let chosen = matches!(&ev.key, Key::Enter) || matches!(&ev.key, Key::Text(t) if t == " ");
@@ -172,22 +278,81 @@ fn choose(key: SessionKey) -> impl Fn(&mut Ui, &KeyEvent, &mut Tx) -> bool + 'st
             return false;
         }
         if !tx.key_repeat() {
-            glue::show(ui, tx, key, true);
+            ui.passed_row = None;
+            glue::show(ui, tx, key, Place::Focused, true);
         }
         true
     }
 }
 
+/// Whether `ev` is a key a focused row acts on: Return or Space, which choose it, or a key the
+/// list's focus group moves with, pressing the row it reaches.
+fn moves_or_chooses(ev: &KeyEvent) -> bool {
+    matches!(
+        &ev.key,
+        Key::Enter
+            | Key::Up
+            | Key::Down
+            | Key::Left
+            | Key::Right
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown
+    ) || matches!(&ev.key, Key::Text(t) if t == " ")
+}
+
 /// A secondary press opens `target`'s menu where it landed. Rune calls it for the Menu key and
-/// Shift+F10 too, at the bottom-left of the focused element.
+/// Shift+F10 too, at the bottom-left of the focused element. A row being dragged stops there:
+/// the menu takes the pointer, and its release never comes.
 fn open_menu(target: MenuTarget) -> impl Fn(&mut Ui, PointerPress, &mut Tx) + 'static {
     move |ui: &mut Ui, at: PointerPress, _: &mut Tx| {
+        ui.drag = None;
         ui.side_menu = Some(SideMenu {
             target: target.clone(),
             at,
             sub_open: false,
         });
     }
+}
+
+/// A row whose session's name is being edited in it: the field in place of its title, then
+/// its folder and its mark, on the fill it has at rest. Built from the kit's parts as
+/// `SidebarRow::build` builds one, since the kit's own field takes a key of the kit's. It is
+/// no stop for the list's arrow keys while the field is there; a secondary press opens its
+/// menu.
+fn renaming_row(ui: &Ui, session: &Row, kit: &Kit) -> El {
+    let c = &kit.c;
+    let field = name_field(&ui.rename, ROW_RENAME, "Session name", kit.ty.ui, kit)
+        .focus_return("sidebar-list");
+    let fill = if session.focused {
+        c.pressed
+    } else if session.shown {
+        c.hover
+    } else {
+        Color::TRANSPARENT
+    };
+    row()
+        .label(session.title.clone())
+        .w_full()
+        .h(ROW_HEIGHT)
+        .px(INSET)
+        .gap(6.0)
+        .center_y()
+        .radius(kit.radius.md)
+        .fill(fill)
+        .child(field)
+        .children(session.folder_label.as_ref().map(|folder| {
+            text(folder.clone())
+                .key("mr-row-folder")
+                .font(kit.ty.small)
+                .color(c.text_faint)
+                .a11y_hidden()
+        }))
+        .children(mark_slot(session.mark, kit))
+        .on_secondary_press(open_menu(MenuTarget::Row(session.key)))
+        .focusable(false)
+        .role("listitem")
 }
 
 /// The kit's status mark for a session's mark.
@@ -203,7 +368,8 @@ fn status(mark: Mark) -> Option<RowStatus> {
 /// A group's header: a chevron, its name (or, while it is being renamed, the field), while it
 /// is collapsed the strongest mark among its sessions, and a "+" for a new session in it. A
 /// press folds or unfolds it, but not while it is being renamed, so a click in the field only
-/// moves the caret. A secondary press opens its menu.
+/// moves the caret. A secondary press opens its menu. While a dragged row would drop into its
+/// group, it has the kit's selected fill and a border in the accent ([`target_ring`]).
 ///
 /// Built from the kit's parts as `SidebarHeader::build` builds one, so that it can hold a
 /// text field. Like the kit's, it is for the pointer only: the list's arrow keys pass over it
@@ -211,14 +377,21 @@ fn status(mark: Mark) -> Option<RowStatus> {
 /// they passed.
 fn header(ui: &Ui, section: &Section, kit: &Kit) -> El {
     let c = &kit.c;
-    let renaming = ui.renaming.as_ref() == Some(&section.id);
+    let renaming = matches!(&ui.renaming, Some(Renaming::Group(id)) if *id == section.id);
     let glyph = if section.collapsed {
         kit.glyph.triangle_right
     } else {
         kit.glyph.triangle_down
     };
     let name = if renaming {
-        rename_field(&ui.rename, kit)
+        name_field(
+            &ui.rename,
+            RENAME,
+            "Group name",
+            kit.ty.text_xsmall_medium,
+            kit,
+        )
+        .focus_return("sidebar-list")
     } else {
         text(section.name.clone())
             .key("mr-group-name")
@@ -247,6 +420,10 @@ fn header(ui: &Ui, section: &Section, kit: &Kit) -> El {
         .px(INSET)
         .center_y()
         .radius(kit.radius.md);
+    let mark = target_mark(ui, &section.id, kit);
+    if mark.is_some() {
+        header = header.fill(c.pressed);
+    }
     // The field fills the header and must be reachable by assistive technology; the name it
     // replaces only repeats the header's label.
     header = if renaming {
@@ -262,6 +439,9 @@ fn header(ui: &Ui, section: &Section, kit: &Kit) -> El {
         header = header.child(mark);
     }
     header = header.child(add_button(section, kit));
+    if let Some(color) = mark {
+        header = header.child(target_ring(color, kit));
+    }
     let menu = open_menu(MenuTarget::Group(section.id.clone()));
     if renaming {
         return header.on_secondary_press(menu).focusable(false);
@@ -279,28 +459,36 @@ fn header(ui: &Ui, section: &Section, kit: &Kit) -> El {
     .focusable(false)
 }
 
-/// The one-line field a group's name is edited in: Return keeps the name, Escape drops the
-/// change. When it loses the focus otherwise, [`rename_watch`] keeps the name. As the kit's
-/// row rename does, it gives the focus back to the list when it goes.
-fn rename_field(edit: &TextEdit, kit: &Kit) -> El {
+/// The window's one-line field a name is edited in, keyed `key`, for a group's header, a
+/// session's row or a tile's header: Return keeps the name, Escape drops the change, and
+/// neither does anything else (`glue::finish_rename`). When it loses the focus otherwise,
+/// [`rename_watch`] keeps the name. In the sidebar, as the kit's row rename does, it gives the
+/// focus back to the list when it goes (`El::focus_return`).
+pub(super) fn name_field(
+    edit: &TextEdit,
+    key: &'static str,
+    label: &'static str,
+    font: TextStyle,
+    kit: &Kit,
+) -> El {
     let c = &kit.c;
-    text_input(edit, kit.ty.text_xsmall_medium)
+    text_input(edit, font)
         .single_line()
-        .key(RENAME)
-        .label("Group name")
+        .key(key)
+        .label(label)
         .focus_selected(true)
-        .focus_return("sidebar-list")
         .grow(1.0)
         .shrink()
+        .min_w(0.0)
         .color(c.text_base)
         .caret(c.text_base, kit.selection())
         .on_edit(|ui: &mut Ui| &mut ui.rename)
-        .on_submit(|ui: &mut Ui, _: &mut Tx| end_rename(ui, true))
+        .on_submit(|ui: &mut Ui, _: &mut Tx| glue::finish_rename(ui, true))
         .on_input_key(|ui: &mut Ui, ev: &KeyEvent, _: &mut Tx| {
             if ev.key != Key::Escape {
                 return false;
             }
-            end_rename(ui, false);
+            glue::finish_rename(ui, false);
             true
         })
 }
@@ -313,7 +501,10 @@ fn add_button(section: &Section, kit: &Kit) -> El {
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
         .label("New session")
-        .on_press_tx(move |ui: &mut Ui, tx: &mut Tx| new_session(ui, tx, &id))
+        .on_press_tx(move |ui: &mut Ui, tx: &mut Tx| {
+            let side = tx.mods().cmd;
+            new_session(ui, tx, &id, side);
+        })
         .build(kit)
         .key(add_key(&section.id))
         .focusable(false)
@@ -324,25 +515,36 @@ pub fn add_key(id: &GroupId) -> String {
     format!("mr-group-add-{}", id.key_text())
 }
 
-/// A new session in group `id`: in a folder's group, in that folder at once while it is still
-/// a folder (see `folder::start_chosen`); in a custom group, in the folder the folder menu is
-/// asked for.
-fn new_session(ui: &mut Ui, tx: &mut Tx, id: &GroupId) {
+/// A new session in group `id`, to the side with `side`: in a folder's group, in that folder at
+/// once while it is still a folder (see `folder::start_chosen`); in a custom group, in the
+/// folder the folder menu is asked for.
+fn new_session(ui: &mut Ui, tx: &mut Tx, id: &GroupId, side: bool) {
     match id {
-        GroupId::Folder(folder) => folder::start_chosen(ui, tx, folder.clone(), Some(id)),
-        GroupId::Custom(_) => folder::ask(ui, tx, Some(id.clone())),
+        GroupId::Folder(folder) => {
+            let place = folder::side_or_focused(side);
+            folder::start_chosen(ui, tx, folder.clone(), Some(id), place);
+        }
+        GroupId::Custom(_) => folder::ask(ui, tx, Some(id.clone()), side),
+    }
+}
+
+/// The colour of a session's mark, as a row's status slot draws it; none for no mark.
+pub(super) fn mark_color(mark: Mark, kit: &Kit) -> Option<Color> {
+    let c = &kit.c;
+    match mark {
+        Mark::None => None,
+        Mark::Working => Some(c.icon_muted),
+        Mark::NeedsYou => Some(c.warning.icon),
+        Mark::Finished => Some(c.bg_accent),
     }
 }
 
 /// A header's mark, keyed `mr-mark`, drawn as a row's status slot draws it.
 fn mark_slot(mark: Mark, kit: &Kit) -> Option<El> {
-    let c = &kit.c;
-    let dot = |color| el().size(7.0, 7.0).radius(3.5).fill(color);
+    let color = mark_color(mark, kit)?;
     let drawn = match mark {
-        Mark::None => return None,
-        Mark::Working => Spinner::new().size(12.0).color(c.icon_muted).build(kit),
-        Mark::NeedsYou => dot(c.warning.icon),
-        Mark::Finished => dot(c.bg_accent),
+        Mark::Working => Spinner::new().size(12.0).color(color).build(kit),
+        _ => el().size(7.0, 7.0).radius(3.5).fill(color),
     };
     Some(
         row()
@@ -406,43 +608,29 @@ fn new_group_line(kit: &Kit) -> El {
     pressable(line, kit)
 }
 
-/// Starts editing `id`'s name in its header: the field holds the name, all selected, and takes
-/// the focus. A change being made to another group's name is dropped.
-fn start_rename(ui: &mut Ui, tx: &mut Tx, id: GroupId) {
-    let mut edit = TextEdit::new(ui.app.groups.name(&id));
-    edit.anchor = 0;
-    edit.focused = true;
-    ui.rename = edit;
-    // Only the rows near the viewport are built: a header far off has no field to focus.
-    tx.scroll_into_view(header_key(&id));
-    ui.renaming = Some(id);
-}
-
-/// Ends the rename going on, if any: with `keep`, the name typed is given to the group, unless
-/// it is the name it has.
-fn end_rename(ui: &mut Ui, keep: bool) {
-    let Some(id) = ui.renaming.take() else {
-        return;
-    };
-    let edit = std::mem::replace(&mut ui.rename, TextEdit::new(""));
-    if keep && edit.text.trim() != ui.app.groups.name(&id) {
-        let effects = ui.app.rename_group(&id, &edit.text);
-        glue::run(ui, effects);
+/// Starts editing a group's name in its header or a session's in its row (`glue::start_rename`),
+/// the line scrolled into view first: only the rows near the viewport are built, and a line far
+/// off has no field to focus.
+fn start_rename(ui: &mut Ui, tx: &mut Tx, what: Renaming) {
+    match &what {
+        Renaming::Group(id) => tx.scroll_into_view(header_key(id)),
+        Renaming::Row(key) => tx.scroll_into_view(format!("mr-row-{}", key.0)),
+        Renaming::Header(_) => {}
     }
+    glue::start_rename(ui, what);
 }
 
-/// Shuts the menu as one of its items is chosen. The focus left the rename field going on when
-/// the menu opened: unless the item starts another rename, the name typed so far is kept now,
-/// before the item changes the groups.
-fn chosen(ui: &mut Ui, keep_rename: bool) {
+/// Shuts the menu as one of its items is chosen. The focus left the field of the name being
+/// edited when the menu opened: the name typed so far is kept now, before the item changes the
+/// groups or starts another rename.
+fn chosen(ui: &mut Ui) {
     ui.side_menu = None;
-    if keep_rename {
-        end_rename(ui, true);
-    }
+    glue::end_rename(ui, true);
 }
 
-/// While a group's name is edited in a field that has lost the focus otherwise than to the
-/// sidebar's menu (a click elsewhere, Tab), the name typed so far is kept.
+/// While a name is edited, in a group's header, a session's row or a tile's header, in a field
+/// that has lost the focus otherwise than to the sidebar's menu (a click elsewhere, Tab, F6),
+/// the name typed so far is kept.
 ///
 /// Rune has no focus-change callback, but it keeps the field's `TextEdit::focused` up to date
 /// on each commit, and the view runs again when it changes. So this puts into `layer`, only
@@ -455,7 +643,7 @@ pub fn rename_watch(ui: &Ui, layer: &mut Vec<El>) {
         el().key("mr-rename-lost")
             .absolute(0.0, 0.0)
             .size(0.0, 0.0)
-            .on_layout(|ui: &mut Ui, _| end_rename(ui, true)),
+            .on_layout(|ui: &mut Ui, _| glue::end_rename(ui, true)),
     );
 }
 
@@ -489,7 +677,9 @@ pub fn menu(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, layer: &mut Vec<El>) {
 }
 
 /// A row's menu: "Move to group", whose submenu lists every group but the row's own, in the
-/// sidebar's order and the hidden ones after them, then "New group…".
+/// sidebar's order and the hidden ones after them, then "New group…"; "Open to the side",
+/// which cannot be chosen while there is no room for a tile or the session is in one already;
+/// and "Rename", which edits the session's name in its row.
 fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu> {
     let entry = ui.app.sessions.get(key)?;
     let own = ui.app.groups.group_of(entry);
@@ -502,7 +692,7 @@ fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu
         .map(|(id, name)| {
             let id = id.clone();
             MenuEntry::item(MenuItem::new(name.clone()).on_select(move |ui: &mut Ui| {
-                chosen(ui, true);
+                chosen(ui);
                 let effects = ui.app.move_session(key, &id);
                 glue::run(ui, effects);
             }))
@@ -511,13 +701,13 @@ fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu
     groups.push(MenuEntry::Separator);
     groups.push(MenuEntry::item(MenuItem::new("New group…").on_select_tx(
         move |ui: &mut Ui, tx: &mut Tx| {
-            chosen(ui, false);
+            chosen(ui);
             let (id, mut effects) = ui.app.new_group("");
             // Moving it saves again, with the new group.
             effects.retain(|effect| !matches!(effect, Effect::SaveState(_)));
             effects.extend(ui.app.move_session(key, &id));
             glue::run(ui, effects);
-            start_rename(ui, tx, id);
+            start_rename(ui, tx, Renaming::Group(id));
         },
     )));
     let move_to = MenuItem::new("Move to group")
@@ -534,7 +724,17 @@ fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu
                 tx.focus(SUBMENU, tx.focus_visible());
             }
         });
-    Some(menu.item(move_to))
+    let side = MenuItem::new("Open to the side")
+        .disabled(!ui.app.room_for_tile() || ui.app.tiles.contains(key))
+        .on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
+            chosen(ui);
+            glue::show(ui, tx, key, Place::Side, true);
+        });
+    let rename = MenuItem::new("Rename").on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
+        chosen(ui);
+        start_rename(ui, tx, Renaming::Row(key));
+    });
+    Some(menu.item(move_to).item(side).item(rename))
 }
 
 /// A header's menu: "New session", "Rename", "Hide group", "Delete group".
@@ -543,21 +743,22 @@ fn group_menu(ui: &Ui, menu: Menu, id: &GroupId) -> Option<Menu> {
     let new_session = {
         let id = id.clone();
         MenuItem::new("New session").on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
-            chosen(ui, true);
-            self::new_session(ui, tx, &id);
+            chosen(ui);
+            let side = tx.mods().cmd;
+            self::new_session(ui, tx, &id, side);
         })
     };
     let rename = {
         let id = id.clone();
         MenuItem::new("Rename").on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
-            chosen(ui, false);
-            start_rename(ui, tx, id.clone());
+            chosen(ui);
+            start_rename(ui, tx, Renaming::Group(id.clone()));
         })
     };
     let hide = {
         let id = id.clone();
         MenuItem::new("Hide group").on_select(move |ui: &mut Ui| {
-            chosen(ui, true);
+            chosen(ui);
             let effects = ui.app.hide_group(&id, true);
             glue::run(ui, effects);
         })
@@ -569,11 +770,10 @@ fn group_menu(ui: &Ui, menu: Menu, id: &GroupId) -> Option<Menu> {
             .disabled(!section.can_delete)
             .on_select(move |ui: &mut Ui| {
                 // A name typed for the group deleted goes with it.
-                let keep = ui.renaming.as_ref() != Some(&id);
-                chosen(ui, keep);
-                if !keep {
-                    end_rename(ui, false);
+                if ui.renaming == Some(Renaming::Group(id.clone())) {
+                    glue::end_rename(ui, false);
                 }
+                chosen(ui);
                 let effects = ui.app.delete_group(&id);
                 glue::run(ui, effects);
             })
@@ -590,7 +790,7 @@ fn hidden_menu(ui: &Ui, menu: Menu) -> Option<Menu> {
     Some(hidden.iter().fold(menu, |menu, (id, name)| {
         let id = id.clone();
         menu.item(MenuItem::new(name.clone()).on_select(move |ui: &mut Ui| {
-            chosen(ui, true);
+            chosen(ui);
             let effects = ui.app.hide_group(&id, false);
             glue::run(ui, effects);
         }))
@@ -606,18 +806,16 @@ mod tests {
     use mr_core::{FromBackend, GroupId, Line, SessionKey};
 
     use super::line_key;
-    use rune::{Key, Mods, Runtime};
+    use rune::{Key, Mods, PhysicalInput, Runtime};
 
     use super::super::conversation;
     use crate::demo::{self, RUNE_CLAUDE, SKETCHES};
-    use crate::glue::{self, MenuTarget, Ui};
-    use crate::{testkit, theme};
-
-    const FINISHED: &str = "Tidying the sidebar keys";
-    const NEEDS_YOU: &str = "Running the window tests";
-    const WORKING: &str = "Profiling the long scene";
-    const GARDEN: &str = "Planning the spring beds";
-    const WEBSITE: &str = "/home/alex/website";
+    use crate::glue::{self, MenuTarget, Renaming, Ui};
+    use crate::testkit::{
+        self, FINISHED, GARDEN, NEEDS_YOU, WEBSITE, WORKING, box_focused, group_named, group_of,
+        tile_keys, titled,
+    };
+    use crate::theme;
 
     fn row(key: SessionKey) -> String {
         format!("mr-row-{}", key.0)
@@ -625,17 +823,6 @@ mod tests {
 
     fn group(folder: &str) -> String {
         format!("mr-group-{}", GroupId::Folder(folder.into()).key_text())
-    }
-
-    /// The session titled `title`.
-    fn titled(rt: &Runtime<Ui>, title: &str) -> SessionKey {
-        rt.state
-            .app
-            .sessions
-            .iter()
-            .find(|entry| entry.session.title.as_deref() == Some(title))
-            .map(|entry| entry.key)
-            .unwrap_or_else(|| panic!("no session titled {title:?}"))
     }
 
     /// The texts the list shows, top to bottom.
@@ -772,9 +959,9 @@ mod tests {
     #[test]
     fn a_question_out_of_sight_marks_its_row() {
         let mut rt = testkit::window("elsewhere");
-        let asked = rt.state.app.shown.expect("the parser is shown");
+        let asked = testkit::focused(&rt).expect("the parser is shown");
         let other = testkit::add_session(&mut rt, "/home/alex/notes");
-        assert_eq!(rt.state.app.shown, Some(other));
+        assert_eq!(testkit::focused(&rt), Some(other));
         assert_eq!(mark(&rt, &row(asked)), Some("needs you"));
         testkit::show(&mut rt, asked);
         testkit::click(&mut rt, "mr-elsewhere-cancel");
@@ -791,7 +978,7 @@ mod tests {
         assert!(!testkit::has_text(&rt, "Run the window tests"));
         testkit::click(&mut rt, &row(asking));
         testkit::step(&mut rt);
-        assert_eq!(rt.state.app.shown, Some(asking));
+        assert_eq!(testkit::focused(&rt), Some(asking));
         assert!(testkit::has_text(&rt, "Run the window tests"));
         assert!(!testkit::has_text(&rt, "Which beds get the most sun"));
         assert!(selected(&rt, &row(asking)));
@@ -819,7 +1006,7 @@ mod tests {
         rt.settle_all();
         testkit::step(&mut rt);
         let finished = titled(&rt, FINISHED);
-        let before = conversation::row_builds();
+        let before = conversation::all_row_builds();
         let shown = testkit::texts(&rt)
             .into_iter()
             .filter(|t| !list_texts(&rt).contains(t))
@@ -833,7 +1020,7 @@ mod tests {
         assert_eq!(mark(&rt, &row(finished)), Some("working"));
         assert!(!testkit::has_text(&rt, "Out of sight"));
         assert!(testkit::has_text(&rt, "Which beds get the most sun"));
-        assert_eq!(conversation::row_builds(), before, "no row built again");
+        assert_eq!(conversation::all_row_builds(), before, "no row built again");
         let after = testkit::texts(&rt)
             .into_iter()
             .filter(|t| !list_texts(&rt).contains(t))
@@ -1020,31 +1207,7 @@ mod tests {
     #[test]
     fn a_long_list_builds_only_what_is_on_screen() {
         let mut rt = testkit::window("empty");
-        let archive = "/home/alex/archive";
-        let now = rt.state.app.now_unix;
-        let listed: Vec<StoredSession> = (0..2_000)
-            .map(|n| StoredSession {
-                id: SessionId(format!("archived-{n}")),
-                folder: archive.into(),
-                title: format!("Archived session {n}"),
-                last_active_unix: now - (40 + n) * 86_400,
-            })
-            .collect();
-        let ui = &mut rt.state;
-        let effects = ui.app.receive(
-            FromBackend::Sessions {
-                since_unix: Some(0),
-                result: Ok(listed),
-            },
-            0.0,
-        );
-        glue::run(ui, effects);
-        let id = GroupId::Folder(archive.into());
-        let mut effects = ui.app.toggle_older_groups();
-        effects.extend(ui.app.show_older(&id));
-        glue::run(ui, effects);
-        rt.invalidate();
-        testkit::step(&mut rt);
+        testkit::long_list(&mut rt, 2_000);
         let model = &rt.state.app.sidebar;
         let rows: usize = model.sections.iter().map(|s| s.rows.len()).sum();
         assert!(rows > 2_000, "every session has its row in the model");
@@ -1072,7 +1235,7 @@ mod tests {
         for next in [asking, working, garden] {
             testkit::press(&mut rt, Key::Down);
             testkit::step(&mut rt);
-            assert_eq!(rt.state.app.shown, Some(next));
+            assert_eq!(testkit::focused(&rt), Some(next));
             assert_eq!(
                 focused_key(&rt),
                 Some(row(next)),
@@ -1082,7 +1245,7 @@ mod tests {
         }
         testkit::press(&mut rt, Key::Up);
         testkit::step(&mut rt);
-        assert_eq!(rt.state.app.shown, Some(working), "over the headers");
+        assert_eq!(testkit::focused(&rt), Some(working), "over the headers");
         assert!(selected(&rt, &row(working)));
     }
 
@@ -1102,11 +1265,11 @@ mod tests {
                 testkit::press(&mut rt, Key::Down);
             }
             testkit::step(&mut rt);
-            assert_eq!(rt.state.app.shown, Some(chosen));
+            assert_eq!(testkit::focused(&rt), Some(chosen));
             assert!(!input_focused(&rt), "moving leaves the focus in the list");
             testkit::press(&mut rt, key.clone());
             testkit::step(&mut rt);
-            assert_eq!(rt.state.app.shown, Some(chosen), "{key:?}");
+            assert_eq!(testkit::focused(&rt), Some(chosen), "{key:?}");
             assert!(input_focused(&rt), "{key:?} moves into the input box");
             assert!(
                 glue::view_of(&rt.state, chosen).draft.text.is_empty(),
@@ -1118,7 +1281,7 @@ mod tests {
 
     /// The texts shown inside the shown session's row.
     fn shown_row_texts(rt: &Runtime<Ui>) -> Vec<String> {
-        let key = rt.state.app.shown.expect("a session is shown");
+        let key = testkit::focused(rt).expect("a session is shown");
         texts_in(rt, &row(key))
     }
 
@@ -1181,7 +1344,7 @@ mod tests {
             "sessions",
         ] {
             let rt = testkit::window(scene);
-            let session = rt.state.shown_session().unwrap();
+            let session = rt.state.focused_session().unwrap();
             let title = session
                 .title
                 .clone()
@@ -1243,26 +1406,16 @@ mod tests {
             .rect
     }
 
-    /// The group listed as `name`.
-    fn group_named(rt: &Runtime<Ui>, name: &str) -> GroupId {
-        rt.state
-            .app
-            .sidebar
-            .sections
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| panic!("no group named {name:?}"))
-    }
-
     fn header_of(id: &GroupId) -> String {
         format!("mr-group-{}", id.key_text())
     }
 
-    /// The group `key`'s session is in.
-    fn group_of(rt: &Runtime<Ui>, key: SessionKey) -> GroupId {
-        let entry = rt.state.app.sessions.get(key).unwrap();
-        rt.state.app.groups.group_of(entry)
+    /// The group whose name is being edited.
+    fn renamed_group(rt: &Runtime<Ui>) -> GroupId {
+        match &rt.state.renaming {
+            Some(Renaming::Group(id)) => id.clone(),
+            other => panic!("renaming no group: {other:?}"),
+        }
     }
 
     /// Something was written under the state key since it was removed.
@@ -1282,7 +1435,7 @@ mod tests {
     fn a_right_click_on_a_row_opens_its_menu() {
         let mut rt = testkit::window("sessions");
         let working = titled(&rt, WORKING);
-        let shown = rt.state.app.shown;
+        let shown = testkit::focused(&rt);
         let version = rt.state.app.sidebar_version;
         rt.state.prefs.remove(glue::STATE_KEY).unwrap();
         right_click(&mut rt, &row(working));
@@ -1290,7 +1443,10 @@ mod tests {
             rt.state.side_menu.as_ref().map(|m| m.target.clone()),
             Some(MenuTarget::Row(working))
         );
-        assert_eq!(texts_in(&rt, MENU), ["Move to group"]);
+        assert_eq!(
+            texts_in(&rt, MENU),
+            ["Move to group", "Open to the side", "Rename"]
+        );
         let focused = focused_key(&rt).unwrap_or_default();
         assert!(
             focused.starts_with("mr-side-menu"),
@@ -1303,7 +1459,7 @@ mod tests {
         assert!(rt.state.side_menu.is_none());
         assert!(!open(&rt, MENU));
         assert_eq!(rt.state.app.sidebar_version, version, "nothing changed");
-        assert_eq!(rt.state.app.shown, shown);
+        assert_eq!(testkit::focused(&rt), shown);
         assert!(!saved(&rt));
     }
 
@@ -1369,7 +1525,7 @@ mod tests {
         testkit::click(&mut rt, "mr-side-menu-item0-sub-item4");
         testkit::step(&mut rt);
         assert!(rt.state.side_menu.is_none());
-        let id = rt.state.renaming.clone().expect("renaming the new group");
+        let id = renamed_group(&rt);
         assert!(matches!(id, GroupId::Custom(_)));
         assert_eq!(group_of(&rt, working), id, "the session moved into it");
         let rename = &rt.state.rename;
@@ -1402,7 +1558,7 @@ mod tests {
         };
         let before = rows(&rt);
         header_item(&mut rt, &header, 1);
-        assert_eq!(rt.state.renaming, Some(id.clone()));
+        assert_eq!(rt.state.renaming, Some(Renaming::Group(id.clone())));
         assert_eq!(focused_key(&rt).as_deref(), Some("mr-group-rename"));
         testkit::type_text(&mut rt, "Mind");
         assert_eq!(
@@ -1440,7 +1596,7 @@ mod tests {
         let asking = titled(&rt, NEEDS_YOU);
         testkit::click(&mut rt, &row(asking));
         testkit::step(&mut rt);
-        assert_eq!(rt.state.app.shown, Some(asking));
+        assert_eq!(testkit::focused(&rt), Some(asking));
         assert_eq!(rt.state.renaming, None);
         assert_eq!(texts_in(&rt, &header), ["Kept"]);
         assert_eq!(rows(&rt).len(), before.len());
@@ -1456,19 +1612,22 @@ mod tests {
         let id = GroupId::Folder(RUNE_CLAUDE.into());
         let section = rt.state.app.sidebar.sections.iter().find(|s| s.id == id);
         assert!(!section.unwrap().collapsed);
-        assert_eq!(rt.state.renaming, Some(id), "still renaming");
+        assert_eq!(
+            rt.state.renaming,
+            Some(Renaming::Group(id)),
+            "still renaming"
+        );
     }
 
     #[test]
-    fn starting_another_rename_drops_the_change() {
+    fn starting_another_rename_keeps_the_change() {
         let mut rt = testkit::window("sessions");
         header_item(&mut rt, &group(RUNE_CLAUDE), 1);
-        testkit::type_text(&mut rt, "Dropped");
+        testkit::type_text(&mut rt, "Kept");
         let website = GroupId::Folder(WEBSITE.into());
         header_item(&mut rt, &header_of(&website), 1);
-        assert_eq!(rt.state.renaming, Some(website));
-        assert_eq!(texts_in(&rt, &group(RUNE_CLAUDE)), ["rune_claude"]);
-        assert!(!list_texts(&rt).contains(&"Dropped".to_string()));
+        assert_eq!(rt.state.renaming, Some(Renaming::Group(website)));
+        assert_eq!(texts_in(&rt, &group(RUNE_CLAUDE)), ["Kept"]);
     }
 
     #[test]
@@ -1536,7 +1695,7 @@ mod tests {
         assert!(list_texts(&rt).contains(&"New group".to_string()));
         testkit::click(&mut rt, "mr-new-group");
         testkit::step(&mut rt);
-        let id = rt.state.renaming.clone().expect("renaming the new group");
+        let id = renamed_group(&rt);
         assert!(rt.state.app.sidebar.sections.iter().any(|s| s.id == id));
         assert_eq!(focused_key(&rt).as_deref(), Some("mr-group-rename"));
         testkit::type_text(&mut rt, "Errands");
@@ -1621,7 +1780,7 @@ mod tests {
         rt.state.folder_error = Some("an earlier error".into());
         testkit::click(&mut rt, &format!("mr-group-add-{}", id.key_text()));
         testkit::step(&mut rt);
-        let shown = rt.state.app.shown.expect("a session is shown");
+        let shown = testkit::focused(&rt).expect("a session is shown");
         assert_ne!(shown, there, "a new session is shown");
         assert_eq!(rt.state.folder_error, None, "a new try");
         let entry = rt.state.app.sessions.get(shown).unwrap();
@@ -1642,12 +1801,12 @@ mod tests {
         let mut rt = testkit::window("sessions");
         // The demo's folders are not on this disk: like a worktree removed since.
         let id = GroupId::Folder(RUNE_CLAUDE.into());
-        let (shown, count) = (rt.state.app.shown, rt.state.app.sessions.len());
+        let (shown, count) = (testkit::focused(&rt), rt.state.app.sessions.len());
         let recent = rt.state.app.recent_folders.clone();
         let gone = format!("That folder no longer exists: {RUNE_CLAUDE}");
         testkit::click(&mut rt, &format!("mr-group-add-{}", id.key_text()));
         testkit::step(&mut rt);
-        assert_eq!(rt.state.app.shown, shown, "nothing started");
+        assert_eq!(testkit::focused(&rt), shown, "nothing started");
         assert_eq!(rt.state.app.sessions.len(), count);
         assert_eq!(rt.state.app.recent_folders, recent, "not remembered");
         assert_eq!(rt.state.folder_error.as_deref(), Some(gone.as_str()));
@@ -1656,7 +1815,7 @@ mod tests {
         rt.state.folder_error = None;
         header_item(&mut rt, &header_of(&id), 0);
         testkit::step(&mut rt);
-        assert_eq!(rt.state.app.shown, shown);
+        assert_eq!(testkit::focused(&rt), shown);
         assert_eq!(rt.state.app.sessions.len(), count);
         assert_eq!(rt.state.folder_error.as_deref(), Some(gone.as_str()));
     }
@@ -1876,7 +2035,7 @@ mod tests {
         assert!(!list_texts(&rt).contains(&"Work on project 0".to_string()));
         testkit::click(&mut rt, "mr-new-group");
         testkit::step(&mut rt);
-        let id = rt.state.renaming.clone().expect("renaming the new group");
+        let id = renamed_group(&rt);
         let first = rt.state.app.sidebar.lines[0];
         assert_eq!(
             line_key(&rt.state.app.sidebar, first),
@@ -1885,7 +2044,11 @@ mod tests {
         );
         rt.settle_all();
         testkit::step(&mut rt);
-        assert_eq!(rt.state.renaming, Some(id.clone()), "still renaming");
+        assert_eq!(
+            rt.state.renaming,
+            Some(Renaming::Group(id.clone())),
+            "still renaming"
+        );
         assert!(
             rt.elements().iter().any(|e| !e.exiting
                 && e.key.as_deref() == Some("mr-group-rename")
@@ -1903,7 +2066,10 @@ mod tests {
     #[test]
     fn the_group_menu_scene_shows_a_rows_submenu_inside_the_window() {
         let rt = testkit::window("group-menu");
-        assert_eq!(texts_in(&rt, MENU), ["Move to group"]);
+        assert_eq!(
+            texts_in(&rt, MENU),
+            ["Move to group", "Open to the side", "Rename"]
+        );
         assert_eq!(
             texts_in(&rt, SUBMENU),
             ["sketches", "Side projects", "website", "New group…"]
@@ -1921,5 +2087,328 @@ mod tests {
             sub[0] >= item[0] + item[2] - 0.5,
             "beside its item, not over it"
         );
+    }
+
+    // Open to the side: Task 9 of plan 4.
+
+    /// A window wide enough for a second tile beside the first.
+    const WIDE: (f32, f32) = (1800.0, 900.0);
+
+    /// The "Open to the side" item of a row's menu.
+    const SIDE_ITEM: &str = "mr-side-menu-item1";
+
+    /// Clicks the element keyed `key` with Ctrl held, then lets Ctrl go and steps.
+    fn ctrl_click(rt: &mut Runtime<Ui>, key: &str) {
+        rt.physical_input(PhysicalInput::Modifiers(testkit::ctrl()));
+        testkit::step(rt);
+        testkit::click(rt, key);
+        rt.physical_input(PhysicalInput::Modifiers(Mods::default()));
+        testkit::step(rt);
+    }
+
+    /// Whether the menu item keyed `key` can be chosen: the kit's disabled items take no focus.
+    fn enabled(rt: &Runtime<Ui>, key: &str) -> bool {
+        rt.elements()
+            .into_iter()
+            .find(|e| !e.exiting && e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no element keyed {key:?}"))
+            .focusable
+    }
+
+    #[test]
+    fn a_ctrl_click_opens_the_session_to_the_side() {
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let garden = titled(&rt, GARDEN);
+        assert_eq!(tile_keys(&rt), [garden]);
+        let finished = titled(&rt, FINISHED);
+        ctrl_click(&mut rt, &row(finished));
+        assert_eq!(tile_keys(&rt), [garden, finished]);
+        assert_eq!(testkit::focused(&rt), Some(finished));
+        assert!(box_focused(&rt, finished), "its input box has the focus");
+        assert!(!box_focused(&rt, garden));
+        // A plain click shows a session in the focused tile, as before.
+        let asking = titled(&rt, NEEDS_YOU);
+        testkit::click(&mut rt, &row(asking));
+        testkit::step(&mut rt);
+        assert_eq!(tile_keys(&rt), [garden, asking]);
+        assert_eq!(testkit::focused(&rt), Some(asking));
+    }
+
+    #[test]
+    fn an_arrow_passes_the_row_of_another_tile() {
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let [asking, working, garden] = [NEEDS_YOU, WORKING, GARDEN].map(|t| titled(&rt, t));
+        testkit::click(&mut rt, &row(asking));
+        testkit::step(&mut rt);
+        ctrl_click(&mut rt, &row(working));
+        // Back in the first tile, and in the list on its row, as Tab into the list lands.
+        testkit::click(&mut rt, &row(asking));
+        testkit::step(&mut rt);
+        rt.update(|_, tx| tx.focus(row(asking), true));
+        testkit::step(&mut rt);
+        assert_eq!(
+            (tile_keys(&rt), testkit::focused(&rt)),
+            (vec![asking, working], Some(asking))
+        );
+        let from = sent_count(&rt);
+        testkit::press(&mut rt, Key::Down);
+        testkit::step(&mut rt);
+        assert_eq!(
+            focused_key(&rt),
+            Some(row(working)),
+            "the list is on its row"
+        );
+        assert!(selected(&rt, &row(working)) && !selected(&rt, &row(asking)));
+        assert_eq!(
+            (tile_keys(&rt), testkit::focused(&rt)),
+            (vec![asking, working], Some(asking)),
+            "nothing else changed"
+        );
+        testkit::press(&mut rt, Key::Down);
+        testkit::step(&mut rt);
+        assert_eq!(focused_key(&rt), Some(row(garden)));
+        assert!(selected(&rt, &row(garden)) && !selected(&rt, &row(working)));
+        assert_eq!(
+            (tile_keys(&rt), testkit::focused(&rt)),
+            (vec![garden, working], Some(garden)),
+            "on in the tile that was being browsed"
+        );
+        // Up passes it as well; Return on its row focuses its tile.
+        testkit::press(&mut rt, Key::Up);
+        testkit::step(&mut rt);
+        assert_eq!(focused_key(&rt), Some(row(working)));
+        assert_eq!(testkit::focused(&rt), Some(garden));
+        testkit::press(&mut rt, Key::Enter);
+        testkit::step(&mut rt);
+        assert_eq!(
+            (tile_keys(&rt), testkit::focused(&rt)),
+            (vec![garden, working], Some(working))
+        );
+        assert!(box_focused(&rt, working));
+        assert_eq!(sent_count(&rt), from, "nothing was sent");
+    }
+
+    #[test]
+    fn the_menu_opens_a_session_to_the_side() {
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let garden = titled(&rt, GARDEN);
+        let finished = titled(&rt, FINISHED);
+        right_click(&mut rt, &row(finished));
+        assert_eq!(
+            texts_in(&rt, MENU),
+            ["Move to group", "Open to the side", "Rename"]
+        );
+        assert!(enabled(&rt, SIDE_ITEM));
+        testkit::click(&mut rt, SIDE_ITEM);
+        testkit::step(&mut rt);
+        assert!(rt.state.side_menu.is_none());
+        assert!(!open(&rt, MENU));
+        assert_eq!(tile_keys(&rt), [garden, finished]);
+        assert_eq!(testkit::focused(&rt), Some(finished));
+        assert!(box_focused(&rt, finished), "its input box has the focus");
+    }
+
+    #[test]
+    fn without_room_the_menu_entry_is_disabled_and_a_ctrl_click_swaps() {
+        let mut rt = testkit::window_sized("sessions", (1000.0, 800.0));
+        let garden = titled(&rt, GARDEN);
+        assert_eq!(tile_keys(&rt), [garden]);
+        assert!(!rt.state.app.room_for_tile());
+        let finished = titled(&rt, FINISHED);
+        right_click(&mut rt, &row(finished));
+        assert_eq!(
+            texts_in(&rt, MENU),
+            ["Move to group", "Open to the side", "Rename"]
+        );
+        assert!(!enabled(&rt, SIDE_ITEM), "no room");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        assert!(rt.state.side_menu.is_none());
+        ctrl_click(&mut rt, &row(finished));
+        assert_eq!(tile_keys(&rt), [finished], "shown in the focused tile");
+        assert_eq!(testkit::focused(&rt), Some(finished));
+        assert!(box_focused(&rt, finished));
+    }
+
+    #[test]
+    fn a_session_in_a_tile_cannot_be_opened_twice() {
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let garden = titled(&rt, GARDEN);
+        let finished = titled(&rt, FINISHED);
+        ctrl_click(&mut rt, &row(finished));
+        assert_eq!(tile_keys(&rt), [garden, finished]);
+        assert!(rt.state.app.room_for_tile(), "there is room for a third");
+        right_click(&mut rt, &row(garden));
+        assert!(!enabled(&rt, SIDE_ITEM), "in a tile already");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        ctrl_click(&mut rt, &row(garden));
+        assert_eq!(tile_keys(&rt), [garden, finished], "no second tile for it");
+        assert_eq!(testkit::focused(&rt), Some(garden), "its tile is focused");
+        assert!(box_focused(&rt, garden));
+    }
+
+    #[test]
+    fn the_move_to_group_submenu_still_opens() {
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let working = titled(&rt, WORKING);
+        right_click(&mut rt, &row(working));
+        assert!(!open(&rt, "mr-side-menu-item0-sub-menu"));
+        testkit::click(&mut rt, "mr-side-menu-item0");
+        testkit::step(&mut rt);
+        assert!(open(&rt, "mr-side-menu-item0-sub-menu"));
+        assert_eq!(
+            texts_in(&rt, "mr-side-menu-item0-sub-menu"),
+            ["sketches", "Side projects", "website", "New group…"]
+        );
+    }
+
+    #[test]
+    fn a_ctrl_click_on_a_groups_plus_opens_its_session_to_the_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let there = testkit::add_session(&mut rt, dir.path().to_str().unwrap());
+        let id = GroupId::Folder(dir.path().into());
+        ctrl_click(&mut rt, &format!("mr-group-add-{}", id.key_text()));
+        let new = testkit::focused(&rt).expect("a session is shown");
+        assert_ne!(new, there);
+        assert_eq!(tile_keys(&rt), [there, new]);
+        assert_eq!(group_of(&rt, new), id);
+        assert!(box_focused(&rt, new));
+    }
+
+    // Renaming a session in its row: Task 10 of plan 4.
+
+    const RESTING: &str = "Fixing the contact form";
+
+    /// The "Rename" item of a row's menu.
+    const RENAME_ITEM: &str = "mr-side-menu-item2";
+
+    /// Opens the menu of `key`'s row and chooses "Rename".
+    fn rename_row(rt: &mut Runtime<Ui>, key: SessionKey) {
+        right_click(rt, &row(key));
+        testkit::click(rt, RENAME_ITEM);
+        testkit::step(rt);
+        assert_eq!(rt.state.renaming, Some(Renaming::Row(key)));
+    }
+
+    #[test]
+    fn the_rows_menu_renames_in_the_row() {
+        let mut rt = testkit::window("sessions");
+        let resting = titled(&rt, RESTING);
+        let entry = rt.state.app.sessions.get(resting).unwrap();
+        assert!(entry.open.is_none() && !rt.state.app.tiles.contains(resting));
+        let id = entry.session.id.clone().expect("a stored session");
+        let shown = testkit::focused(&rt);
+        let from = sent_count(&rt);
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        rename_row(&mut rt, resting);
+        assert!(rt.state.side_menu.is_none());
+        assert_eq!(focused_key(&rt).as_deref(), Some("mr-row-rename"));
+        let edit = &rt.state.rename;
+        assert_eq!(edit.text, RESTING);
+        assert_eq!(
+            (edit.anchor, edit.focus),
+            (0, RESTING.len()),
+            "all selected"
+        );
+        assert_eq!(texts_in(&rt, &row(resting)), [RESTING]);
+        testkit::type_text(&mut rt, "Contact");
+        assert_eq!(texts_in(&rt, &row(resting)), ["Contact"], "shown as typed");
+        testkit::type_text(&mut rt, " form");
+        testkit::press(&mut rt, Key::Enter);
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.renaming, None);
+        assert_eq!(texts_in(&rt, &row(resting)), ["Contact form"]);
+        assert_eq!(sent_to(&rt, resting, from), [], "nothing was sent");
+        let saved: mr_core::Saved = rt.state.prefs.get(glue::STATE_KEY).expect("saved");
+        assert!(saved.names.contains(&(id, "Contact form".into())));
+        assert_eq!(testkit::focused(&rt), shown, "the tile focus did not move");
+        // Back in the list, on its selected row, as Tab into it lands.
+        assert_eq!(focused_key(&rt), shown.map(row));
+    }
+
+    #[test]
+    fn a_row_rename_leaves_the_tiles_alone() {
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let garden = titled(&rt, GARDEN);
+        let finished = titled(&rt, FINISHED);
+        ctrl_click(&mut rt, &row(finished));
+        assert_eq!(tile_keys(&rt), [garden, finished]);
+        assert!(box_focused(&rt, finished));
+        let resting = titled(&rt, RESTING);
+        rename_row(&mut rt, resting);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        assert_eq!(
+            focused_key(&rt).as_deref(),
+            Some("mr-row-rename"),
+            "not given back"
+        );
+        assert_eq!(
+            testkit::focused(&rt),
+            Some(finished),
+            "the tile focus stays"
+        );
+        testkit::type_text(&mut rt, "Contact form");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.renaming, None);
+        assert!(list_texts(&rt).contains(&RESTING.to_string()), "dropped");
+        assert_eq!(testkit::focused(&rt), Some(finished));
+    }
+
+    #[test]
+    fn renaming_a_group_still_works() {
+        let mut rt = testkit::window("sessions");
+        let header = group(RUNE_CLAUDE);
+        header_item(&mut rt, &header, 1);
+        assert_eq!(focused_key(&rt).as_deref(), Some("mr-group-rename"));
+        testkit::type_text(&mut rt, "MindRune");
+        testkit::press(&mut rt, Key::Enter);
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.renaming, None);
+        assert_eq!(texts_in(&rt, &header), ["MindRune"]);
+    }
+
+    #[test]
+    fn one_name_is_edited_at_a_time() {
+        let mut rt = testkit::window("sessions");
+        let header = group(RUNE_CLAUDE);
+        header_item(&mut rt, &header, 1);
+        testkit::type_text(&mut rt, "MindRune");
+        let resting = titled(&rt, RESTING);
+        rename_row(&mut rt, resting);
+        assert_eq!(
+            texts_in(&rt, &header),
+            ["MindRune"],
+            "the group's name is kept"
+        );
+        assert!(rt.find("mr-group-rename").is_none());
+        assert_eq!(focused_key(&rt).as_deref(), Some("mr-row-rename"));
+        testkit::type_text(&mut rt, "Contact form");
+        // And a group's rename ends the row's, keeping it.
+        header_item(&mut rt, &header, 1);
+        assert_eq!(
+            rt.state.renaming,
+            Some(Renaming::Group(GroupId::Folder(RUNE_CLAUDE.into())))
+        );
+        assert_eq!(texts_in(&rt, &row(resting)), ["Contact form"]);
+    }
+
+    #[test]
+    fn a_row_rename_ends_when_the_row_goes() {
+        let mut rt = testkit::window("sessions");
+        let resting = titled(&rt, RESTING);
+        rename_row(&mut rt, resting);
+        testkit::type_text(&mut rt, "Contact form");
+        let ui = &mut rt.state;
+        let effects = ui.app.hide_group(&GroupId::Folder(WEBSITE.into()), true);
+        glue::run(ui, effects);
+        assert_eq!(rt.state.renaming, None, "its row is no longer listed");
+        rt.invalidate();
+        testkit::step(&mut rt);
+        let title = &rt.state.app.sessions.get(resting).unwrap().session.title;
+        assert_eq!(title.as_deref(), Some(RESTING), "dropped");
     }
 }

@@ -4,17 +4,15 @@
 //! the wheel scrolls it over the empty margins too; only its rows and the input box are as wide
 //! as the column.
 
-use mr_core::{Effect, MIN_WIDTH, Width};
+use mr_core::{Effect, MIN_WIDTH, SessionKey, Width};
 use rune::{Cursor, Cx, Drag, El, Phase, Transition, Tx, col, el, row};
 use rune_kit::Kit;
 
+use super::tiles::tile_key;
 use crate::glue::{self, Ui};
 
 /// How close to the tile's edge a drag lets go of every limit.
 pub const EDGE_SNAP: f32 = 24.0;
-
-/// The key of the tile the column is centred in.
-const TILE: &str = "mr-tile";
 
 /// A handle's width, and the width of the line it shows while hovered.
 const HANDLE: f32 = 8.0;
@@ -38,20 +36,21 @@ pub fn width_from_drag(pointer_x: f32, tile_left: f32, tile: f32) -> Width {
     Width::Points((2.0 * (pointer_x - centre).abs()).max(MIN_WIDTH))
 }
 
-/// The column's width in this frame, for the rows and the input box: the chosen width inside
-/// the tile as last laid out. `None` before the tile's first layout, which the same commit
-/// follows at once with the real width.
-pub fn current(ui: &Ui, cx: &mut Cx<Ui>) -> Option<f32> {
-    tile(cx).map(|[_, tile]| column_width(ui.app.width, tile))
+/// The column's width in this frame in `key`'s tile, for the rows and the input box: the chosen
+/// width inside the tile as last laid out. `None` before the tile's first layout, which the
+/// same commit follows at once with the real width.
+pub fn current(ui: &Ui, cx: &mut Cx<Ui>, key: SessionKey) -> Option<f32> {
+    tile(cx, key).map(|[_, tile]| column_width(ui.app.width, tile))
 }
 
-/// Wraps the conversation and the input box in the centred column with its two handles.
+/// Wraps the conversation and the input box of `key`'s session in the column centred in its
+/// tile, with its two handles.
 ///
 /// `content` spans the tile and limits its own rows and input box to [`current`]. Over it lies
 /// the column keyed `mr-column`, which takes no pointer input itself, holding a handle at each
 /// edge, keyed `mr-width-left` and `mr-width-right`.
-pub fn column(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, content: El) -> El {
-    let tile = tile(cx);
+pub fn column(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, key: SessionKey, content: El) -> El {
+    let tile = tile(cx, key);
     let lane = el().key("mr-column").transition(Transition::none());
     let lane = match tile {
         Some([_, tile]) => {
@@ -72,9 +71,9 @@ pub fn column(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, content: El) -> El {
         .child(lane)
 }
 
-/// The tile's left edge in window points and its width, as last laid out.
-fn tile(cx: &mut Cx<Ui>) -> Option<[f32; 2]> {
-    cx.layout_with(TILE, |rect| [rect[0], rect[2]])
+/// The left edge of `key`'s tile in window points and its width, as last laid out.
+fn tile(cx: &mut Cx<Ui>, key: SessionKey) -> Option<[f32; 2]> {
+    cx.layout_with(&tile_key(key), |rect| [rect[0], rect[2]])
 }
 
 /// One of the column's handles: 8 points wide along one edge, the tile's full height, a
@@ -203,12 +202,18 @@ mod tests {
         rt.presented("mr-column").unwrap().0
     }
 
+    /// The focused session's tile, as drawn.
+    fn tile_rect(rt: &Runtime<Ui>) -> [f32; 4] {
+        let key = testkit::focused(rt).unwrap();
+        rt.presented(&tile_key(key)).unwrap().0
+    }
+
     #[test]
     fn dragging_a_handle_changes_the_width_and_remembers_it() {
         let mut rt = testkit::window_sized("conversation", (2400.0, 900.0));
         let [_, _, w, _] = column(&rt);
         assert_eq!(w, 1000.0);
-        let [tile_x, _, tile_w, _] = rt.presented("mr-tile").unwrap().0;
+        let [tile_x, _, tile_w, _] = tile_rect(&rt);
         let centre = tile_x + tile_w / 2.0;
         drag(&mut rt, "mr-width-right", centre + 700.0);
         assert_eq!(rt.state.app.width, Width::Points(1400.0));
@@ -235,7 +240,7 @@ mod tests {
     #[test]
     fn a_narrow_window_uses_all_of_its_tile() {
         let rt = testkit::window_sized("conversation", (900.0, 700.0));
-        let [_, _, tile_w, _] = rt.presented("mr-tile").unwrap().0;
+        let [_, _, tile_w, _] = tile_rect(&rt);
         assert_eq!(column(&rt)[2], tile_w);
     }
 
@@ -247,7 +252,7 @@ mod tests {
     fn the_rows_and_their_text_follow_the_width() {
         let mut rt = testkit::window_sized("conversation", (2400.0, 900.0));
         assert_eq!(width_of(&rt, "mr-item-1"), 1000.0);
-        let [tile_x, _, tile_w, _] = rt.presented("mr-tile").unwrap().0;
+        let [tile_x, _, tile_w, _] = tile_rect(&rt);
         drag(&mut rt, "mr-width-right", tile_x + tile_w / 2.0 + 700.0);
         assert_eq!(width_of(&rt, "mr-item-0"), 1400.0);
         assert_eq!(width_of(&rt, "mr-item-1"), 1400.0);
@@ -258,7 +263,7 @@ mod tests {
     fn the_wheel_scrolls_the_conversation_over_the_margins() {
         let mut rt = testkit::window_sized("long", (2400.0, 900.0));
         let [column_x, ..] = column(&rt);
-        let [tile_x, ..] = rt.presented("mr-tile").unwrap().0;
+        let [tile_x, ..] = tile_rect(&rt);
         let (_, y) = rt.find(&testkit::conversation(&rt)).unwrap();
         let margin = (tile_x + column_x) / 2.0;
         assert!(margin + 20.0 < column_x);
@@ -297,7 +302,7 @@ mod tests {
                 .any(|e| e.focused && e.path.ends_with("mr-input/scroll/input"))
         };
         assert!(focused(&rt));
-        let [tile_x, _, tile_w, _] = rt.presented("mr-tile").unwrap().0;
+        let [tile_x, _, tile_w, _] = tile_rect(&rt);
         drag(&mut rt, "mr-width-right", tile_x + tile_w / 2.0 + 700.0);
         assert!(focused(&rt));
     }
@@ -322,7 +327,7 @@ mod tests {
         let mut rt = testkit::window_sized("conversation", (2400.0, 900.0));
         let before = saved(&rt);
         assert_ne!(before, Some(Width::Points(1400.0)));
-        let [tile_x, _, tile_w, _] = rt.presented("mr-tile").unwrap().0;
+        let [tile_x, _, tile_w, _] = tile_rect(&rt);
         let to_x = tile_x + tile_w / 2.0 + 700.0;
         let y = hold_at(&mut rt, "mr-width-right", to_x);
         assert_eq!(column(&rt)[2], 1400.0);
@@ -340,7 +345,7 @@ mod tests {
     fn a_cancelled_drag_puts_the_width_back_and_saves_nothing() {
         let mut rt = testkit::window_sized("conversation", (2400.0, 900.0));
         let before = saved(&rt);
-        let [tile_x, _, tile_w, _] = rt.presented("mr-tile").unwrap().0;
+        let [tile_x, _, tile_w, _] = tile_rect(&rt);
         let to_x = tile_x + tile_w / 2.0 + 700.0;
         let y = hold_at(&mut rt, "mr-width-right", to_x);
         assert_eq!(rt.state.app.width, Width::Points(1400.0));

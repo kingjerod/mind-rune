@@ -21,6 +21,9 @@ const LIST_PAD_TOP: f32 = 16.0;
 /// How far above the list's bottom edge "Jump to latest" floats.
 const JUMP_INSET: f32 = 16.0;
 
+/// The key of the list of rows inside a conversation's scroll.
+pub const ROWS: &str = "mr-rows";
+
 /// The key of `key`'s conversation scroll, so that each session keeps its own place.
 pub fn conversation_key(key: SessionKey) -> String {
     format!("mr-conversation-{}", key.0)
@@ -43,7 +46,9 @@ pub fn conversation(ui: &Ui, kit: &'static Kit, key: SessionKey, width: Option<f
     let view = glue::view_of(ui, key);
     let count = items_of(ui, key).len();
     let generation = session.map_or(0, |s| s.generation);
-    let rows = col().key("mr-rows");
+    // `items::toggle_path` climbs from a row's toggle through this list to the scroll keyed
+    // `conversation_key`: a keyed wrapper put between them must go into that path too.
+    let rows = col().key(ROWS);
     let rows = match width {
         Some(width) => rows.w(width).self_center(),
         None => rows.w_full(),
@@ -114,21 +119,31 @@ fn build_row(ui: &Ui, key: SessionKey, item: &Item, kit: &'static Kit) -> El {
     // The row's own key is the list's (`items::row_key`), which Rune gives every row it builds.
     memo(id.clone(), items::version(ui, key, item), move || {
         #[cfg(test)]
-        ROW_BUILDS.with(|n| n.set(n.get() + 1));
+        ROW_BUILDS.with(|builds| *builds.borrow_mut().entry(key).or_default() += 1);
         items::row(ui, key, item, kit).key(id)
     })
 }
 
 #[cfg(test)]
 thread_local! {
-    /// How many memoised rows were built on this thread: each test runs on its own.
-    static ROW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many memoised rows of each session were built on this thread: each test runs on its
+    /// own.
+    static ROW_BUILDS: std::cell::RefCell<std::collections::HashMap<SessionKey, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// How many memoised rows have been built, rather than reused, on this thread.
+/// How many memoised rows of `key`'s session have been built, rather than reused, on this
+/// thread.
 #[cfg(test)]
-pub(crate) fn row_builds() -> usize {
-    ROW_BUILDS.with(std::cell::Cell::get)
+pub(crate) fn row_builds(key: SessionKey) -> usize {
+    ROW_BUILDS.with(|builds| builds.borrow().get(&key).copied().unwrap_or(0))
+}
+
+/// How many memoised rows of every session have been built, rather than reused, on this
+/// thread.
+#[cfg(test)]
+pub(crate) fn all_row_builds() -> usize {
+    ROW_BUILDS.with(|builds| builds.borrow().values().sum())
 }
 
 fn items_of(ui: &Ui, key: SessionKey) -> &[Item] {
@@ -158,11 +173,15 @@ fn empty_hint(folder: &Path, kit: &Kit) -> El {
 }
 
 /// "Jump to latest", floating over the bottom of `key`'s list while the user reads further up.
+/// Pressing it also focuses the tile.
 fn jump_to_latest(key: SessionKey, kit: &Kit) -> El {
     let button = Button::new("Jump to latest")
         .icon(&ARROW_DOWN_TO_LINE)
         .variant(ButtonVariant::Neutral)
-        .on_press_tx(move |_: &mut Ui, tx| tx.scroll_to_bottom(conversation_key(key)))
+        .on_press_tx(move |ui: &mut Ui, tx| {
+            glue::focus_tile(ui, key, false);
+            tx.scroll_to_bottom(conversation_key(key));
+        })
         .build(kit)
         .key("mr-jump-latest");
     row()

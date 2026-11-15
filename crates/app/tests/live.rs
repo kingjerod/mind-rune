@@ -6,9 +6,10 @@
 //! ```
 //!
 //! It needs Claude Code installed and signed in. It runs the app twice, as the window would be
-//! opened, closed and opened again, and starts the real program three times in all: the
-//! session of the first run, the look the first run takes, and the same session resumed in the
-//! second run. The account is checked once; the second run is handed what the first found.
+//! opened, closed and opened again, and starts the real program four times in all: the session
+//! of the first run, the look the first run takes, a second session opened to the side in the
+//! first run, and the first session resumed in the second run. The account is checked once;
+//! the second run is handed what the first found.
 //!
 //! The first run opens with no folder, so it lists the stored sessions and looks, as the window
 //! does; the test then starts a new session in a fresh temporary folder, asks for a one-word
@@ -17,18 +18,23 @@
 //! `claude` accepts the Auto permission mode. Then it prints how long the two listings took,
 //! what the look gave, and how long the largest of a few recent stored histories took to read.
 //! None of these fails the test, except not getting back to "Ask before edits" after trying
-//! Auto. The first run then closes, as the window closes, keeping what it would save.
+//! Auto. Then a second session opens to the side, in the same folder, and is sent one message:
+//! each session must hold its own reply and not the other's. The first session is renamed: its
+//! program must confirm the name, and a listing of the store must then give it. The first run
+//! then closes, as the window closes, keeping what it would save: both tiles, the first
+//! focused.
 //!
 //! The second run starts with what the first kept, so it shows the test's session again from
-//! the store. The first message and its reply must be in the history read back, a second
-//! message must wake the session, resuming the same id, and get its reply. What the first run
-//! kept also says that this app closed the session, so the second run is not expected to ask
-//! whether another app has it open; it prints whether it did.
+//! the store. Both tiles must come back, the first focused and under its new name. The first
+//! message and its reply must be in the history read back, a second message must wake the
+//! session, resuming the same id, and get its reply. What the first run kept also says that
+//! this app closed the session, so the second run is not expected to ask whether another app
+//! has it open; it prints whether it did.
 //!
-//! Every way out of the test, a failed assertion included, closes the session, so no `claude`
+//! Every way out of the test, a failed assertion included, closes both sessions, so no `claude`
 //! is left running, and every wait has a deadline that says what it waited for. Of the user's
 //! other stored sessions it prints only counts and times: never a title, a folder, a message
-//! or an id. It writes nothing; only `claude` itself stores the test's session.
+//! or an id. It writes nothing; only `claude` itself stores the test's two sessions.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,7 +47,8 @@ use mr_agent::{
 use mr_claude::ClaudeAgent;
 use mr_core::{
     App, Backend, DEFAULT_WIDTH, Effect, FromBackend, HistoryState, ItemBody, Launch, Leaving,
-    Phase, Prompt, PromptChoice, Saved, Screen, Session, SessionKey, ToBackend, Width, mode_label,
+    Phase, Place, Prompt, PromptChoice, Saved, Screen, Session, SessionKey, ToBackend, Width,
+    mode_label,
 };
 
 /// The whole run, from the account check to the reply; also a resumed session's reply.
@@ -83,6 +90,18 @@ const MESSAGE: &str = "Reply with the single word: ok";
 
 const SECOND_MESSAGE: &str = "Reply with the single word: again";
 
+/// The message to the session opened to the side.
+const SIDE_MESSAGE: &str = "Reply with the single word: side";
+
+/// The name the test's session is given.
+const NAME: &str = "MindRune live test";
+
+/// How long the program may take to confirm a name.
+const RENAME_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long a listing of the store may take to give the new name, asked again each second.
+const NAMED_LIMIT: Duration = Duration::from_secs(30);
+
 #[test]
 #[ignore = "starts the real claude; run with MINDRUNE_LIVE=1 and --ignored"]
 fn a_real_turn_the_store_the_look_and_the_session_resumed() {
@@ -107,7 +126,12 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     live.report_listings();
     live.report_look();
     live.report_histories();
+    live.side_turn();
+    live.rename();
     let id = live.id().expect("the session has the agent's id");
+    let side_id = live
+        .side_id()
+        .expect("the session to the side has the agent's id");
     let saved = live.close_app();
     let account = live.app.account.clone().expect("the account was checked");
     drop(live);
@@ -121,6 +145,7 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     };
     let mut again = Live::start(agent, launch, &folder, Some(account));
     again.read_back(&id);
+    again.restored(&id, &side_id);
     again.resume(&id);
     again.close_app();
 }
@@ -142,6 +167,8 @@ struct Live {
     folder: PathBuf,
     /// The test's session in this run, once there is one.
     key: Option<SessionKey>,
+    /// The session opened to the side of it, once there is one.
+    side: Option<SessionKey>,
     /// A new session is still to be started in `folder` once the account is signed in.
     start_new: bool,
     started: Instant,
@@ -174,6 +201,10 @@ struct Live {
     activity: Option<Option<i64>>,
     /// The spec of the latest program opened for the test's session.
     opened: Option<mr_agent::StartSpec>,
+    /// A listing was asked for to see the test's session's new name.
+    asked_for_name: bool,
+    /// Whether the first listing that answered since gave that name.
+    listed_name: Option<bool>,
 }
 
 impl Live {
@@ -198,6 +229,7 @@ impl Live {
             backend,
             folder: folder.to_path_buf(),
             key: None,
+            side: None,
             start_new: account.is_none(),
             started: Instant::now(),
             running: false,
@@ -216,6 +248,8 @@ impl Live {
             read: HashMap::new(),
             activity: None,
             opened: None,
+            asked_for_name: false,
+            listed_name: None,
         };
         if let Some(account) = account {
             effects.retain(|effect| *effect != Effect::CheckAccount);
@@ -373,7 +407,7 @@ impl Live {
         stored.truncate(HISTORIES_READ);
         let mut unanswered = false;
         for &(_, key) in &stored {
-            let effects = self.app.show(key, Leaving::ForgetIfEmpty);
+            let effects = self.app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
             self.carry_out(effects);
             if !self.wait_for(HISTORY_LIMIT, |live| live.read.contains_key(&key)) {
                 // The library thread is held up: what is asked next would only wait behind it.
@@ -382,7 +416,7 @@ impl Live {
             }
         }
         let key = self.key.expect("the test's session");
-        let effects = self.app.show(key, Leaving::ForgetIfEmpty);
+        let effects = self.app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
         self.carry_out(effects);
 
         let largest = stored
@@ -414,13 +448,200 @@ impl Live {
         }
     }
 
+    /// Opens a second session to the side of the test's, in the same folder, as "Open to the
+    /// side" does, sends it [`SIDE_MESSAGE`] and waits for its reply. Each session must hold its
+    /// own message and reply only. The test's tile is focused again afterwards.
+    fn side_turn(&mut self) {
+        let key = self.key.expect("the test's session");
+        let asked = Instant::now();
+        let effects =
+            self.app
+                .new_session(self.folder.clone(), Place::Side, Leaving::ForgetIfEmpty);
+        let side = self.app.focused().expect("the new session is shown");
+        assert_ne!(side, key, "a second session opened");
+        assert_eq!(
+            self.tile_keys(),
+            vec![key, side],
+            "it opened in a tile right of the test's"
+        );
+        self.side = Some(side);
+        self.carry_out(effects);
+        let ready = self.wait_for(TURN_LIMIT, |live| live.phase_of(side) == Some(Phase::Idle));
+        assert!(
+            ready,
+            "the session to the side never reached Idle within {} s: phase {:?}",
+            TURN_LIMIT.as_secs(),
+            self.phase_of(side)
+        );
+        let effects = self.app.submit(side, SIDE_MESSAGE);
+        assert!(!effects.is_empty(), "the message to the side was not sent");
+        self.carry_out(effects);
+        let replied = |live: &Live| {
+            live.phase_of(side) == Some(Phase::Idle)
+                && !finished_replies(&live.items_of(side)).is_empty()
+        };
+        if !self.wait_for(TURN_LIMIT, replied) {
+            panic!(
+                "no reply in the session to the side within {} s (phase {:?}); conversation:\n{:#?}",
+                TURN_LIMIT.as_secs(),
+                self.phase_of(side),
+                self.items_of(side)
+            );
+        }
+        let took = asked.elapsed();
+
+        let said = |items: &[ItemBody], message: &str| {
+            items
+                .iter()
+                .any(|body| matches!(body, ItemBody::User { text, .. } if text.contains(message)))
+        };
+        let (first, second) = (self.items(), self.items_of(side));
+        let side_replies = finished_replies(&second);
+        assert_eq!(
+            side_replies.len(),
+            1,
+            "one reply in the session to the side; conversation:\n{second:#?}"
+        );
+        assert!(
+            side_replies[0].to_lowercase().contains("side"),
+            "the reply to the side does not say side: {:?}",
+            side_replies[0]
+        );
+        assert!(
+            said(&second, SIDE_MESSAGE) && !said(&second, MESSAGE),
+            "the session to the side holds the test's message; conversation:\n{second:#?}"
+        );
+        assert!(
+            !said(&first, SIDE_MESSAGE) && finished_replies(&first).len() == 1,
+            "the test's session holds the message or the reply to the side; conversation:\n\
+             {first:#?}"
+        );
+        eprintln!(
+            "live: the session to the side replied in {} ms; each reply is in its own session",
+            took.as_millis()
+        );
+        let effects = self.app.focus_tile(key);
+        self.carry_out(effects);
+    }
+
+    /// Renames the test's session [`NAME`], as a double click on its tile's title does. Its
+    /// program must confirm the name, and a listing of the store must then give it: one is
+    /// asked for each second until one does.
+    fn rename(&mut self) {
+        let key = self.key.expect("the test's session");
+        let id = self.id().expect("the test's session has its id");
+        let (titles_before, refused_before) = (self.titles.len(), self.refusals.len());
+        let asked = Instant::now();
+        let effects = self.app.rename(key, NAME);
+        let open = self.open().expect("the test's session's program runs");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Send { open: to, command: SessionCommand::Rename(_) } if *to == open
+            )),
+            "the rename was not sent to the program: {effects:?}"
+        );
+        self.carry_out(effects);
+        let confirmed = |live: &Live| live.titles[titles_before..].iter().any(|t| t == NAME);
+        let refused = |live: &Live| {
+            live.refusals[refused_before..]
+                .iter()
+                .any(|(what, _)| *what == CommandKind::Rename)
+        };
+        self.wait_for(RENAME_LIMIT, |live| confirmed(live) || refused(live));
+        assert!(
+            confirmed(self),
+            "the program did not confirm the name within {} s; refused: {:?}",
+            RENAME_LIMIT.as_secs(),
+            self.refusal(CommandKind::Rename)
+        );
+        let took = asked.elapsed();
+
+        let listed_from = Instant::now();
+        let deadline = listed_from + NAMED_LIMIT;
+        loop {
+            self.asked_for_name = true;
+            self.listed_name = None;
+            self.backend
+                .send(ToBackend::ListSessions { since_unix: None });
+            let answered = self
+                .wait_for(deadline.saturating_duration_since(Instant::now()), |live| {
+                    live.listed_name.is_some()
+                });
+            if self.listed_name == Some(true) {
+                break;
+            }
+            assert!(
+                answered && Instant::now() + Duration::from_secs(1) < deadline,
+                "no listing gave the new name within {} s of its confirmation",
+                NAMED_LIMIT.as_secs()
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        self.asked_for_name = false;
+        assert_eq!(self.id(), Some(id), "the same session was renamed");
+        eprintln!(
+            "live: the name was confirmed in {} ms; a listing gave it {} ms later",
+            took.as_millis(),
+            listed_from.elapsed().as_millis()
+        );
+    }
+
+    /// Checks that the second run brought back both tiles of the first, `id`'s session (named
+    /// [`NAME`]) focused on the left and `side_id`'s on its right.
+    fn restored(&mut self, id: &SessionId, side_id: &SessionId) {
+        let ids: Vec<Option<SessionId>> = self
+            .tile_keys()
+            .into_iter()
+            .map(|key| {
+                self.app
+                    .sessions
+                    .get(key)
+                    .and_then(|e| e.session.id.clone())
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some(id.clone()), Some(side_id.clone())],
+            "the second run did not bring back both tiles in their order"
+        );
+        assert_eq!(
+            self.app.focused(),
+            self.tile_keys().first().copied(),
+            "the left tile, the test's, is focused"
+        );
+        assert_eq!(
+            self.title().as_deref(),
+            Some(NAME),
+            "the test's session is not shown under its new name"
+        );
+        // The session to the side rests in this run: no program of its is started to close.
+        eprintln!("live: restored 2 tiles, the focus on the first");
+    }
+
+    /// The sessions in the tiles, left to right.
+    fn tile_keys(&self) -> Vec<SessionKey> {
+        self.app.tiles.list().iter().map(|tile| tile.key).collect()
+    }
+
+    /// The test's sessions in this run: its own, and the one to the side once there is one.
+    fn ours(&self) -> Vec<SessionKey> {
+        self.key.into_iter().chain(self.side).collect()
+    }
+
+    fn side_id(&self) -> Option<SessionId> {
+        self.side
+            .and_then(|key| self.app.sessions.get(key))
+            .and_then(|entry| entry.session.id.clone())
+    }
+
     /// Waits for the second run to show the test's session `id` again, as kept by the first,
     /// with its history read from the store, and checks that the first message and its reply
     /// are in it.
     fn read_back(&mut self, id: &SessionId) {
-        let shown_id = |live: &Live| live.app.shown_entry().and_then(|e| e.session.id.clone());
+        let shown_id = |live: &Live| live.app.focused_entry().and_then(|e| e.session.id.clone());
         let read = self.wait_for(READ_BACK_LIMIT, |live| {
-            live.app.shown_entry().is_some_and(|entry| {
+            live.app.focused_entry().is_some_and(|entry| {
                 entry.session.id.as_ref() == Some(id)
                     && matches!(
                         entry.session.history,
@@ -440,10 +661,10 @@ impl Live {
                     Some(_) => "is another",
                     None => "is none",
                 },
-                self.app.shown_entry().map(|entry| &entry.session.history)
+                self.app.focused_entry().map(|entry| &entry.session.history)
             );
         }
-        self.key = self.app.shown;
+        self.key = self.app.focused();
         let session = self.session().expect("the test's session");
         if let HistoryState::Failed(reason) = &session.history {
             panic!("the session's history could not be read back from the store: {reason}");
@@ -587,10 +808,12 @@ impl Live {
             if self.start_new && self.app.screen == Screen::Main {
                 // As "New session" does, in the test's folder, before any listing is merged.
                 self.start_new = false;
-                let effects = self
-                    .app
-                    .new_session(self.folder.clone(), Leaving::ForgetIfEmpty);
-                self.key = self.app.shown;
+                let effects = self.app.new_session(
+                    self.folder.clone(),
+                    Place::Focused,
+                    Leaving::ForgetIfEmpty,
+                );
+                self.key = self.app.focused();
                 self.carry_out(effects);
             }
         }
@@ -611,6 +834,14 @@ impl Live {
                 _ => {}
             },
             FromBackend::Sessions { since_unix, result } => {
+                if self.asked_for_name && self.listed_name.is_none() {
+                    let id = self.id();
+                    self.listed_name = Some(result.as_ref().is_ok_and(|listed| {
+                        listed
+                            .iter()
+                            .any(|stored| Some(&stored.id) == id.as_ref() && stored.title == NAME)
+                    }));
+                }
                 let (asked, answered) = match since_unix {
                     Some(_) => (self.recent_asked, &mut self.recent),
                     None => (self.all_asked, &mut self.all),
@@ -819,12 +1050,25 @@ impl Live {
     }
 
     fn phase(&self) -> Option<Phase> {
-        self.session().map(|s| s.phase.clone())
+        self.key.and_then(|key| self.phase_of(key))
+    }
+
+    fn phase_of(&self, key: SessionKey) -> Option<Phase> {
+        self.app
+            .sessions
+            .get(key)
+            .map(|entry| entry.session.phase.clone())
     }
 
     fn items(&self) -> Vec<ItemBody> {
-        self.session().map_or_else(Vec::new, |s| {
-            s.conversation
+        self.key.map_or_else(Vec::new, |key| self.items_of(key))
+    }
+
+    fn items_of(&self, key: SessionKey) -> Vec<ItemBody> {
+        self.app.sessions.get(key).map_or_else(Vec::new, |entry| {
+            entry
+                .session
+                .conversation
                 .items()
                 .iter()
                 .map(|i| i.body.clone())
@@ -839,38 +1083,44 @@ impl Live {
             Screen::SignedOut => panic!("Claude Code is not signed in: run `claude auth login`"),
             Screen::Checking | Screen::Main => {}
         }
-        match self.phase() {
-            Some(Phase::Ended { clean, detail }) => panic!(
-                "the session ended before the reply (clean: {clean}): {detail}; conversation:\n{:#?}",
-                self.items()
-            ),
-            Some(Phase::Resting) if self.running && !self.closed => panic!(
-                "the session's program ended cleanly before the reply; conversation:\n{:#?}",
-                self.items()
-            ),
-            Some(Phase::NeedsUser) => panic!(
-                "the turn asked the user for something; conversation:\n{:#?}",
-                self.items()
-            ),
-            _ => {}
+        for key in self.ours() {
+            match self.phase_of(key) {
+                Some(Phase::Ended { clean, detail }) => panic!(
+                    "a session ended before the reply (clean: {clean}): {detail}; \
+                     conversation:\n{:#?}",
+                    self.items_of(key)
+                ),
+                Some(Phase::Resting) if self.running && !self.closed => panic!(
+                    "a session's program ended cleanly before the reply; conversation:\n{:#?}",
+                    self.items_of(key)
+                ),
+                Some(Phase::NeedsUser) => panic!(
+                    "a turn asked the user for something; conversation:\n{:#?}",
+                    self.items_of(key)
+                ),
+                _ => {}
+            }
         }
     }
 
-    /// Sends `Close` to the test's session, once, unless its program has ended already.
+    /// Sends `Close` to each of the test's sessions, once, unless its program has ended
+    /// already.
     fn send_close(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
-        if let Some(open) = self.open() {
-            self.backend.send(ToBackend::Send {
-                open,
-                command: SessionCommand::Close,
-            });
+        for key in self.ours() {
+            if let Some(open) = self.app.sessions.get(key).and_then(|entry| entry.open) {
+                self.backend.send(ToBackend::Send {
+                    open,
+                    command: SessionCommand::Close,
+                });
+            }
         }
     }
 
-    /// Closes the app as the window does, and waits until the test's session has ended
+    /// Closes the app as the window does, and waits until each of the test's sessions has ended
     /// cleanly: with a message in it, it then rests. Returns what the app would save.
     fn close_app(&mut self) -> Saved {
         self.closed = true;
@@ -886,25 +1136,32 @@ impl Live {
         let deadline = Instant::now() + CLOSE_LIMIT;
         loop {
             self.take_in();
-            match self.phase() {
-                Some(Phase::Resting) => return saved,
-                Some(Phase::Ended { clean, detail }) => {
-                    panic!("the session did not rest after closing (clean: {clean}): {detail}")
-                }
-                phase => assert!(
-                    Instant::now() < deadline,
-                    "the session never ended within {} s of Close: phase {phase:?}",
-                    CLOSE_LIMIT.as_secs()
-                ),
+            let phases: Vec<Option<Phase>> = self
+                .ours()
+                .into_iter()
+                .map(|key| self.phase_of(key))
+                .collect();
+            if phases.iter().all(|phase| *phase == Some(Phase::Resting)) {
+                return saved;
             }
+            for phase in &phases {
+                if let Some(Phase::Ended { clean, detail }) = phase {
+                    panic!("a session did not rest after closing (clean: {clean}): {detail}")
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a session never ended within {} s of Close: phases {phases:?}",
+                CLOSE_LIMIT.as_secs()
+            );
             std::thread::sleep(TICK);
         }
     }
 }
 
 impl Drop for Live {
-    /// Closes the test's session if the test left without closing it, and gives it a moment to
-    /// end, so a failure never leaves a `claude` running. Dropping the `Backend` afterwards
+    /// Closes the test's sessions if the test left without closing them, and gives them a moment
+    /// to end, so a failure never leaves a `claude` running. Dropping the `Backend` afterwards
     /// also passes `Close` to every session its threads still hold, the look's included.
     fn drop(&mut self) {
         if self.closed {
@@ -918,16 +1175,19 @@ impl Drop for Live {
                 let now = self.now();
                 let _ = self.app.receive(message, now);
             }
-            if matches!(
-                self.phase(),
-                Some(Phase::Resting | Phase::Ended { .. }) | None
-            ) {
+            let ended = self.ours().into_iter().all(|key| {
+                matches!(
+                    self.phase_of(key),
+                    Some(Phase::Resting | Phase::Ended { .. }) | None
+                )
+            });
+            if ended {
                 return;
             }
             std::thread::sleep(TICK);
         }
         eprintln!(
-            "live: the session had not ended {} s after Close",
+            "live: a session had not ended {} s after Close",
             CLOSE_LIMIT.as_secs()
         );
     }

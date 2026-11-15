@@ -42,9 +42,10 @@ pub struct Entry {
     pub last_active_unix: i64,
     /// When its own program last reported anything, in this run: Unix seconds.
     pub last_own_unix: Option<i64>,
-    /// A turn ended while it was not shown, and it has not been shown since.
+    /// A turn ended in it while it was not the focused session, also when it was in a tile, and
+    /// it has not been focused since.
     pub unseen: bool,
-    /// It was shown or started in this run.
+    /// It was in a tile or started in this run.
     pub touched: bool,
     /// The store is being asked whether another app may have it open, before it wakes.
     pub checking: bool,
@@ -54,7 +55,7 @@ pub struct Entry {
 
 impl Entry {
     /// `NeedsYou` while a request or a question waits, `Working` while a turn runs or a message
-    /// waits for the program to start, `Finished` while a turn that ended out of sight is unseen.
+    /// waits for the program to start, `Finished` while it is `unseen`.
     pub fn mark(&self) -> Mark {
         if self.prompt.is_some() {
             return Mark::NeedsYou;
@@ -107,8 +108,15 @@ impl Sessions {
     }
 
     /// Adds what is new, refreshes the title and time of resting entries, and, when `complete`,
-    /// removes resting entries that were never touched and are no longer in the store.
-    pub fn merge_listing(&mut self, listed: Vec<StoredSession>, complete: bool) {
+    /// removes resting entries that were never touched and are no longer in the store. A title
+    /// the user gave is not replaced (see [`Session::take_listed_title`]). A new entry whose id
+    /// has a name among `names` takes that name, and the name leaves `names`.
+    pub fn merge_listing(
+        &mut self,
+        listed: Vec<StoredSession>,
+        complete: bool,
+        names: &mut Vec<(SessionId, String)>,
+    ) {
         let mut known: HashMap<SessionId, SessionKey> = self
             .entries
             .values()
@@ -121,14 +129,17 @@ impl Sessions {
                     if let Some(mut entry) = self.get_mut(key)
                         && entry.session.phase == Phase::Resting
                     {
-                        if !stored.title.is_empty() {
-                            entry.session.title = Some(stored.title.clone());
-                        }
+                        entry.session.take_listed_title(&stored.title);
                         entry.last_active_unix = stored.last_active_unix;
                     }
                 }
                 None => {
-                    let key = self.add(Session::resting(&stored), stored.last_active_unix);
+                    let mut session = Session::resting(&stored);
+                    if let Some(at) = names.iter().position(|(id, _)| *id == stored.id) {
+                        session.keep_name(names.remove(at).1);
+                        session.take_listed_title(&stored.title);
+                    }
+                    let key = self.add(session, stored.last_active_unix);
                     known.insert(stored.id.clone(), key);
                 }
             }
@@ -479,19 +490,19 @@ mod tests {
             title: "Fix it".into(),
             last_active_unix: 20,
         };
-        sessions.merge_listing(vec![stored.clone()], true);
+        sessions.merge_listing(vec![stored.clone()], true, &mut Vec::new());
         assert!(!moved(&sessions), "a listing that tells nothing new");
         let retitled = StoredSession {
             title: "Fix it all".into(),
             ..stored.clone()
         };
-        sessions.merge_listing(vec![retitled], false);
+        sessions.merge_listing(vec![retitled], false, &mut Vec::new());
         assert!(moved(&sessions), "a new title");
         let other = StoredSession {
             id: SessionId("s2".into()),
             ..stored
         };
-        sessions.merge_listing(vec![other], false);
+        sessions.merge_listing(vec![other], false, &mut Vec::new());
         assert!(moved(&sessions), "a new entry");
         sessions.drop_copies_of(key);
         assert!(!moved(&sessions), "no copies");

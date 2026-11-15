@@ -12,7 +12,8 @@ use mr_agent::{Agent, FakeAgent, RequestId};
 use mr_core::EntryMut;
 use mr_core::{
     App, Backend, DEFAULT_WIDTH, Effect, FromBackend, GroupId, ItemBody, ItemId, Launch, Leaving,
-    Phase, RequestState, SAVED_VERSION, Saved, Screen, Session, SessionKey, ToBackend, Width,
+    Line, Phase, Place, RequestState, SAVED_VERSION, Saved, Screen, Session, SessionKey, ToBackend,
+    Width,
 };
 use rune::prefs::Prefs;
 use rune::runtime::Waker;
@@ -64,6 +65,52 @@ pub enum MenuTarget {
     Group(GroupId),
     /// The "Hidden groups" line: one item per hidden group.
     HiddenGroups,
+}
+
+/// What the window's one name field edits.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Renaming {
+    /// A group, in its header in the sidebar.
+    Group(GroupId),
+    /// A session, in its sidebar row.
+    Row(SessionKey),
+    /// A session, in its tile's header.
+    Header(SessionKey),
+}
+
+/// Where a drag in [`Ui::drag`] would go if it were let go there.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DropTarget {
+    /// This edge of the tile row, as `Tiles::edge_at` counts them: a new tile there for a
+    /// row's drag, the tile moved there for a header's.
+    Edge(usize),
+    /// In place of this tile's session.
+    Tile(SessionKey),
+    /// Into this group.
+    Group(GroupId),
+}
+
+/// What a drag in [`Ui::drag`] took hold of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragFrom {
+    /// A sidebar row.
+    Row,
+    /// A tile's header.
+    Header,
+}
+
+/// A sidebar row or a tile's header on its way: past the slop, not yet let go.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowDrag {
+    /// The session of the row, or of the tile.
+    pub key: SessionKey,
+    /// The pointer, in window points.
+    pub at: [f32; 2],
+    pub over: Option<DropTarget>,
+    /// Whether the drag heard the last pointer move, and how many it missed in a row.
+    pub heard: bool,
+    pub missed: u8,
+    pub from: DragFrom,
 }
 
 /// The sidebar's menu, open: there is one at a time, for the whole window.
@@ -119,15 +166,33 @@ impl SessionView {
         }
     }
 
-    /// The session is no longer drawn: its fields give up the keyboard focus, which a field
-    /// left focused would take back whenever it is drawn again, and its picker list shuts.
+    /// The session is no longer drawn: its fields give up the keyboard focus ([`let_go`]),
+    /// which a field left focused would take back whenever it is drawn again, and its picker
+    /// list shuts.
     fn leave(&mut self) {
         self.open_picker = None;
-        self.draft.focused = false;
+        let_go(&mut self.draft);
         for draft in self.answers.values_mut().flatten() {
-            draft.other.focused = false;
+            let_go(&mut draft.other);
         }
     }
+}
+
+/// A field that is no longer drawn gives up the keyboard focus. One that had it is made anew,
+/// with the same text and caret and no undo history, so that it can ask for the focus again.
+///
+/// Rune keeps a field unmounted while it had the focus as one that may come back, and knows it
+/// by its undo history: drawn again while another field holds the focus, such a field asking
+/// for it is taken for its old flag and not heard (`sync_requested_focus`, in
+/// `crates/rune/src/runtime/input/focus.rs` in the Rune checkout).
+fn let_go(edit: &mut TextEdit) {
+    if !edit.focused {
+        return;
+    }
+    let mut fresh = TextEdit::new(edit.text.clone());
+    fresh.anchor = edit.anchor;
+    fresh.focus = edit.focus;
+    *edit = fresh;
 }
 
 pub struct Ui {
@@ -154,15 +219,42 @@ pub struct Ui {
     pub(crate) fake_time: f64,
     /// What [`view_of`] lends for a session that has no view: one not shown yet.
     blank: SessionView,
-    /// The session shown as of the last [`run`].
-    was_shown: Option<SessionKey>,
+    /// The sessions in tiles as of the last [`run`].
+    was_tiled: Vec<SessionKey>,
+    /// The tile row as last laid out, in window points: x, y, width, height.
+    pub row_rect: Option<[f32; 4]>,
+    /// The shares of the two tiles beside the divider being dragged, as they were at its press:
+    /// what a cancelled drag puts back.
+    pub divider_press: Option<[f32; 2]>,
     /// The sidebar's menu, while it is open.
     pub side_menu: Option<SideMenu>,
-    /// The group whose name is being edited, and the field.
-    pub renaming: Option<GroupId>,
+    /// The sidebar row or the tile header being dragged (`view::drag`).
+    pub drag: Option<RowDrag>,
+    /// The row's press that may follow a drag's release is not a click (`view::drag::row`).
+    ///
+    /// Set at the release of every row's drag that went past the slop, whatever is under the
+    /// pointer; a header's drag never sets it.
+    /// Rune queues the row's press, when it runs one, right after that release, from the same
+    /// pointer release (`release`, in `crates/rune/src/runtime/input/pointer.rs` in the Rune
+    /// checkout), and a frame dispatches all the input queued before it, so that press comes in
+    /// the same frame and takes the flag. [`poll`] clears it: it runs before the input of every
+    /// later frame (or a timer's poll between frames stands for it), so no later press is
+    /// swallowed. Only a press of a row queued after the release and before that frame (an
+    /// assistive tool's activation within the same frame) could still be taken.
+    pub swallow_row_press: bool,
+    /// The row of a session in another tile that the list's arrow keys passed onto, with the
+    /// tiles' placement then (`Tiles::placement`): it is the list's selected row until a row
+    /// is pressed or a tile comes, goes or takes the focus (`view::sidebar::selected_row`).
+    pub passed_row: Option<(SessionKey, u64)>,
+    /// The name being edited, and the field it is edited in: one at a time, in the window.
+    pub renaming: Option<Renaming>,
     pub rename: TextEdit,
     /// The folder menu is open, for this group when one is named.
     pub folder_menu: Option<Option<GroupId>>,
+    /// The open folder menu starts its session to the side (Ctrl+Shift+N, or Ctrl held on a
+    /// custom group's "+"): a folder chosen in it, or in the folder picker it opens, opens a tile
+    /// right of the focused one. It goes when the menu shuts.
+    pub folder_side: bool,
     /// The folders the open folder menu offers: the app's choices that were folders on the disk
     /// as it opened (`view::folder::ask`), so it reads the disk once per opening.
     pub folder_offers: Vec<PathBuf>,
@@ -218,11 +310,17 @@ impl Ui {
             last_poll: None,
             fake_time: 0.0,
             blank: SessionView::new(0),
-            was_shown: None,
+            was_tiled: Vec::new(),
+            row_rect: None,
+            divider_press: None,
             side_menu: None,
+            drag: None,
+            swallow_row_press: false,
+            passed_row: None,
             renaming: None,
             rename: TextEdit::new(""),
             folder_menu: None,
+            folder_side: false,
             folder_offers: Vec::new(),
             folder_error: None,
         };
@@ -236,16 +334,16 @@ impl Ui {
         self.waiting.clear();
     }
 
-    /// The session the window shows. The demo and tests read it; a view draws the session it
+    /// The session in the focused tile. The demo and tests read it; a view draws the session it
     /// is given.
-    pub fn shown_session(&self) -> Option<&Session> {
-        self.app.shown_entry().map(|entry| &entry.session)
+    pub fn focused_session(&self) -> Option<&Session> {
+        self.app.focused_entry().map(|entry| &entry.session)
     }
 
-    /// The shown session's entry, lent out to change.
+    /// The focused session's entry, lent out to change.
     #[cfg(test)]
-    pub fn shown_entry_mut(&mut self) -> Option<EntryMut<'_>> {
-        let key = self.app.shown?;
+    pub fn focused_entry_mut(&mut self) -> Option<EntryMut<'_>> {
+        let key = self.app.focused()?;
         self.app.sessions.get_mut(key)
     }
 }
@@ -268,10 +366,16 @@ pub fn view_mut(ui: &mut Ui, key: SessionKey) -> &mut SessionView {
         .or_insert_with(|| SessionView::new(generation))
 }
 
-/// What becomes of the session shown now when another is shown: it stays while something that
-/// is not white space is typed in its input box; otherwise it is forgotten when it is empty.
-pub fn leaving(ui: &Ui) -> Leaving {
-    let typed = ui.app.shown.is_some_and(|left| {
+/// What becomes of the session `place` would take out of its tile: kept while text is typed
+/// in its input box, else forgotten when it is empty. `Side` and `At` take none out, but
+/// `Side` swaps the focused tile's session when there is no room, so it is read as `Focused`.
+pub fn leaving(ui: &Ui, place: Place) -> Leaving {
+    let out = match place {
+        Place::Focused | Place::Side => ui.app.focused(),
+        Place::Tile(key) => Some(key),
+        Place::At(_) => None,
+    };
+    let typed = out.is_some_and(|left| {
         view_of(ui, left)
             .draft
             .text
@@ -285,24 +389,25 @@ pub fn leaving(ui: &Ui) -> Leaving {
     }
 }
 
-/// Shows `key`'s session. One shown for the first time starts at its end; one shown again keeps
-/// its draft and is scrolled back to where it was. The session left stays while text is typed
-/// in it ([`leaving`]). With `focus`, its input box takes the keyboard focus, as when the user
-/// picked it with a click; without, the focus stays where it is (on the sidebar's list, say,
-/// whose arrow keys move from session to session).
-pub fn show(ui: &mut Ui, tx: &mut Tx, key: SessionKey, focus: bool) {
-    let before = ui.app.shown;
-    let effects = ui.app.show(key, leaving(ui));
-    if ui.app.shown == Some(key) {
-        // At once, as a tab shows: the conversation left does not fade out over this one.
+/// Shows `key`'s session at `place`. One shown for the first time starts at its end; one shown
+/// again keeps its draft and is scrolled back to where it was. The session taken out of its
+/// tile stays while text is typed in it ([`leaving`]). With `focus`, its input box takes the
+/// keyboard focus, as when the user picked it with a click; without, the focus stays where it
+/// is (on the sidebar's list, say, whose arrow keys move from session to session).
+pub fn show(ui: &mut Ui, tx: &mut Tx, key: SessionKey, place: Place, focus: bool) {
+    let tiled = ui.app.tiles.contains(key);
+    let effects = ui.app.show(key, place, leaving(ui, place));
+    if ui.app.focused() == Some(key) {
+        // At once, as a tab shows: the conversation left does not fade out over this one, and
+        // the tiles take their new widths in the same frame.
         tx.instant();
         let again = ui.views.contains_key(&key);
-        let view = view_mut(ui, key);
         if focus {
-            view.draft.focused = true;
+            type_in(ui, key);
         }
+        let view = view_mut(ui, key);
         // A new viewport opens at its end, which is where a following one is anyway.
-        if before != Some(key)
+        if !tiled
             && again
             && !view.following
             && let Some(first) = view.first_seen
@@ -311,6 +416,171 @@ pub fn show(ui: &mut Ui, tx: &mut Tx, key: SessionKey, focus: bool) {
         }
     }
     run(ui, effects);
+}
+
+/// `key`'s tile takes the focus; with `typing`, its input box takes the keyboard focus.
+/// Without, while a field of another tile holds the keyboard focus, the focus stays there
+/// ([`run`]).
+///
+/// `typing` is a focus asked for on purpose (F6, a press on the tile). When the tile's box
+/// cannot take the keyboard (its session has ended), the tile is focused all the same and
+/// no field keeps the keyboard: the one that had it gives it up, or [`run`] would hand the
+/// focus back to its tile.
+pub fn focus_tile(ui: &mut Ui, key: SessionKey, typing: bool) {
+    // The box asks first, so that `run` finds the keyboard going to the tile focused.
+    if typing {
+        take_keyboard(ui, key);
+    }
+    let effects = ui.app.focus_tile(key);
+    run(ui, effects);
+}
+
+/// The keyboard focus goes to `key`'s input box, for a tile focused on purpose
+/// ([`focus_tile`]); when the box cannot take it, no field keeps it.
+fn take_keyboard(ui: &mut Ui, key: SessionKey) {
+    if type_in(ui, key) {
+        return;
+    }
+    for view in ui.views.values_mut() {
+        view.draft.focused = false;
+        for draft in view.answers.values_mut().flatten() {
+            draft.other.focused = false;
+        }
+    }
+    // A name being edited is kept as the field lets go (`view::sidebar::rename_watch`).
+    ui.rename.focused = false;
+}
+
+/// The tile one of whose text fields has the keyboard focus: its input box, the "Something
+/// else" field of one of its questions, or the field its header's name is edited in, as Rune
+/// last wrote the focus into them. The focused tile is asked first, so a flag left behind in
+/// another tile can never take the focus away from it. The field of a name edited in a
+/// sidebar row belongs to no tile.
+pub fn typing_in(ui: &Ui) -> Option<SessionKey> {
+    let typing = |key: &SessionKey| {
+        let view = view_of(ui, *key);
+        view.draft.focused
+            || view.answers.values().flatten().any(|d| d.other.focused)
+            || (ui.rename.focused && ui.renaming == Some(Renaming::Header(*key)))
+    };
+    let focused = ui.app.focused().filter(typing);
+    focused.or_else(|| ui.app.tiles.list().iter().map(|tile| tile.key).find(typing))
+}
+
+/// The input box of `key`'s session takes the keyboard focus, while the session is in a tile
+/// and its box takes text: not once it has ended, when the box drawn is a disabled one. False
+/// when it does not.
+fn type_in(ui: &mut Ui, key: SessionKey) -> bool {
+    let typing = ui.app.tiles.contains(key)
+        && ui
+            .app
+            .sessions
+            .get(key)
+            .is_some_and(|entry| !ended(&entry.session));
+    if typing {
+        view_mut(ui, key).draft.focused = true;
+    }
+    typing
+}
+
+fn ended(session: &Session) -> bool {
+    matches!(session.phase, Phase::Ended { .. })
+}
+
+/// Closes `key`'s tile; its session leaves as `leaving(ui, Place::Tile(key))` says. The tiles
+/// take their new widths at once. When the tile closed was the focused one, the input box of the
+/// tile focused now takes the keyboard focus; otherwise the focus stays where it is.
+///
+/// A name being edited in its header goes with it, dropped.
+pub fn close_tile(ui: &mut Ui, tx: &mut Tx, key: SessionKey) {
+    if ui.renaming == Some(Renaming::Header(key)) {
+        end_rename(ui, false);
+    }
+    let was_focused = ui.app.focused() == Some(key);
+    let effects = ui.app.close_tile(key, leaving(ui, Place::Tile(key)));
+    tx.instant();
+    run(ui, effects);
+    if was_focused && let Some(now) = ui.app.focused() {
+        type_in(ui, now);
+    }
+}
+
+/// Moves `key`'s tile to `edge`, at once, with the keyboard in its input box when `typing`.
+///
+/// The tile takes the focus and keeps its width (`App::move_tile`). With `typing`, the keyboard
+/// goes to its box as [`focus_tile`] puts it there; without, it stays where it is. Nothing in
+/// the tile is made anew: the tiles are keyed, so Rune moves the tile's elements with it, and
+/// a field in it keeps the keyboard and what was typed. Nothing happens when nothing would move.
+pub fn move_tile(ui: &mut Ui, tx: &mut Tx, key: SessionKey, edge: usize, typing: bool) {
+    if ui.app.tiles.moved_index(key, edge).is_none() {
+        return;
+    }
+    tx.instant();
+    // The box asks first, so that `run` finds the keyboard going to the tile focused.
+    if typing {
+        take_keyboard(ui, key);
+    }
+    let effects = ui.app.move_tile(key, edge);
+    run(ui, effects);
+}
+
+/// Starts editing the name of `what`: the field holds its name (a session's title, empty while
+/// it has none), all selected, and asks for the keyboard focus. The name being edited before,
+/// if any, is kept first: one name is edited at a time in the window.
+pub fn start_rename(ui: &mut Ui, what: Renaming) {
+    end_rename(ui, true);
+    let name = match &what {
+        Renaming::Group(id) => ui.app.groups.name(id),
+        Renaming::Row(key) | Renaming::Header(key) => ui
+            .app
+            .sessions
+            .get(*key)
+            .and_then(|entry| entry.session.title.clone())
+            .unwrap_or_default(),
+    };
+    if let Renaming::Header(key) = what {
+        // The press that started it asked for the keyboard in the tile's input box.
+        view_mut(ui, key).draft.focused = false;
+    }
+    let mut edit = TextEdit::new(name);
+    edit.anchor = 0;
+    edit.focused = true;
+    ui.rename = edit;
+    ui.renaming = Some(what);
+}
+
+/// Ends the rename going on, if any. With `keep`, the name typed is given: to a group unless it
+/// is the name it has; to a session through `App::rename`, which leaves an empty name or the
+/// title it has alone.
+pub fn end_rename(ui: &mut Ui, keep: bool) {
+    let Some(what) = ui.renaming.take() else {
+        return;
+    };
+    let edit = std::mem::replace(&mut ui.rename, TextEdit::new(""));
+    if !keep {
+        return;
+    }
+    let effects = match what {
+        Renaming::Group(id) if edit.text.trim() != ui.app.groups.name(&id) => {
+            ui.app.rename_group(&id, &edit.text)
+        }
+        Renaming::Group(_) => return,
+        Renaming::Row(key) | Renaming::Header(key) => ui.app.rename(key, &edit.text),
+    };
+    run(ui, effects);
+}
+
+/// Return (`keep`) or Escape in the name field: the rename ends, and after one in a header the
+/// keyboard focus goes to that tile's input box.
+pub fn finish_rename(ui: &mut Ui, keep: bool) {
+    let header = match ui.renaming {
+        Some(Renaming::Header(key)) => Some(key),
+        _ => None,
+    };
+    end_rename(ui, keep);
+    if let Some(key) = header {
+        focus_tile(ui, key, true);
+    }
 }
 
 /// What was kept under [`STATE_KEY`]: the default when nothing is, and also, with a line to say
@@ -358,8 +628,12 @@ pub fn setup(ui: &mut Ui, waker: Waker) {
 }
 
 /// `AppSpec::poll`. The app's clock is brought up to date first, so what is taken in after is
-/// stamped with it.
+/// stamped with it. Tiles that come or go with what was taken in (a row restored, a session
+/// gone) do so at once, as when the user opens or closes one.
 pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
+    // A press that did not follow the release that set it never comes now. Nothing shows it.
+    ui.swallow_row_press = false;
+    let tiled = ui.was_tiled.clone();
     let since = ui.last_poll.map_or(0.0, |last| (now - last).max(0.0));
     ui.last_poll = Some(now);
     let minute = ui.app.now_unix / 60;
@@ -381,6 +655,10 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
         now
     };
     changed |= take_in(ui, stamp);
+    if ui.was_tiled != tiled {
+        tx.instant();
+        changed = true;
+    }
     changed
 }
 
@@ -390,8 +668,15 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
 /// started it.
 ///
 /// Every change to the `App` (an intent, or a message taken in) is followed by a call to this,
-/// so it ends by bringing the sessions' views up to date ([`tidy_views`]) and the sidebar's
-/// model with them (`App::settle`).
+/// so it ends by bringing the sidebar's model up to date (`App::settle`, which also takes out
+/// the tiles of sessions that are gone) and the sessions' views with it ([`tidy_views`]).
+///
+/// Last, the rule of ruling R7: while a text field of a tile holds the keyboard focus, that
+/// tile is the focused one. An intent on a session in another tile (a request button, a row's
+/// toggle: controls that take no keyboard focus) focused that other tile; the focus goes back
+/// to the tile the user types in here, in the same change, so no outline or row flashes. A
+/// tile focused on purpose whose box cannot take the keyboard leaves no field holding it
+/// ([`focus_tile`]), so nothing is given back.
 pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
     for effect in effects {
         let message = match effect {
@@ -429,14 +714,27 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
             None => ui.waiting.push(message),
         }
     }
-    tidy_views(ui);
     ui.app.settle();
+    tidy_views(ui);
     tidy_sidebar(ui);
+    if let Some(typing) = typing_in(ui)
+        && ui.app.focused() != Some(typing)
+    {
+        let effects = ui.app.focus_tile(typing);
+        run(ui, effects);
+    }
 }
 
 /// The sidebar's menu shuts when what it is the menu of is gone, and so does the folder menu of
-/// a group no longer listed; the rename of a group no longer listed ends, dropped: its field is
-/// gone with its header.
+/// a group no longer listed. A row's drag ends when its session is gone, a header's when its
+/// tile is, and either while a menu is open: a menu takes the pointer, and the drag's release
+/// never comes.
+///
+/// A rename whose field is gone with its place ends: that of a group no longer listed, of a
+/// session that is gone, of a row no longer listed, of a header whose session left its tile.
+/// It ends dropped while the field still had the keyboard focus (the tile closed under it, say);
+/// a session's name is kept when the field had already lost it (a click on another row shows
+/// that session in the header's tile), as `view::sidebar::rename_watch` would have kept it.
 fn tidy_sidebar(ui: &mut Ui) {
     let model = &ui.app.sidebar;
     let listed = |id: &GroupId| model.sections.iter().any(|section| section.id == *id);
@@ -449,48 +747,80 @@ fn tidy_sidebar(ui: &mut Ui) {
     if gone {
         ui.side_menu = None;
     }
+    let menu = ui.side_menu.is_some() || ui.folder_menu.is_some();
+    if let Some(drag) = &ui.drag {
+        let gone = match drag.from {
+            DragFrom::Row => ui.app.sessions.get(drag.key).is_none(),
+            DragFrom::Header => !ui.app.tiles.contains(drag.key),
+        };
+        if menu || gone {
+            ui.drag = None;
+        }
+    }
     if let Some(Some(id)) = &ui.folder_menu
         && !listed(id)
     {
         ui.folder_menu = None;
+        ui.folder_side = false;
     }
-    if ui.renaming.as_ref().is_some_and(|id| !listed(id)) {
-        ui.renaming = None;
-        ui.rename = TextEdit::new("");
+    let row_listed = |key: &SessionKey| {
+        model
+            .lines
+            .iter()
+            .any(|line| matches!(*line, Line::Row(s, r) if model.sections[s].rows[r].key == *key))
+    };
+    let (gone, session) = match &ui.renaming {
+        Some(Renaming::Group(id)) => (!listed(id), false),
+        Some(Renaming::Row(key)) => (!row_listed(key), true),
+        Some(Renaming::Header(key)) => (!ui.app.tiles.contains(*key), true),
+        None => (false, false),
+    };
+    if gone {
+        let keep = session && !ui.rename.focused && ui.side_menu.is_none();
+        end_rename(ui, keep);
     }
 }
 
 /// Brings every session's view up to what the core now holds:
 ///
 /// - The view of a session that is gone is dropped.
-/// - When the shown session changed, the one left gives up the keyboard focus and shuts its
-///   picker list, and one the core showed by itself (the first at the start, a new session) is
-///   shown for the first time, at its end and with its input box focused. [`show`] makes the
-///   view first, and focuses the box only when asked to.
+/// - A session that was in a tile and is in none now gives up the keyboard focus and shuts its
+///   picker list. One that came into a tile the core filled by itself (the first at the start, a
+///   new session) is shown for the first time, at its end, with its input box focused when its
+///   tile is the focused one. [`show`] makes the view first, and focuses the box only when asked
+///   to. A tile that only gained or lost the focus keeps its picker and its fields as they are.
 /// - A view whose `generation` is behind its session's forgets its rows opened, closed or shown
 ///   whole, and its open picker: the items were numbered again.
+/// - The draft of a session that has ended gives up the keyboard focus: its box is drawn
+///   disabled, with no field for the draft.
 /// - The drafts of a request no longer waiting in its own session are dropped.
 /// - A picker list open while its picker cannot be used is shut.
 fn tidy_views(ui: &mut Ui) {
     let Ui {
         app,
         views,
-        was_shown,
+        was_tiled,
         ..
     } = ui;
     views.retain(|key, _| app.sessions.get(*key).is_some());
-    if app.shown != *was_shown {
-        if let Some(left) = was_shown.and_then(|key| views.get_mut(&key)) {
-            left.leave();
+    let tiled: Vec<SessionKey> = app.tiles.list().iter().map(|tile| tile.key).collect();
+    if tiled != *was_tiled {
+        for left in was_tiled.iter().filter(|key| !tiled.contains(key)) {
+            if let Some(view) = views.get_mut(left) {
+                view.leave();
+            }
         }
-        if let Some(entry) = app.shown_entry() {
-            views.entry(entry.key).or_insert_with(|| {
+        for &came in tiled.iter().filter(|key| !was_tiled.contains(key)) {
+            let Some(entry) = app.sessions.get(came) else {
+                continue;
+            };
+            views.entry(came).or_insert_with(|| {
                 let mut view = SessionView::new(entry.session.generation);
-                view.draft.focused = true;
+                view.draft.focused = app.focused() == Some(came) && !ended(&entry.session);
                 view
             });
         }
-        *was_shown = app.shown;
+        *was_tiled = tiled;
     }
     for (key, view) in views.iter_mut() {
         let Some(entry) = app.sessions.get(*key) else {
@@ -503,6 +833,10 @@ fn tidy_views(ui: &mut Ui) {
             view.open_picker = None;
             view.first_seen = None;
             view.generation = session.generation;
+        }
+        // Its box is drawn disabled from now on, with no field for its draft.
+        if ended(session) {
+            let_go(&mut view.draft);
         }
         drop_settled_drafts(view, session);
         shut_disabled_picker(view, session);
@@ -645,9 +979,10 @@ mod tests {
     fn the_demo_window_reaches_the_main_screen_and_asks_for_usage() {
         let rt = testkit::window("empty");
         assert_eq!(rt.state.app.screen, Screen::Main);
-        assert_eq!(rt.state.shown_session().unwrap().phase, Phase::Idle);
+        assert_eq!(rt.state.focused_session().unwrap().phase, Phase::Idle);
         assert!(testkit::sent(&rt).contains(&SessionCommand::RefreshUsage));
-        assert!(rt.find("mr-tile").is_some());
+        let key = testkit::focused(&rt).unwrap();
+        assert!(rt.find(&view::tile_key(key)).is_some());
         assert_eq!(rt.state.app.usage.session.as_ref().unwrap().percent(), 37);
     }
 
@@ -657,7 +992,7 @@ mod tests {
             ("checking", "mr-screen-checking"),
             ("signed-out", "mr-screen-signin"),
             ("not-installed", "mr-screen-missing"),
-            ("empty", "mr-tile"),
+            ("empty", view::ROW),
         ] {
             let rt = testkit::window(scene);
             assert!(rt.find(key).is_some(), "{scene}");
@@ -671,7 +1006,7 @@ mod tests {
         assert!(!demo::pump(&mut rt.state, 0.0));
         testkit::emit(&mut rt, SessionEvent::TitleChanged("Fix the parser".into()));
         assert_eq!(
-            rt.state.shown_session().unwrap().title.as_deref(),
+            rt.state.focused_session().unwrap().title.as_deref(),
             Some("Fix the parser")
         );
     }
@@ -685,12 +1020,12 @@ mod tests {
             .unwrap()
             .1)(&mut ui);
         let fake = ui.fake.clone().unwrap();
-        let id = ui.shown_session().unwrap().id.clone().unwrap();
+        let id = ui.focused_session().unwrap().id.clone().unwrap();
         fake.emit(&id, SessionEvent::ThinkingStarted);
         demo::pump(&mut ui, 0.0);
         fake.emit(&id, SessionEvent::BlockFinished);
         demo::pump(&mut ui, 4.0);
-        let items = ui.shown_session().unwrap().conversation.items();
+        let items = ui.focused_session().unwrap().conversation.items();
         let Some(ItemBody::Thinking { time, .. }) = items.last().map(|i| &i.body) else {
             panic!("no thinking item: {items:?}");
         };
@@ -811,7 +1146,7 @@ mod tests {
         let mut ui = Ui::new(agent, None, launch, Prefs::memory());
         setup(&mut ui, Arc::new(|| {}));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !ui.shown_session().is_some_and(|s| s.phase == Phase::Idle) {
+        while !ui.focused_session().is_some_and(|s| s.phase == Phase::Idle) {
             take_in(&mut ui, 0.0);
             assert!(Instant::now() < deadline, "the session never started");
             std::thread::sleep(Duration::from_millis(2));
@@ -974,7 +1309,8 @@ mod tests {
 
     #[test]
     fn the_state_is_written_and_read_back() {
-        let mut rt = testkit::window("empty");
+        // A message was handed over: the store has the session, so its tile is kept.
+        let mut rt = testkit::window("conversation");
         let ui = &mut rt.state;
         let (_, effects) = ui.app.new_group("Side projects");
         run(ui, effects);
@@ -993,7 +1329,8 @@ mod tests {
         assert_eq!(written.groups.len(), 1);
         let project = std::path::PathBuf::from("/home/alex/project");
         assert_eq!(written.recent_folders, vec![project], "the demo's folder");
-        assert!(written.shown.is_some());
+        assert_eq!(written.tiles.len(), 1);
+        assert_eq!(written.shown.as_ref(), Some(&written.tiles[0].id));
 
         let prefs = std::mem::replace(&mut ui.prefs, Prefs::memory());
         let (back, warning) = opened(prefs);
@@ -1021,7 +1358,7 @@ mod tests {
     #[test]
     fn a_session_that_is_gone_leaves_no_view() {
         let mut rt = testkit::window("empty");
-        let first = rt.state.app.shown.unwrap();
+        let first = testkit::focused(&rt).unwrap();
         assert!(
             rt.state.views.contains_key(&first),
             "the shown session has its view"

@@ -8,8 +8,8 @@ use mr_agent::{
 };
 use mr_claude::{Incoming, PermissionReply, Translator, parse_line};
 use mr_core::{
-    App, DEFAULT_WIDTH, Effect, FromBackend, ItemBody, Launch, Leaving, Phase, Screen, Session,
-    SessionKey, Width, answer_words,
+    App, DEFAULT_WIDTH, Effect, FromBackend, ItemBody, Launch, Leaving, Phase, Place, Screen,
+    Session, SessionKey, Width, answer_words,
 };
 use serde_json::json;
 
@@ -167,9 +167,10 @@ struct Player<'r> {
 }
 
 impl<'r> Player<'r> {
-    /// A new session in `app`, as "New session" makes one, with [`FIRST_MESSAGE`] waiting in it.
-    fn new(app: &mut App, recording: &'r Recording) -> Player<'r> {
-        let effects = app.new_session(recording.folder().into(), Leaving::ForgetIfEmpty);
+    /// A new session in `app` at `place`, as "New session" makes one, with [`FIRST_MESSAGE`]
+    /// waiting in it.
+    fn new(app: &mut App, recording: &'r Recording, place: Place) -> Player<'r> {
+        let effects = app.new_session(recording.folder().into(), place, Leaving::ForgetIfEmpty);
         let open = effects
             .iter()
             .find_map(|effect| match effect {
@@ -177,7 +178,7 @@ impl<'r> Player<'r> {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("{}: no program was opened: {effects:?}", recording.name));
-        let key = app.shown.expect("the new session is shown");
+        let key = app.focused().expect("the new session is shown");
         let effects = app.submit(key, FIRST_MESSAGE);
         assert!(
             effects.is_empty(),
@@ -306,7 +307,7 @@ struct Ending {
 /// ended and how many requests were raised.
 fn replay_alone(recording: &Recording) -> (Ending, usize, usize) {
     let mut app = signed_in_app();
-    let mut player = Player::new(&mut app, recording);
+    let mut player = Player::new(&mut app, recording, Place::Focused);
     for line in 0..recording.lines() {
         player.play_line(&mut app, line);
     }
@@ -318,26 +319,29 @@ fn replay_alone(recording: &Recording) -> (Ending, usize, usize) {
 }
 
 /// Plays `recordings` into as many sessions of one app at once: line by line, one line of each
-/// in turn. Returns how each ends, in the same order.
-fn replay_together(recordings: &[&Recording]) -> Vec<Ending> {
+/// in turn. Each session after the first is shown at `place`. Returns the app and how each
+/// session ends, in the same order.
+fn replay_together(recordings: &[&Recording], place: Place) -> (App, Vec<Ending>) {
     let mut app = signed_in_app();
-    let mut players: Vec<Player> = recordings
-        .iter()
-        .map(|recording| Player::new(&mut app, recording))
-        .collect();
+    let mut players: Vec<Player> = Vec::new();
+    for (i, recording) in recordings.iter().enumerate() {
+        let place = if i == 0 { Place::Focused } else { place };
+        players.push(Player::new(&mut app, recording, place));
+    }
     let lines = recordings.iter().map(|r| r.lines()).max().unwrap_or(0);
     for line in 0..lines {
         for player in &mut players {
             player.play_line(&mut app, line);
         }
     }
-    players
+    let endings = players
         .iter()
         .map(|player| Ending {
             session: player.session(&app).clone(),
             sent: player.sent.clone(),
         })
-        .collect()
+        .collect();
+    (app, endings)
 }
 
 #[test]
@@ -365,7 +369,7 @@ fn recordings_played_into_three_sessions_at_once_end_as_each_does_alone() {
         let three: Vec<&Recording> = (first..first + 3)
             .map(|i| &recordings[i % recordings.len()])
             .collect();
-        let together = replay_together(&three);
+        let (_, together) = replay_together(&three, Place::Focused);
         for (recording, ending) in three.iter().zip(together) {
             let (alone, _, _) = replay_alone(recording);
             let others: Vec<&str> = three
@@ -382,6 +386,47 @@ fn recordings_played_into_three_sessions_at_once_end_as_each_does_alone() {
                 alone.session.phase,
                 ending.session.conversation.items().len(),
                 alone.session.conversation.items().len(),
+                ending.sent.len(),
+                alone.sent.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn recordings_played_in_three_tiles_at_once_each_show_what_they_show_alone() {
+    let recordings: Vec<Recording> = recordings().iter().map(|p| Recording::read(p)).collect();
+    assert!(recordings.len() >= 3, "three recordings at least");
+    // Every recording is played in a tile beside two others: in threes, the last three
+    // wrapping round.
+    for first in (0..recordings.len()).step_by(3) {
+        let three: Vec<&Recording> = (first..first + 3)
+            .map(|i| &recordings[i % recordings.len()])
+            .collect();
+        let (app, together) = replay_together(&three, Place::Side);
+        assert_eq!(
+            app.tiles.list().len(),
+            3,
+            "{}, {} and {} are in three tiles",
+            three[0].name,
+            three[1].name,
+            three[2].name
+        );
+        for (recording, ending) in three.iter().zip(together) {
+            let (alone, _, _) = replay_alone(recording);
+            assert_eq!(
+                ending.session.conversation.items(),
+                alone.session.conversation.items(),
+                "{}: its items in a tile beside two others are not those it has alone",
+                recording.name
+            );
+            assert!(
+                ending == alone,
+                "{}: in a tile beside two others it ends otherwise than alone: phase {:?} \
+                 against {:?}, {} commands against {}",
+                recording.name,
+                ending.session.phase,
+                alone.session.phase,
                 ending.sent.len(),
                 alone.sent.len()
             );

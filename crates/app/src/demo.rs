@@ -18,13 +18,13 @@ use mr_agent::{
     ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
 };
 use mr_core::{
-    Effect, FromBackend, GroupId, HistoryState, ItemBody, Launch, Leaving, Phase, Screen,
-    SessionKey, ThinkingTime,
+    Effect, FromBackend, GroupId, HistoryState, ItemBody, Launch, Leaving, Mark, Phase, Place,
+    Screen, SessionKey, ThinkingTime,
 };
 use rune::PointerPress;
 use rune::prefs::Prefs;
 
-use crate::glue::{self, MenuTarget, SideMenu, Ui};
+use crate::glue::{self, DragFrom, DropTarget, MenuTarget, Renaming, RowDrag, SideMenu, Ui};
 
 /// The folder the demo's session is opened in.
 const FOLDER: &str = "/home/alex/project";
@@ -43,6 +43,12 @@ pub fn ui() -> Ui {
 
 /// [`ui`], started in `folder`, or as `mindrune` with no folder starts.
 fn ui_in(folder: Option<&str>) -> Ui {
+    ui_with(folder, Prefs::memory())
+}
+
+/// [`ui_in`], with the settings `prefs` holds: what a last run kept, say. Only tests call it
+/// with their own.
+pub(crate) fn ui_with(folder: Option<&str>, prefs: Prefs) -> Ui {
     let fake = FakeAgent::new();
     fake.set_account(Account::SignedIn {
         name: "alex".into(),
@@ -57,7 +63,7 @@ fn ui_in(folder: Option<&str>) -> Ui {
         home: "/home/alex".into(),
         ..Launch::default()
     };
-    let mut ui = Ui::new(Arc::new(fake.clone()), Some(fake), launch, Prefs::memory());
+    let mut ui = Ui::new(Arc::new(fake.clone()), Some(fake), launch, prefs);
     ui.unix_clock = || NOW_UNIX;
     ui.app.now_unix = NOW_UNIX;
     ui.folder_exists = |_| true;
@@ -119,6 +125,11 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("history-loading", history_loading),
     ("history-failed", history_failed),
     ("elsewhere", elsewhere),
+    ("tiles", tiles),
+    ("tiles-needs-you", tiles_needs_you),
+    ("tiles-drag", tiles_drag),
+    ("tiles-move", tiles_move),
+    ("tile-rename", tile_rename),
 ];
 
 /// Replaces the state with a fresh demo state.
@@ -154,14 +165,14 @@ fn say(ui: &mut Ui, message: &str, title: &str) {
         0.0,
         SessionEvent::TitleChanged(title.into()),
     )]);
-    let key = ui.app.shown.expect("a session is shown");
+    let key = ui.app.focused().expect("a session is shown");
     let effects = ui.app.submit(key, message);
     glue::run(ui, effects);
 }
 
-/// Emits `event` to the shown session.
+/// Emits `event` to the focused session.
 fn emit(ui: &Ui, event: SessionEvent) {
-    let key = ui.app.shown.expect("a session is shown");
+    let key = ui.app.focused().expect("a session is shown");
     emit_to(ui, key, event);
 }
 
@@ -204,7 +215,7 @@ fn empty(ui: &mut Ui) {
     fresh(ui);
     start(ui);
     pump_until(ui, "an idle session", |ui| {
-        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle)
+        ui.focused_session().is_some_and(|s| s.phase == Phase::Idle)
     });
     usage(ui, 0.37, 0.10);
 }
@@ -274,7 +285,7 @@ fn conversation(ui: &mut Ui) {
     ]);
     say(ui, USER_MESSAGE, CONVERSATION_TITLE);
     pump_until(ui, "the finished reply", |ui| {
-        ui.shown_session()
+        ui.focused_session()
             .is_some_and(|s| s.phase == Phase::Idle && s.conversation.items().len() == 2)
     });
 }
@@ -295,7 +306,7 @@ fn streaming(ui: &mut Ui) {
     ]);
     say(ui, USER_MESSAGE, CONVERSATION_TITLE);
     pump_until(ui, "the reply cut off in its code block", |ui| {
-        ui.shown_session().is_some_and(|s| {
+        ui.focused_session().is_some_and(|s| {
             matches!(
                 s.conversation.items().last().map(|item| &item.body),
                 Some(ItemBody::Reply {
@@ -321,7 +332,7 @@ fn long(ui: &mut Ui) {
     }
     pump(ui, 0.0);
     let items = ui
-        .shown_session()
+        .focused_session()
         .map_or(0, |s| s.conversation.items().len());
     assert_eq!(
         items, LONG_REPLIES,
@@ -448,7 +459,7 @@ pub(crate) fn tools_turn(ui: &mut Ui) {
     ]);
     say(ui, TOOLS_MESSAGE, "Fixing the failing tests");
     pump_until(ui, "the thinking", |ui| {
-        ui.shown_session().is_some_and(|s| {
+        ui.focused_session().is_some_and(|s| {
             matches!(
                 s.conversation.items().last().map(|item| &item.body),
                 Some(ItemBody::Thinking {
@@ -460,7 +471,7 @@ pub(crate) fn tools_turn(ui: &mut Ui) {
     });
     pump(ui, t);
     pump_until(ui, "the finished turn", |ui| {
-        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle)
+        ui.focused_session().is_some_and(|s| s.phase == Phase::Idle)
     });
 }
 
@@ -491,7 +502,7 @@ fn working(ui: &mut Ui) {
         "Waiting half a minute",
     );
     pump_until(ui, "the running command and thought", |ui| {
-        ui.shown_session().is_some_and(|s| {
+        ui.focused_session().is_some_and(|s| {
             s.phase == Phase::Working
                 && matches!(
                     s.conversation.items().last().map(|item| &item.body),
@@ -515,7 +526,7 @@ fn ended(ui: &mut Ui) {
     ]);
     say(ui, "Tidy up the README", "Tidying up the README");
     pump_until(ui, "the reply", |ui| {
-        ui.shown_session()
+        ui.focused_session()
             .is_some_and(|s| s.phase == Phase::Idle && s.conversation.items().len() == 2)
     });
     emit(
@@ -526,7 +537,7 @@ fn ended(ui: &mut Ui) {
         },
     );
     pump_until(ui, "the ended session", |ui| {
-        ui.shown_session()
+        ui.focused_session()
             .is_some_and(|s| matches!(s.phase, Phase::Ended { .. }))
     });
 }
@@ -547,7 +558,7 @@ fn ask(ui: &mut Ui, message: &str, title: &str, request: UserRequest) {
     fake(ui).reply(steps);
     say(ui, message, title);
     pump_until(ui, "the request waiting", |ui| {
-        ui.shown_session()
+        ui.focused_session()
             .is_some_and(|s| s.phase == Phase::NeedsUser && s.conversation.waiting() == 1)
     });
 }
@@ -819,7 +830,7 @@ fn sessions(ui: &mut Ui) {
     );
     start(ui);
     pump_until(ui, "an idle session and the listing", |ui| {
-        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle) && ui.app.listed_all
+        ui.focused_session().is_some_and(|s| s.phase == Phase::Idle) && ui.app.listed_all
     });
     usage(ui, 0.37, 0.10);
 
@@ -884,14 +895,14 @@ fn sessions(ui: &mut Ui) {
         .app
         .collapse_group(&GroupId::Folder(SKETCHES.into()), true);
     glue::run(ui, effects);
-    let effects = ui.app.show(garden, Leaving::ForgetIfEmpty);
+    let effects = ui.app.show(garden, Place::Focused, Leaving::ForgetIfEmpty);
     glue::run(ui, effects);
     pump(ui, 1.0);
     pump_until(ui, "the finished turn and the shown history", |ui| {
         let marks = ui.app.sessions.iter().filter(|e| e.unseen).count();
         marks == 1
             && ui
-                .shown_session()
+                .focused_session()
                 .is_some_and(|s| s.conversation.items().len() == 2)
     });
 }
@@ -905,9 +916,9 @@ const GROUP_MENU_AT: PointerPress = PointerPress { x: 150.0, y: 154.0 };
 fn group_menu(ui: &mut Ui) {
     sessions(ui);
     let key = key_of_title(ui, "Running the window tests");
-    // As after a right-click: the open menu holds the focus, not the shown session's box.
-    if let Some(shown) = ui.app.shown {
-        glue::view_mut(ui, shown).draft.focused = false;
+    // As after a right-click: the open menu holds the focus, not the focused session's box.
+    if let Some(focused) = ui.app.focused() {
+        glue::view_mut(ui, focused).draft.focused = false;
     }
     ui.side_menu = Some(SideMenu {
         target: MenuTarget::Row(key),
@@ -922,9 +933,9 @@ fn group_menu(ui: &mut Ui) {
 /// (`view::folder::ask`) would offer none of them.
 fn folders(ui: &mut Ui) {
     sessions(ui);
-    // As after a press on the button: the open menu holds the focus, not the shown session's box.
-    if let Some(shown) = ui.app.shown {
-        glue::view_mut(ui, shown).draft.focused = false;
+    // As after a press on the button: the open menu holds the focus, not the focused session's box.
+    if let Some(focused) = ui.app.focused() {
+        glue::view_mut(ui, focused).draft.focused = false;
     }
     ui.folder_offers = ui.app.folder_choices();
     ui.folder_menu = Some(None);
@@ -1056,16 +1067,16 @@ fn parser_listed(ui: &mut Ui, history: Result<StoredHistory, &str>) -> SessionKe
     key_of(ui, PARSER_ID)
 }
 
-/// Whether the shown session's history is `state`.
+/// Whether the focused session's history is `state`.
 fn history_is(ui: &Ui, state: &HistoryState) -> bool {
-    ui.shown_session().is_some_and(|s| s.history == *state)
+    ui.focused_session().is_some_and(|s| s.history == *state)
 }
 
 /// A stored session shown from its history, as the app restores one at launch: its program is
 /// not started, and the pickers show the model and the mode it will start with.
 fn resting(ui: &mut Ui) {
     let key = parser_listed(ui, Ok(parser_history()));
-    let effects = ui.app.show(key, Leaving::ForgetIfEmpty);
+    let effects = ui.app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
     glue::run(ui, effects);
     pump_until(ui, "the stored history", |ui| {
         history_is(ui, &HistoryState::Loaded)
@@ -1076,7 +1087,7 @@ fn resting(ui: &mut Ui) {
 /// the scene stays there.
 fn history_loading(ui: &mut Ui) {
     let key = parser_listed(ui, Ok(parser_history()));
-    let mut effects = ui.app.show(key, Leaving::ForgetIfEmpty);
+    let mut effects = ui.app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
     effects.retain(|effect| !matches!(effect, Effect::ReadHistory { .. }));
     glue::run(ui, effects);
 }
@@ -1084,10 +1095,10 @@ fn history_loading(ui: &mut Ui) {
 /// The same session shown when its history cannot be read.
 fn history_failed(ui: &mut Ui) {
     let key = parser_listed(ui, Err(HISTORY_FAILURE));
-    let effects = ui.app.show(key, Leaving::ForgetIfEmpty);
+    let effects = ui.app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
     glue::run(ui, effects);
     pump_until(ui, "the failed read", |ui| {
-        ui.shown_session()
+        ui.focused_session()
             .is_some_and(|s| matches!(s.history, HistoryState::Failed(_)))
     });
 }
@@ -1098,7 +1109,7 @@ fn elsewhere(ui: &mut Ui) {
     resting(ui);
     let id = SessionId(PARSER_ID.into());
     fake(ui).set_last_active(&id, Some(NOW_UNIX - 40));
-    let key = ui.app.shown.expect("a session is shown");
+    let key = ui.app.focused().expect("a session is shown");
     let effects = ui.app.submit(key, ELSEWHERE_MESSAGE);
     glue::run(ui, effects);
     pump_until(ui, "the question", |ui| ui.app.prompt(key).is_some());
@@ -1127,17 +1138,209 @@ fn thinking_on() -> Vec<FakeStep> {
 /// A new session in `folder`, shown, whose first message `message` plays `steps`; Claude names
 /// it `title`. Pumps until the turn has started.
 fn live(ui: &mut Ui, folder: &str, message: &str, title: &str, steps: Vec<FakeStep>) {
-    let effects = ui.app.new_session(folder.into(), Leaving::ForgetIfEmpty);
+    live_at(ui, Place::Focused, folder, message, title, steps);
+}
+
+/// [`live`], with the new session shown at `place`.
+fn live_at(
+    ui: &mut Ui,
+    place: Place,
+    folder: &str,
+    message: &str,
+    title: &str,
+    steps: Vec<FakeStep>,
+) {
+    let effects = ui
+        .app
+        .new_session(folder.into(), place, Leaving::ForgetIfEmpty);
     glue::run(ui, effects);
     pump_until(ui, "the new session started", |ui| {
-        ui.shown_session().is_some_and(|s| s.phase == Phase::Idle)
+        ui.focused_session().is_some_and(|s| s.phase == Phase::Idle)
     });
     fake(ui).reply(steps);
     say(ui, message, title);
     pump_until(ui, "its turn under way", |ui| {
-        ui.shown_session()
+        ui.focused_session()
             .is_some_and(|s| matches!(s.phase, Phase::Working | Phase::NeedsUser))
     });
+}
+
+/// A turn that asks to run `touch a.txt` (request r1), offering a rule to always allow it.
+fn asking_turn() -> Vec<FakeStep> {
+    let mut asking = vec![FakeStep::at(0.0, SessionEvent::TurnStarted)];
+    let request = touch("r1", Some("Always allow Bash(touch a.txt) in this project"));
+    asking.extend(call_asked_for(&request).map(|call| FakeStep::at(0.0, call)));
+    asking.push(FakeStep::at(0.0, SessionEvent::NeedsUser(request)));
+    asking
+}
+
+/// Three tiles side by side, for a window of 1,800 by 900: the `conversation` scene's finished
+/// conversation, then a session whose permission request waits, then one at work. The middle
+/// one is focused, its input box with the keyboard focus.
+fn tiles(ui: &mut Ui) {
+    conversation(ui);
+    live_at(
+        ui,
+        Place::Side,
+        "/home/alex/website",
+        PERMISSION_MESSAGE,
+        PERMISSION_TITLE,
+        asking_turn(),
+    );
+    let asks = ui.app.focused().expect("the second tile is focused");
+    let working = vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(
+            0.0,
+            tool(
+                "c1",
+                "Bash",
+                ToolDetail::Command {
+                    command: "sleep 30".into(),
+                },
+            ),
+        ),
+        FakeStep::at(0.0, SessionEvent::ThinkingStarted),
+        FakeStep::at(LATER, SessionEvent::BlockFinished),
+        FakeStep::at(LATER, done("c1", "")),
+        FakeStep::at(LATER, finished()),
+    ];
+    live_at(
+        ui,
+        Place::Side,
+        SKETCHES,
+        "Wait half a minute, then tell me",
+        "Waiting half a minute",
+        working,
+    );
+    focus_tile(ui, asks);
+}
+
+/// Focuses `key`'s tile, its input box with the keyboard focus. Each tile's box asked for the
+/// keyboard focus as its tile opened: only the focused one's keeps asking.
+fn focus_tile(ui: &mut Ui, key: SessionKey) {
+    let effects = ui.app.focus_tile(key);
+    glue::run(ui, effects);
+    let tiled: Vec<SessionKey> = ui.app.tiles.list().iter().map(|tile| tile.key).collect();
+    for tiled in tiled {
+        glue::view_mut(ui, tiled).draft.focused = tiled == key;
+    }
+}
+
+/// The user's message in the middle tile of the `tiles-needs-you` scene, Claude's reply, and
+/// the title Claude gives the session.
+const README_MESSAGE: &str = "What does the README say?";
+const README_REPLY: &str = "It says how to build the sketches and how to run each one.";
+const README_TITLE: &str = "Reading the README";
+
+/// How long the middle tile's turn in the `tiles-needs-you` scene lasts, in seconds.
+const README_TURN: f32 = 2.0;
+
+/// Three tiles side by side, for a window of 1,800 by 900: the `conversation` scene's finished
+/// conversation, focused; a session whose turn finished while its tile was not the focused
+/// one, so that it says "Finished"; and a session whose permission request waits.
+fn tiles_needs_you(ui: &mut Ui) {
+    conversation(ui);
+    let first = ui.app.focused().expect("the first tile is focused");
+    let reading = vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(README_TURN, SessionEvent::TextDelta(README_REPLY.into())),
+        FakeStep::at(README_TURN, SessionEvent::BlockFinished),
+        FakeStep::at(README_TURN, finished()),
+    ];
+    live_at(
+        ui,
+        Place::Side,
+        SKETCHES,
+        README_MESSAGE,
+        README_TITLE,
+        reading,
+    );
+    let reads = ui.app.focused().expect("the second tile is focused");
+    live_at(
+        ui,
+        Place::Side,
+        "/home/alex/website",
+        PERMISSION_MESSAGE,
+        PERMISSION_TITLE,
+        asking_turn(),
+    );
+    focus_tile(ui, first);
+    pump(ui, README_TURN);
+    pump_until(ui, "the middle tile's turn finished out of sight", |ui| {
+        ui.app
+            .sessions
+            .get(reads)
+            .is_some_and(|entry| entry.mark() == Mark::Finished)
+    });
+}
+
+/// Where the `tiles-drag` scene's pointer is, in window points: in the tile row of a window of
+/// 1,800 by 900, just right of the edge between its two tiles.
+const DRAG_AT: [f32; 2] = [1_040.0, 380.0];
+
+/// The tile row of a window of 1,800 by 900, as the window lays it out: x, y, width, height.
+/// The snapshot test runs `tiles-drag` and `tiles-move` at that size (`WIDE` in
+/// `tests/snapshots.rs`).
+const WIDE_ROW: [f32; 4] = [260.0, 48.0, 1_532.0, 844.0];
+
+/// Two tiles, for a window of 1,800 by 900: the `tiles` scene with its middle tile closed, and
+/// that tile's session, whose permission request waits, dragged by its sidebar row half way
+/// to the tile row, where the line marks the edge between the two tiles.
+fn tiles_drag(ui: &mut Ui) {
+    tiles(ui);
+    let asks = ui.app.focused().expect("the middle tile is focused");
+    let effects = ui.app.close_tile(asks, Leaving::Keep);
+    glue::run(ui, effects);
+    let focused = ui
+        .app
+        .focused()
+        .expect("the tile on its right takes the focus");
+    focus_tile(ui, focused);
+    // The line is placed from the row's last layout, which a snapshot's one frame comes too
+    // late for. No pointer moves come in a snapshot, so the watcher of a lost release never
+    // ends the drag.
+    ui.row_rect = Some(WIDE_ROW);
+    ui.app.set_row_width(WIDE_ROW[2]);
+    ui.drag = Some(RowDrag {
+        key: asks,
+        at: DRAG_AT,
+        over: Some(DropTarget::Edge(1)),
+        heard: true,
+        missed: 0,
+        from: DragFrom::Row,
+    });
+}
+
+/// Where the `tiles-move` scene's pointer is, in window points: in the headers of a window of
+/// 1,800 by 900, a little right of the edge between the second tile and the third.
+const MOVE_AT: [f32; 2] = [1_300.0, 66.0];
+
+/// The `tiles` scene's three tiles, for a window of 1,800 by 900, the first dragged by its
+/// header to the edge between the second and the third, where the line shows it would go.
+fn tiles_move(ui: &mut Ui) {
+    tiles(ui);
+    let first = ui.app.tiles.list()[0].key;
+    // As for `tiles-drag`: the line is placed from the row's last layout, which a snapshot's
+    // one frame comes too late for.
+    ui.row_rect = Some(WIDE_ROW);
+    ui.app.set_row_width(WIDE_ROW[2]);
+    ui.drag = Some(RowDrag {
+        key: first,
+        at: MOVE_AT,
+        over: Some(DropTarget::Edge(2)),
+        heard: true,
+        missed: 0,
+        from: DragFrom::Header,
+    });
+}
+
+/// The `conversation` scene with its title being edited in the tile's header, as a double click
+/// on the title starts it: the whole title selected.
+fn tile_rename(ui: &mut Ui) {
+    conversation(ui);
+    let key = ui.app.focused().expect("a session is shown");
+    glue::start_rename(ui, Renaming::Header(key));
 }
 
 /// The key of the session the agent knows as `id`.

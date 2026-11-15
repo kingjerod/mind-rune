@@ -194,7 +194,7 @@ mod tests {
         FakeAgent, FakeStep, HistoryItem, PermissionMode, SessionCommand, SessionEvent, SessionId,
         StoredHistory, StoredSession,
     };
-    use mr_core::{HistoryState, Phase, Session, SessionKey};
+    use mr_core::{HistoryState, Phase, Place, Session, SessionKey};
     use rune::{Key, Runtime};
 
     use crate::demo::{
@@ -341,7 +341,7 @@ mod tests {
     fn a_stored_session_shows_its_history() {
         let rt = testkit::window("resting");
         let key = parser(&rt);
-        assert_eq!(rt.state.app.shown, Some(key));
+        assert_eq!(testkit::focused(&rt), Some(key));
         assert_eq!(session(&rt, key).phase, Phase::Resting);
         assert!(
             testkit::has_text(&rt, PARSER_QUESTION),
@@ -468,15 +468,22 @@ mod tests {
     #[test]
     fn the_pickers_show_what_the_session_will_start_with() {
         let mut rt = testkit::window("resting");
-        assert_eq!(shown_by(&rt, "mr-model-trigger").as_deref(), Some("Fast"));
-        assert_eq!(shown_by(&rt, "mr-mode-trigger").as_deref(), Some("Plan"));
-        testkit::click(&mut rt, "mr-mode-trigger");
+        assert_eq!(
+            shown_by(&rt, &testkit::model_key(&rt, "trigger")).as_deref(),
+            Some("Fast")
+        );
+        assert_eq!(
+            shown_by(&rt, &testkit::mode_key(&rt, "trigger")).as_deref(),
+            Some("Plan")
+        );
+        let picker = testkit::mode_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         testkit::click_text(&mut rt, "Accept edits");
         testkit::step(&mut rt);
         assert!(nothing_opened(&rt), "{:?}", fake(&rt).sent());
         assert_eq!(
-            shown_by(&rt, "mr-mode-trigger").as_deref(),
+            shown_by(&rt, &testkit::mode_key(&rt, "trigger")).as_deref(),
             Some("Accept edits")
         );
         let key = parser(&rt);
@@ -501,33 +508,41 @@ mod tests {
         rt.invalidate();
         testkit::step(&mut rt);
         assert_eq!(
-            shown_by(&rt, "mr-model-trigger").as_deref(),
+            shown_by(&rt, &testkit::model_key(&rt, "trigger")).as_deref(),
             Some("fake-model-fast")
         );
-        testkit::click(&mut rt, "mr-model-trigger");
+        let picker = testkit::model_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
-        assert!(rt.find("mr-model-content").is_none(), "disabled");
+        assert!(
+            rt.find(&testkit::model_key(&rt, "content")).is_none(),
+            "disabled"
+        );
         rt.state.app.sessions.get_mut(key).unwrap().session.model = None;
         glue::run(&mut rt.state, Vec::new());
         rt.invalidate();
         testkit::step(&mut rt);
-        assert_eq!(shown_by(&rt, "mr-model-trigger").as_deref(), Some("Model"));
+        assert_eq!(
+            shown_by(&rt, &testkit::model_key(&rt, "trigger")).as_deref(),
+            Some("Model")
+        );
     }
 
     #[test]
     fn sending_wakes_the_session() {
         let mut rt = testkit::window("resting");
         let key = parser(&rt);
-        testkit::click(&mut rt, "mr-mode-trigger");
+        let picker = testkit::mode_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         testkit::click_text(&mut rt, "Accept edits");
         testkit::step(&mut rt);
         assert!(
-            element(&rt, "mr-mode-trigger").focusable,
+            element(&rt, &testkit::mode_key(&rt, "trigger")).focusable,
             "usable while it rests"
         );
         assert!(
-            element(&rt, "mr-model-trigger").focusable,
+            element(&rt, &testkit::model_key(&rt, "trigger")).focusable,
             "usable while it rests"
         );
         turn_goes_on(&rt);
@@ -548,11 +563,11 @@ mod tests {
             "opened"
         );
         assert!(
-            !element(&rt, "mr-mode-trigger").focusable,
+            !element(&rt, &testkit::mode_key(&rt, "trigger")).focusable,
             "the mode picker waits"
         );
         assert!(
-            !element(&rt, "mr-model-trigger").focusable,
+            !element(&rt, &testkit::model_key(&rt, "trigger")).focusable,
             "the model picker waits"
         );
         assert_eq!(glue::view_of(&rt.state, key).draft.text, "");
@@ -691,7 +706,7 @@ mod tests {
             "the same session"
         );
         assert_eq!(joined.phase, Phase::Working);
-        assert_eq!(rt.state.app.shown, Some(key));
+        assert_eq!(testkit::focused(&rt), Some(key));
     }
 
     #[test]
@@ -706,7 +721,7 @@ mod tests {
         testkit::click(&mut rt, "mr-elsewhere-copy");
         testkit::step(&mut rt);
         testkit::step(&mut rt);
-        let copy = rt.state.app.shown.expect("a session is shown");
+        let copy = testkit::focused(&rt).expect("a session is shown");
         assert_ne!(copy, original, "the copy is shown");
         let section_of = |key: SessionKey| {
             rt.state
@@ -750,10 +765,12 @@ mod tests {
             .into_iter()
             .find(|e| e.focused)
             .and_then(|e| e.key);
-        matches!(
-            focused.as_deref(),
-            Some("mr-new-session" | "mr-model-trigger" | "mr-mode-trigger")
-        )
+        let controls = [
+            "mr-new-session".to_string(),
+            testkit::model_key(rt, "trigger"),
+            testkit::mode_key(rt, "trigger"),
+        ];
+        focused.is_some_and(|key| controls.contains(&key))
     }
 
     #[test]
@@ -863,14 +880,14 @@ mod tests {
             ..StoredHistory::default()
         };
         let key = stored(&mut rt, "stored-long", history);
-        let built = conversation::row_builds();
-        rt.update(|ui, tx| glue::show(ui, tx, key, true));
+        let built = conversation::row_builds(key);
+        rt.update(|ui, tx| glue::show(ui, tx, key, Place::Focused, true));
         rt.frame(0.016);
         assert_eq!(session(&rt, key).conversation.items().len(), 2_000);
-        let first = conversation::row_builds() - built;
+        let first = conversation::row_builds(key) - built;
         assert!(first < 100, "the first frame built {first} rows");
         testkit::step(&mut rt);
-        let all = conversation::row_builds() - built;
+        let all = conversation::row_builds(key) - built;
         assert!(all < 100, "{all} rows were built");
         let scroll = conversation::conversation_key(key);
         assert_eq!(rt.scroll_at_bottom(&scroll), Some(true), "at its end");

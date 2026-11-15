@@ -43,8 +43,12 @@ pub struct Session {
     pub folder: PathBuf,
     pub id: Option<SessionId>,
     /// The agent's name for the session or, until it gives one, a stand-in made from the first
-    /// message sent; for a stored session, the store's title. `None` before any message.
+    /// message sent; for a stored session, the store's title; the user's name once they gave
+    /// one. `None` before any message.
     pub title: Option<String>,
+    /// The name the user gave in this run, or one kept from an earlier run that the program has
+    /// not been told yet.
+    pub user_title: Option<String>,
     pub phase: Phase,
     /// The full id of the model in use, once known.
     pub model: Option<String>,
@@ -69,6 +73,9 @@ pub struct Session {
     from_store: bool,
     /// Messages handed over in this run, less those that could not be.
     handed_over: usize,
+    /// `user_title` waits for a program to confirm it: it is kept between runs and told to
+    /// each program that starts. Not after the program confirmed or refused it.
+    name_pending: bool,
 }
 
 impl Session {
@@ -77,6 +84,7 @@ impl Session {
             folder: folder.into(),
             id: None,
             title: None,
+            user_title: None,
             phase: Phase::Opening,
             model: None,
             models: Vec::new(),
@@ -92,6 +100,7 @@ impl Session {
             own_models: false,
             from_store: false,
             handed_over: 0,
+            name_pending: false,
         }
     }
 
@@ -193,6 +202,52 @@ impl Session {
         }
     }
 
+    /// Names the session `name`, trimmed, as the user's name. Returns the `Rename` for its
+    /// program when it runs and has started; the next program that starts is told otherwise.
+    /// Nothing for an empty name or the title it has.
+    pub fn rename(&mut self, name: &str) -> Option<SessionCommand> {
+        let name = name.trim();
+        if name.is_empty() || self.title.as_deref() == Some(name) {
+            return None;
+        }
+        self.title = Some(name.into());
+        self.user_title = Some(name.into());
+        self.name_pending = true;
+        matches!(self.phase, Phase::Idle | Phase::Working | Phase::NeedsUser)
+            .then(|| SessionCommand::Rename(name.into()))
+    }
+
+    /// Takes `name`, kept from an earlier run, as the user's name, to tell the next program
+    /// that starts.
+    pub fn keep_name(&mut self, name: String) {
+        self.title = Some(name.clone());
+        self.user_title = Some(name);
+        self.name_pending = true;
+    }
+
+    /// The store's title, from a listing. It is the title unless the user named the session;
+    /// when it is the user's name, the store has that name and no program needs telling.
+    pub fn take_listed_title(&mut self, title: &str) {
+        match &self.user_title {
+            Some(name) if name == title => self.name_pending = false,
+            Some(_) => {}
+            None if title.is_empty() => {}
+            None => self.title = Some(title.into()),
+        }
+    }
+
+    /// The name to keep between runs, by the session's id: the user's, while no program has
+    /// confirmed it.
+    pub fn kept_name(&self) -> Option<(SessionId, String)> {
+        let name = self.pending_name()?;
+        Some((self.id.clone()?, name))
+    }
+
+    /// The user's name, while no program has confirmed it.
+    fn pending_name(&self) -> Option<String> {
+        self.name_pending.then(|| self.user_title.clone()).flatten()
+    }
+
     /// Gives the session models to choose from when it has none of its own yet.
     pub fn offer_models(&mut self, models: &[ModelOption]) {
         if !self.own_models {
@@ -200,8 +255,10 @@ impl Session {
         }
     }
 
-    /// Applies an event. Returns commands the session now wants sent: a queued message, and the
-    /// request for a title when that message is the session's first.
+    /// Applies an event. Returns commands the session now wants sent: at a start, the user's
+    /// name when no program has confirmed it yet; a queued message, and the request for a title
+    /// when that message is the session's first. While the user's name holds, a title from the
+    /// program only confirms it when it is the same, and is ignored otherwise.
     pub fn apply(&mut self, event: SessionEvent, now: f64) -> Vec<SessionCommand> {
         self.conversation.apply(&event, now);
         match event {
@@ -214,7 +271,13 @@ impl Session {
                     self.mode = info.permission_mode;
                     self.mode_known = true;
                     self.phase = Phase::Idle;
-                    return self.send_queued();
+                    let mut commands: Vec<SessionCommand> = self
+                        .pending_name()
+                        .map(SessionCommand::Rename)
+                        .into_iter()
+                        .collect();
+                    commands.extend(self.send_queued());
+                    return commands;
                 }
             }
             SessionEvent::TurnStarted => {
@@ -248,13 +311,21 @@ impl Session {
                     return self.send_queued();
                 }
             }
-            SessionEvent::TitleChanged(title) => self.title = Some(title),
+            SessionEvent::TitleChanged(title) => match &self.user_title {
+                Some(name) if *name == title => self.name_pending = false,
+                Some(_) => {}
+                None => self.title = Some(title),
+            },
             SessionEvent::ModelChanged(model) => self.model = Some(model),
             SessionEvent::PermissionModeChanged(mode) => {
                 self.mode = mode;
                 self.mode_known = true;
             }
             SessionEvent::CommandFailed { what, reason } => {
+                if what == CommandKind::Rename {
+                    // The name stays on screen for this run, and is neither kept nor told again.
+                    self.name_pending = false;
+                }
                 let wording = match what {
                     CommandKind::SetModel => "Could not change the model",
                     CommandKind::SetPermissionMode => "Could not change the permission mode",

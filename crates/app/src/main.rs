@@ -176,7 +176,7 @@ mod tests {
             !effects.iter().any(|e| matches!(e, Effect::Open { .. })),
             "no session starts by itself: {effects:?}"
         );
-        assert_eq!(app.shown, None);
+        assert_eq!(app.focused(), None);
         let stored = StoredSession {
             id: SessionId("a1".into()),
             folder: "/home/alex/notes".into(),
@@ -190,7 +190,9 @@ mod tests {
             },
             0.0,
         );
-        let shown = app.shown_entry().expect("the last session is shown again");
+        let shown = app
+            .focused_entry()
+            .expect("the last session is shown again");
         assert_eq!(shown.session.folder, PathBuf::from("/home/alex/notes"));
         assert!(shown.open.is_none(), "without starting its program");
         assert!(
@@ -214,7 +216,7 @@ mod tests {
             _ => None,
         });
         assert_eq!(opened.as_deref(), Some(dir.path()));
-        let shown = app.shown_entry().expect("its session is shown");
+        let shown = app.focused_entry().expect("its session is shown");
         assert_eq!(shown.session.folder, dir.path());
     }
 

@@ -5,10 +5,10 @@
 
 use std::cell::RefCell;
 
-use mr_agent::{FakeStep, SessionCommand, SessionEvent, TurnSummary};
-use mr_core::{Leaving, Phase, SessionKey};
+use mr_agent::{FakeStep, SessionCommand, SessionEvent, SessionId, StoredSession, TurnSummary};
+use mr_core::{FromBackend, GroupId, Leaving, Phase, Place, SessionKey};
 use rune::clipboard::MemoryClipboard;
-use rune::{Env, Key, KeyEvent, Mods, Runtime};
+use rune::{ElementInfo, Env, Key, KeyEvent, Mods, Runtime};
 
 use crate::glue::{self, SessionView, Ui};
 use crate::{demo, view};
@@ -34,6 +34,13 @@ pub fn window_sized(scene: &str, size: (f32, f32)) -> Runtime<Ui> {
     };
     let mut ui = demo::ui();
     run_scene(&mut ui);
+    let mut rt = runtime(ui, size);
+    step(&mut rt);
+    rt
+}
+
+/// The window over `ui` at `size`, as [`window`] opens it, with no frame run yet.
+pub fn runtime(ui: Ui, size: (f32, f32)) -> Runtime<Ui> {
     let env = Env {
         system_dark: true,
         scale: 1.0,
@@ -44,19 +51,229 @@ pub fn window_sized(scene: &str, size: (f32, f32)) -> Runtime<Ui> {
     let clipboard = rune::clipboard::memory();
     rt.use_clipboard(&clipboard);
     CLIPBOARD.with(|c| *c.borrow_mut() = Some(clipboard));
-    step(&mut rt);
     rt
 }
 
-/// Moves the pointer onto the element keyed `key`, presses and releases, and runs a frame.
+/// `mr-tile-{n}/{inner}`, the path [`find`], [`rect`] and [`click`] take to something inside
+/// `key`'s tile. Rune takes a key path only when its leading keys are the element's nearest
+/// keyed ancestors, which a tile seldom is: never hand this to a Rune lookup.
+pub fn tile(key: SessionKey, inner: &str) -> String {
+    format!("{}/{inner}", view::tile_key(key))
+}
+
+/// The drawn rectangle `[x, y, w, h]` of the element `key` names, as [`find`] picks it.
+pub fn rect(rt: &Runtime<Ui>, key: &str) -> Option<[f32; 4]> {
+    match key.split_once('/') {
+        Some((tile, _)) if tile.starts_with("mr-tile-") => element(rt, key).map(|e| e.rect),
+        _ => rt.presented(key).map(|(rect, _)| rect),
+    }
+}
+
+/// The element a path from [`tile`] names, as [`find`] picks it.
+pub fn element(rt: &Runtime<Ui>, key: &str) -> Option<ElementInfo> {
+    let (tile, inner) = key.split_once('/')?;
+    rt.elements()
+        .into_iter()
+        .find(|e| !e.exiting && under_tile(&e.path, tile, inner))
+}
+
+/// The centre of the element `key` names: as `Runtime::find` takes it, or, for a path from
+/// [`tile`], the first element inside that tile whose own key path ends with `inner`. Rune's
+/// key paths name an element by its nearest keyed ancestors only, which a tile seldom is.
+pub fn find(rt: &Runtime<Ui>, key: &str) -> Option<(f32, f32)> {
+    match key.split_once('/') {
+        Some((tile, _)) if tile.starts_with("mr-tile-") => {
+            rect(rt, key).map(|[x, y, w, h]| (x + w / 2.0, y + h / 2.0))
+        }
+        _ => rt.find(key),
+    }
+}
+
+/// Whether the element at `path` sits inside the tile keyed `tile` and its keyed ancestors end
+/// with the keys of `inner`, as in `mr-input/scroll/input`.
+fn under_tile(path: &str, tile: &str, inner: &str) -> bool {
+    let Some((_, below)) = path.split_once(&format!("/{tile}/")) else {
+        return false;
+    };
+    if below
+        .rsplit('/')
+        .next()
+        .is_some_and(|own| own.starts_with('#'))
+    {
+        return false;
+    }
+    let mut keyed = below
+        .rsplit('/')
+        .filter(|segment| !segment.starts_with('#'));
+    inner.rsplit('/').all(|want| keyed.next() == Some(want))
+}
+
+/// The sessions in the tiles, left to right.
+pub fn tile_keys(rt: &Runtime<Ui>) -> Vec<SessionKey> {
+    rt.state.app.tiles.list().iter().map(|t| t.key).collect()
+}
+
+/// Whether the keyboard focus is in `key`'s input box.
+pub fn box_focused(rt: &Runtime<Ui>, key: SessionKey) -> bool {
+    let inside = format!("/{}/", view::tile_key(key));
+    rt.elements().into_iter().any(|e| {
+        !e.exiting && e.focused && e.path.contains(&inside) && e.path.contains("/mr-input/")
+    })
+}
+
+/// Ctrl as it is held off macOS, Cmd on macOS.
+pub fn ctrl() -> Mods {
+    Mods {
+        cmd: true,
+        ctrl: !cfg!(target_os = "macos"),
+        ..Mods::default()
+    }
+}
+
+/// Ctrl+Shift as they are held off macOS, Cmd+Shift on macOS.
+pub fn ctrl_shift() -> Mods {
+    Mods {
+        shift: true,
+        ..ctrl()
+    }
+}
+
+/// Whether a visible text inside `key`'s tile contains `part`.
+pub fn tile_has_text(rt: &Runtime<Ui>, key: SessionKey, part: &str) -> bool {
+    let inside = format!("/{}/", view::tile_key(key));
+    rt.elements()
+        .into_iter()
+        .filter(|e| !e.exiting && e.visible[2] > 0.0 && e.visible[3] > 0.0)
+        .filter(|e| e.path.contains(&inside))
+        .filter_map(|e| e.text)
+        .any(|t| t.contains(part))
+}
+
+/// Moves the pointer onto the element `key` names ([`find`]), presses and releases, and runs a
+/// frame.
 pub fn click(rt: &mut Runtime<Ui>, key: &str) {
-    let Some((x, y)) = rt.find(key) else {
+    let Some((x, y)) = find(rt, key) else {
         panic!("no element keyed {key:?}");
     };
     rt.pointer_move(x, y);
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
     rt.frame(FRAME);
+}
+
+/// The key of `key`'s row in the sidebar.
+pub fn row_key(key: SessionKey) -> String {
+    format!("mr-row-{}", key.0)
+}
+
+/// Presses on the centre of `key`'s sidebar row and moves the pointer to `to` in eight even
+/// steps, a frame after each: the row is held there, its release still to come.
+pub fn hold_row(rt: &mut Runtime<Ui>, key: SessionKey, to: (f32, f32)) {
+    let row = row_key(key);
+    let Some(from) = find(rt, &row) else {
+        panic!("no element keyed {row:?}");
+    };
+    rt.pointer_move(from.0, from.1);
+    rt.pointer_down(from.0, from.1);
+    rt.frame(FRAME);
+    move_held(rt, to);
+}
+
+/// Moves the pointer from where it is to `to` in eight even steps, a frame after each.
+pub fn move_held(rt: &mut Runtime<Ui>, to: (f32, f32)) {
+    let from = rt.pointer().expect("the pointer is in the window");
+    for i in 1..=8 {
+        let t = i as f32 / 8.0;
+        rt.pointer_move(from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+        rt.frame(FRAME);
+    }
+}
+
+/// Lets the held pointer go where it is, then steps.
+pub fn release(rt: &mut Runtime<Ui>) {
+    let (x, y) = rt.pointer().expect("the pointer is in the window");
+    rt.pointer_up(x, y);
+    step(rt);
+}
+
+/// Drags `key`'s sidebar row to `to` ([`hold_row`]) and lets it go there ([`release`]).
+pub fn drag_row(rt: &mut Runtime<Ui>, key: SessionKey, to: (f32, f32)) {
+    hold_row(rt, key, to);
+    release(rt);
+}
+
+/// `count` stored sessions in `/home/alex/archive`, each older than the last, listed whole: the
+/// older groups shown and the archive's older sessions with them. Then steps.
+pub fn long_list(rt: &mut Runtime<Ui>, count: i64) {
+    let archive = "/home/alex/archive";
+    let now = rt.state.app.now_unix;
+    let listed: Vec<StoredSession> = (0..count)
+        .map(|n| StoredSession {
+            id: SessionId(format!("archived-{n}")),
+            folder: archive.into(),
+            title: format!("Archived session {n}"),
+            last_active_unix: now - (40 + n) * 86_400,
+        })
+        .collect();
+    let ui = &mut rt.state;
+    let effects = ui.app.receive(
+        FromBackend::Sessions {
+            since_unix: Some(0),
+            result: Ok(listed),
+        },
+        0.0,
+    );
+    glue::run(ui, effects);
+    let id = GroupId::Folder(archive.into());
+    let mut effects = ui.app.toggle_older_groups();
+    effects.extend(ui.app.show_older(&id));
+    glue::run(ui, effects);
+    rt.invalidate();
+    step(rt);
+}
+
+/// Titles of sessions of the `sessions` scene, and the folder of its website group.
+pub const FINISHED: &str = "Tidying the sidebar keys";
+pub const NEEDS_YOU: &str = "Running the window tests";
+pub const WORKING: &str = "Profiling the long scene";
+pub const GARDEN: &str = "Planning the spring beds";
+pub const CONTACT: &str = "Fixing the contact form";
+pub const WEBSITE: &str = "/home/alex/website";
+
+/// The session titled `title`.
+pub fn titled(rt: &Runtime<Ui>, title: &str) -> SessionKey {
+    rt.state
+        .app
+        .sessions
+        .iter()
+        .find(|entry| entry.session.title.as_deref() == Some(title))
+        .map(|entry| entry.key)
+        .unwrap_or_else(|| panic!("no session titled {title:?}"))
+}
+
+/// The listed group named `name`.
+pub fn group_named(rt: &Runtime<Ui>, name: &str) -> GroupId {
+    rt.state
+        .app
+        .sidebar
+        .sections
+        .iter()
+        .find(|section| section.name == name)
+        .map(|section| section.id.clone())
+        .unwrap_or_else(|| panic!("no group named {name:?}"))
+}
+
+/// The group `key`'s session is in.
+pub fn group_of(rt: &Runtime<Ui>, key: SessionKey) -> GroupId {
+    let entry = rt.state.app.sessions.get(key).unwrap();
+    rt.state.app.groups.group_of(entry)
+}
+
+/// Whether an element keyed exactly `key` is drawn and not on its way out.
+pub fn drawn(rt: &Runtime<Ui>, key: &str) -> bool {
+    rt.elements()
+        .into_iter()
+        .any(|e| !e.exiting && e.key.as_deref() == Some(key))
 }
 
 /// Clicks the centre of the visible element whose text is exactly `text`, leaving out a
@@ -145,14 +362,19 @@ pub fn sent(rt: &Runtime<Ui>) -> Vec<SessionCommand> {
     fake(rt).sent().into_iter().map(|(_, c)| c).collect()
 }
 
-/// The number of the shown session's current open.
-pub fn shown_open(rt: &Runtime<Ui>) -> Option<u64> {
-    rt.state.app.shown_entry().and_then(|entry| entry.open)
+/// The session in the focused tile.
+pub fn focused(rt: &Runtime<Ui>) -> Option<SessionKey> {
+    rt.state.app.focused()
 }
 
-/// Emits `event` to the shown session, then steps.
+/// The number of the focused session's current open.
+pub fn shown_open(rt: &Runtime<Ui>) -> Option<u64> {
+    rt.state.app.focused_entry().and_then(|entry| entry.open)
+}
+
+/// Emits `event` to the focused session, then steps.
 pub fn emit(rt: &mut Runtime<Ui>, event: SessionEvent) {
-    let key = rt.state.app.shown.expect("a session is shown");
+    let key = focused(rt).expect("a session is shown");
     emit_to(rt, key, event);
 }
 
@@ -162,27 +384,27 @@ pub fn emit_to(rt: &mut Runtime<Ui>, key: SessionKey, event: SessionEvent) {
     step(rt);
 }
 
-/// The shown session's items.
+/// The focused session's items.
 pub fn shown_session_items(rt: &Runtime<Ui>) -> &[mr_core::Item] {
     rt.state
-        .shown_session()
+        .focused_session()
         .map_or(&[], |s| s.conversation.items())
 }
 
-/// The key of the shown session's conversation scroll.
+/// The key of the focused session's conversation scroll.
 pub fn conversation(rt: &Runtime<Ui>) -> String {
-    view::conversation_key(rt.state.app.shown.expect("a session is shown"))
+    view::conversation_key(focused(rt).expect("a session is shown"))
 }
 
-/// How the shown session is shown: its draft, its open rows, its question drafts.
+/// How the focused session is shown: its draft, its open rows, its question drafts.
 pub fn shown_view(rt: &Runtime<Ui>) -> &SessionView {
-    let key = rt.state.app.shown.expect("a session is shown");
+    let key = focused(rt).expect("a session is shown");
     glue::view_of(&rt.state, key)
 }
 
-/// How the shown session is shown, lent out to change.
+/// How the focused session is shown, lent out to change.
 pub fn shown_view_mut(rt: &mut Runtime<Ui>) -> &mut SessionView {
-    let key = rt.state.app.shown.expect("a session is shown");
+    let key = focused(rt).expect("a session is shown");
     glue::view_mut(&mut rt.state, key)
 }
 
@@ -204,9 +426,11 @@ pub fn add_session(rt: &mut Runtime<Ui>, folder: &str) -> SessionKey {
         ),
     ]);
     let ui = &mut rt.state;
-    let effects = ui.app.new_session(folder.into(), Leaving::ForgetIfEmpty);
+    let effects = ui
+        .app
+        .new_session(folder.into(), Place::Focused, Leaving::ForgetIfEmpty);
     glue::run(ui, effects);
-    let key = ui.app.shown.expect("the new session is shown");
+    let key = ui.app.focused().expect("the new session is shown");
     let idle = |ui: &Ui| {
         ui.app
             .sessions
@@ -248,8 +472,27 @@ pub fn new_session_elsewhere(rt: &mut Runtime<Ui>) -> tempfile::TempDir {
 
 /// Shows `key`'s session as a click on its row does, its input box focused, then steps.
 pub fn show(rt: &mut Runtime<Ui>, key: SessionKey) {
-    rt.update(|ui, tx| glue::show(ui, tx, key, true));
+    rt.update(|ui, tx| glue::show(ui, tx, key, Place::Focused, true));
     step(rt);
+}
+
+/// Shows `key`'s session in a new tile right of the focused one, as Ctrl+click on its row does,
+/// its input box focused, then steps.
+pub fn show_side(rt: &mut Runtime<Ui>, key: SessionKey) {
+    rt.update(|ui, tx| glue::show(ui, tx, key, Place::Side, true));
+    step(rt);
+}
+
+/// The key of `part` of the focused session's model picker: `mr-model-{n}-{part}`.
+pub fn model_key(rt: &Runtime<Ui>, part: &str) -> String {
+    let key = focused(rt).expect("a session is shown");
+    format!("mr-model-{}-{part}", key.0)
+}
+
+/// The key of `part` of the focused session's permission-mode picker: `mr-mode-{n}-{part}`.
+pub fn mode_key(rt: &Runtime<Ui>, part: &str) -> String {
+    let key = focused(rt).expect("a session is shown");
+    format!("mr-mode-{}-{part}", key.0)
 }
 
 /// Pumps the demo's fake until `done` holds. Panics when it never does.

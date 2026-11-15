@@ -1,12 +1,12 @@
-//! Which screen shows, the sessions the app knows and the one it shows, and the numbered opens
-//! that keep a replaced program from changing anything. Every intent returns the effects to
-//! carry out instead of doing the work, so this module stays plain data.
+//! Which screen shows, the sessions the app knows and the tiles it shows them in, and the
+//! numbered opens that keep a replaced program from changing anything. Every intent returns the
+//! effects to carry out instead of doing the work, so this module stays plain data.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use mr_agent::{
-    Account, AgentError, Answer, Capabilities, ModelOption, PermissionMode, RequestId,
+    Account, AgentError, Answer, Capabilities, CommandKind, ModelOption, PermissionMode, RequestId,
     SessionCommand, SessionEvent, SessionId, StartSpec, StoredSession, UsageLimits,
 };
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::backend::FromBackend;
 use crate::conversation::NoticeKind;
 use crate::groups::{GroupId, Groups, Recency, SidebarModel, sidebar_model};
-use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, remember_folder};
+use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedTile, remember_folder};
 use crate::session::{HistoryState, Phase, Session};
 use crate::sessions::{Entry, Prompt, SessionKey, Sessions};
+use crate::tiles::{Place, Put, Tile, Tiles};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -61,7 +62,7 @@ pub enum Listing {
     Failed(String),
 }
 
-/// What showing another session does with the one shown until now.
+/// What becomes of the session that leaves its tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leaving {
     /// It is closed and forgotten when it is empty: nothing was handed over in it and nothing
@@ -132,8 +133,8 @@ pub struct App {
     pub capabilities: Capabilities,
     pub usage: UsageLimits,
     pub sessions: Sessions,
-    /// The session the window shows.
-    pub shown: Option<SessionKey>,
+    /// The row of tiles the window shows sessions in.
+    pub tiles: Tiles,
     pub width: Width,
     /// The wall clock in Unix seconds, as the app was last told it: what the user's and the
     /// programs' activity is stamped with.
@@ -164,14 +165,40 @@ pub struct App {
     usage_asked_unix: Option<i64>,
     /// What `sidebar` was built from; `None` before the first [`App::settle`].
     settled: Option<Settled>,
-    /// The session shown when the last run ended, by the agent's id, while it may still be
-    /// shown again: until it is, or the complete listing has come without it.
-    restore: Option<SessionId>,
-    /// The entry shown because it was shown when the last run ended.
+    /// The width of the tile row as the window last laid it out; `None` until it has.
+    row_width: Option<f32>,
+    /// The tiles open when the last run ended, as read, while they may still be opened again:
+    /// until a listing knows them all or is complete, or anything is put in a tile.
+    restore: Option<Waiting>,
+    /// The entry focused because it was focused when the last run ended.
     restored: Option<SessionKey>,
     /// From the last run: the sessions whose program it ran, with when it closed (see
     /// [`Saved::closed_by_app`]).
     closed_by_app: Vec<(SessionId, i64)>,
+    /// From the last run: the names kept for sessions no listing has given yet (see
+    /// [`Saved::names`]).
+    names: Vec<(SessionId, String)>,
+}
+
+/// The tiles of the last run, as [`Saved`] had them.
+#[derive(Debug)]
+struct Waiting {
+    tiles: Vec<SavedTile>,
+    shown: Option<SessionId>,
+}
+
+impl Waiting {
+    /// The tiles to open: a state with no tiles and a shown session (one plan 3 wrote) has
+    /// that one alone.
+    fn row(&self) -> Vec<SavedTile> {
+        match (&self.tiles[..], &self.shown) {
+            ([], Some(id)) => vec![SavedTile {
+                id: id.clone(),
+                share: 1.0,
+            }],
+            _ => self.tiles.clone(),
+        }
+    }
 }
 
 /// What the sidebar's model was last built from: while all of it holds, the model holds.
@@ -179,15 +206,15 @@ pub struct App {
 struct Settled {
     sessions: u64,
     groups: u64,
-    shown: Option<SessionKey>,
+    placement: u64,
     loading: bool,
     recency: Recency,
 }
 
 impl App {
     /// Starts on `Screen::Checking` and asks for the account, with what `launch` kept from the
-    /// last run. The session shown then is shown again once a listing knows it, unless there
-    /// is a launch folder.
+    /// last run. Its tiles open again once a listing knows them, unless there is a launch
+    /// folder.
     pub fn new(
         capabilities: Capabilities,
         width: Width,
@@ -197,7 +224,12 @@ impl App {
         let saved = std::mem::take(&mut launch.saved);
         let mut recent_folders = saved.recent_folders.clone();
         recent_folders.truncate(RECENT_FOLDERS);
-        let restore = saved.shown.clone().filter(|_| launch.folder.is_none());
+        let restore = Waiting {
+            tiles: saved.tiles.clone(),
+            shown: saved.shown.clone(),
+        };
+        let nothing = restore.tiles.is_empty() && restore.shown.is_none();
+        let restore = (launch.folder.is_none() && !nothing).then_some(restore);
         let app = App {
             screen: Screen::Checking,
             account: None,
@@ -207,7 +239,7 @@ impl App {
                 weekly: None,
             },
             sessions: Sessions::default(),
-            shown: None,
+            tiles: Tiles::default(),
             width,
             now_unix,
             listing: Listing::NotAsked,
@@ -225,18 +257,40 @@ impl App {
             looked: false,
             usage_asked_unix: None,
             settled: None,
+            row_width: None,
             restore,
             restored: None,
             closed_by_app: saved.closed_by_app,
+            names: saved.names,
         };
         (app, vec![Effect::CheckAccount])
     }
 
-    pub fn shown_entry(&self) -> Option<&Entry> {
-        self.shown.and_then(|key| self.sessions.get(key))
+    /// The session in the focused tile.
+    pub fn focused(&self) -> Option<SessionKey> {
+        self.tiles.focused()
     }
 
-    /// Picks the screen for `account`. Signed in with a launch folder and nothing shown, a new
+    pub fn focused_entry(&self) -> Option<&Entry> {
+        self.focused().and_then(|key| self.sessions.get(key))
+    }
+
+    /// The width of the tile row, as the window last laid it out.
+    pub fn set_row_width(&mut self, width: f32) {
+        self.row_width = Some(width);
+    }
+
+    pub fn row_width(&self) -> Option<f32> {
+        self.row_width
+    }
+
+    /// A tile more would fit. True while the row's width is not known.
+    pub fn room_for_tile(&self) -> bool {
+        self.row_width
+            .is_none_or(|width| self.tiles.fits_another(width))
+    }
+
+    /// Picks the screen for `account`. Signed in with a launch folder and no tile, a new
     /// session starts in that folder. Signed in for the first time, the recent stored sessions
     /// are asked for.
     pub fn account_checked(&mut self, account: Account) -> Vec<Effect> {
@@ -249,11 +303,11 @@ impl App {
         self.account = Some(account);
         let mut effects = Vec::new();
         if signed_in
-            && self.shown.is_none()
+            && self.tiles.list().is_empty()
             && let Some(folder) = self.launch.folder.clone()
         {
-            // Nothing is shown yet, so nothing is left.
-            effects = self.new_session(folder, Leaving::ForgetIfEmpty);
+            // There is no tile yet, so nothing leaves one.
+            effects = self.new_session(folder, Place::Focused, Leaving::ForgetIfEmpty);
         }
         if signed_in && self.listing == Listing::NotAsked {
             effects.push(self.list_recent());
@@ -270,7 +324,7 @@ impl App {
     }
 
     /// The open numbered `open` could not start its program. When the agent is not installed,
-    /// its session goes and the app says so; any other failure ends the session.
+    /// its session and its tile go and the app says so; any other failure ends the session.
     pub fn open_failed(&mut self, open: u64, error: AgentError) -> Vec<Effect> {
         let Some(key) = self.sessions.by_open(open).map(|entry| entry.key) else {
             return Vec::new();
@@ -278,9 +332,7 @@ impl App {
         if error == AgentError::NotInstalled {
             self.screen = Screen::NotInstalled;
             self.sessions.remove(key);
-            if self.shown == Some(key) {
-                self.shown = None;
-            }
+            self.remove_tile(key);
             return Vec::new();
         }
         let exited = SessionEvent::Exited {
@@ -322,9 +374,11 @@ impl App {
     }
 
     /// Applies `event` to the session whose current open is `open`, stamped `now`. A turn that
-    /// ends out of sight leaves its session unseen; a program that is gone lets go of its open.
+    /// ends in a session other than the focused one leaves it unseen, also when it is in a
+    /// tile; a program that is gone lets go of its open. A save is asked for when the name kept
+    /// for the session changed: its id became known, or its program confirmed or refused it.
     pub fn event(&mut self, open: u64, event: SessionEvent, now: f64) -> Vec<Effect> {
-        let (now_unix, shown) = (self.now_unix, self.shown);
+        let (now_unix, focused) = (self.now_unix, self.focused());
         let Some(mut entry) = self.sessions.by_open(open) else {
             return Vec::new();
         };
@@ -349,13 +403,25 @@ impl App {
                 | SessionEvent::Exited { clean: false, .. }
         );
         entry.last_own_unix = Some(now_unix);
+        // Only these change the name kept for it.
+        let names_event = matches!(
+            event,
+            SessionEvent::Started(_)
+                | SessionEvent::TitleChanged(_)
+                | SessionEvent::CommandFailed {
+                    what: CommandKind::Rename,
+                    ..
+                }
+        );
+        let kept = names_event.then(|| entry.session.kept_name());
         let mut effects: Vec<Effect> = entry
             .session
             .apply(event, now)
             .into_iter()
             .map(|command| Effect::Send { open, command })
             .collect();
-        if ends_turn && shown != Some(entry.key) {
+        let names_changed = kept.is_some_and(|kept| entry.session.kept_name() != kept);
+        if ends_turn && focused != Some(entry.key) {
             entry.unseen = true;
         }
         if entry.session.at_rest() {
@@ -384,6 +450,9 @@ impl App {
                 open,
                 command: SessionCommand::RefreshUsage,
             });
+        }
+        if names_changed {
+            effects.push(self.save_state());
         }
         effects
     }
@@ -423,9 +492,10 @@ impl App {
     }
 
     /// Merges a listing since `since_unix`: a listing of every stored session is complete. The
-    /// first recent listing merged asks for all of them, the session shown when the last run
-    /// ended is shown again once it is known (see [`App::restore_shown`]), and the first answer
-    /// of any kind asks for a look when the app looks.
+    /// first recent listing merged asks for all of them, the tiles open when the last run ended
+    /// may open again (see [`App::restore_tiles`]), and the first answer of any kind asks for a
+    /// look when the app looks. A listed session takes the name kept for it from the last run;
+    /// a save is asked for when that changed the names kept.
     fn listed(
         &mut self,
         since_unix: Option<i64>,
@@ -435,7 +505,13 @@ impl App {
         let mut effects = Vec::new();
         match result {
             Ok(listed) => {
-                self.sessions.merge_listing(listed, complete);
+                let names = self.saved_names();
+                self.sessions
+                    .merge_listing(listed, complete, &mut self.names);
+                if complete {
+                    // The store has none of the sessions these were kept for.
+                    self.names.clear();
+                }
                 self.listing = Listing::Done;
                 if complete {
                     self.listed_all = true;
@@ -443,7 +519,10 @@ impl App {
                     self.all_asked = true;
                     effects.push(Effect::ListSessions { since_unix: None });
                 }
-                effects.extend(self.restore_shown(complete));
+                effects.extend(self.restore_tiles(complete));
+                if self.saved_names() != names {
+                    effects.push(self.save_state());
+                }
             }
             Err(error) => {
                 self.listing = Listing::Failed(error.to_string());
@@ -459,24 +538,43 @@ impl App {
         effects
     }
 
-    /// Shows the session that was shown when the last run ended, when nothing is shown and a
-    /// listing knows it, without starting its program. Once the complete listing has been
-    /// merged it is not tried again, nor once something else is shown.
-    fn restore_shown(&mut self, complete: bool) -> Vec<Effect> {
-        let Some(id) = self.restore.take() else {
+    /// Opens the tiles that were open when the last run ended, when there is no tile, without
+    /// starting a program: once every one's session is known, or once the complete listing has
+    /// come, the known ones in their order with their shares. Each is marked as [`App::show`]
+    /// marks a session. The focus goes to the one focused then when it is among them, else to
+    /// the first. Once it ran, or once anything is in a tile, it is not tried again.
+    fn restore_tiles(&mut self, complete: bool) -> Vec<Effect> {
+        let Some(waiting) = self.restore.take() else {
             return Vec::new();
         };
-        if self.shown.is_some() {
+        if !self.tiles.list().is_empty() {
             return Vec::new();
         }
-        let Some(key) = self.sessions.by_id(&id) else {
-            if !complete {
-                self.restore = Some(id);
-            }
+        let saved = waiting.row();
+        let known: Vec<Tile> = saved
+            .iter()
+            .filter_map(|tile| {
+                let key = self.sessions.by_id(&tile.id)?;
+                Some(Tile {
+                    key,
+                    share: tile.share,
+                })
+            })
+            .collect();
+        if known.len() < saved.len() && !complete {
+            self.restore = Some(waiting);
             return Vec::new();
-        };
-        self.restored = Some(key);
-        self.show(key, Leaving::ForgetIfEmpty)
+        }
+        if known.is_empty() {
+            return Vec::new();
+        }
+        let focused = waiting.shown.and_then(|id| self.sessions.by_id(&id));
+        self.tiles.restore(known, focused);
+        self.restored = self.focused();
+        let keys: Vec<SessionKey> = self.tiles.list().iter().map(|tile| tile.key).collect();
+        keys.into_iter()
+            .filter_map(|key| self.mark_shown(key))
+            .collect()
     }
 
     /// The store's answer to whether `key`'s session may be open elsewhere. Changed within
@@ -513,24 +611,26 @@ impl App {
         self.start(key)
     }
 
-    /// Shows a new session in `folder` and starts its program, and puts `folder` first among the
-    /// recent folders, asking to save when that changed them. The session shown until now is
-    /// left as `leaving` says (see [`App::show`]). When the shown session is an empty one in
-    /// that folder already, and its program has not ended, nothing happens.
-    pub fn new_session(&mut self, folder: PathBuf, leaving: Leaving) -> Vec<Effect> {
+    /// Shows a new session in `folder` at `place` and starts its program, and puts `folder`
+    /// first among the recent folders. Asks once to save, after the start, when that changed
+    /// them or [`App::show`] asked to. A session taken out of its tile leaves as `leaving`
+    /// says (see [`App::show`]). When the focused session is an empty one in that folder
+    /// already, and its program has not ended, nothing happens.
+    pub fn new_session(&mut self, folder: PathBuf, place: Place, leaving: Leaving) -> Vec<Effect> {
         if self.screen != Screen::Main {
             return Vec::new();
         }
-        if self.shown_entry().is_some_and(|entry| {
+        if self.focused_entry().is_some_and(|entry| {
             empty(&entry.session) && entry.live() && entry.session.folder == folder
         }) {
             return Vec::new();
         }
         let remembered = remember_folder(&mut self.recent_folders, &folder);
         let key = self.sessions.add(Session::opening(folder), self.now_unix);
-        let mut effects = self.show(key, leaving);
+        let mut effects = self.show(key, place, leaving);
+        let asked = drop_saves(&mut effects);
         effects.extend(self.start(key));
-        if remembered {
+        if remembered || asked {
             effects.push(self.save_state());
         }
         effects
@@ -560,29 +660,103 @@ impl App {
         &self.launch.home
     }
 
-    /// Shows `key`'s session and counts it as seen, offering it the models known. The session
-    /// shown until now is closed and forgotten when it is empty, unless `leaving` says to keep
-    /// it. A stored history not read yet is asked for.
-    pub fn show(&mut self, key: SessionKey, leaving: Leaving) -> Vec<Effect> {
-        if self.shown == Some(key) {
+    /// Shows `key`'s session at `place` (see [`Tiles`]): a session already in a tile only has
+    /// its tile focused. The session counts as seen and is offered the models known, and a
+    /// stored history not read yet is asked for. The session taken out of its tile, if any, is
+    /// closed and forgotten when it is empty, unless `leaving` says to keep it. Asks to save
+    /// when a tile opened beside the focused one or at a place. A session shown in the focused
+    /// tile, the first tile included, is saved with the next change that asks.
+    pub fn show(&mut self, key: SessionKey, place: Place, leaving: Leaving) -> Vec<Effect> {
+        if self.focused() == Some(key) || self.sessions.get(key).is_none() {
             return Vec::new();
         }
-        let Some(mut entry) = self.sessions.get_mut(key) else {
+        let put = self.tiles.put(key, place, self.row_width);
+        if put == Put::Nothing {
             return Vec::new();
-        };
-        entry.unseen = false;
-        entry.touched = true;
-        if !self.known_models.is_empty() {
-            entry.session.offer_models(&self.known_models);
         }
-        let read = read_history(&mut entry);
-        drop(entry);
-        let mut effects = match (self.shown.replace(key), leaving) {
-            (Some(left), Leaving::ForgetIfEmpty) => self.forget_if_empty(left),
+        // Something is in a tile: the last run's tiles no longer open.
+        self.restore = None;
+        let read = self.mark_shown(key);
+        let mut effects = match (put, leaving) {
+            (Put::Replaced(left), Leaving::ForgetIfEmpty) => self.forget_if_empty(left),
             _ => Vec::new(),
         };
         effects.extend(read);
+        if put == Put::Added && place != Place::Focused {
+            effects.push(self.save_state());
+        }
         effects
+    }
+
+    /// Moves the focus to `key`'s tile and counts its session as seen. Nothing happens when it
+    /// is in no tile or its tile has the focus already. Asks for no save.
+    pub fn focus_tile(&mut self, key: SessionKey) -> Vec<Effect> {
+        self.focus(key);
+        Vec::new()
+    }
+
+    /// Takes `key`'s tile out of the row; its session leaves as `leaving` says. The focus goes
+    /// to the tile on its right, else on its left. Asks to save.
+    pub fn close_tile(&mut self, key: SessionKey, leaving: Leaving) -> Vec<Effect> {
+        if !self.remove_tile(key) {
+            return Vec::new();
+        }
+        let mut effects = match leaving {
+            Leaving::ForgetIfEmpty => self.forget_if_empty(key),
+            Leaving::Keep => Vec::new(),
+        };
+        effects.push(self.save_state());
+        effects
+    }
+
+    /// Moves `key`'s tile to `edge` (see `Tiles::move_to`); the tile takes the focus and its
+    /// session counts as seen. Asks to save. Nothing, and no effect, when nothing moved.
+    pub fn move_tile(&mut self, key: SessionKey, edge: usize) -> Vec<Effect> {
+        if !self.tiles.move_to(key, edge) {
+            return Vec::new();
+        }
+        if let Some(mut entry) = self.sessions.get_mut(key) {
+            entry.unseen = false;
+        }
+        vec![self.save_state()]
+    }
+
+    /// Makes `left`'s tile `width` points wide against the tile on its right (see
+    /// `Tiles::resize`). Nothing happens while the row's width is not known.
+    /// Asks for no save: the view asks once, when the drag ends.
+    pub fn resize_tile(&mut self, left: SessionKey, width: f32) {
+        if let Some(row_width) = self.row_width {
+            self.tiles.resize(left, width, row_width);
+        }
+    }
+
+    /// Gives `left`'s tile and the one on its right `shares`, as [`App::tile_pair`] read them
+    /// before a drag of the divider between them: a cancelled drag puts them back exactly,
+    /// whatever the least width. Asks for no save.
+    pub fn put_tile_pair(&mut self, left: SessionKey, shares: [f32; 2]) {
+        self.tiles.set_pair(left, shares);
+    }
+
+    /// The shares of `left`'s tile and of the one on its right; none for the last tile.
+    pub fn tile_pair(&self, left: SessionKey) -> Option<[f32; 2]> {
+        let list = self.tiles.list();
+        let index = self.tiles.index_of(left)?;
+        let right = list.get(index + 1)?;
+        Some([list[index].share, right.share])
+    }
+
+    /// Every tile gets the same width; asks for a save when that changed anything.
+    pub fn even_tiles(&mut self) -> Vec<Effect> {
+        if self.tiles.even() {
+            vec![self.save_state()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Asks for the state to be written.
+    pub fn save_now(&self) -> Vec<Effect> {
+        vec![self.save_state()]
     }
 
     /// The app is going away, at `now_unix` by the wall clock: its state saved first, then
@@ -618,25 +792,53 @@ impl App {
     /// are the window's: they are left at their defaults.
     ///
     /// Once the complete listing has been merged, a placement whose session the app does not
-    /// know is left out. The shown session is kept by its id; while nothing is shown, the one
-    /// that may still be shown again from the last run is kept instead. Of the sessions the
-    /// last run closed, only those it closed recently enough that a change it made could still
-    /// look new to the activity check are kept ([`App::close`] adds this run's).
+    /// know is left out. Every tile whose session the store has is kept, in order, and the
+    /// focused session by its id, or the first kept tile's when the focused one is not kept;
+    /// while the last run's tiles may still open again, they are kept as they were read. Of
+    /// the sessions the last run closed, only those it closed recently enough that a change it
+    /// made could still look new to the activity check are kept ([`App::close`] adds this
+    /// run's). The names no program has confirmed are always
+    /// those the app holds now.
     pub fn saved(&self) -> Saved {
         let recent = ELSEWHERE_SECONDS + OWN_EXIT_SLACK_SECONDS;
+        let (tiles, shown) = match &self.restore {
+            Some(waiting) => (waiting.tiles.clone(), waiting.shown.clone()),
+            _ => {
+                // What the store does not have could not come back.
+                let stored = |key: SessionKey| {
+                    let session = &self.sessions.get(key)?.session;
+                    session.id.clone().filter(|_| session.is_stored())
+                };
+                let tiles: Vec<SavedTile> = self
+                    .tiles
+                    .list()
+                    .iter()
+                    .filter_map(|tile| {
+                        Some(SavedTile {
+                            id: stored(tile.key)?,
+                            share: tile.share,
+                        })
+                    })
+                    .collect();
+                let shown = self
+                    .focused()
+                    .and_then(stored)
+                    .or_else(|| tiles.first().map(|tile| tile.id.clone()));
+                (tiles, shown)
+            }
+        };
         let mut saved = Saved {
             version: SAVED_VERSION,
             recent_folders: self.recent_folders.clone(),
-            shown: match self.shown_entry() {
-                Some(entry) => entry.session.id.clone(),
-                None => self.restore.clone(),
-            },
+            shown,
+            tiles,
             closed_by_app: self
                 .closed_by_app
                 .iter()
                 .filter(|(_, closed)| self.now_unix - closed <= recent)
                 .cloned()
                 .collect(),
+            names: self.saved_names(),
             ..Saved::default()
         };
         self.groups.save_into(&mut saved);
@@ -651,13 +853,39 @@ impl App {
         saved
     }
 
+    /// The names to keep between runs, by id: every session's that no program has confirmed,
+    /// and those kept from the last run for sessions not known yet.
+    fn saved_names(&self) -> Vec<(SessionId, String)> {
+        let mut names: Vec<(SessionId, String)> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| entry.session.kept_name())
+            .collect();
+        // A session the app knows holds its latest name itself.
+        let known: HashSet<&SessionId> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| entry.session.id.as_ref())
+            .collect();
+        names.extend(
+            self.names
+                .iter()
+                .filter(|(id, _)| !known.contains(id))
+                .cloned(),
+        );
+        names.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
+        names
+    }
+
     /// No session has a program still running.
     pub fn all_ended(&self) -> bool {
         !self.sessions.iter().any(Entry::live)
     }
 
     /// Starts an ended session's program again. A resting one is woken by a message instead.
+    /// This and the session intents below first focus the session's tile, when it is in one.
     pub fn restart(&mut self, key: SessionKey) -> Vec<Effect> {
+        self.focus(key);
         let Some(mut entry) = self.sessions.get_mut(key) else {
             return Vec::new();
         };
@@ -674,6 +902,7 @@ impl App {
     /// run, the store is first asked whether another app may have it open. A session that does
     /// not take a message now (see [`App::takes_message`]) takes nothing.
     pub fn submit(&mut self, key: SessionKey, text: &str) -> Vec<Effect> {
+        self.focus(key);
         if text.trim().is_empty() || !self.takes_message(key) {
             return Vec::new();
         }
@@ -715,6 +944,7 @@ impl App {
     }
 
     pub fn stop(&mut self, key: SessionKey) -> Vec<Effect> {
+        self.focus(key);
         let command = self
             .sessions
             .get(key)
@@ -723,6 +953,7 @@ impl App {
     }
 
     pub fn answer(&mut self, key: SessionKey, id: &RequestId, answer: Answer) -> Vec<Effect> {
+        self.focus(key);
         let command = self
             .sessions
             .get_mut(key)
@@ -731,6 +962,7 @@ impl App {
     }
 
     pub fn choose_model(&mut self, key: SessionKey, option_id: &str) -> Vec<Effect> {
+        self.focus(key);
         let command = self
             .sessions
             .get_mut(key)
@@ -739,11 +971,32 @@ impl App {
     }
 
     pub fn choose_mode(&mut self, key: SessionKey, mode: PermissionMode) -> Vec<Effect> {
+        self.focus(key);
         let command = self
             .sessions
             .get_mut(key)
             .and_then(|mut entry| entry.session.choose_mode(mode));
         self.send(key, command)
+    }
+
+    /// Names `key`'s session `name`, trimmed. Nothing for an empty name or the name it has.
+    ///
+    /// Its program is told when it runs and has started, else the next one is when it starts.
+    /// Once the session has an id the name is kept between runs until a program confirms it,
+    /// and a save is asked for. The focus does not move.
+    pub fn rename(&mut self, key: SessionKey, name: &str) -> Vec<Effect> {
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return Vec::new();
+        };
+        let kept = entry.session.kept_name();
+        let command = entry.session.rename(name);
+        let names_changed = entry.session.kept_name() != kept;
+        drop(entry);
+        let mut effects = self.send(key, command);
+        if names_changed {
+            effects.push(self.save_state());
+        }
+        effects
     }
 
     /// Brings the clock up to date and returns what is due: a new listing, a usage refresh.
@@ -765,14 +1018,16 @@ impl App {
 
     /// Answers the question waiting about `key`'s session and clears it. `ContinueHere` wakes
     /// the session with the message and opens its program; `ContinueAsCopy` puts a copy of it
-    /// beside it, shows the copy and opens a program that forks the stored conversation, the
-    /// message queued in it, leaving the original resting. The text that goes back into that
-    /// session's input box, when the choice was Cancel.
+    /// beside it, shows the copy in the original's tile (in the focused one when the original
+    /// is in no tile) and opens a program that forks the stored conversation, the message
+    /// queued in it, leaving the original resting. The text that goes back into that session's
+    /// input box, when the choice was Cancel.
     pub fn answer_prompt(
         &mut self,
         key: SessionKey,
         choice: PromptChoice,
     ) -> (Vec<Effect>, Option<String>) {
+        self.focus(key);
         let now_unix = self.now_unix;
         let Some(mut entry) = self.sessions.get_mut(key) else {
             return (Vec::new(), None);
@@ -804,8 +1059,14 @@ impl App {
                 if let Some(entry) = self.sessions.get(copy) {
                     self.groups.place(entry, &group);
                 }
-                // What it leaves is the original, which is stored: nothing to forget.
-                let mut effects = self.show(copy, Leaving::Keep);
+                // In the original's tile, else in the focused one. What it leaves is the
+                // original or a session the window may have text typed in: nothing to forget.
+                let place = if self.tiles.contains(key) {
+                    Place::Tile(key)
+                } else {
+                    Place::Focused
+                };
+                let mut effects = self.show(copy, place, Leaving::Keep);
                 if let Some(mut entry) = self.sessions.get_mut(copy)
                     && let Some(id) = read_from
                     && matches!(
@@ -826,15 +1087,26 @@ impl App {
         }
     }
 
-    /// Rebuilds `sidebar` when sessions, groups or the shown session changed since the last call.
-    /// So does the end of the first listing, and a clock that moved an entry across the
-    /// [`RECENT_DAYS`] line. Each rebuild puts `sidebar_version` up by one.
+    /// Takes out every tile whose session is gone, then rebuilds `sidebar` when sessions, groups
+    /// or the tiles' placement (not their widths) changed since the last call. So does the end
+    /// of the first listing, and a clock that moved an entry across the [`RECENT_DAYS`] line.
+    /// Each rebuild puts `sidebar_version` up by one.
     pub fn settle(&mut self) {
+        let gone: Vec<SessionKey> = self
+            .tiles
+            .list()
+            .iter()
+            .map(|tile| tile.key)
+            .filter(|key| self.sessions.get(*key).is_none())
+            .collect();
+        for key in gone {
+            self.remove_tile(key);
+        }
         let loading = self.listing == Listing::Loading;
         if self.settled.is_some_and(|settled| {
             settled.sessions == self.sessions.version()
                 && settled.groups == self.groups.version()
-                && settled.shown == self.shown
+                && settled.placement == self.tiles.placement()
                 && settled.loading == loading
                 && settled.recency.holds_at(self.now_unix)
         }) {
@@ -843,7 +1115,7 @@ impl App {
         self.sidebar = sidebar_model(
             &self.sessions,
             &self.groups,
-            self.shown,
+            &self.tiles,
             self.now_unix,
             loading,
         );
@@ -851,24 +1123,25 @@ impl App {
         self.settled = Some(Settled {
             sessions: self.sessions.version(),
             groups: self.groups.version(),
-            shown: self.shown,
+            placement: self.tiles.placement(),
             loading,
             recency: Recency::of(&self.sessions, self.now_unix),
         });
     }
 
-    /// [`App::new_session`] in `folder`, and the session shown then placed in `group`. Asks
+    /// [`App::new_session`] in `folder`, and the session focused then placed in `group`. Asks
     /// once to save, after the placement.
     pub fn new_session_in(
         &mut self,
         folder: PathBuf,
         group: &GroupId,
+        place: Place,
         leaving: Leaving,
     ) -> Vec<Effect> {
-        let mut effects = self.new_session(folder, leaving);
-        effects.retain(|effect| !matches!(effect, Effect::SaveState(_)));
+        let mut effects = self.new_session(folder, place, leaving);
+        drop_saves(&mut effects);
         if self.screen == Screen::Main
-            && let Some(entry) = self.shown.and_then(|key| self.sessions.get(key))
+            && let Some(entry) = self.focused().and_then(|key| self.sessions.get(key))
         {
             self.groups.place(entry, group);
             effects.push(self.save_state());
@@ -1041,12 +1314,51 @@ impl App {
         self.known_models = models;
     }
 
-    /// Closes and forgets `key`'s session when it is empty.
+    /// Marks `key`'s session as one put in a tile: it counts as seen and is offered the models
+    /// known. Its stored history, when not read yet, is asked for.
+    fn mark_shown(&mut self, key: SessionKey) -> Option<Effect> {
+        let mut entry = self.sessions.get_mut(key)?;
+        entry.unseen = false;
+        entry.touched = true;
+        if !self.known_models.is_empty() {
+            entry.session.offer_models(&self.known_models);
+        }
+        read_history(&mut entry)
+    }
+
+    /// Moves the focus to `key`'s tile, when it is in one without it, and counts its session as
+    /// seen. True when the focus moved.
+    fn focus(&mut self, key: SessionKey) -> bool {
+        if !self.tiles.focus(key) {
+            return false;
+        }
+        if let Some(mut entry) = self.sessions.get_mut(key) {
+            entry.unseen = false;
+        }
+        true
+    }
+
+    /// Takes `key`'s tile out of the row and counts the session whose tile takes the focus as
+    /// seen. True when there was such a tile.
+    fn remove_tile(&mut self, key: SessionKey) -> bool {
+        if !self.tiles.remove(key) {
+            return false;
+        }
+        if let Some(focused) = self.focused()
+            && let Some(mut entry) = self.sessions.get_mut(focused)
+        {
+            entry.unseen = false;
+        }
+        true
+    }
+
+    /// Closes and forgets `key`'s session when it is empty and in no tile.
     fn forget_if_empty(&mut self, key: SessionKey) -> Vec<Effect> {
-        if !self
-            .sessions
-            .get(key)
-            .is_some_and(|entry| empty(&entry.session))
+        if self.tiles.contains(key)
+            || !self
+                .sessions
+                .get(key)
+                .is_some_and(|entry| empty(&entry.session))
         {
             return Vec::new();
         }
@@ -1089,6 +1401,13 @@ fn take_usage(usage: &mut UsageLimits, limits: &UsageLimits) {
     }
 }
 
+/// Takes the asks to save out of `effects`. True when there was one.
+fn drop_saves(effects: &mut Vec<Effect>) -> bool {
+    let before = effects.len();
+    effects.retain(|effect| !matches!(effect, Effect::SaveState(_)));
+    effects.len() != before
+}
+
 /// `entry`'s stored history, asked for when it has not been read yet.
 fn read_history(entry: &mut Entry) -> Option<Effect> {
     if entry.session.history != HistoryState::NotLoaded {
@@ -1112,14 +1431,14 @@ fn empty(session: &Session) -> bool {
 #[cfg(test)]
 mod tests {
     use mr_agent::{
-        HistoryItem, LimitWindow, StoredHistory, ToolDetail, TurnSummary, UserRequest,
+        HistoryItem, LimitWindow, SessionInfo, StoredHistory, ToolDetail, TurnSummary, UserRequest,
         UserRequestKind,
     };
 
     use super::*;
     use crate::conversation::ItemBody;
     use crate::groups::Group;
-    use crate::saved::{RECENT_FOLDERS, SAVED_VERSION};
+    use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, SavedTile};
     use crate::session::testing::info;
     use crate::sessions::Mark;
 
@@ -1207,7 +1526,7 @@ mod tests {
         let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
         listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![a1]);
         let key = by_id(&app, "a1");
-        app.show(key, Leaving::ForgetIfEmpty);
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
         let history = StoredHistory {
             items: vec![
                 HistoryItem::User {
@@ -1285,7 +1604,7 @@ mod tests {
         let (mut app, _) = App::new(caps(), Width::Unlimited, launch("/p"), NOW);
         app.account_checked(signed_in());
         app.event(1, SessionEvent::Started(info()), 0.0);
-        let key = app.shown.expect("the launch folder's session is shown");
+        let key = app.focused().expect("the launch folder's session is shown");
         (app, key)
     }
 
@@ -1299,8 +1618,8 @@ mod tests {
     /// A new session in `folder`, started, with a message handed over: a turn runs in it, and
     /// it is not forgotten when another is shown.
     fn busy(app: &mut App, folder: &str) -> SessionKey {
-        app.new_session(folder.into(), Leaving::ForgetIfEmpty);
-        let key = app.shown.unwrap();
+        app.new_session(folder.into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let key = app.focused().unwrap();
         app.event(open_of(app, key), SessionEvent::Started(info()), 0.0);
         app.submit(key, "go");
         key
@@ -1410,7 +1729,7 @@ mod tests {
             ],
             "the launch folder is a recent folder now"
         );
-        let shown = app.shown_entry().unwrap();
+        let shown = app.focused_entry().unwrap();
         assert_eq!((app.screen, shown.open), (Screen::Main, Some(1)));
         assert_eq!(shown.session.phase, Phase::Opening);
         assert_eq!(app.check_again(), vec![]);
@@ -1421,7 +1740,7 @@ mod tests {
         let (mut app, _) = App::new(caps(), Width::Unlimited, Launch::default(), NOW);
         assert_eq!(app.account_checked(signed_in()), vec![recent(NOW)]);
         assert_eq!(app.screen, Screen::Main);
-        assert!(app.sessions.is_empty() && app.shown.is_none());
+        assert!(app.sessions.is_empty() && app.focused().is_none());
     }
 
     #[test]
@@ -1517,7 +1836,7 @@ mod tests {
     #[test]
     fn a_replaced_session_can_no_longer_change_anything() {
         let (mut app, old) = ready();
-        let effects = unsaved(app.new_session("/q".into(), Leaving::ForgetIfEmpty));
+        let effects = unsaved(app.new_session("/q".into(), Place::Focused, Leaving::ForgetIfEmpty));
         assert_eq!(
             effects,
             vec![
@@ -1535,7 +1854,7 @@ mod tests {
             app.sessions.get(old).is_none(),
             "an empty session is replaced"
         );
-        let new = app.shown.unwrap();
+        let new = app.focused().unwrap();
         for stale in [
             SessionEvent::TextDelta("late".into()),
             SessionEvent::UsageLimits(UsageLimits {
@@ -1581,7 +1900,7 @@ mod tests {
         let (mut app, key) = ready();
         app.submit(key, "go");
         app.event(1, exited(false), 0.0);
-        let effects = app.new_session("/p".into(), Leaving::ForgetIfEmpty);
+        let effects = app.new_session("/p".into(), Place::Focused, Leaving::ForgetIfEmpty);
         assert_eq!(effects.len(), 1, "{effects:?}");
         assert_eq!(
             closes(&effects),
@@ -1608,7 +1927,7 @@ mod tests {
     fn a_failed_open_shows_where_the_problem_is() {
         let (mut app, _) = App::new(caps(), Width::Unlimited, launch("/p"), NOW);
         app.account_checked(signed_in());
-        let key = app.shown.unwrap();
+        let key = app.focused().unwrap();
         app.open_failed(1, AgentError::Io("no such folder".into()));
         assert_eq!(
             session(&app, key).phase,
@@ -1622,7 +1941,7 @@ mod tests {
         app.account_checked(signed_in());
         app.open_failed(1, AgentError::NotInstalled);
         assert_eq!(app.screen, Screen::NotInstalled);
-        assert!(app.shown.is_none() && app.sessions.is_empty());
+        assert!(app.focused().is_none() && app.sessions.is_empty());
     }
 
     #[test]
@@ -1705,7 +2024,7 @@ mod tests {
             ]
         );
         assert_eq!(app.screen, Screen::Main);
-        let key = app.shown.unwrap();
+        let key = app.focused().unwrap();
 
         let started = FromBackend::Event {
             open: 1,
@@ -1759,7 +2078,7 @@ mod tests {
         };
         assert_eq!(app.receive(failed, 0.0), vec![]);
         assert_eq!(app.screen, Screen::NotInstalled);
-        assert!(app.shown.is_none() && app.sessions.is_empty());
+        assert!(app.focused().is_none() && app.sessions.is_empty());
     }
 
     #[test]
@@ -1866,7 +2185,7 @@ mod tests {
         let a = busy(&mut app, "/a");
         let b = busy(&mut app, "/b");
         let c = busy(&mut app, "/c");
-        app.show(a, Leaving::ForgetIfEmpty);
+        app.show(a, Place::Focused, Leaving::ForgetIfEmpty);
         assert_eq!(mark(&app, b), Mark::Working);
         app.event(open_of(&app, b), done(), 0.0);
         assert_eq!(mark(&app, b), Mark::Finished);
@@ -1877,7 +2196,7 @@ mod tests {
         assert_eq!(mark(&app, c), Mark::Finished, "a failed turn ended too");
         app.event(open_of(&app, a), done(), 0.0);
         assert_eq!(mark(&app, a), Mark::None, "it ended in sight");
-        app.show(b, Leaving::ForgetIfEmpty);
+        app.show(b, Place::Focused, Leaving::ForgetIfEmpty);
         assert_eq!(mark(&app, b), Mark::None);
         let b = app.sessions.get(b).unwrap();
         assert!(!b.unseen && b.touched);
@@ -1889,7 +2208,7 @@ mod tests {
         let a = busy(&mut app, "/a");
         let b = busy(&mut app, "/b");
         let c = busy(&mut app, "/c");
-        app.show(a, Leaving::ForgetIfEmpty);
+        app.show(a, Place::Focused, Leaving::ForgetIfEmpty);
         app.event(open_of(&app, b), exited(false), 0.0);
         assert_eq!(mark(&app, b), Mark::Finished);
         app.event(open_of(&app, c), exited(true), 0.0);
@@ -1905,7 +2224,7 @@ mod tests {
         let mut app = main_screen();
         let a = busy(&mut app, "/a");
         let b = busy(&mut app, "/b");
-        app.show(a, Leaving::ForgetIfEmpty);
+        app.show(a, Place::Focused, Leaving::ForgetIfEmpty);
         app.event(open_of(&app, b), permission("r1"), 0.0);
         assert_eq!(mark(&app, b), Mark::NeedsYou);
         assert_eq!(mark(&app, a), Mark::Working);
@@ -1927,22 +2246,25 @@ mod tests {
     fn an_empty_session_is_forgotten_when_left() {
         let mut app = main_screen();
         let other = app.sessions.add(stored("s9"), NOW - 60);
-        app.new_session("/a".into(), Leaving::ForgetIfEmpty);
-        let a = app.shown.unwrap();
+        app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let a = app.focused().unwrap();
         assert_eq!(
-            app.show(a, Leaving::ForgetIfEmpty),
+            app.show(a, Place::Focused, Leaving::ForgetIfEmpty),
             vec![],
             "showing the shown entry does nothing"
         );
-        assert_eq!(closes(&app.show(other, Leaving::ForgetIfEmpty)), vec![1]);
+        assert_eq!(
+            closes(&app.show(other, Place::Focused, Leaving::ForgetIfEmpty)),
+            vec![1]
+        );
         assert!(app.sessions.get(a).is_none());
-        assert_eq!(app.shown, Some(other));
+        assert_eq!(app.focused(), Some(other));
 
         let mut app = main_screen();
         let other = app.sessions.add(stored("s9"), NOW - 60);
         let a = busy(&mut app, "/a");
         assert_eq!(
-            closes(&app.show(other, Leaving::ForgetIfEmpty)),
+            closes(&app.show(other, Place::Focused, Leaving::ForgetIfEmpty)),
             Vec::<u64>::new(),
             "a message was sent"
         );
@@ -1950,12 +2272,12 @@ mod tests {
 
         let mut app = main_screen();
         let other = app.sessions.add(stored("s9"), NOW - 60);
-        app.new_session("/a".into(), Leaving::ForgetIfEmpty);
-        let a = app.shown.unwrap();
+        app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let a = app.focused().unwrap();
         app.submit(a, "early");
         assert_eq!(mark(&app, a), Mark::Working);
         assert_eq!(
-            closes(&app.show(other, Leaving::ForgetIfEmpty)),
+            closes(&app.show(other, Place::Focused, Leaving::ForgetIfEmpty)),
             Vec::<u64>::new(),
             "a message is queued"
         );
@@ -1966,22 +2288,31 @@ mod tests {
     fn an_empty_session_told_to_stay_is_kept() {
         let mut app = main_screen();
         let other = app.sessions.add(stored("s9"), NOW - 60);
-        app.new_session("/a".into(), Leaving::ForgetIfEmpty);
-        let a = app.shown.unwrap();
-        assert_eq!(closes(&app.show(other, Leaving::Keep)), Vec::<u64>::new());
-        assert!(app.sessions.get(a).is_some(), "kept");
-        assert_eq!(app.show(a, Leaving::ForgetIfEmpty), vec![]);
-        // A new session in another folder keeps it too.
+        app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let a = app.focused().unwrap();
         assert_eq!(
-            closes(&app.new_session("/b".into(), Leaving::Keep)),
+            closes(&app.show(other, Place::Focused, Leaving::Keep)),
             Vec::<u64>::new()
         );
-        let b = app.shown.unwrap();
+        assert!(app.sessions.get(a).is_some(), "kept");
+        assert_eq!(app.show(a, Place::Focused, Leaving::ForgetIfEmpty), vec![]);
+        // A new session in another folder keeps it too.
+        assert_eq!(
+            closes(&app.new_session("/b".into(), Place::Focused, Leaving::Keep)),
+            Vec::<u64>::new()
+        );
+        let b = app.focused().unwrap();
         assert!(app.sessions.get(a).is_some(), "kept again");
         // Left later with nothing typed, each goes.
-        assert_eq!(closes(&app.show(a, Leaving::ForgetIfEmpty)), vec![2]);
+        assert_eq!(
+            closes(&app.show(a, Place::Focused, Leaving::ForgetIfEmpty)),
+            vec![2]
+        );
         assert!(app.sessions.get(b).is_none());
-        assert_eq!(closes(&app.show(other, Leaving::ForgetIfEmpty)), vec![1]);
+        assert_eq!(
+            closes(&app.show(other, Place::Focused, Leaving::ForgetIfEmpty)),
+            vec![1]
+        );
         assert!(app.sessions.get(a).is_none());
     }
 
@@ -1989,17 +2320,20 @@ mod tests {
     fn new_session_keeps_an_empty_one_in_the_same_folder() {
         let mut app = main_screen();
         assert_eq!(
-            unsaved(app.new_session("/a".into(), Leaving::ForgetIfEmpty)),
+            unsaved(app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty)),
             vec![Effect::Open {
                 open: 1,
                 spec: StartSpec::new("/a")
             }]
         );
-        let a = app.shown;
-        assert_eq!(app.new_session("/a".into(), Leaving::ForgetIfEmpty), vec![]);
-        assert_eq!((app.shown, app.sessions.len()), (a, 1));
+        let a = app.focused();
         assert_eq!(
-            unsaved(app.new_session("/b".into(), Leaving::ForgetIfEmpty)),
+            app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty),
+            vec![]
+        );
+        assert_eq!((app.focused(), app.sessions.len()), (a, 1));
+        assert_eq!(
+            unsaved(app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty)),
             vec![
                 Effect::Send {
                     open: 1,
@@ -2012,9 +2346,9 @@ mod tests {
             ]
         );
         assert_eq!(app.sessions.len(), 1);
-        assert_ne!(app.shown, a);
+        assert_ne!(app.focused(), a);
         assert_eq!(
-            app.shown_entry().unwrap().session.folder,
+            app.focused_entry().unwrap().session.folder,
             std::path::Path::new("/b")
         );
     }
@@ -2022,19 +2356,19 @@ mod tests {
     #[test]
     fn new_session_replaces_an_empty_session_that_ended() {
         let mut app = main_screen();
-        app.new_session("/a".into(), Leaving::ForgetIfEmpty);
-        let failed = app.shown.unwrap();
+        app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let failed = app.focused().unwrap();
         app.open_failed(1, AgentError::Io("no such folder".into()));
         assert!(matches!(session(&app, failed).phase, Phase::Ended { .. }));
         assert_eq!(
-            app.new_session("/a".into(), Leaving::ForgetIfEmpty),
+            app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty),
             vec![Effect::Open {
                 open: 2,
                 spec: StartSpec::new("/a")
             }]
         );
         assert!(app.sessions.get(failed).is_none(), "the ended one is gone");
-        let fresh = app.shown_entry().unwrap();
+        let fresh = app.focused_entry().unwrap();
         assert_ne!(fresh.key, failed);
         assert_eq!(
             (fresh.session.phase.clone(), fresh.open),
@@ -2043,13 +2377,337 @@ mod tests {
         assert_eq!(app.sessions.len(), 1);
     }
 
+    /// An app with two busy sessions side by side: tiles `[a, b]`, `a` focused.
+    fn two_tiles() -> (App, SessionKey, SessionKey) {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        let b = busy(&mut app, "/b");
+        app.show(a, Place::Focused, Leaving::ForgetIfEmpty);
+        app.show(b, Place::Side, Leaving::ForgetIfEmpty);
+        app.focus_tile(a);
+        (app, a, b)
+    }
+
+    /// The sessions in the tiles, left to right.
+    fn tile_keys(app: &App) -> Vec<SessionKey> {
+        app.tiles.list().iter().map(|tile| tile.key).collect()
+    }
+
+    /// The sidebar's row of `key`'s session.
+    fn row_of(app: &App, key: SessionKey) -> &crate::groups::Row {
+        app.sidebar
+            .sections
+            .iter()
+            .flat_map(|section| &section.rows)
+            .find(|row| row.key == key)
+            .expect("listed")
+    }
+
+    fn reads_s9(key: SessionKey) -> Effect {
+        Effect::ReadHistory {
+            key,
+            id: id("s9"),
+            max_items: HISTORY_ITEMS,
+        }
+    }
+
+    #[test]
+    fn a_click_swaps_the_focused_tiles_session() {
+        let (mut app, a, b) = two_tiles();
+        let c = app.sessions.add(stored("s9"), NOW - 60);
+        assert_eq!(
+            app.show(c, Place::Focused, Leaving::ForgetIfEmpty),
+            vec![reads_s9(c)],
+            "no save"
+        );
+        assert_eq!((tile_keys(&app), app.focused()), (vec![c, b], Some(c)));
+        assert!(app.sessions.get(a).is_some(), "a message was sent in it");
+    }
+
+    #[test]
+    fn to_the_side_adds_a_tile_and_asks_for_a_save() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        let c = app.sessions.add(stored("s9"), NOW - 60);
+        let effects = app.show(c, Place::Side, Leaving::ForgetIfEmpty);
+        assert_eq!(effects, vec![reads_s9(c), save(&app)]);
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a, c], Some(c)));
+    }
+
+    #[test]
+    fn a_session_in_a_tile_is_only_focused() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        let b = app.sessions.add(stored("s9"), NOW - 60);
+        app.show(b, Place::Side, Leaving::ForgetIfEmpty);
+        app.focus_tile(a);
+        assert_eq!(app.focused(), Some(a));
+        assert_eq!(app.show(b, Place::Focused, Leaving::ForgetIfEmpty), vec![]);
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a, b], Some(b)));
+        assert_eq!(app.show(a, Place::Side, Leaving::ForgetIfEmpty), vec![]);
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a, b], Some(a)));
+    }
+
+    #[test]
+    fn a_turn_that_ends_in_an_unfocused_tile_is_marked_finished() {
+        let (mut app, a, b) = two_tiles();
+        app.event(open_of(&app, a), done(), 0.0);
+        assert_eq!(mark(&app, a), Mark::None, "it ended in the focused tile");
+        app.event(open_of(&app, b), done(), 0.0);
+        assert_eq!(mark(&app, b), Mark::Finished, "though it is in a tile");
+        assert_eq!(app.focus_tile(b), vec![], "no save");
+        assert_eq!(mark(&app, b), Mark::None);
+    }
+
+    #[test]
+    fn sending_in_a_tile_focuses_it() {
+        type Intent = fn(&mut App, SessionKey) -> Vec<Effect>;
+        let intents: [(&str, Intent); 7] = [
+            ("submit", |app, key| app.submit(key, "hi")),
+            ("restart", |app, key| app.restart(key)),
+            ("answer_prompt", |app, key| {
+                app.answer_prompt(key, PromptChoice::ContinueHere).0
+            }),
+            ("stop", |app, key| app.stop(key)),
+            ("answer", |app, key| {
+                let allow = Answer::Allow { always: false };
+                app.answer(key, &RequestId("r1".into()), allow)
+            }),
+            ("model", |app, key| app.choose_model(key, "default")),
+            ("mode", |app, key| {
+                app.choose_mode(key, PermissionMode::Plan)
+            }),
+        ];
+        for (name, intent) in intents {
+            let (mut app, a, b) = two_tiles();
+            intent(&mut app, b);
+            assert_eq!(
+                (tile_keys(&app), app.focused()),
+                (vec![a, b], Some(b)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_a_tile_keeps_its_session_running() {
+        let (mut app, a, b) = two_tiles();
+        let effects = app.close_tile(b, Leaving::ForgetIfEmpty);
+        assert_eq!(effects, vec![save(&app)], "no Close");
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a], Some(a)));
+        assert_eq!(session(&app, b).phase, Phase::Working);
+        app.settle();
+        assert!(!row_of(&app, b).shown && row_of(&app, a).shown);
+        assert_eq!(app.close_tile(b, Leaving::ForgetIfEmpty), vec![], "no tile");
+    }
+
+    #[test]
+    fn closing_a_tile_forgets_an_empty_new_session() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        let b = app.focused().unwrap();
+        let effects = app.close_tile(b, Leaving::ForgetIfEmpty);
+        assert_eq!(closes(&effects), vec![2]);
+        assert_eq!(effects.last(), Some(&save(&app)));
+        assert!(app.sessions.get(b).is_none());
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a], Some(a)));
+
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        let b = app.focused().unwrap();
+        let effects = app.close_tile(b, Leaving::Keep);
+        assert_eq!(effects, vec![save(&app)]);
+        assert!(app.sessions.get(b).is_some(), "text is typed in it");
+        assert_eq!(tile_keys(&app), vec![a]);
+    }
+
+    #[test]
+    fn the_session_swapped_out_is_forgotten_only_when_it_is_in_no_tile() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        let b = app.focused().unwrap();
+        assert_eq!(app.show(a, Place::Focused, Leaving::ForgetIfEmpty), vec![]);
+        assert!(app.sessions.get(b).is_some(), "it is still in its tile");
+        app.focus_tile(b);
+        let c = app.sessions.add(stored("s9"), NOW - 60);
+        let effects = app.show(c, Place::Focused, Leaving::ForgetIfEmpty);
+        assert_eq!(closes(&effects), vec![2]);
+        assert!(app.sessions.get(b).is_none());
+        assert_eq!(tile_keys(&app), vec![a, c]);
+    }
+
+    #[test]
+    fn a_session_that_could_not_open_leaves_its_tile() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        assert_eq!(tile_keys(&app).len(), 2);
+        app.open_failed(2, AgentError::NotInstalled);
+        app.settle();
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a], Some(a)));
+    }
+
+    #[test]
+    fn a_copy_takes_its_originals_tile() {
+        let (mut app, key, _) = checked(5);
+        let a = app.sessions.add(stored("s9"), NOW - 60);
+        app.show(a, Place::At(0), Leaving::ForgetIfEmpty);
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a, key], Some(a)));
+        app.answer_prompt(key, PromptChoice::ContinueAsCopy);
+        let copy = app.focused().unwrap();
+        assert_ne!(copy, key);
+        assert_eq!(tile_keys(&app), vec![a, copy]);
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+    }
+
+    #[test]
+    fn a_copy_of_a_session_in_no_tile_is_shown_in_the_focused_one() {
+        let (mut app, key, _) = checked(5);
+        let other = app.sessions.add(stored("s9"), NOW - 60);
+        app.show(other, Place::Focused, Leaving::ForgetIfEmpty);
+        assert_eq!(tile_keys(&app), vec![other], "the original is in no tile");
+        app.answer_prompt(key, PromptChoice::ContinueAsCopy);
+        let copy = app.focused().unwrap();
+        assert!(copy != key && copy != other);
+        assert_eq!(tile_keys(&app), vec![copy]);
+        assert!(app.sessions.get(other).is_some(), "it is stored");
+    }
+
+    #[test]
+    fn a_session_gone_from_the_store_leaves_its_tile() {
+        let (mut app, a, b) = two_tiles();
+        app.sessions.remove(b);
+        app.settle();
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a], Some(a)));
+
+        let (mut app, a, b) = two_tiles();
+        app.sessions.remove(a);
+        app.settle();
+        assert_eq!((tile_keys(&app), app.focused()), (vec![b], Some(b)));
+    }
+
+    #[test]
+    fn without_room_side_swaps_the_focused_tile() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        assert!(app.room_for_tile(), "the row's width is not known");
+        app.set_row_width(800.0);
+        assert_eq!(app.row_width(), Some(800.0));
+        assert!(!app.room_for_tile());
+        let b = app.sessions.add(stored("s9"), NOW - 60);
+        assert_eq!(
+            app.show(b, Place::Side, Leaving::ForgetIfEmpty),
+            vec![reads_s9(b)]
+        );
+        assert_eq!((tile_keys(&app), app.focused()), (vec![b], Some(b)));
+        assert!(app.sessions.get(a).is_some());
+        app.set_row_width(840.0);
+        assert!(app.room_for_tile());
+    }
+
+    #[test]
+    fn the_sidebar_is_rebuilt_when_the_focus_moves() {
+        let (mut app, a, b) = two_tiles();
+        app.settle();
+        let version = app.sidebar_version;
+        assert!(row_of(&app, a).focused && !row_of(&app, b).focused);
+        app.focus_tile(b);
+        app.settle();
+        assert_eq!(app.sidebar_version, version + 1);
+        assert!(!row_of(&app, a).focused && row_of(&app, b).focused);
+        assert!(row_of(&app, a).shown && row_of(&app, b).shown);
+        app.focus_tile(b);
+        app.settle();
+        assert_eq!(app.sidebar_version, version + 1, "it had the focus");
+    }
+
+    #[test]
+    fn resizing_asks_for_no_save_and_evening_out_does() {
+        let (mut app, a, b) = two_tiles();
+        app.resize_tile(a, 900.0);
+        assert_eq!(shares(&app), vec![1.0, 1.0], "the row's width is not known");
+        app.set_row_width(1500.0);
+        app.resize_tile(a, 900.0);
+        assert_near(&app.tiles.widths(1500.0), &[900.0, 600.0]);
+        app.resize_tile(b, 900.0);
+        assert_near(&app.tiles.widths(1500.0), &[900.0, 600.0]);
+        assert_eq!(saves(&app.even_tiles()), 1);
+        assert_near(&app.tiles.widths(1500.0), &[750.0, 750.0]);
+        assert_eq!(app.even_tiles(), Vec::new(), "even already");
+    }
+
+    #[test]
+    fn resizing_a_tile_does_not_rebuild_the_sidebar() {
+        let (mut app, a, b) = two_tiles();
+        app.set_row_width(1500.0);
+        app.settle();
+        let version = app.sidebar_version;
+        app.resize_tile(a, 900.0);
+        app.settle();
+        app.even_tiles();
+        app.settle();
+        assert_eq!(app.sidebar_version, version);
+        app.focus_tile(b);
+        app.settle();
+        assert_eq!(app.sidebar_version, version + 1);
+    }
+
+    #[test]
+    fn moving_a_tile_focuses_it_and_asks_for_a_save() {
+        let (mut app, a, b) = two_tiles();
+        let effects = app.move_tile(b, 0);
+        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!((tile_keys(&app), app.focused()), (vec![b, a], Some(b)));
+    }
+
+    #[test]
+    fn a_move_of_nothing_asks_for_nothing() {
+        let (mut app, a, b) = two_tiles();
+        for edge in [0, 1] {
+            assert_eq!(app.move_tile(a, edge), vec![], "edge {edge}");
+        }
+        assert_eq!(app.move_tile(SessionKey(99), 0), vec![], "no tile");
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a, b], Some(a)));
+    }
+
+    #[test]
+    fn a_moved_tile_counts_as_seen() {
+        let (mut app, _, b) = two_tiles();
+        app.event(open_of(&app, b), done(), 0.0);
+        assert_eq!(mark(&app, b), Mark::Finished);
+        app.move_tile(b, 0);
+        assert_ne!(mark(&app, b), Mark::Finished);
+    }
+
+    #[test]
+    fn the_new_order_is_saved() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let [a1, a2, b1] = ["a1", "a2", "b1"].map(|text| by_id(&app, text));
+        app.show(a1, Place::Focused, Leaving::ForgetIfEmpty);
+        app.show(a2, Place::Side, Leaving::ForgetIfEmpty);
+        app.show(b1, Place::Side, Leaving::ForgetIfEmpty);
+        // As in `the_arrangement_is_written_and_read_back`: shares of 2, 1 and 1, scaled.
+        assert!(app.tiles.resize(a1, 1500.0, 3000.0));
+        assert!(app.tiles.resize(a2, 750.0, 3000.0));
+        assert_near(&shares(&app), &[1.5, 0.75, 0.75]);
+        app.move_tile(a1, 3);
+        let saved = app.saved();
+        assert_eq!(
+            saved.tiles,
+            vec![tile("a2", 0.75), tile("b1", 0.75), tile("a1", 1.5)]
+        );
+        assert_eq!(saved.shown, Some(id("a1")));
+    }
+
     #[test]
     fn the_old_session_keeps_working() {
         let mut app = main_screen();
         let a = busy(&mut app, "/a");
         assert_eq!(session(&app, a).phase, Phase::Working);
         assert_eq!(
-            unsaved(app.new_session("/b".into(), Leaving::ForgetIfEmpty)),
+            unsaved(app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty)),
             vec![Effect::Open {
                 open: 2,
                 spec: StartSpec::new("/b")
@@ -2088,8 +2746,11 @@ mod tests {
         app.event(1, permission("r1"), 0.0);
         let before = session(&app, key).clone();
         let unknown = SessionKey(99);
-        assert_eq!(app.show(unknown, Leaving::ForgetIfEmpty), vec![]);
-        assert_eq!(app.shown, Some(key));
+        assert_eq!(
+            app.show(unknown, Place::Focused, Leaving::ForgetIfEmpty),
+            vec![]
+        );
+        assert_eq!(app.focused(), Some(key));
         assert_eq!(app.submit(unknown, "more"), vec![]);
         assert_eq!(app.stop(unknown), vec![]);
         let allow = Answer::Allow { always: false };
@@ -2212,7 +2873,7 @@ mod tests {
             ],
         );
         let (untouched, touched) = (by_id(&app, "a1"), by_id(&app, "a2"));
-        app.show(touched, Leaving::ForgetIfEmpty);
+        app.show(touched, Place::Focused, Leaving::ForgetIfEmpty);
         let live = busy(&mut app, "/a");
         listing(&mut app, None, vec![]);
         assert!(app.sessions.get(untouched).is_none());
@@ -2228,8 +2889,8 @@ mod tests {
     #[test]
     fn a_listing_before_its_program_started_makes_no_second_entry() {
         let mut app = main_screen();
-        app.new_session("/p".into(), Leaving::ForgetIfEmpty);
-        let key = app.shown.unwrap();
+        app.new_session("/p".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let key = app.focused().unwrap();
         app.submit(key, "go");
         listing(&mut app, None, vec![store("s1", "Go", "/p", NOW)]);
         assert_eq!(app.sessions.len(), 2, "the listing came first");
@@ -2245,7 +2906,7 @@ mod tests {
         listing(&mut app, Some(NOW - 2_592_000), vec![a1]);
         let key = by_id(&app, "a1");
         assert_eq!(
-            app.show(key, Leaving::ForgetIfEmpty),
+            app.show(key, Place::Focused, Leaving::ForgetIfEmpty),
             vec![Effect::ReadHistory {
                 key,
                 id: id("a1"),
@@ -2259,9 +2920,9 @@ mod tests {
                 .filter(|e| matches!(e, Effect::ReadHistory { .. }))
                 .count()
         };
-        app.new_session("/b".into(), Leaving::ForgetIfEmpty);
+        app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty);
         assert_eq!(
-            reads(&app.show(key, Leaving::ForgetIfEmpty)),
+            reads(&app.show(key, Place::Focused, Leaving::ForgetIfEmpty)),
             0,
             "while it loads"
         );
@@ -2279,9 +2940,9 @@ mod tests {
         assert_eq!(app.receive(answer(key), 0.0), vec![]);
         assert_eq!(session(&app, key).history, HistoryState::Loaded);
         assert_eq!(session(&app, key).conversation.items().len(), 1);
-        app.new_session("/b".into(), Leaving::ForgetIfEmpty);
+        app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty);
         assert_eq!(
-            reads(&app.show(key, Leaving::ForgetIfEmpty)),
+            reads(&app.show(key, Place::Focused, Leaving::ForgetIfEmpty)),
             0,
             "once it is loaded"
         );
@@ -2295,7 +2956,7 @@ mod tests {
         let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 60);
         listing(&mut app, Some(NOW - 2_592_000), vec![a1]);
         let key = by_id(&app, "a1");
-        app.show(key, Leaving::ForgetIfEmpty);
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
         app.receive(
             FromBackend::History {
                 key,
@@ -2461,7 +3122,7 @@ mod tests {
         let other = by_id(&app, "a2");
         app.submit(key, "carry on");
         // The user looks elsewhere before the store answers.
-        app.show(other, Leaving::ForgetIfEmpty);
+        app.show(other, Place::Focused, Leaving::ForgetIfEmpty);
         let project = GroupId::Folder("/home/alex/project".into());
         app.collapse_group(&project, true);
         app.settle();
@@ -2553,7 +3214,7 @@ mod tests {
         let mut spec = resume_a1();
         spec.fork = true;
         assert_eq!(effects, vec![Effect::Open { open: 1, spec }]);
-        let copy = app.shown.unwrap();
+        let copy = app.focused().unwrap();
         assert_ne!(copy, key);
         assert_eq!(app.sessions.len(), 2);
         let (original, forked) = (session(&app, key), session(&app, copy));
@@ -2618,7 +3279,7 @@ mod tests {
         let s1 = store("s1", "Fix the parser", "/p", changed);
         listing(&mut app, None, vec![s1]);
         let key = by_id(&app, "s1");
-        app.show(key, Leaving::ForgetIfEmpty);
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
         assert_eq!(
             app.submit(key, "more"),
             vec![Effect::CheckActivity { key, id: id("s1") }]
@@ -2757,7 +3418,7 @@ mod tests {
         listing(&mut app, None, vec![a3]);
         let later = by_id(&app, "a3");
         assert!(session(&app, later).models.is_empty());
-        app.show(later, Leaving::ForgetIfEmpty);
+        app.show(later, Place::Focused, Leaving::ForgetIfEmpty);
         assert_eq!(session(&app, later).models, info().models, "when shown");
     }
 
@@ -2874,7 +3535,7 @@ mod tests {
         app.toggle_older_groups();
         app.settle();
         assert_eq!(app.sidebar_version, version + 4, "a group changed");
-        app.show(by_id(&app, "b1"), Leaving::ForgetIfEmpty);
+        app.show(by_id(&app, "b1"), Place::Focused, Leaving::ForgetIfEmpty);
         app.settle();
         assert_eq!(app.sidebar_version, version + 5, "another session is shown");
         let rows = (&app.sidebar.sections[0].rows, &app.sidebar.sections[1].rows);
@@ -2886,8 +3547,12 @@ mod tests {
     fn a_new_session_in_a_group_is_placed_there() {
         let mut app = main_screen();
         let (side, _) = app.new_group("Side projects");
-        let effects =
-            unsaved(app.new_session_in("/home/alex/notes".into(), &side, Leaving::ForgetIfEmpty));
+        let effects = unsaved(app.new_session_in(
+            "/home/alex/notes".into(),
+            &side,
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        ));
         assert_eq!(
             effects,
             vec![Effect::Open {
@@ -2895,7 +3560,7 @@ mod tests {
                 spec: StartSpec::new("/home/alex/notes")
             }]
         );
-        let key = app.shown.unwrap();
+        let key = app.focused().unwrap();
         app.settle();
         let section = &app.sidebar.sections[0];
         assert_eq!(section.id, side);
@@ -2912,9 +3577,10 @@ mod tests {
         app.new_session_in(
             "/home/alex/rune_claude".into(),
             &home,
+            Place::Focused,
             Leaving::ForgetIfEmpty,
         );
-        let other = app.shown.unwrap();
+        let other = app.focused().unwrap();
         assert_ne!(other, key);
         assert_eq!(group_of(&app, other), home);
     }
@@ -2925,7 +3591,7 @@ mod tests {
         let (side, _) = app.new_group("Side projects");
         app.move_session(key, &side);
         app.answer_prompt(key, PromptChoice::ContinueAsCopy);
-        let copy = app.shown.unwrap();
+        let copy = app.focused().unwrap();
         assert_ne!(copy, key);
         assert_eq!(group_of(&app, copy), side);
         app.event(1, SessionEvent::Started(info()), 0.0);
@@ -2962,7 +3628,11 @@ mod tests {
             app.sidebar.sections[0].id, side,
             "the shown session keeps it listed"
         );
-        app.new_session("/home/alex/notes".into(), Leaving::ForgetIfEmpty);
+        app.new_session(
+            "/home/alex/notes".into(),
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        );
         app.settle();
         assert_eq!(
             app.sidebar.hidden,
@@ -3238,7 +3908,7 @@ mod tests {
         let mut app = restored(saved.clone());
         let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
         let key = by_id(&app, "a2");
-        assert_eq!(app.shown, Some(key));
+        assert_eq!(app.focused(), Some(key));
         assert_eq!(
             effects,
             vec![
@@ -3256,13 +3926,13 @@ mod tests {
         let mut app = restored(saved.clone());
         let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![]);
         assert_eq!(effects, vec![Effect::ListSessions { since_unix: None }]);
-        assert_eq!(app.shown, None);
+        assert_eq!(app.focused(), None);
         assert_eq!(app.saved().shown, Some(id("a2")), "it may still come");
         let old = store("a2", "Write the docs", "/home/alex/docs", NOW - 90 * DAY);
         let effects = listing(&mut app, None, vec![old]);
         let key = by_id(&app, "a2");
         assert_eq!(
-            app.shown,
+            app.focused(),
             Some(key),
             "an old one comes with the complete listing"
         );
@@ -3319,21 +3989,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_restored_with_a_launch_folder() {
-        let saved = Saved {
-            version: SAVED_VERSION,
-            shown: Some(id("a2")),
-            ..Saved::default()
-        };
-        let mut app = restored_with(launch("/home/alex/notes"), saved);
-        let started = app.shown.expect("the launch folder's session");
-        let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
-        assert_eq!(effects, vec![Effect::ListSessions { since_unix: None }]);
-        listing(&mut app, None, three_stored());
-        assert_eq!(app.shown, Some(started));
-    }
-
-    #[test]
     fn a_shown_session_that_is_gone_restores_nothing() {
         let saved = Saved {
             version: SAVED_VERSION,
@@ -3342,11 +3997,296 @@ mod tests {
         };
         let mut app = restored(saved);
         list_both(&mut app, three_stored());
-        assert_eq!(app.shown, None);
+        assert_eq!(app.focused(), None);
         assert_eq!(app.saved().shown, None);
         let back = store("gone", "Back again", "/home/alex/notes", NOW - 10);
         listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![back]);
-        assert_eq!(app.shown, None, "not tried after the complete listing");
+        assert_eq!(app.focused(), None, "not tried after the complete listing");
+    }
+
+    fn tile(text: &str, share: f32) -> SavedTile {
+        SavedTile {
+            id: id(text),
+            share,
+        }
+    }
+
+    /// A state with `tiles` and `shown` focused, as a run that closed wrote it.
+    fn with_tiles(tiles: Vec<SavedTile>, shown: &str) -> Saved {
+        Saved {
+            version: SAVED_VERSION,
+            shown: Some(id(shown)),
+            tiles,
+            next_custom: 1,
+            ..Saved::default()
+        }
+    }
+
+    fn shares(app: &App) -> Vec<f32> {
+        app.tiles.list().iter().map(|tile| tile.share).collect()
+    }
+
+    fn assert_near(found: &[f32], expected: &[f32]) {
+        assert_eq!(found.len(), expected.len(), "{found:?}");
+        for (found_one, expected_one) in found.iter().zip(expected) {
+            assert!(
+                (found_one - expected_one).abs() < 0.001,
+                "{found:?}, not {expected:?}"
+            );
+        }
+    }
+
+    fn reads(key: SessionKey, text: &str) -> Effect {
+        Effect::ReadHistory {
+            key,
+            id: id(text),
+            max_items: HISTORY_ITEMS,
+        }
+    }
+
+    #[test]
+    fn the_arrangement_is_written_and_read_back() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let [a1, a2, b1] = ["a1", "a2", "b1"].map(|text| by_id(&app, text));
+        app.show(a1, Place::Focused, Leaving::ForgetIfEmpty);
+        app.show(a2, Place::Side, Leaving::ForgetIfEmpty);
+        app.show(b1, Place::Side, Leaving::ForgetIfEmpty);
+        // Two divider drags in a row 3000 points wide make it 1500, 750 and 750: 2, 1 and 1.
+        assert!(app.tiles.resize(a1, 1500.0, 3000.0));
+        assert!(app.tiles.resize(a2, 750.0, 3000.0));
+        app.focus_tile(a2);
+        assert_near(&shares(&app), &[1.5, 0.75, 0.75]);
+
+        let saved = app.saved();
+        let json = serde_json::to_string(&saved).unwrap();
+        let read: Saved = serde_json::from_str(&json).unwrap();
+        let mut again = restored(read.checked());
+        let effects = listing(&mut again, None, three_stored());
+        let [a1, a2, b1] = ["a1", "a2", "b1"].map(|text| by_id(&again, text));
+        assert_eq!(tile_keys(&again), vec![a1, a2, b1]);
+        assert_near(&shares(&again), &shares(&app));
+        assert_eq!(again.focused(), Some(a2));
+        assert_eq!(
+            effects,
+            vec![reads(a1, "a1"), reads(a2, "a2"), reads(b1, "b1")],
+            "no Open"
+        );
+        assert!(
+            [a1, a2, b1]
+                .iter()
+                .all(|&key| session(&again, key).phase == Phase::Resting)
+        );
+        assert_eq!(again.saved(), saved);
+    }
+
+    #[test]
+    fn a_state_from_plan_3_restores_one_tile() {
+        let read: Saved = serde_json::from_str(r#"{"version":1,"shown":"s1"}"#).unwrap();
+        let mut app = restored(read.checked());
+        let s1 = store("s1", "Tidy the notes", "/home/alex/notes", NOW - 60);
+        let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![s1]);
+        let key = by_id(&app, "s1");
+        assert_eq!((tile_keys(&app), app.focused()), (vec![key], Some(key)));
+        assert_eq!(
+            effects,
+            vec![Effect::ListSessions { since_unix: None }, reads(key, "s1")]
+        );
+        let saved = app.saved();
+        assert_eq!(
+            (saved.tiles, saved.shown),
+            (vec![tile("s1", 1.0)], Some(id("s1")))
+        );
+    }
+
+    #[test]
+    fn tiles_wait_for_every_session_or_the_whole_listing() {
+        let saved = with_tiles(vec![tile("a1", 1.0), tile("old", 1.0)], "a1");
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 60);
+        let old = store("old", "Old work", "/home/alex/notes", NOW - 90 * DAY);
+
+        let mut app = restored(saved.clone());
+        let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1.clone()]);
+        assert_eq!(effects, vec![Effect::ListSessions { since_unix: None }]);
+        assert_eq!(app.focused(), None, "the old one may still come");
+        listing(&mut app, None, vec![a1.clone(), old.clone()]);
+        let both = vec![by_id(&app, "a1"), by_id(&app, "old")];
+        assert_eq!(
+            (tile_keys(&app), app.focused()),
+            (both.clone(), Some(both[0]))
+        );
+
+        let mut app = restored(saved);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1, old]);
+        let both = vec![by_id(&app, "a1"), by_id(&app, "old")];
+        assert_eq!(tile_keys(&app), both, "every one is known: no wait");
+    }
+
+    #[test]
+    fn a_tile_whose_session_is_gone_is_left_out() {
+        let saved = with_tiles(
+            vec![tile("a1", 1.0), tile("gone", 1.0), tile("b1", 1.0)],
+            "gone",
+        );
+        let mut app = restored(saved);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        assert_eq!(app.focused(), None, "it may still come");
+        listing(&mut app, None, three_stored());
+        let (a1, b1) = (by_id(&app, "a1"), by_id(&app, "b1"));
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a1, b1], Some(a1)));
+        let saved = app.saved();
+        assert_eq!(
+            (saved.tiles, saved.shown),
+            (vec![tile("a1", 1.0), tile("b1", 1.0)], Some(id("a1")))
+        );
+    }
+
+    #[test]
+    fn odd_shares_and_twins_are_put_right() {
+        let saved = with_tiles(
+            vec![tile("a1", 0.0), tile("a2", f32::NAN), tile("a1", 4.0)],
+            "a2",
+        );
+        let mut app = restored(saved);
+        list_both(&mut app, three_stored());
+        let (a1, a2) = (by_id(&app, "a1"), by_id(&app, "a2"));
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a1, a2], Some(a2)));
+        assert_eq!(shares(&app), vec![1.0, 1.0]);
+
+        // Their sum is not finite: the row would have no width to give.
+        let huge = vec![tile("a1", f32::MAX), tile("a2", f32::MAX * 0.75)];
+        let mut app = restored(with_tiles(huge, "a1"));
+        list_both(&mut app, three_stored());
+        assert_eq!(tile_keys(&app).len(), 2);
+        assert_near(&shares(&app), &[8.0 / 7.0, 6.0 / 7.0]);
+        let widths = app.tiles.widths(1400.0);
+        assert!((widths[0] - 800.0).abs() < 0.5, "{widths:?}");
+        assert!((widths[1] - 600.0).abs() < 0.5, "{widths:?}");
+    }
+
+    #[test]
+    fn a_new_session_without_an_id_is_not_saved() {
+        let (mut app, _) = shows_stored();
+        app.new_session(
+            "/home/alex/notes".into(),
+            Place::Side,
+            Leaving::ForgetIfEmpty,
+        );
+        assert_eq!(tile_keys(&app).len(), 2);
+        let saved = app.saved();
+        assert_eq!(
+            (saved.tiles, saved.shown),
+            (vec![tile("a1", 1.0)], Some(id("a1"))),
+            "the first kept tile stands for the focused one"
+        );
+    }
+
+    #[test]
+    fn a_new_session_nothing_was_sent_in_is_not_saved() {
+        let (mut app, a1) = shows_stored();
+        app.new_session(
+            "/home/alex/notes".into(),
+            Place::Side,
+            Leaving::ForgetIfEmpty,
+        );
+        let new = app.focused().unwrap();
+        assert_ne!(new, a1);
+        let started = SessionInfo {
+            id: id("new"),
+            ..info()
+        };
+        app.event(open_of(&app, new), SessionEvent::Started(started), 0.0);
+        assert_eq!(session(&app, new).id, Some(id("new")));
+        let Some(Effect::SaveState(saved)) = app.close(NOW).into_iter().next() else {
+            panic!("closing saves first");
+        };
+        assert_eq!(
+            (saved.tiles.clone(), saved.shown.clone()),
+            (vec![tile("a1", 1.0)], Some(id("a1")))
+        );
+
+        // The next run has every tile at the recent listing.
+        let mut app = restored(*saved);
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1]);
+        let a1 = by_id(&app, "a1");
+        assert_eq!((tile_keys(&app), app.focused()), (vec![a1], Some(a1)));
+    }
+
+    #[test]
+    fn a_launch_folder_restores_nothing() {
+        for saved in [
+            with_tiles(vec![tile("a1", 1.0), tile("a2", 1.0)], "a2"),
+            with_tiles(Vec::new(), "a2"),
+        ] {
+            let mut app = restored_with(launch("/home/alex/notes"), saved);
+            let started = app.focused().expect("the launch folder's session");
+            let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+            assert_eq!(effects, vec![Effect::ListSessions { since_unix: None }]);
+            listing(&mut app, None, three_stored());
+            assert_eq!(
+                (tile_keys(&app), app.focused()),
+                (vec![started], Some(started))
+            );
+        }
+    }
+
+    /// The tiles and the focused session `effects` ask to save.
+    fn saved_row(effects: &[Effect]) -> (Vec<SavedTile>, Option<SessionId>) {
+        let saves: Vec<&Saved> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::SaveState(saved) => Some(&**saved),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(saves.len(), 1, "{effects:?}");
+        (saves[0].tiles.clone(), saves[0].shown.clone())
+    }
+
+    #[test]
+    fn a_restore_that_waited_does_not_run_after_a_tile_was_opened() {
+        let saved = with_tiles(vec![tile("a1", 1.0), tile("old", 1.0)], "a1");
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 60);
+        let old = store("old", "Old work", "/home/alex/notes", NOW - 90 * DAY);
+
+        // A row shown by a click, then closed.
+        let mut app = restored(saved.clone());
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1.clone()]);
+        assert_eq!(app.focused(), None, "it waits for the old one");
+        let key = by_id(&app, "a1");
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        let effects = app.close_tile(key, Leaving::ForgetIfEmpty);
+        assert_eq!(saved_row(&effects), (Vec::new(), None), "the empty row");
+        listing(&mut app, None, vec![a1.clone(), old.clone()]);
+        assert_eq!(tile_keys(&app), vec![], "the user left the row empty");
+
+        // A new session, then closed.
+        let mut app = restored(saved);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1.clone()]);
+        app.new_session(
+            "/home/alex/notes".into(),
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        );
+        let key = app.focused().unwrap();
+        let effects = app.close_tile(key, Leaving::Keep);
+        assert_eq!(saved_row(&effects), (Vec::new(), None), "the empty row");
+        listing(&mut app, None, vec![a1, old]);
+        assert_eq!(tile_keys(&app), vec![]);
+    }
+
+    #[test]
+    fn waiting_tiles_are_written_back_unchanged() {
+        let read = with_tiles(vec![tile("a1", 2.0), tile("gone", 0.5)], "gone");
+        let mut app = restored(read.clone());
+        assert_eq!(app.saved(), read);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        assert_eq!(
+            app.saved(),
+            read,
+            "the recent listing does not know them all"
+        );
     }
 
     #[test]
@@ -3371,7 +4311,11 @@ mod tests {
         assert_eq!(folders(&app), expected);
         assert_eq!(RECENT_FOLDERS, 12);
 
-        app.new_session("/home/alex/f5".into(), Leaving::ForgetIfEmpty);
+        app.new_session(
+            "/home/alex/f5".into(),
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        );
         let mut expected: Vec<String> = vec!["/home/alex/f5".into()];
         expected.extend(
             (2..=13)
@@ -3382,13 +4326,21 @@ mod tests {
         assert_eq!(folders(&app), expected);
         assert_eq!(app.saved().recent_folders, app.recent_folders);
 
-        let key = app.shown.unwrap();
+        let key = app.focused().unwrap();
         app.event(open_of(&app, key), SessionEvent::Started(info()), 0.0);
         app.submit(key, "go");
-        let effects = app.new_session("/home/alex/f5".into(), Leaving::ForgetIfEmpty);
+        let effects = app.new_session(
+            "/home/alex/f5".into(),
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        );
         assert_eq!(saves(&effects), 0, "nothing changed: {effects:?}");
         assert_eq!(folders(&app), expected);
-        let effects = app.new_session("/home/alex/f9".into(), Leaving::ForgetIfEmpty);
+        let effects = app.new_session(
+            "/home/alex/f9".into(),
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        );
         assert_eq!(effects.last(), Some(&save(&app)));
         assert_eq!(saves(&effects), 1);
     }
@@ -3455,13 +4407,18 @@ mod tests {
         assert_eq!(app.hide_group(&project(), true), vec![save(&app)]);
         assert_eq!(app.delete_group(&side), vec![save(&app)]);
         let (other, _) = app.new_group("Other");
-        let effects =
-            app.new_session_in("/home/alex/project".into(), &other, Leaving::ForgetIfEmpty);
+        let effects = app.new_session_in(
+            "/home/alex/project".into(),
+            &other,
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        );
         assert_eq!(effects.last(), Some(&save(&app)), "after the placement");
         assert_eq!(saves(&effects), 1, "{effects:?}");
         let effects = app.new_session_in(
             "/home/alex/project".into(),
             &project(),
+            Place::Focused,
             Leaving::ForgetIfEmpty,
         );
         assert_eq!(effects, vec![save(&app)], "the empty one moves");
@@ -3495,5 +4452,262 @@ mod tests {
             ],
             "the state is written first"
         );
+    }
+
+    /// The `Rename` commands in `effects`, by their names.
+    fn renames(effects: &[Effect]) -> Vec<&str> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Send {
+                    command: SessionCommand::Rename(name),
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn names(app: &App) -> Vec<(SessionId, String)> {
+        app.saved().names
+    }
+
+    fn garden(id_text: &str) -> Vec<(SessionId, String)> {
+        vec![(id(id_text), "Garden".into())]
+    }
+
+    /// An app from a state that keeps the name "Garden" for `s1`, and the recent listing giving
+    /// `s1` titled `listed`.
+    fn named_before(listed: &str) -> (App, SessionKey, Vec<Effect>) {
+        let mut app = restored(Saved {
+            version: SAVED_VERSION,
+            names: garden("s1"),
+            ..Saved::default()
+        });
+        let s1 = store("s1", listed, "/home/alex/project", NOW - 60);
+        let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![s1]);
+        let key = by_id(&app, "s1");
+        (app, key, effects)
+    }
+
+    #[test]
+    fn renaming_a_running_session_tells_its_program() {
+        let (mut app, key) = ready();
+        let effects = app.rename(key, "  Garden ");
+        assert_eq!(session(&app, key).title.as_deref(), Some("Garden"));
+        assert_eq!(session(&app, key).user_title.as_deref(), Some("Garden"));
+        assert_eq!(
+            unsaved(effects.clone()),
+            vec![Effect::Send {
+                open: 1,
+                command: SessionCommand::Rename("Garden".into())
+            }]
+        );
+        assert_eq!(saves(&effects), 1, "it has an id");
+        assert_eq!(names(&app), garden("s1"));
+        let effects = app.event(1, SessionEvent::TitleChanged("Garden".into()), 0.0);
+        assert_eq!(effects, vec![save(&app)], "confirmed");
+        assert!(names(&app).is_empty());
+        assert_eq!(session(&app, key).user_title.as_deref(), Some("Garden"));
+    }
+
+    #[test]
+    fn renaming_a_resting_session_waits_for_its_program() {
+        let (mut app, key) = shows_stored();
+        let effects = app.rename(key, "Garden");
+        assert_eq!(effects, vec![save(&app)], "nothing is sent");
+        assert_eq!(session(&app, key).title.as_deref(), Some("Garden"));
+        assert_eq!(names(&app), garden("a1"));
+        app.submit(key, "carry on");
+        let effects = app.receive(
+            FromBackend::Activity {
+                key,
+                result: Ok(None),
+            },
+            0.0,
+        );
+        assert!(renames(&effects).is_empty(), "not before its start");
+        let started = SessionInfo {
+            id: id("a1"),
+            ..info()
+        };
+        let effects = app.event(1, SessionEvent::Started(started), 0.0);
+        assert_eq!(renames(&effects), vec!["Garden"]);
+        assert!(sends_text(&effects, 1, "carry on"));
+        assert_eq!(saves(&effects), 0, "it was kept already");
+        assert_eq!(names(&app), garden("a1"), "until it is confirmed");
+        let effects = app.event(1, SessionEvent::TitleChanged("Garden".into()), 0.0);
+        assert_eq!(saves(&effects), 1);
+        assert!(names(&app).is_empty());
+    }
+
+    #[test]
+    fn a_new_session_renamed_before_its_start_is_named_at_the_start() {
+        let mut app = main_screen();
+        app.new_session("/p".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let key = app.focused().unwrap();
+        let effects = app.rename(key, "Garden");
+        assert!(effects.is_empty(), "no id yet: nothing to keep or send");
+        assert!(names(&app).is_empty());
+        let effects = app.event(1, SessionEvent::Started(info()), 0.0);
+        assert_eq!(renames(&effects), vec!["Garden"]);
+        assert_eq!(saves(&effects), 1, "its id is known now");
+        assert_eq!(names(&app), garden("s1"));
+        app.event(1, SessionEvent::TitleChanged("Garden".into()), 0.0);
+        assert!(names(&app).is_empty());
+        // A name the program confirmed is not sent again to the next one.
+        app.event(1, exited(false), 0.0);
+        app.restart(key);
+        let effects = app.event(2, SessionEvent::Started(info()), 0.0);
+        assert!(renames(&effects).is_empty());
+        assert_eq!(saves(&effects), 0);
+    }
+
+    #[test]
+    fn a_name_kept_from_the_last_run_is_sent_when_its_program_starts() {
+        let (mut app, key, _) = named_before("Planting plan");
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        app.submit(key, "carry on");
+        let effects = app.receive(
+            FromBackend::Activity {
+                key,
+                result: Ok(None),
+            },
+            0.0,
+        );
+        assert!(renames(&effects).is_empty(), "not before its start");
+        let effects = app.event(open_of(&app, key), SessionEvent::Started(info()), 0.0);
+        assert_eq!(renames(&effects), vec!["Garden"]);
+        let at = |wanted: &dyn Fn(&Effect) -> bool| effects.iter().position(wanted).unwrap();
+        let rename = at(&|effect| {
+            matches!(
+                effect,
+                Effect::Send {
+                    command: SessionCommand::Rename(_),
+                    ..
+                }
+            )
+        });
+        let message = at(&|effect| {
+            matches!(
+                effect,
+                Effect::Send {
+                    command: SessionCommand::Send { text, .. },
+                    ..
+                } if text == "carry on"
+            )
+        });
+        assert!(rename < message, "before the queued message: {effects:?}");
+    }
+
+    #[test]
+    fn a_name_kept_from_the_last_run_names_the_row() {
+        let (mut app, key, effects) = named_before("Planting plan");
+        assert_eq!(saves(&effects), 0);
+        assert_eq!(session(&app, key).title.as_deref(), Some("Garden"));
+        assert_eq!(session(&app, key).user_title.as_deref(), Some("Garden"));
+        assert_eq!(names(&app), garden("s1"));
+        app.settle();
+        assert_eq!(row_of(&app, key).title, "Garden");
+    }
+
+    #[test]
+    fn the_store_agreeing_drops_the_kept_name() {
+        let (app, key, effects) = named_before("Garden");
+        assert_eq!(session(&app, key).user_title.as_deref(), Some("Garden"));
+        assert!(names(&app).is_empty());
+        assert_eq!(saves(&effects), 1);
+    }
+
+    #[test]
+    fn a_complete_listing_drops_the_names_of_sessions_it_does_not_give() {
+        let mut kept = garden("s1");
+        kept.push((id("gone"), "Old".into()));
+        let mut app = restored(Saved {
+            version: SAVED_VERSION,
+            names: kept,
+            ..Saved::default()
+        });
+        let s1 = store("s1", "Planting plan", "/home/alex/project", NOW - 60);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![s1.clone()]);
+        assert_eq!(names(&app).len(), 2, "the recent listing is not all");
+        let effects = listing(&mut app, None, vec![s1]);
+        assert_eq!(names(&app), garden("s1"));
+        assert_eq!(saves(&effects), 1);
+    }
+
+    #[test]
+    fn a_late_generated_title_does_not_replace_the_users_name() {
+        let (mut app, key) = ready();
+        app.submit(key, "plan the garden");
+        app.rename(key, "Garden");
+        let effects = app.event(1, SessionEvent::TitleChanged("Something else".into()), 0.0);
+        assert!(effects.is_empty());
+        assert_eq!(session(&app, key).title.as_deref(), Some("Garden"));
+        assert_eq!(names(&app), garden("s1"), "still not confirmed");
+    }
+
+    #[test]
+    fn a_listing_does_not_rename_what_the_user_named() {
+        let (mut app, key) = shows_stored();
+        app.rename(key, "Garden");
+        let a1 = store("a1", "Something else", "/home/alex/project", NOW - 30);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1]);
+        assert_eq!(session(&app, key).title.as_deref(), Some("Garden"));
+        assert_eq!(app.sessions.get(key).unwrap().last_active_unix, NOW - 30);
+        assert_eq!(names(&app), garden("a1"));
+    }
+
+    #[test]
+    fn an_empty_name_changes_nothing() {
+        let (mut app, key) = shows_stored();
+        assert!(app.rename(key, " \t\n").is_empty());
+        assert_eq!(session(&app, key).title.as_deref(), Some("Fix the parser"));
+        assert_eq!(session(&app, key).user_title, None);
+        assert!(names(&app).is_empty());
+    }
+
+    #[test]
+    fn the_same_name_sends_nothing() {
+        let (mut app, key) = ready();
+        app.rename(key, "Garden");
+        assert!(app.rename(key, " Garden ").is_empty());
+        let (mut app, key) = shows_stored();
+        assert!(app.rename(key, "Fix the parser").is_empty());
+        assert_eq!(session(&app, key).user_title, None);
+        assert!(names(&app).is_empty());
+    }
+
+    #[test]
+    fn a_refused_rename_is_said_and_not_kept() {
+        let (mut app, key) = ready();
+        app.rename(key, "Garden");
+        let refused = SessionEvent::CommandFailed {
+            what: CommandKind::Rename,
+            reason: "no".into(),
+        };
+        let effects = app.event(1, refused, 0.0);
+        assert_eq!(saves(&effects), 1);
+        assert!(names(&app).is_empty());
+        let last = session(&app, key)
+            .conversation
+            .items()
+            .last()
+            .unwrap()
+            .body
+            .clone();
+        assert_eq!(
+            last,
+            ItemBody::Notice {
+                kind: NoticeKind::CommandFailed,
+                text: "Could not rename the session: no".into()
+            }
+        );
+        assert_eq!(session(&app, key).title.as_deref(), Some("Garden"));
+        // Nor is it told to the next program.
+        app.event(1, exited(false), 0.0);
+        app.restart(key);
+        let effects = app.event(2, SessionEvent::Started(info()), 0.0);
+        assert!(renames(&effects).is_empty());
     }
 }

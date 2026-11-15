@@ -375,7 +375,7 @@ fn model_picker(
     let names: Vec<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
     let current = session.map_or_else(|| "Model".to_owned(), Session::model_label);
     let disabled = options.is_empty() || !picker_enabled(session);
-    let picker = Select::new("mr-model", &names)
+    let picker = Select::new(picker_key("mr-model", key), &names)
         .label("Model")
         .current(Some(&current))
         .placement(Placement::TopStart)
@@ -413,7 +413,7 @@ fn mode_picker(
     let auto_mode = session.is_some_and(Session::auto_mode);
     let choices = mode_choices(&mode, plan_mode, auto_mode);
     let labels: Vec<String> = choices.iter().map(mode_label).collect();
-    Select::new("mr-mode", &labels)
+    Select::new(picker_key("mr-mode", key), &labels)
         .label("Permission mode")
         .current(Some(&mode_label(&mode)))
         .placement(Placement::TopStart)
@@ -435,15 +435,31 @@ fn mode_picker(
         .min_w(0.0)
 }
 
+/// `{name}-{n}`, the key of a picker of `key`'s session. The kit anchors a picker's list to its
+/// trigger, and gives the focus back to it, by that key alone, the first in the window: so it
+/// carries the session's number, which tells two tiles' pickers apart.
+fn picker_key(name: &str, key: SessionKey) -> String {
+    format!("{name}-{}", key.0)
+}
+
 /// The pickers work while the session can take a command: not while it opens, nor once ended.
 fn picker_enabled(session: Option<&Session>) -> bool {
     session.is_some_and(|s| !matches!(s.phase, Phase::Opening | Phase::Ended { .. }))
 }
 
-/// Opens `picker` of `key`'s session, closing the other one, or closes it when it is open.
+/// Opens `picker` of `key`'s session, closing the other one and the picker of every other
+/// session's view, and focuses its tile; or closes it when it is open.
 fn toggle(ui: &mut Ui, key: SessionKey, picker: Picker) {
-    let view = glue::view_mut(ui, key);
-    view.open_picker = (view.open_picker != Some(picker)).then_some(picker);
+    let opens = glue::view_of(ui, key).open_picker != Some(picker);
+    if opens {
+        glue::focus_tile(ui, key, false);
+        for (other, view) in &mut ui.views {
+            if *other != key {
+                view.open_picker = None;
+            }
+        }
+    }
+    glue::view_mut(ui, key).open_picker = opens.then_some(picker);
 }
 
 /// Escape or a press outside closed the open picker; the kit hands focus back to its trigger.
@@ -464,7 +480,7 @@ mod tests {
     use mr_core::Session;
     use rune::{Key, Mods, Runtime};
 
-    use super::{MODE_MIN, mode_choices};
+    use super::{MODE_MIN, mode_choices, toggle};
     use crate::glue::{self, Picker, Ui};
     use crate::testkit;
 
@@ -593,17 +609,18 @@ mod tests {
     fn the_model_picker_shows_the_model_and_changes_it() {
         let mut rt = testkit::window("empty");
         assert_eq!(
-            rt.state.shown_session().unwrap().model_label(),
+            rt.state.focused_session().unwrap().model_label(),
             DEFAULT_LABEL
         );
         assert!(testkit::has_text(&rt, DEFAULT_LABEL));
-        testkit::click(&mut rt, "mr-model-trigger");
+        let picker = testkit::model_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         testkit::click_text(&mut rt, "Fast");
         testkit::step(&mut rt);
         assert!(testkit::sent(&rt).contains(&SessionCommand::SetModel("fast".into())));
         assert_eq!(
-            rt.state.shown_session().unwrap().model_label(),
+            rt.state.focused_session().unwrap().model_label(),
             DEFAULT_LABEL,
             "not until the agent confirms"
         );
@@ -611,7 +628,7 @@ mod tests {
             &mut rt,
             SessionEvent::ModelChanged("fake-model-fast".into()),
         );
-        assert_eq!(rt.state.shown_session().unwrap().model_label(), "Fast");
+        assert_eq!(rt.state.focused_session().unwrap().model_label(), "Fast");
         assert!(testkit::has_text(&rt, "Fast"));
         assert_eq!(testkit::shown_view(&rt).open_picker, None);
     }
@@ -626,13 +643,17 @@ mod tests {
             &mut rt,
             SessionEvent::ModelChanged("fake-model-fast".into()),
         );
-        assert_eq!(rt.state.shown_session().unwrap().model_label(), "Fast");
-        testkit::click(&mut rt, "mr-model-trigger");
+        assert_eq!(rt.state.focused_session().unwrap().model_label(), "Fast");
+        let picker = testkit::model_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         let listed: Vec<String> = rt
             .elements()
             .into_iter()
-            .filter(|e| e.path.contains("mr-model-content") && e.key.as_deref() == Some("label"))
+            .filter(|e| {
+                e.path.contains(&testkit::model_key(&rt, "content"))
+                    && e.key.as_deref() == Some("label")
+            })
             .filter_map(|e| e.text)
             .collect();
         assert_eq!(listed, vec![DEFAULT_LABEL.to_string(), "Fast".to_string()]);
@@ -648,7 +669,8 @@ mod tests {
     fn the_mode_picker_offers_the_three_modes() {
         let mut rt = testkit::window("empty");
         assert!(testkit::has_text(&rt, "Ask before edits"));
-        testkit::click(&mut rt, "mr-mode-trigger");
+        let picker = testkit::mode_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         assert!(testkit::has_text(&rt, "Accept edits") && testkit::has_text(&rt, "Plan"));
         assert!(!testkit::has_text(&rt, "Bypass permissions"));
@@ -702,7 +724,8 @@ mod tests {
     #[test]
     fn choosing_auto_asks_for_it_and_a_refusal_keeps_the_mode_in_use() {
         let mut rt = testkit::window("empty");
-        testkit::click(&mut rt, "mr-mode-trigger");
+        let picker = testkit::mode_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         testkit::click_text(&mut rt, "Auto");
         testkit::step(&mut rt);
@@ -721,11 +744,18 @@ mod tests {
             &rt,
             "Could not change the permission mode: auto mode is not available"
         ));
-        assert_eq!(rt.state.shown_session().unwrap().mode, PermissionMode::Ask);
+        assert_eq!(
+            rt.state.focused_session().unwrap().mode,
+            PermissionMode::Ask
+        );
         let shown = rt
             .elements()
             .into_iter()
-            .find(|e| e.path.contains("/mr-mode-trigger/") && e.text.is_some())
+            .find(|e| {
+                e.path
+                    .contains(&format!("/{}/", testkit::mode_key(&rt, "trigger")))
+                    && e.text.is_some()
+            })
             .and_then(|e| e.text);
         assert_eq!(shown.as_deref(), Some("Ask before edits"));
         // Accepted, it is the mode shown.
@@ -743,7 +773,8 @@ mod tests {
             &mut rt,
             SessionEvent::ModelChanged("fake-model-fast".into()),
         );
-        testkit::click(&mut rt, "mr-mode-trigger");
+        let picker = testkit::mode_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         assert!(testkit::has_text(&rt, "Plan"));
         assert!(!testkit::texts(&rt).iter().any(|t| t == "Auto"));
@@ -773,13 +804,13 @@ mod tests {
             },
         );
         assert_eq!(
-            rt.state.shown_session().unwrap().phase,
+            rt.state.focused_session().unwrap().phase,
             mr_core::Phase::Resting
         );
         assert!(!testkit::has_text(&rt, "This session has ended"));
         testkit::type_text(&mut rt, "hello");
         testkit::press(&mut rt, Key::Enter);
-        let session = rt.state.shown_session().unwrap();
+        let session = rt.state.focused_session().unwrap();
         assert_eq!(session.phase, mr_core::Phase::Opening);
         assert_eq!(
             session.queued.as_deref(),
@@ -814,7 +845,11 @@ mod tests {
         app.sessions.get_mut(key).unwrap().prompt = Some(mr_core::Prompt::OpenElsewhere {
             text: "carry on".into(),
         });
-        let effects = app.show(key, mr_core::Leaving::ForgetIfEmpty);
+        let effects = app.show(
+            key,
+            mr_core::Place::Focused,
+            mr_core::Leaving::ForgetIfEmpty,
+        );
         glue::run(&mut rt.state, effects);
         testkit::step(&mut rt);
         testkit::type_text(&mut rt, "hello");
@@ -824,7 +859,7 @@ mod tests {
         testkit::step(&mut rt);
         assert_eq!(testkit::shown_view(&rt).draft.text, "hello");
         assert_eq!(
-            rt.state.shown_session().unwrap().phase,
+            rt.state.focused_session().unwrap().phase,
             mr_core::Phase::Resting
         );
     }
@@ -864,12 +899,15 @@ mod tests {
     #[test]
     fn escape_in_an_open_picker_closes_it_and_the_turn_runs_on() {
         let mut rt = testkit::window("working");
-        testkit::click(&mut rt, "mr-mode-trigger");
+        let picker = testkit::mode_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         assert_eq!(testkit::shown_view(&rt).open_picker, Some(Picker::Mode));
-        testkit::click(&mut rt, "mr-model-trigger");
+        let picker = testkit::model_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
-        testkit::click(&mut rt, "mr-model-trigger");
+        let picker = testkit::model_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         assert_eq!(
             testkit::shown_view(&rt).open_picker,
@@ -885,7 +923,8 @@ mod tests {
     #[test]
     fn a_picker_open_when_the_session_ends_does_not_open_again() {
         let mut rt = testkit::window("empty");
-        testkit::click(&mut rt, "mr-model-trigger");
+        let picker = testkit::model_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         assert_eq!(testkit::shown_view(&rt).open_picker, Some(Picker::Model));
         testkit::emit(
@@ -900,7 +939,7 @@ mod tests {
         let scrim = |rt: &Runtime<Ui>| {
             rt.elements()
                 .iter()
-                .any(|e| e.key.as_deref() == Some("mr-model-scrim"))
+                .any(|e| e.key == Some(testkit::model_key(rt, "scrim")))
         };
         for _ in 0..20 {
             if !scrim(&rt) {
@@ -911,22 +950,40 @@ mod tests {
         testkit::click(&mut rt, "mr-restart");
         testkit::step(&mut rt);
         assert_eq!(testkit::shown_open(&rt), Some(2));
-        assert!(rt.find("mr-model-trigger").is_some());
-        assert!(rt.find("mr-model-content").is_none(), "the list stays shut");
+        assert!(rt.find(&testkit::model_key(&rt, "trigger")).is_some());
+        assert!(
+            rt.find(&testkit::model_key(&rt, "content")).is_none(),
+            "the list stays shut"
+        );
+    }
+
+    #[test]
+    fn opening_a_picker_shuts_every_other_sessions_picker() {
+        let mut rt = testkit::window("empty");
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        let b = testkit::add_session(&mut rt, "/home/alex/b");
+        glue::view_mut(&mut rt.state, a).open_picker = Some(Picker::Mode);
+        toggle(&mut rt.state, b, Picker::Model);
+        assert_eq!(glue::view_of(&rt.state, a).open_picker, None);
+        assert_eq!(glue::view_of(&rt.state, b).open_picker, Some(Picker::Model));
+        toggle(&mut rt.state, b, Picker::Model);
+        assert_eq!(glue::view_of(&rt.state, b).open_picker, None, "shut again");
     }
 
     #[test]
     fn the_model_picker_shuts_when_its_list_empties() {
         let mut rt = testkit::window("empty");
-        testkit::click(&mut rt, "mr-model-trigger");
+        let picker = testkit::model_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         assert_eq!(testkit::shown_view(&rt).open_picker, Some(Picker::Model));
-        rt.state.shown_entry_mut().unwrap().session.models.clear();
+        rt.state.focused_entry_mut().unwrap().session.models.clear();
         // Anything taken in from the agent goes through the glue.
         testkit::emit(&mut rt, SessionEvent::TitleChanged("Renamed".into()));
         assert_eq!(testkit::shown_view(&rt).open_picker, None);
         // The mode picker has its list whatever the models.
-        testkit::click(&mut rt, "mr-mode-trigger");
+        let picker = testkit::mode_key(&rt, "trigger");
+        testkit::click(&mut rt, &picker);
         testkit::step(&mut rt);
         testkit::emit(&mut rt, SessionEvent::TitleChanged("Again".into()));
         assert_eq!(testkit::shown_view(&rt).open_picker, Some(Picker::Mode));
@@ -936,7 +993,7 @@ mod tests {
     fn in_the_smallest_window_a_long_model_label_is_cut_inside_its_trigger() {
         let mut rt = testkit::window_sized("working", (560.0, 400.0));
         // The label the recorded list gives the default model, the longest seen.
-        let mut entry = rt.state.shown_entry_mut().unwrap();
+        let mut entry = rt.state.focused_entry_mut().unwrap();
         let session = &mut entry.session;
         session.models[0].name = "Default (recommended)".into();
         session.models[0].stands_for = Some("Fable 5.2".into());
@@ -951,9 +1008,9 @@ mod tests {
         };
         let stop = rect(&rt, "mr-stop");
         assert!(inside(stop), "{stop:?} inside {frame:?}");
-        let model = rect(&rt, "mr-model-trigger");
+        let model = rect(&rt, &testkit::model_key(&rt, "trigger"));
         assert!(inside(model), "{model:?} inside {frame:?}");
-        let mode = rect(&rt, "mr-mode-trigger");
+        let mode = rect(&rt, &testkit::mode_key(&rt, "trigger"));
         assert!(
             model[0] + model[2] <= mode[0] + 0.5,
             "the pickers do not overlap"
@@ -965,7 +1022,11 @@ mod tests {
         let value = rt
             .elements()
             .into_iter()
-            .find(|e| e.path.contains("/mr-model-trigger/") && e.text.as_deref() == Some(&label))
+            .find(|e| {
+                e.path
+                    .contains(&format!("/{}/", testkit::model_key(&rt, "trigger")))
+                    && e.text.as_deref() == Some(&label)
+            })
             .expect("the model picker shows the label");
         assert!(
             value.rect[0] + value.rect[2] <= model[0] + model[2] + 0.5,
@@ -973,7 +1034,7 @@ mod tests {
             value.rect
         );
         let mut roomy = testkit::window("working");
-        let mut entry = roomy.state.shown_entry_mut().unwrap();
+        let mut entry = roomy.state.focused_entry_mut().unwrap();
         let session = &mut entry.session;
         session.models[0].name = "Default (recommended)".into();
         session.models[0].stands_for = Some("Fable 5.2".into());
@@ -983,7 +1044,11 @@ mod tests {
         let whole = roomy
             .elements()
             .into_iter()
-            .find(|e| e.path.contains("/mr-model-trigger/") && e.text.as_deref() == Some(&label))
+            .find(|e| {
+                e.path
+                    .contains(&format!("/{}/", testkit::model_key(&roomy, "trigger")))
+                    && e.text.as_deref() == Some(&label)
+            })
             .expect("the model picker shows the label");
         assert!(
             value.rect[2] < whole.rect[2],
@@ -1010,9 +1075,13 @@ mod tests {
         let value = rt
             .elements()
             .into_iter()
-            .find(|e| e.path.contains("/mr-model-trigger/") && e.text.is_some())
+            .find(|e| {
+                e.path
+                    .contains(&format!("/{}/", testkit::model_key(&rt, "trigger")))
+                    && e.text.is_some()
+            })
             .expect("the model picker shows a name");
-        let model = rect(&rt, "mr-model-trigger");
+        let model = rect(&rt, &testkit::model_key(&rt, "trigger"));
         assert!(
             value.rect[0] + value.rect[2] <= model[0] + model[2],
             "the name is inside its trigger"
@@ -1021,7 +1090,11 @@ mod tests {
         let whole = roomy
             .elements()
             .into_iter()
-            .find(|e| e.path.contains("/mr-model-trigger/") && e.text.is_some())
+            .find(|e| {
+                e.path
+                    .contains(&format!("/{}/", testkit::model_key(&roomy, "trigger")))
+                    && e.text.is_some()
+            })
             .expect("the model picker shows a name");
         assert_eq!(value.rect[2], whole.rect[2], "the name is not cut");
     }

@@ -21,6 +21,8 @@ pub enum SessionCommand {
     SetRemoteAccess {
         on: bool,
     },
+    /// Names the session. The answer is a `TitleChanged` event with that name; a refusal is
+    /// `CommandFailed { what: CommandKind::Rename, .. }`.
     Rename(String),
     /// Asks the agent to name the session from this text. The answer is a `TitleChanged`
     /// event; a refusal is `CommandFailed { what: CommandKind::SuggestTitle, .. }`. An agent

@@ -1,6 +1,8 @@
 //! One row of the conversation per item: the user's message, Claude's reply with its copy
 //! controls, thinking, tool lines with their details, file edits as diffs, and notices.
-//! Requests are drawn as cards by `requests`.
+//! Requests are drawn as cards by `requests`. A control here that calls no core intent (a
+//! row's toggle, "Show all", a copy button) focuses its tile itself; the core's intents do so
+//! for the others.
 
 use std::hash::Hash;
 
@@ -55,16 +57,37 @@ pub fn memo_id(key: SessionKey, generation: u64, id: ItemId) -> String {
     format!("mr-item-{}-g{generation}-{}", id.0, key.0)
 }
 
+/// The key path of the line that opens and closes item `id` in `key`'s conversation. Rune names
+/// an element by its nearest keyed ancestors, so the path climbs to the conversation, whose key
+/// carries the session's number: the same item of another tile's session is not named.
+pub(crate) fn toggle_path(key: SessionKey, id: ItemId) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        super::conversation_key(key),
+        super::conversation::ROWS,
+        row_key(id),
+        toggle_key(id)
+    )
+}
+
+/// `mr-toggle-{id}`.
+fn toggle_key(id: ItemId) -> String {
+    format!("mr-toggle-{}", id.0)
+}
+
 /// One item of `key`'s session as a row keyed `mr-item-{id}`, its spacing as padding inside it.
 pub fn row(ui: &Ui, key: SessionKey, item: &Item, kit: &'static Kit) -> El {
     let id = item.id;
     let view = glue::view_of(ui, key);
     let folds = matches!(item.body, ItemBody::Thinking { .. } | ItemBody::Tools(_));
     let (content, pad_bottom) = match &item.body {
-        ItemBody::User { text, image_count } => (
-            Some(user_message(id, text, *image_count, kit)),
-            ROW_PAD_BOTTOM,
-        ),
+        ItemBody::User { text, image_count } => {
+            let whole = view.whole.contains(&id);
+            (
+                Some(user_message(key, id, text, *image_count, whole, kit)),
+                ROW_PAD_BOTTOM,
+            )
+        }
         ItemBody::Reply {
             markdown,
             streaming,
@@ -89,6 +112,9 @@ pub fn row(ui: &Ui, key: SessionKey, item: &Item, kit: &'static Kit) -> El {
         }
         ItemBody::Request { .. } => (Some(requests::card(ui, key, item, kit)), ROW_PAD_BOTTOM),
     };
+    // `toggle_path` names the chain of keys from the conversation down to a row's toggle: a
+    // keyed element added between this row and its toggle, or above it, must go there too, or
+    // `keep_on_screen` silently names nothing.
     let r = col()
         .key(row_key(id))
         .w_full()
@@ -116,7 +142,7 @@ struct RowVersion {
     changed: u64,
     /// The user opened or closed it against its kind's default (thinking, tool groups).
     toggled: bool,
-    /// The user asked to see its long text whole (tool groups).
+    /// The user asked to see its long text whole (tool groups, the user's messages).
     whole: bool,
     /// It is the notice that offers Restart: read from the session's phase and the
     /// conversation's later items.
@@ -157,29 +183,43 @@ fn waiting_draft(view: &SessionView, item: &Item) -> Option<Vec<QuestionDraft>> 
 }
 
 /// The user's message as typed, never read as Markdown: plain selectable text in a filled,
-/// rounded box at the right of the column. A stored message that had images says how many under
-/// its text, in muted text (keyed `mr-user-images-{id}`); one with images and no text shows only
+/// rounded box at the right of the column. A long message is cut as long tool output is, unless
+/// `whole`, with [`show_all`] under it. A stored message that had images says how many at the
+/// bottom, in muted text (keyed `mr-user-images-{id}`); one with images and no text shows only
 /// that. The images themselves are not drawn.
-fn user_message(id: ItemId, message: &str, image_count: usize, kit: &Kit) -> El {
-    let words = text(message.to_owned())
+fn user_message(
+    key: SessionKey,
+    id: ItemId,
+    message: &str,
+    image_count: usize,
+    whole: bool,
+    kit: &Kit,
+) -> El {
+    let mut cut = None;
+    let shown = clipped(message, whole, &mut cut);
+    let words = text(shown.to_owned())
         .key(format!("mr-user-{}", id.0))
         .font(kit.ty.body)
         .color(kit.c.text_base)
         .wrap()
         .selectable(true);
-    let bubble = if image_count == 0 {
+    let more = cut.map(|lines| show_all(key, id, lines, kit));
+    let bubble = if image_count == 0 && more.is_none() {
         words.max_w(USER_MAX_WIDTH)
     } else {
-        let images = text(images_line(image_count))
-            .key(format!("mr-user-images-{}", id.0))
-            .font(kit.ty.ui)
-            .color(kit.c.text_muted)
-            .wrap();
+        let images = (image_count > 0).then(|| {
+            text(images_line(image_count))
+                .key(format!("mr-user-images-{}", id.0))
+                .font(kit.ty.ui)
+                .color(kit.c.text_muted)
+                .wrap()
+        });
         col()
             .max_w(USER_MAX_WIDTH)
             .gap(4.0)
             .children((!message.is_empty()).then_some(words))
-            .child(images)
+            .children(more)
+            .children(images)
     };
     let bubble = bubble
         .px(14.0)
@@ -204,7 +244,7 @@ fn reply(key: SessionKey, id: ItemId, markdown: &str, streaming: bool, kit: &'st
     let body = Markdown::new(markdown)
         .streaming(streaming)
         .selectable(true)
-        .code_frame(move |card, frame| code_block(id, card, frame, kit))
+        .code_frame(move |card, frame| code_block(key, id, card, frame, kit))
         .build(kit)
         .key(format!("mr-reply-{}", id.0))
         .w_full();
@@ -215,6 +255,7 @@ fn reply(key: SessionKey, id: ItemId, markdown: &str, streaming: bool, kit: &'st
         .variant(IconButtonVariant::GhostMuted)
         .help("Copy")
         .on_press_tx(move |ui: &mut Ui, tx| {
+            glue::focus_tile(ui, key, false);
             let item = find(ui, key, id);
             if let Some(ItemBody::Reply { markdown, .. }) = item.map(|item| &item.body) {
                 tx.copy(markdown.clone());
@@ -231,7 +272,7 @@ fn reply(key: SessionKey, id: ItemId, markdown: &str, streaming: bool, kit: &'st
 
 /// A code block of a reply, with a button at its top right that copies its text once the
 /// block has arrived whole.
-fn code_block(id: ItemId, card: El, frame: &CodeFrame<'_>, kit: &Kit) -> El {
+fn code_block(key: SessionKey, id: ItemId, card: El, frame: &CodeFrame<'_>, kit: &Kit) -> El {
     let framed = col().w_full().child(card);
     if frame.open {
         return framed;
@@ -240,7 +281,10 @@ fn code_block(id: ItemId, card: El, frame: &CodeFrame<'_>, kit: &Kit) -> El {
     let copy = IconButton::new(kit.glyph.copy)
         .variant(IconButtonVariant::GhostMuted)
         .help("Copy")
-        .on_press_tx(move |_: &mut Ui, tx| tx.copy(source.clone()))
+        .on_press_tx(move |ui: &mut Ui, tx| {
+            glue::focus_tile(ui, key, false);
+            tx.copy(source.clone());
+        })
         .build(kit)
         .key(format!("mr-code-copy-{}-{}", id.0, frame.index));
     framed.child(
@@ -451,18 +495,20 @@ pub fn call_details(
     CallDetails { el: c, cut }
 }
 
-/// "Show all (N more lines)", or "Show all" when no line was left out whole, keyed
-/// `mr-show-all-{id}`: pressing it adds `id` to the `whole` of `key`'s view, so the row shows
-/// its text whole. A tool group puts it at the right end of its line.
+/// "Show all (N more lines)", "Show all (1 more line)" for one, or "Show all" when no line
+/// was left out whole, keyed `mr-show-all-{id}`: pressing it focuses the tile and adds `id` to
+/// the `whole` of `key`'s view, so the row shows its text whole. A tool group puts it at the
+/// right end of its line, a message of the user's under its text.
 pub fn show_all(key: SessionKey, id: ItemId, hidden_lines: usize, kit: &Kit) -> El {
-    let label = if hidden_lines == 0 {
-        "Show all".to_owned()
-    } else {
-        format!("Show all ({hidden_lines} more lines)")
+    let label = match hidden_lines {
+        0 => "Show all".to_owned(),
+        1 => "Show all (1 more line)".to_owned(),
+        _ => format!("Show all ({hidden_lines} more lines)"),
     };
     Button::new(label)
         .variant(ButtonVariant::GhostMuted)
         .on_press(move |ui: &mut Ui| {
+            glue::focus_tile(ui, key, false);
             glue::view_mut(ui, key).whole.insert(id);
         })
         .build(kit)
@@ -601,20 +647,21 @@ fn line(
     match toggle {
         None => r.key(format!("mr-line-{}", id.0)),
         Some(open) => {
-            let toggle_key = format!("mr-toggle-{}", id.0);
+            // Named by `toggle_path`, through every keyed ancestor up to the conversation.
             r = r
-                .key(toggle_key.clone())
+                .key(toggle_key(id))
                 .role("button")
                 .label(label.to_owned())
                 .expanded(open)
                 .cursor(Cursor::Pointer)
                 .radius(kit.radius.md)
                 .on_press_tx(move |ui: &mut Ui, tx| {
+                    glue::focus_tile(ui, key, false);
                     let toggled = &mut glue::view_mut(ui, key).toggled;
                     if !toggled.remove(&id) {
                         toggled.insert(id);
                     }
-                    tx.keep_on_screen(toggle_key.clone());
+                    tx.keep_on_screen(toggle_path(key, id));
                 });
             kit.interactive(r)
         }
@@ -664,8 +711,8 @@ fn file_head(path: &str, added: usize, removed: Option<usize>, kit: &Kit) -> El 
         .child(rich(counts, spans).font(kit.ty.ui).key("mr-counts"))
 }
 
-/// `text` cut to what a closed-up tool output shows, unless `whole`; adds to `cut` what was
-/// left out.
+/// `text` cut to what long tool output and a long message of the user's show, unless `whole`;
+/// adds to `cut` what was left out.
 fn clipped<'a>(text: &'a str, whole: bool, cut: &mut Option<usize>) -> &'a str {
     if whole {
         return text;
@@ -701,11 +748,15 @@ fn output_box(output: &str, ink: Color, kit: &Kit) -> El {
 
 #[cfg(test)]
 mod tests {
-    use mr_agent::{SessionEvent, ToolCallId, ToolDetail, ToolOutcome};
-    use mr_core::Phase;
+    use mr_agent::{
+        HistoryItem, SessionEvent, SessionId, StoredHistory, StoredSession, ToolCallId, ToolDetail,
+        ToolOutcome,
+    };
+    use mr_core::{ItemBody, ItemId, Phase, Session, SessionKey};
     use rune::Runtime;
 
-    use crate::glue::Ui;
+    use crate::demo::{DAY, NOW_UNIX};
+    use crate::glue::{self, Ui};
     use crate::testkit;
 
     /// The `mr-toggle-` key of the line that reads `summary`.
@@ -882,7 +933,7 @@ mod tests {
         testkit::click(&mut rt, "mr-restart");
         testkit::step(&mut rt);
         assert_eq!(testkit::shown_open(&rt), Some(2));
-        assert_eq!(rt.state.shown_session().unwrap().phase, Phase::Idle);
+        assert_eq!(rt.state.focused_session().unwrap().phase, Phase::Idle);
         assert!(rt.find("mr-restart").is_none());
     }
 
@@ -1016,5 +1067,160 @@ mod tests {
         rt.settle_all();
         testkit::step(&mut rt);
         assert!(testkit::has_text(&rt, "Did not finish"));
+    }
+
+    /// "line 1" to "line {count}", one per line.
+    fn numbered_lines(count: usize) -> String {
+        (1..=count)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Sends `message` as the user from the focused tile and lets its row land; returns the
+    /// tile's session and the message's item.
+    fn say(rt: &mut Runtime<Ui>, message: &str) -> (SessionKey, ItemId) {
+        let key = testkit::focused(rt).expect("a session is shown");
+        rt.update(|ui, _tx| {
+            let effects = ui.app.submit(key, message);
+            glue::run(ui, effects);
+        });
+        // The row grows in; it is read, and pressed, once it is whole.
+        rt.settle_all();
+        testkit::step(rt);
+        (key, last_message(rt))
+    }
+
+    /// The last message of the user's in the focused session.
+    fn last_message(rt: &Runtime<Ui>) -> ItemId {
+        testkit::shown_session_items(rt)
+            .iter()
+            .rev()
+            .find(|item| matches!(item.body, ItemBody::User { .. }))
+            .expect("the user said something")
+            .id
+    }
+
+    /// The text that the message `id` in `key`'s tile shows.
+    fn shown_message(rt: &Runtime<Ui>, key: SessionKey, id: ItemId) -> String {
+        testkit::element(rt, &testkit::tile(key, &format!("mr-user-{}", id.0)))
+            .and_then(|e| e.text)
+            .expect("the message is drawn")
+    }
+
+    #[test]
+    fn a_long_message_is_cut_at_twenty_lines() {
+        let mut rt = testkit::window("empty");
+        let (key, id) = say(&mut rt, &numbered_lines(500));
+        assert!(testkit::has_text(&rt, "Show all (480 more lines)"));
+        let shown = shown_message(&rt, key, id);
+        assert!(shown.ends_with("line 20"), "{shown:?}");
+        assert!(!testkit::has_text(&rt, "line 21"));
+    }
+
+    #[test]
+    fn one_line_more_is_said_in_the_singular() {
+        let offers = |rt: &Runtime<Ui>| -> Vec<String> {
+            let texts = testkit::texts(rt);
+            texts
+                .into_iter()
+                .filter(|t| t.starts_with("Show all"))
+                .collect()
+        };
+        let mut rt = testkit::window("empty");
+        say(&mut rt, &numbered_lines(21));
+        assert_eq!(offers(&rt), ["Show all (1 more line)"]);
+        // And for a tool's output.
+        command(&mut rt, "c1", "seq 21", numbered_lines(21));
+        let toggle = toggle_key(&rt, "Ran seq 21");
+        testkit::click(&mut rt, &toggle);
+        testkit::step(&mut rt);
+        assert_eq!(offers(&rt), ["Show all (1 more line)"; 2]);
+        // Two lines or more read as before.
+        let mut rt = testkit::window("empty");
+        say(&mut rt, &numbered_lines(22));
+        assert_eq!(offers(&rt), ["Show all (2 more lines)"]);
+    }
+
+    #[test]
+    fn a_message_of_one_very_long_line_is_cut_at_4000_characters() {
+        let mut rt = testkit::window("empty");
+        let (key, id) = say(&mut rt, &"alex ".repeat(5_200));
+        assert_eq!(shown_message(&rt, key, id).chars().count(), 4_000);
+        assert!(testkit::texts(&rt).iter().any(|t| t == "Show all"));
+    }
+
+    #[test]
+    fn show_all_shows_the_whole_message() {
+        let mut rt = testkit::window("empty");
+        let (key, id) = say(&mut rt, &numbered_lines(500));
+        testkit::click(&mut rt, &format!("mr-show-all-{}", id.0));
+        testkit::step(&mut rt);
+        assert_eq!(shown_message(&rt, key, id), numbered_lines(500));
+        assert!(!testkit::has_text(&rt, "Show all"));
+        assert!(glue::view_of(&rt.state, key).whole.contains(&id));
+    }
+
+    #[test]
+    fn a_short_message_has_no_button() {
+        let mut rt = testkit::window("empty");
+        let (key, id) = say(&mut rt, "Hello from alex");
+        assert_eq!(shown_message(&rt, key, id), "Hello from alex");
+        assert!(!testkit::drawn(&rt, &format!("mr-show-all-{}", id.0)));
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_character() {
+        let mut rt = testkit::window("empty");
+        let message = format!("{}é{}", "a".repeat(3_999), "b".repeat(100));
+        let (key, id) = say(&mut rt, &message);
+        let shown = shown_message(&rt, key, id);
+        assert_eq!(shown.chars().count(), 4_000);
+        assert_eq!(shown.chars().last(), Some('é'));
+    }
+
+    #[test]
+    fn a_stored_long_message_is_cut_too() {
+        let mut rt = testkit::window("resting");
+        let id = SessionId("stored-long-message".into());
+        let history = StoredHistory {
+            items: vec![
+                HistoryItem::User {
+                    text: numbered_lines(500),
+                    image_count: 2,
+                },
+                HistoryItem::AssistantText("Read them all.".into()),
+            ],
+            ..StoredHistory::default()
+        };
+        rt.state
+            .fake
+            .as_ref()
+            .expect("the demo window has its fake")
+            .set_history(&id, history);
+        let stored = StoredSession {
+            id,
+            folder: "/home/alex/notes".into(),
+            title: "Notes".into(),
+            last_active_unix: NOW_UNIX - DAY,
+        };
+        let key = rt
+            .state
+            .app
+            .sessions
+            .add(Session::resting(&stored), stored.last_active_unix);
+        glue::run(&mut rt.state, Vec::new());
+        testkit::show(&mut rt, key);
+        let id = last_message(&rt);
+        assert!(testkit::has_text(&rt, "Show all (480 more lines)"));
+        assert!(shown_message(&rt, key, id).ends_with("line 20"));
+        assert!(!testkit::has_text(&rt, "line 21"));
+        let below = |inner: &str| testkit::rect(&rt, &testkit::tile(key, inner)).unwrap()[1];
+        let button = below(&format!("mr-show-all-{}", id.0));
+        let images = below(&format!("mr-user-images-{}", id.0));
+        assert!(
+            below(&format!("mr-user-{}", id.0)) < button && button < images,
+            "the text, the button, then how many images it had"
+        );
     }
 }

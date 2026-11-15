@@ -6,31 +6,42 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The scenes that make up the window's screens: one session's, in the order it meets them,
-/// then those with many sessions, the sidebar's menus and a stored session's.
-const SCENES: &[&str] = &[
-    "checking",
-    "signed-out",
-    "not-installed",
-    "empty",
-    "limit",
-    "conversation",
-    "streaming",
-    "tools",
-    "working",
-    "ended",
-    "permission",
-    "permission-edit",
-    "question",
-    "plan",
-    "sessions",
-    "group-menu",
-    "folders",
-    "empty-start",
-    "resting",
-    "history-loading",
-    "history-failed",
-    "elsewhere",
+/// then those with many sessions, the sidebar's menus, a stored session's, and tiles side by
+/// side. Each runs in the binary's own window size unless a size is given, as `--size` takes it.
+const SCENES: &[(&str, Option<&str>)] = &[
+    ("checking", None),
+    ("signed-out", None),
+    ("not-installed", None),
+    ("empty", None),
+    ("limit", None),
+    ("conversation", None),
+    ("streaming", None),
+    ("tools", None),
+    ("working", None),
+    ("ended", None),
+    ("permission", None),
+    ("permission-edit", None),
+    ("question", None),
+    ("plan", None),
+    ("sessions", None),
+    ("group-menu", None),
+    ("folders", None),
+    ("empty-start", None),
+    ("resting", None),
+    ("history-loading", None),
+    ("history-failed", None),
+    ("elsewhere", None),
+    ("tiles", Some(WIDE)),
+    ("tiles-needs-you", Some(WIDE)),
+    ("tiles-drag", Some(WIDE)),
+    ("tiles-move", Some(WIDE)),
+    ("tile-rename", None),
 ];
+
+/// A window wide enough for three tiles of more than 420 points each beside the sidebar. The
+/// `tiles-drag` and `tiles-move` scenes place their line for this size: see `WIDE_ROW` in
+/// `src/demo.rs`.
+const WIDE: &str = "1800x900";
 
 /// An image smaller than this is taken to be blank.
 const MIN_IMAGE_BYTES: u64 = 2_000;
@@ -53,8 +64,8 @@ fn snap_every_scene(theme: &str) {
     std::fs::create_dir_all(&out).expect("the snapshot folder can be made");
     // Rune's own files (settings, caches) go to a folder of this run's, never the user's.
     let dirs_root = tempfile::tempdir().expect("a temporary folder");
-    for scene in SCENES {
-        snap(scene, theme, &out, dirs_root.path());
+    for &(scene, size) in SCENES {
+        snap(scene, size, theme, &out, dirs_root.path());
     }
 }
 
@@ -68,17 +79,22 @@ fn snap_dir() -> PathBuf {
     target.join("snap").join("final")
 }
 
-fn snap(scene: &str, theme: &str, out: &Path, dirs_root: &Path) {
+fn snap(scene: &str, size: Option<&str>, theme: &str, out: &Path, dirs_root: &Path) {
     let image = out.join(format!("{scene}-{theme}.png"));
     let tree = out.join(format!("{scene}-{theme}.json"));
     let _ = std::fs::remove_file(&image);
     let _ = std::fs::remove_file(&tree);
-    let run = Command::new(env!("CARGO_BIN_EXE_mindrune"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mindrune"));
+    command
         .args(["--demo", "--scene", scene, "--theme", theme, "--snap"])
         .arg(&image)
         .arg("--tree")
         .arg(&tree)
-        .env("RUNE_DIRS_ROOT", dirs_root)
+        .env("RUNE_DIRS_ROOT", dirs_root);
+    if let Some(size) = size {
+        command.args(["--size", size]);
+    }
+    let run = command
         .output()
         .unwrap_or_else(|e| panic!("{scene} ({theme}): the binary did not start: {e}"));
     let stderr = String::from_utf8_lossy(&run.stderr);

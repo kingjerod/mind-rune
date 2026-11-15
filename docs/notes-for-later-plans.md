@@ -1,10 +1,234 @@
 # Notes for later plans
 
-Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window) and plan 3 (many sessions). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions) and plan 4 (tiles). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
 
-Plan 3's sections come first. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+Plan 4's sections come first, then plan 3's. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## Jerod's look at plan 4
+
+Plan 4 ("tiles") is on `main`: on 2026-11-15 Jerod said to merge it there before looking, and to report on the look afterwards. The branch `plan-4-tiles` is gone, nothing is pushed, and none of the ten things to try was reported on when it was merged; they stay open, and a defect found in them is fixed on `main` or in the next plan. Jerod runs, in their own terminal:
+
+```bash
+MINDRUNE_LIVE=1 cargo test -p mindrune --test live -- --ignored --nocapture
+```
+
+```bash
+cargo run --release -p mindrune
+```
+
+With no folder the window shows again the tiles it had when it last closed, as wide as they were and with the same one focused, without starting any program, or says how to start a session. A new session you sent nothing in is not among them: it is left out, the others take its room, and when it was the focused one the first tile is. `cargo run --release -p mindrune -- FOLDER` starts a new session in FOLDER instead.
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- Tiles sit in one row. They cannot be stacked one above another.
+- There is no right panel, and a tile's header has no Remote Control mark.
+- Closing the window ends every session's program. Running in the background is plan 5.
+- While a row is dragged the sidebar does not scroll by itself. A group that is out of sight is reached through "Move to group".
+- Tiles that come back into a window narrower than the one they were saved in come back narrower than 420 points if they must. None of them is closed.
+
+### The live test
+
+It needs Claude Code installed and signed in. It runs the app twice, as the window would be opened, closed and opened again, and starts the real `claude` four times in all: the test's session, the look the first run takes at launch, a second session opened to the side of the first, and the first session resumed in the second run. The account is checked once.
+
+What it prints, in order, besides plan 3's lines (see "Jerod's look at plan 3"). None of these lines fails the test:
+
+- `live: the session to the side replied in X ms; each reply is in its own session`.
+- `live: the name was confirmed in X ms; a listing gave it Y ms later`.
+- `live: restored 2 tiles, the focus on the first`, in the second run, before it resumes the first session.
+
+What fails it, besides what failed plan 3's: no reply in the second session, a reply that does not say the word asked for, either session holding the other's message or reply, the program not confirming the new name, no listing giving the new name within 30 seconds of its confirmation, and the second run not bringing back both tiles in their order, the first focused and under its new name.
+
+Two things the rename step counts on were read from the program's protocol and never seen live: that `claude` confirms a new name by sending the title back, and that a listing of the store gives the new name within 30 seconds of that. If the test fails at the rename, the first thing to check is which of the two did not happen; its failure line says which ("did not confirm the name" or "no listing gave the new name").
+
+What stays behind: the two sessions `claude` stores for the test, both in a temporary folder that is deleted when the test ends. They appear in the window's sidebar under one group named after that folder (`.tmp` and some letters); the first is named "MindRune live test". "Hide group" removes the group by hand. Of the other stored sessions the test prints only counts and times.
+
+### What to try in the window
+
+1. Two sessions side by side, both working at once, each answering in its own tile. Seen: works (Jerod, 2026-11-15).
+2. Ctrl+click on a row and "Open to the side" in a row's menu open a tile; a plain click swaps the focused tile's session. Seen: works (Jerod, 2026-11-15).
+3. The outline follows a click and typing; F6 and Ctrl+W do what they say. Seen: works (Jerod, 2026-11-15).
+4. A turn that ends in the tile you are not in says "Finished" until you go there. Seen: works (Jerod, 2026-11-15).
+5. A divider drags, stops at a sensible width, and evens out on a double click. Seen: works (Jerod, 2026-11-15).
+6. A row dragged between two tiles opens there; a row dragged onto a group moves. Seen: works (Jerod, 2026-11-15).
+7. A session renamed by a double click keeps its name, also in Claude Desktop once it has run. Seen: works (Jerod, 2026-11-15).
+8. Close and open the app: the same tiles, the same widths, the same focus (but for a new session you sent nothing in, which is left out). Seen: works (Jerod, 2026-11-15).
+9. On the ultrawide: how many tiles are comfortable, and is anything too small? Seen: works (Jerod, 2026-11-15).
+10. A tile dragged by its header goes where the line shows, with its width; Ctrl+Shift+PageUp and Ctrl+Shift+PageDown move the focused tile. Seen: works (Jerod, 2026-11-15).
+
+### What Jerod reported on 2026-11-15
+
+Jerod ran the window after the merge. Shown plan 3's seven things again, they said: "Those look good." Asked what that covered, they chose: the window was run, and plan 4's ten things and plan 3's seven all work. So each of the seventeen is recorded as seen. Nothing was said about what the live test printed, about the decisions listed below, or about the "Things to look at"; those stand as built until Jerod says otherwise.
+
+In the same message Jerod asked for the next two pieces of work and settled one thing about the first: tiles stacked one above another support two rows and no more. Asked which shape that means, they chose: a column of the row can hold two tiles, one above the other; a column with one tile keeps the full height. Asked what of plan 5 comes first, they chose the right panel, Remote Control and the effort level; attachments and running in the background follow in plans of their own.
+
+A defect found later in something plan 4 built is fixed on `main` or in the next plan.
+
+### Decisions made while building that you have not seen
+
+The plan made 21 decisions of its own (in the plan under "Decisions in this plan that the design does not make"). These were made while it was built, each because the plan's wording did not hold up in the window; three after the review of the whole branch, and the last four with Task 15 (moving a tile), which you asked for on 2026-11-15:
+
+- **Typing keeps its tile.** While you are typing in a tile, that tile stays the focused one. Pressing Allow, Deny, a question's option, the arrow that opens a tool's line, or "Show all" in another tile acts there and leaves you typing where you were. When you are typing nowhere, the same press focuses the tile it was in. A click on a tile's text or header always moves the focus there.
+- **A tile whose session has ended can still be focused.** F6 and a click reach it; its input box cannot take text, so nothing has the keyboard then.
+- **Selecting text in a reply** (a double click, a triple click, Shift+click) focuses its tile and keeps the selection, so Ctrl+C copies it; the input box does not take the keyboard.
+- **A name you are typing is not lost easily.** Starting to rename something else keeps what you typed in the first, for groups too (plan 3 dropped it between two groups). Clicking elsewhere keeps it. Only Escape, or closing the tile whose title you are editing, drops it.
+- **A drag can always be called off.** While a row is dragged, Escape cancels the drag and does nothing else, and the window's keys (Ctrl+N, Ctrl+Shift+N, F6, Ctrl+W) and the sidebar's arrow keys do nothing. A menu opening ends the drag.
+- **Every drop target is marked in the accent colour**: the line between two tiles, the outline of the tile that would be replaced (also on a tile that needs you, whose amber gives way for the length of the drag), and a ring around a group's header.
+- **While a dragged row points into the tiles, the focused tile loses its outline**, so the accent marks only where the drop lands; otherwise the line beside the focused tile lay on its outline and could not be seen. A tile that needs you keeps its amber while the line is at one of its edges. The outline comes back when the drag ends or leaves the tiles.
+- **Letting go of a dragged row is not also a click** on that row, wherever it is let go.
+- **The first tile opened by a plain click is not saved at once.** The arrangement is saved when a tile opens to the side, closes, has its divider let go, and when the window closes, as the plan said; one tile shown by a click is kept when the window closes.
+- **The saved arrangement survives a damaged settings file.** A tile whose width cannot be read is kept, and comes back with about an even share of the row; a name that cannot be read is left out; the rest comes back.
+- **The arrangement from last time is dropped** as soon as you open anything in a tile before it came back.
+- **A session renamed before its program has started** is given its name as the program starts.
+- **Ctrl held on a custom group's "+"** opens its folder choice for a session to the side, as Ctrl does elsewhere.
+- **The arrow keys in the sidebar stay in the tile you browse in.** Moving through the list swaps the focused tile's session row by row; when the arrow reaches the row of a session that is in another tile, that row is only selected, and no tile changes or takes the focus. The next arrow goes on in the tile you were browsing in. Return, Space or a click on that row moves to its tile.
+- **A new session you sent nothing in is not kept with the tiles.** Claude Code stores nothing for it, so it could not come back: the arrangement is saved without it, and when it was the focused one, the first tile kept is focused next time.
+- **"Show all (1 more line)"** is said when exactly one line is left out, for a tool's output and for a message alike.
+- **Moving a tile has keys.** You asked for moving a tile; the two keys (Ctrl+Shift+PageUp, Ctrl+Shift+PageDown) were added with it so that it can be done without the pointer, as every other tile action can. They are the keys a browser and a terminal move a tab with.
+- **A row of a session that is already in a tile still only focuses its tile** when it is dropped on the tile row. A tile is moved by its header. Letting the row move its tile too would be a small change.
+- **A tile dropped on the sidebar does nothing.** It does not move its session to the group under the pointer.
+- **A press on a tile's header leaves the keyboard where it is until the release.** Before, the press took the keyboard from the field you were typing in at once. A click ends as it did, with the tile focused and the keyboard in its box; a drag cancelled with Escape now leaves you typing where you were.
+
+### Things to look at
+
+Each is a question the reviews left for you, with what they saw:
+
+- In the light theme the focused tile's row in the sidebar and the other tiles' rows are almost the same grey, and rows of tiles give no feedback when the pointer is over them. Can you tell which row is the focused tile's?
+- A divider's grip covers the outer 4 points of the right edge of the tile on its left: that tile's scroll bar there, and its own handle for the conversation width when the width is "no limit". Does either feel hard to reach?
+- A name being edited, in a tile's header or in a row, has no box or border, as plan 3's group rename. Only the caret and the selection say it can be typed in. Is that enough?
+- The "Show all" button under a long message of yours is as wide as the message, with its label centred under left-aligned text. Does it look right?
+- The line that marks where a dragged row would open sits right against the amber outline of a tile that needs you. The title that follows the pointer is not kept inside the window at its right and bottom edges. Can you see where a drop will land?
+- Closing the tile you are typing in (Ctrl+W) keeps its text and caret but loses that box's undo history. Does it matter?
+- The word "Finished" in a tile's header is drawn in the accent colour; in the screenshots it reads clearly in both themes. Is it the right word and the right weight beside "Working" and "Needs you"?
+- In a very narrow tile (three tiles in a window 1,200 wide, where a tile's text is about 270 points wide) a long line of code runs about 10 points past its block. Is a tile that narrow ever useful?
+- A command waiting for your permission is listed above the card as "Ran touch a.txt" with a spinner, in the past tense while it has not run. This is from plan 2, seen again in the tile screenshots. Should it read otherwise while it waits?
+- The arrangement is saved when a tile opens to the side, when one closes, when a divider is let go, and when the window closes. A session swapped into a tile by a plain click asks for no save of its own: it is written with the next thing that saves (one of those four, a rename, a change to a group, a new listing). So after an unclean end (the desktop logging out, the program killed) the tiles that come back are those of the last save, and may hold sessions that were swapped out since. Saving at every change would be cheap. Should it?
+- While a row is dragged over the tiles, the blue line that shows where the tile would open glides from one edge to the next in under half a second, where everything else about tiles happens at once. Is the glide welcome, or should the line jump?
+
+### Plan 3's seven things
+
+The seven things to try of "Jerod's look at plan 3" were carried into this look as they are: see that section, below. Jerod reported on them on 2026-11-15 with the ten above: all seven work.
+
+## What plan 5 must know
+
+Plan 5 adds attachments, the right panel, Remote Control and running in the background. What plan 4 built that it meets:
+
+- **The tiles are in the core.** `crates/core/src/tiles.rs` holds `Tiles`: the tiles left to right, each a session's key and a share of the row, and the focused tile. `App.tiles` is one `Tiles`, never assigned after `App::new` (`Tiles::restore` replaces it in place when the saved arrangement comes back). Two counters say what changed: `version` with every change, `placement` with every change but of widths; `App::settle` rebuilds the sidebar on `placement` only. `Place` says where a session is shown (`Focused`, `Side`, `At(i)`, `Tile(key)`); `App::show(key, place, leaving)` is the one way in, and a session already in a tile only has its tile focused. `App::focused()` is the focused tile's session. Room is `MIN_TILE_WIDTH` (420 points) per tile, against the row's width the window reports (`App::set_row_width`); `App::room_for_tile` says yes while that width is not known. `App::resize_tile`, `even_tiles`, `put_tile_pair`, `move_tile` and `close_tile` change the row. A tile is moved to an edge of the row as it is before the move, counted as `Tiles::edge_at` counts them: `Tiles::moved_index` says where it would sit, and none at its own two edges; `Tiles::move_to` moves it there with its share and focuses it, counting once on `placement`. `App::move_tile` also counts its session as seen and asks to save. A turn that ends in a tile that is not focused sets `Entry.unseen`, which is `Mark::Finished` until that tile is focused.
+- **What is kept.** `Saved.tiles` holds the tiles by the agent's id with their shares, `Saved.shown` the focused one, and `Saved.names` the names the user gave that no program has confirmed yet. `App::saved` keeps a tile only when the store has its session (`Session::is_stored`: it came from the store, or a message was handed over), since a new session nothing was sent in has an id the store does not know and would hold the restore back until the complete listing; `Saved.shown` is the focused session's id when its tile is kept, else the first kept tile's id, else none. `SAVED_VERSION` stays 1; a share that cannot be read reads as 1, the share of every tile in an even row (the tile is kept), a name entry that cannot be read is left out. Shares are scaled to a mean of 1 when restored.
+- **A tile's header** (`view::tiles::header`) is one row: the folder chip, the title (or its name field while it is renamed), the state word, the close button. The place for the Remote Control mark is between the state word and the close button: the title is the part that shrinks (`grow(1)`, `min_w(0)`), so a mark there takes room from the title, never from the close button. The folder chip has a fixed largest width.
+- **The right panel describes `App::focused()`.** Nothing under a tile reads the focused session: every view takes the key of the session it draws, and every handler captures it. The right panel is the one place that should follow the focus; it changes when `Tiles::placement` changes. The tile focus moves on a press on a tile's plain content or header, on F6, on a field taking the keyboard, and on a control used in a tile while no field holds the keyboard; a control that takes no keyboard focus, used in another tile while the user types, leaves the focus where the user types (`glue::focus_tile`, `glue::typing_in`, `view::tiles::focus_watch`, the give-back at the end of `glue::run`).
+- **Dropping files onto a tile** can reuse the drop target of the row drag: `view::drag::target_in_tiles` finds the edge or the tile under a point from `Ui.row_rect`, and `view::tiles::outline` draws a tile as the target. How Rune reports files dropped from outside the window was not looked at in this plan.
+- **The limits of the drag** (`crates/app/src/view/drag.rs`). It is built by hand on the pressed row's `on_drag`: past 4 points of movement it puts `Ui.drag` in state, a chip follows the pointer in the overlay layer, and the target is worked out on every move. Rune gives no move or release when the pressed row is gone (scrolled out, its group collapsed) or a modal opens mid-press, so a watcher under the whole window counts the moves the drag did not hear and ends it at the second. The count differs from the plan's letter: Rune runs the watcher's move before the drag's own, so every move counts as missed until the drag hears it, as the kit's own grip counts. While a row is dragged, Escape only cancels the drag, the window's keys and the sidebar rows' own keys do nothing, and a menu opening ends it (`tidy_sidebar` also clears a drag whenever a menu is open). Every drop target is in the accent: the line at an edge, the outline of the tile replaced (over amber), a ring on a group's header that takes no room. While the target is in the tile row the focused tile's accent outline is not drawn (`view::tiles::outline`), so the line beside it can be seen; amber stays at an edge target. Rune runs a row's press after the release of its own drag; `Ui.swallow_row_press`, set at every release past the slop and cleared by `glue::poll`, swallows it. A tile's header drags its tile through the same code (`view::drag::header`), with `RowDrag.from` set to `DragFrom::Header`, so the slop, the chip, the line, the watcher, Escape, the keys that wait and the menus that end it are the row's. Its target is only ever an edge of the tile row (`view::drag::move_target`); the sidebar is never asked, and a tile let go there does nothing. It ends when its tile closes, sets no press to swallow, and does not start with one tile in the row or while the header's name is edited. Rune gives a press and its drag to the topmost element with a handler for either, so the header and its title both carry the handler; the close button starts none. A press on the header leaves the keyboard where it is, so a drag let go over nothing or cancelled leaves it there. The sidebar does not scroll by itself near its edges, groups cannot be reordered, and the chip is not kept inside the window.
+- **Keys inside a tile.** Rune's key paths match only an unbroken run of keys (`a/b` names `b` only when `a` is its nearest keyed ancestor), so `mr-tile-7/mr-send` names nothing in a Rune lookup. A lookup Rune makes inside a tile uses a key that carries the session's number (`mr-conversation-7`, `mr-model-7`, `mr-mode-7`) or climbs the real chain of keys (`items::toggle_path`). `testkit::tile(key, inner)` paths are for the test helpers only, which resolve them themselves. The plan's Global Constraint and its Rune fact on keys were wrong on this point.
+- **Focus in the window.** `glue::run` ends by handing the tile focus back to the tile whose field holds the keyboard, in the same handler, so no other tile's outline flashes. A field that leaves the screen while it has the keyboard is rebuilt with the same text and caret (`glue::let_go`), losing its undo history: Rune would otherwise take the returning field for the old one.
+- **Renaming.** `App::rename` names a session at once and sends `Rename` to its program when one runs; else the name is kept in `Saved.names` and told to the next program that starts. A title the program sends later is ignored until a restart; a listing that gives the user's name confirms it, and a complete listing drops the kept names of sessions it does not give. The window has one name field, `Ui.rename`, for whatever `Ui.renaming` says (a group, a row, a header), with `glue::start_rename`, `end_rename` and `finish_rename`. Starting another rename keeps what was typed in the first, groups included. A typed name is lost by Escape, or by closing its tile while its field still has the keyboard. When the place of a session's rename goes (its row or its tile), the name is kept if its field had already lost the keyboard and no sidebar menu is open, and dropped otherwise; a group's rename is always dropped when its group is no longer listed (`glue::tidy_sidebar`).
+
+### Every decision of plan 4, with what was built
+
+1. **"Shown" becomes two things.** Built: `App.tiles`; in a tile means highlighted in the sidebar, history read, kept in the list; focused means seen, Escape stops its turn, a click on a row lands in it.
+2. **"Finished" for a tile that is not focused.** Built: `Entry.unseen` is set when a turn ends out of the focused tile; the header and the row say "Finished" until the tile is focused.
+3. **A click shows a session in the focused tile**, and a session already in a tile only focuses it; "New session" replaces the focused tile's session. Built as said (`Place::Focused`).
+4. **Ctrl means "to the side".** Built: Ctrl+click on a row, "Open to the side" in its menu (disabled without room), Ctrl held while choosing a folder, Ctrl+Shift+N, and Ctrl on a custom group's "+". The arrow keys in the sidebar never open to the side.
+5. **Room**: 420 points per tile when opening and dragging; a narrower window shrinks them all. Built in `Tiles` (`fits_another`, `resize`).
+6. **Closing a tile** focuses its right neighbour, else its left; the session keeps running; an empty new session is forgotten. Built; when the closed tile was the focused one its neighbour's input box takes the keyboard, otherwise the keyboard stays.
+7. **The accent outline shows only with two tiles or more**; amber always. Built (`view::tiles::outline`); a drop target's accent outline wins over amber for the length of a drag.
+8. **What focuses a tile.** Narrowed while building: a control that takes no keyboard focus, used in another tile while you type, acts there and leaves the focus where you type. A selection in a reply focuses its tile and keeps the selection. A tile asked for on purpose (F6, a press on it) whose session has ended is focused with no field holding the keyboard, since its box cannot take text.
+9. **Keys**: F6 and Shift+F6 go round the tiles' input boxes, Ctrl+W closes the focused tile, Escape stops its turn. Built in `view::on_key`; F6 and Ctrl+W do nothing while a menu or a picker's list is open, and during a drag Escape only cancels it and the other keys do nothing.
+10. **Renaming** by a double click on a tile's title or "Rename" in the row's menu. Built; a resting session's name is kept and told at its program's next start.
+11. **A name the user gave is not replaced in the same run.** Built in `Session` (`user_title`, `name_pending`).
+12. **When the arrangement is saved**: opening to the side, closing, letting go of a divider, closing the window. Built; a first tile opened by a plain click asks for no save.
+13. **Restoring** waits until every saved tile's session is known or the complete listing came; nothing with a launch folder. Built; a waiting restore is dropped once anything is put in a tile.
+14. **Dragging a row** into the tiles (a line at an edge with room, a tile outlined without) or onto a group. Built in `view::drag`; a session already in a tile, dropped on the row, only focuses its tile. Escape cancels a drag, a menu opening ends it, every target is marked in the accent, and the focused tile's outline gives way while the target is in the tile row (all four decided while building).
+15. **A double click on a divider evens the tiles.** Built (`App::even_tiles`).
+16. **One conversation width for all tiles**; dragging its handle to the tile's edge means "no limit". Built; the width handle does not focus its tile.
+17. **Tiles appear, go and resize at once.** Built (`Transition::none()`, `tx.instant()`).
+18. **Arrow keys in the sidebar** swap the focused tile's session without taking the keyboard. Built as before; a ruling of the final review added that an arrow reaching the row of a session in another tile only selects that row: `view::sidebar::select` keeps it in `Ui.passed_row` with the tiles' placement, and the list draws it as its selected row (Rune's list moves the focus back to its selected row otherwise) until a row is pressed or the placement changes. No tile is focused and nothing is shown; Return, Space or a click on the row focus its tile.
+19. **The row's menu** reads "Move to group", "Open to the side", "Rename". Built.
+20. **A header on every tile.** Built (`view::tiles::header`).
+21. **A long message of the user's is cut** after 20 lines or 4,000 characters, with "Show all". Built in `view::items` with the tool output's own cut and button; one line left out reads "Show all (1 more line)", for both (a ruling of the final review).
+22. **A tile is moved by its header** (Task 15, asked for by Jerod after the review). Built: the header drags its tile, the line shows at the edge it would go to and not at its own two edges, and the drop puts it there at once with its width, focused, the keyboard in its box; a full row still takes a move. Ctrl+Shift+PageUp and Ctrl+Shift+PageDown (Cmd+Shift on macOS) move the focused tile one place, also held, without wrapping and without moving the keyboard; they wait as F6 waits. The tiles are keyed, so a move rebuilds nothing in them: a draft, a name being edited and a waiting request stay with their session. A sidebar row whose session is in a tile still only focuses it (decision 14 stands).
+
+## Left by plan 4
+
+Found by the per-task reviews of plan 4 and by its final review, and not fixed. None blocks anything. What a person would see is under "Things to look at" above.
+
+The core (`crates/core`):
+
+- The doc of `Tiles::widths` says a row "0 or not finite" gives no widths; a negative width gives none either (`tiles.rs`).
+- `Session::rename` compares the new name with the title, so a name the program refused cannot be tried again in the same run without picking another first (`session.rs`).
+- Two entries for one id in a hand-edited `Saved.names` apply the first, not the latest (`app.rs`).
+- The doc on `App::restart` says the intents below it first focus the session's tile; `rename`, below it, does not (`app.rs`).
+- `saved.rs` line 2 is a doc line of 119 characters.
+
+Tiles and focus (`crates/app/src/view/tiles.rs`, `glue.rs`, `input.rs`):
+
+- `glue::let_go` loses the undo history, and an input method's composition in progress, of a box that leaves the screen while it has the keyboard (Ctrl+W of the tile typed in) (`glue.rs`).
+- `input::give_back` and `edit_queued` set a box's keyboard flag without focusing its tile; in a tile that is not the focused one the tile focus follows a frame later through `focus_watch` (`input.rs`).
+- A tile is announced as a button to assistive tools, although the element is given the role of a group (`tiles.rs`): it needs a look at how Rune derives the accessible role from a press handler. `target/snap/t14/tiles-dark.json` shows it (seen by the review of Task 8, and Minor 6 of the final review).
+- The outline's corners are square under the card's rounded corner (`tiles.rs`).
+- A doc line of 125 columns at `tiles.rs` line 246, and one with an odd line break at `view/mod.rs` line 74.
+
+Renaming (`crates/app/src/view/sidebar.rs`, `glue.rs`):
+
+- `sidebar::renaming_row` copies the kit row's look, because the kit's own rename field forces its key (`sidebar.rs`).
+- `glue.rs` is 1,439 lines; the rename functions could be a module of their own.
+
+The drag (`crates/app/src/view/drag.rs`):
+
+- A drag whose row went away and whose button was let go stays in state until two pointer moves, and holds the window's keys meanwhile.
+- Escape typed into an input box reached by Tab during a drag stops that tile's turn and leaves the drag, since the box takes Escape first (`input.rs`).
+- An assistive tool's activation of a row queued in the same frame as the release of a drag past 4 points is swallowed (stated in the doc of `Ui.swallow_row_press`).
+- The comment on `Phase::Down` in `drag::row` is wrong for a press queued in the same frame as the release.
+- The drop line is placed without a spring of its own (`Transition::none()` only), so when the target moves from one edge to another it glides there over about 25 frames (measured in the final fix wave) rather than jumping; decision 17 says tiles appear at once and does not speak of the line (asked of Jerod under "Things to look at").
+- After an arrow key passed the row of a session in another tile, that row stays marked as the list's selected row when the keyboard then leaves the list (a click into a tile's box, Tab, the sidebar hidden and shown), until some tile changes; the focused tile's own row then shows only the fill of an open tile. `Ui.passed_row` would be cleared when the list loses the keyboard focus (`sidebar.rs`, `glue.rs`). No test covers it. Found by the re-review of the final fix wave.
+- `drag.rs` is about 1,410 lines, mostly tests.
+
+The conversation (`crates/app/src/view/items.rs`):
+
+- A message cut inside a line ends with no ellipsis, as tool output.
+
+Tests:
+
+- The fourth clause of `closing_moves_the_focus_right_then_left` starts from one tile, not a fresh three (`crates/core/src/tiles.rs`).
+- "Opening one tile's picker shuts the other's" is tested by a direct call only, and an `input.rs` test has a duplicated `let picker`.
+- The outline test cannot see the drawn colour through Rune's test interface.
+- No test for Ctrl on a custom group's "+", for Ctrl+Shift+N with no folder on offer, or for a click outside a side menu (`folder.rs`, `sidebar.rs`).
+- `a_row_rename_ends_when_the_row_goes` hides the group through the core, not its menu (which keeps the name); and no test presses Escape in a row's name field during a running turn (`sidebar.rs`).
+- `dragging_rebuilds_no_conversation_row` moves over edges only, never over a tile as target (`drag.rs`).
+- `an_answer_that_comes_after_the_release_changes_nothing` cannot fail, since the guard is structural; two assertions that the press was not swallowed (`drag.rs` lines 495 and 948) pass either way now that `glue::poll` clears the flag.
+- The drag tests copy `titled`, `group_named`, `group_of` and the scene's title constants.
+- `two_saved_tiles_come_back_in_the_window` passes with the `tx.instant()` of `glue::poll` taken out: from an empty row nothing moves from an old place, and tiles have no transition of their own, so it pins what is seen rather than that call (`tiles.rs`).
+- The `tiles-drag` scene sets the tile row's rectangle for a window of 1,800 by 900 itself, since a snapshot draws one frame and the line is placed from the row's last layout (`demo.rs`).
+
+Left by Task 15 (moving a tile), which came after the final review and had its own review:
+
+- The tile being dragged shows nothing itself; only the title by the pointer says which one it is.
+- `RowDrag` holds a row's drag or a header's (`from: DragFrom`) and kept its name, which the tests of Tasks 11 and 12 use.
+- For whoever writes a window test that scrolls: `rt.settle_all()` after wheeling a conversation up lands it at its bottom again and sets `following`, because Rune's settle lands follow-the-end. Step frames instead (`a_move_keeps_the_scroll_position` in `view/drag.rs`). The window's own host calls `settle_all` only for a window that fits its content, which this one is not.
+- One comment line in `view/tiles.rs` (`focus_watch`'s doc) is over 100 columns, from before Task 15.
+
+### What the final review set aside
+
+The whole-branch review of plan 4 declined to judge these, each because the plan or an earlier decision already says how it is. Each stands as built, and each is a small change if Jerod wants it otherwise; the fifth was changed in the same wave.
+
+- Tiles restored into a narrower window fall below 420 points: decision 5 covers a window made narrower, and this is the same rule (also under "Before looking").
+- On macOS, Cmd+W with no tile closes the window: that is Rune's native default; Linux has none.
+- Ctrl+Shift+N, or a folder chosen with Ctrl held, does nothing when the focused session is an empty one in the same folder: the plan's rule for `new_session`.
+- A drop on a row of a hidden group that is listed because it holds a tile moves the session into a hidden group: the plan says hidden groups take no drop, and is silent on one that is listed.
+- "Show all (1 more lines)" for a message of 21 lines was the plan's quoted wording, from plan 2's tool output. A ruling of the controller changed it to "Show all (1 more line)" in the final fix wave.
+- A name given to a resting session masks a later rename made in another app until that session next runs here, when this app's name replaces it: decisions 10 and 11.
+- Focus moves and swaps are saved only with the next saving event: decision 12 (asked of Jerod under "Things to look at").
+- A press and release in the same frame (a touchpad tap) on a control that takes the keyboard in another tile may leave the outline on the tile typed in: it depends on when Rune writes the focus flags, and could not be reproduced without the window.
+- A tile's title can be renamed by a double click only; the keyboard reaches renaming through the row's menu: the plan's design.
+- The sidebar does not scroll during a drag: said in the plan.
+- "Finished" shows for a session whose program ended badly in a tile that is not focused: plan 3's mark.
+- Whether the real `claude` confirms `Rename`, and how long the complete listing takes on the real store: only the live test can say. The second bore on the review's Important finding, which is fixed (a new session nothing was sent in is no longer saved in a tile).
+- An older complete listing arriving after a newer recent one (from "Left by plan 3"): unchanged by this branch.
 
 ## Jerod's look at plan 3
+
+Its seven things to try were not reported on until 2026-11-15, when Jerod said all seven work; they are recorded here.
 
 Plan 3 ("many sessions") is on the branch `plan-3-many-sessions`. Jerod runs, in their own terminal:
 
@@ -55,13 +279,13 @@ Of the other stored sessions it prints only counts and times, never a title, a f
 
 ### What to try in the window
 
-1. The sidebar fills with groups, and how long that takes. Seen: not yet recorded.
-2. An old session opens at once and shows its end. Seen: not yet recorded.
-3. A message to it gets a reply, and the model shown is the one that answers. Seen: not yet recorded.
-4. Two sessions work at the same time, and their marks follow. Seen: not yet recorded.
-5. "New session" offers folders, and "Choose a folder…" opens the desktop's folder picker. Seen: not yet recorded.
-6. A session is moved to a new group, the group renamed, the app closed and opened again, and everything is where it was. Seen: not yet recorded.
-7. A session that is open in Claude Desktop asks before it is sent to. Seen: not yet recorded.
+1. The sidebar fills with groups, and how long that takes. Seen: works (Jerod, 2026-11-15).
+2. An old session opens at once and shows its end. Seen: works (Jerod, 2026-11-15).
+3. A message to it gets a reply, and the model shown is the one that answers. Seen: works (Jerod, 2026-11-15).
+4. Two sessions work at the same time, and their marks follow. Seen: works (Jerod, 2026-11-15).
+5. "New session" offers folders, and "Choose a folder…" opens the desktop's folder picker. Seen: works (Jerod, 2026-11-15).
+6. A session is moved to a new group, the group renamed, the app closed and opened again, and everything is where it was. Seen: works (Jerod, 2026-11-15).
+7. A session that is open in Claude Desktop asks before it is sent to. Seen: works (Jerod, 2026-11-15).
 
 A defect in something plan 3 built is fixed in plan 3.
 
