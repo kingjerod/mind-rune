@@ -1,10 +1,10 @@
 //! The row of tiles in the middle of the shell: one tile per session the app holds in its row,
-//! side by side, each as wide as its share of the row and holding a header over that session's
-//! pane.
+//! in columns side by side, each column as wide as its share of the row and holding one tile or
+//! two, one above the other. Each tile holds a header over that session's pane.
 
 use std::path::Path;
 
-use mr_core::{Entry, Mark, SessionKey};
+use mr_core::{App, Entry, Laid, Mark, SessionKey, Spot, TileLevel};
 use rune::{
     Color, Cursor, Cx, Drag, El, Key, KeyEvent, Phase, Spring, Transition, Tx, col, el,
     row as row_el, text,
@@ -42,6 +42,9 @@ const CHIP_MAX_WIDTH: f32 = 160.0;
 /// How wide a divider's handle is, centred on the edge between two tiles.
 const DIVIDER_WIDTH: f32 = 8.0;
 
+/// How high the handle over the line between the two tiles of a column is, centred on it.
+const SPLIT_HEIGHT: f32 = 8.0;
+
 /// The title of a session that has none yet.
 const NEW_SESSION: &str = "New session";
 
@@ -50,21 +53,32 @@ pub fn tile_key(key: SessionKey) -> String {
     format!("mr-tile-{}", key.0)
 }
 
-/// `mr-divider-{n}`: the divider right of the tile of session `n`.
+/// `mr-divider-{n}`: the divider right of the column whose tile, or upper tile, is session `n`'s.
 fn divider_key(key: SessionKey) -> String {
     format!("mr-divider-{}", key.0)
 }
 
+/// `mr-split-{n}`: the line under the tile of session `n`, the upper of two.
+fn split_key(top: SessionKey) -> String {
+    format!("mr-split-{}", top.0)
+}
+
 /// The row of tiles, or the empty area when there is none.
 ///
-/// Each tile, keyed [`tile_key`], takes its share of the row's width and holds its session's
-/// pane, whose pickers put their lists in `layer`, under its outline when it has one. Each
-/// tile but the last draws a line on its right edge; once the row's width is known, a
-/// divider over each such edge drags it ([`divider`]).
+/// Each tile, keyed [`tile_key`], is a direct child of the row, in the order of `Tiles::keys`,
+/// placed at its rectangle in the row's size as the row last laid out (`Tiles::rects`), so a
+/// tile that moves, joins or leaves a column keeps everything Rune keeps for it. In the pass
+/// before the row was ever laid out, which is never drawn, the tiles take the columns' shares
+/// of its width, the two of a column side by side. Each tile holds its session's pane, whose
+/// pickers put their lists in `layer`, under its outline when it has one. Each tile left of
+/// the last column draws a line on its right edge, and the upper tile of two one on its lower
+/// edge; once the size is known, a divider over each edge between two columns drags it
+/// ([`divider`]), and a handle over the line between two tiles of a column drags that
+/// ([`split`]).
 /// Tiles come and go at once, with no fade. A press on a tile's plain content or its header
 /// focuses the tile, with the keyboard in its input box unless the press selected text there;
 /// the tile stays a group, no Tab stop.
-/// The row tells the window state where it was laid out and the app how wide it is.
+/// The row tells the window state where it was laid out and the app how wide and high it is.
 pub fn row(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, layer: &mut Vec<El>) -> El {
     let row = row_el()
         .key(ROW)
@@ -75,8 +89,8 @@ pub fn row(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, layer: &mut Vec<El>) -> 
         .min_h(0.0)
         .fill(kit.c.bg_base)
         .on_layout(laid_out);
-    let tiles = ui.app.tiles.list();
-    if tiles.is_empty() {
+    let columns = ui.app.tiles.columns();
+    if columns.is_empty() {
         return row.child(
             col()
                 .w_full()
@@ -86,39 +100,70 @@ pub fn row(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, layer: &mut Vec<El>) -> 
                 .child(folder::empty(ui, kit)),
         );
     }
-    let last = tiles.len() - 1;
-    let dividers = ui.app.row_width().map(|row_width| {
-        let widths = ui.app.tiles.widths(row_width);
-        let mut edge = 0.0;
-        tiles[..last]
+    let last = columns.len() - 1;
+    // The view's own read of the size, so a resized window is placed right in the same frame.
+    let size = cx.layout_size(ROW);
+    let laid = ui.app.tiles.rects(size.unwrap_or_default());
+    let handles = size.map(|_| {
+        let lines = laid
             .iter()
-            .zip(widths)
-            .map(|(tile, width)| {
-                edge += width;
-                divider(tile.key, edge)
-            })
-            .collect::<Vec<El>>()
+            .filter(|laid| laid.level == TileLevel::Top)
+            .map(|laid| split(laid.key, laid.rect));
+        let dividers = laid
+            .iter()
+            .filter(|laid| laid.column < last && laid.level != TileLevel::Bottom)
+            .map(|laid| divider(laid.key, laid.rect[0] + laid.rect[2]));
+        // The dividers after the lines, so that where the two meet the divider has the press.
+        lines.chain(dividers).collect::<Vec<El>>()
     });
-    row.children(tiles.iter().enumerate().map(|(index, tile)| {
-        let key = tile.key;
-        let edge = if index < last { 1.0 } else { 0.0 };
-        col()
-            .key(tile_key(key))
-            .grow(tile.share)
-            .min_w(0.0)
-            .h_full()
-            .min_h(0.0)
-            .border_sides([0.0, edge, 0.0, 0.0], kit.c.border_weak)
-            .transition(Transition::none())
-            .on_press_tx(press_tile(key))
-            // After the press handler, which would make it a button.
-            .role("group")
-            .focusable(false)
-            .child(header(ui, kit, key))
-            .child(super::pane(ui, cx, kit, key, layer))
-            .children(outline(ui, key, kit).map(ring))
+    row.children(laid.iter().map(|laid| {
+        let tile = tile(ui, cx, kit, laid, last, layer);
+        match size {
+            Some(_) => {
+                let [x, y, w, h] = laid.rect;
+                tile.absolute(x, y).size(w, h)
+            }
+            None => {
+                let column = &columns[laid.column];
+                let parts = if column.under.is_some() { 2.0 } else { 1.0 };
+                tile.grow(column.share / parts).h_full()
+            }
+        }
     }))
-    .children(dividers.into_iter().flatten())
+    .children(handles.into_iter().flatten())
+}
+
+/// The tile `laid` places, without its place in the row: its header over its session's pane,
+/// under its outline when it has one, and its lines (see [`row`]), `last` being the index of
+/// the row's last column.
+fn tile(
+    ui: &Ui,
+    cx: &mut Cx<Ui>,
+    kit: &'static Kit,
+    laid: &Laid,
+    last: usize,
+    layer: &mut Vec<El>,
+) -> El {
+    let key = laid.key;
+    let right = if laid.column < last { 1.0 } else { 0.0 };
+    let bottom = if laid.level == TileLevel::Top {
+        1.0
+    } else {
+        0.0
+    };
+    col()
+        .key(tile_key(key))
+        .min_w(0.0)
+        .min_h(0.0)
+        .border_sides([0.0, right, bottom, 0.0], kit.c.border_weak)
+        .transition(Transition::none())
+        .on_press_tx(press_tile(key))
+        // After the press handler, which would make it a button.
+        .role("group")
+        .focusable(false)
+        .child(header(ui, kit, key))
+        .child(super::pane(ui, cx, kit, key, layer))
+        .children(outline(ui, key, kit).map(ring))
 }
 
 /// What a press on a tile's plain content or its header does: the tile takes the focus, and its
@@ -132,10 +177,11 @@ fn press_tile(key: SessionKey) -> impl Fn(&mut Ui, &mut Tx) + 'static {
     }
 }
 
-/// The divider over the edge `edge` points from the row's left, right of `left`'s tile: a
-/// handle that takes no room, above the tiles, with a resize cursor. A drag moves width between
-/// the two tiles ([`drag_divider`]); a double press gives every tile the same width. It is no
-/// Tab stop, and a press on it moves neither the keyboard focus nor the tile focus.
+/// The divider over the edge `edge` points from the row's left, right of `left`'s column: a
+/// handle the row's full height that takes no room, above the tiles, with a resize cursor. A
+/// drag moves width between the two columns ([`DIVIDER_DRAG`]); a double press gives every
+/// column the same width. It is no Tab stop, and a press on it moves neither the keyboard focus
+/// nor the tile focus.
 fn divider(left: SessionKey, edge: f32) -> El {
     let handle = el()
         .key(divider_key(left))
@@ -146,7 +192,7 @@ fn divider(left: SessionKey, edge: f32) -> El {
         .cursor(Cursor::ResizeColumn)
         .transition(Transition::none())
         .on_drag(move |ui: &mut Ui, drag: &mut Drag, tx: &mut Tx| {
-            drag_divider(ui, drag, tx, left);
+            drag_handle(ui, drag, tx, left, &DIVIDER_DRAG);
         })
         .on_double_press_tx(|ui: &mut Ui, tx: &mut Tx| {
             tx.instant();
@@ -156,32 +202,103 @@ fn divider(left: SessionKey, edge: f32) -> El {
     requests::unfocusable(handle)
 }
 
-/// One phase of a divider's drag, `left` being the tile on its left.
+/// The handle over the line under `top`'s tile, the upper of two, at `rect` in the row: as
+/// wide as the column and centred on the line, taking no room, above the tiles, with a resize
+/// cursor. A drag moves height between the two tiles ([`SPLIT_DRAG`]); a double press gives
+/// both the same height. It is no Tab stop, and a press on it moves neither the keyboard focus
+/// nor the tile focus.
+fn split(top: SessionKey, rect: [f32; 4]) -> El {
+    let [x, y, w, h] = rect;
+    let handle = el()
+        .key(split_key(top))
+        .absolute(x, y + h - SPLIT_HEIGHT / 2.0)
+        .size(w, SPLIT_HEIGHT)
+        .role("separator")
+        .label("Tile height")
+        .cursor(Cursor::ResizeRow)
+        .transition(Transition::none())
+        .on_drag(move |ui: &mut Ui, drag: &mut Drag, tx: &mut Tx| {
+            drag_handle(ui, drag, tx, top, &SPLIT_DRAG);
+        })
+        .on_double_press_tx(move |ui: &mut Ui, tx: &mut Tx| {
+            tx.instant();
+            let effects = ui.app.even_split(top);
+            glue::run(ui, effects);
+        });
+    requests::unfocusable(handle)
+}
+
+/// What the drag of a handle between two tiles changes: a length of one tile against its
+/// neighbour along the drag, and `P`, what a cancelled drag puts back.
+struct HandleDrag<P> {
+    /// The tile's length along the drag in the row as last laid out.
+    length: fn(&Ui, SessionKey) -> Option<f32>,
+    /// The pointer's travel along the drag since the press.
+    travel: fn(&Drag) -> f32,
+    /// Where the window state keeps `P` from the press to the release.
+    press: fn(&mut Ui) -> &mut Option<P>,
+    /// `P` as it is now.
+    read: fn(&App, SessionKey) -> Option<P>,
+    /// Puts `P` back.
+    put: fn(&mut App, SessionKey, P),
+    /// Makes the tile that long; asks for no save.
+    resize: fn(&mut App, SessionKey, f32),
+}
+
+/// A divider's drag: the width of the column on its left, against the column on its right.
+const DIVIDER_DRAG: HandleDrag<[f32; 2]> = HandleDrag {
+    length: tile_width,
+    travel: |drag| drag.dx,
+    press: |ui| &mut ui.divider_press,
+    read: App::tile_pair,
+    put: App::put_tile_pair,
+    resize: App::resize_tile,
+};
+
+/// A line's drag: the height of the tile above it, against the tile under it.
+const SPLIT_DRAG: HandleDrag<f32> = HandleDrag {
+    length: tile_height,
+    travel: |drag| drag.dy,
+    press: |ui| &mut ui.split_press,
+    read: App::tile_split,
+    put: App::put_split,
+    resize: App::resize_split,
+};
+
+/// One phase of the drag of a handle between two tiles, `key` being the tile `handle` sizes:
+/// for a divider the tile on its left, for a line the tile above it.
 ///
-/// The press keeps the tile's width, and the two tiles' shares. Each move makes it that width
-/// plus the pointer's travel, at once, and writes nothing; the release writes the arrangement
-/// once, when the width ends up different from where it started. A cancelled drag puts the
-/// two shares back as they were, also for a tile the window had made narrower than a drag may.
-/// The tiles never animate.
-fn drag_divider(ui: &mut Ui, drag: &mut Drag, tx: &mut Tx, left: SessionKey) {
+/// The press keeps the tile's length, and what a cancel puts back. Each move makes it that
+/// length plus the pointer's travel, at once, and writes nothing; the release writes the
+/// arrangement once, when the length ends up different from where it started ([`unchanged`]).
+/// A cancelled drag puts back exactly what the press kept, also for a tile the window had made
+/// smaller than a drag may. The tiles never animate.
+fn drag_handle<P>(
+    ui: &mut Ui,
+    drag: &mut Drag,
+    tx: &mut Tx,
+    key: SessionKey,
+    handle: &HandleDrag<P>,
+) {
     tx.instant();
-    let width = match drag.phase {
+    let length = match drag.phase {
         Phase::Down => {
-            drag.data = tile_width(ui, left).unwrap_or(f32::NAN);
-            ui.divider_press = ui.app.tile_pair(left);
+            drag.data = (handle.length)(ui, key).unwrap_or(f32::NAN);
+            let kept = (handle.read)(&ui.app, key);
+            *(handle.press)(ui) = kept;
             return;
         }
-        Phase::Move => drag.data + drag.dx,
+        Phase::Move => drag.data + (handle.travel)(drag),
         Phase::Up if drag.cancelled() => {
-            if let Some(shares) = ui.divider_press.take() {
-                ui.app.put_tile_pair(left, shares);
+            if let Some(kept) = (handle.press)(ui).take() {
+                (handle.put)(&mut ui.app, key, kept);
             }
             glue::run(ui, Vec::new());
             return;
         }
         Phase::Up => {
-            ui.divider_press = None;
-            let effects = if tile_width(ui, left) == Some(drag.data) {
+            *(handle.press)(ui) = None;
+            let effects = if unchanged(drag.data, (handle.length)(ui, key)) {
                 Vec::new()
             } else {
                 ui.app.save_now()
@@ -190,16 +307,32 @@ fn drag_divider(ui: &mut Ui, drag: &mut Drag, tx: &mut Tx, left: SessionKey) {
             return;
         }
     };
-    // A NaN width, from a press before the row's width was known, changes nothing.
-    ui.app.resize_tile(left, width);
+    // A NaN length, from a press before the row's size was known, changes nothing.
+    (handle.resize)(&mut ui.app, key, length);
     glue::run(ui, Vec::new());
+}
+
+/// Whether the drag of a handle that started at the length `start` and ends at `now` changed
+/// nothing: also when `start` is not a number, from a press before the row's size was known,
+/// whose moves change nothing.
+fn unchanged(start: f32, now: Option<f32>) -> bool {
+    start.is_nan() || now == Some(start)
 }
 
 /// `key`'s tile's width in the row as last laid out.
 fn tile_width(ui: &Ui, key: SessionKey) -> Option<f32> {
-    let index = ui.app.tiles.index_of(key)?;
+    let (index, _) = ui.app.tiles.find(key)?;
     let widths = ui.app.tiles.widths(ui.app.row_width()?);
     widths.get(index).copied()
+}
+
+/// `key`'s tile's height in the row as last laid out.
+fn tile_height(ui: &Ui, key: SessionKey) -> Option<f32> {
+    let size = [ui.app.row_width()?, ui.app.row_height()?];
+    let laid = ui.app.tiles.rects(size);
+    laid.iter()
+        .find(|laid| laid.key == key)
+        .map(|laid| laid.rect[3])
 }
 
 /// The colour of `key`'s outline. While a row dragged over the row would take its place, the
@@ -208,7 +341,8 @@ fn tile_width(ui: &Ui, key: SessionKey) -> Option<f32> {
 /// mark while its session needs the user, whether its tile is focused or not; else the accent
 /// while its tile is the focused one of two or more, unless a dragged row or header has a
 /// target in the row (ruling R11): the accent then marks only where the drop lands, the line at
-/// an edge or the tile it replaces. None otherwise: one tile alone is always the focused one.
+/// an edge, the half of a tile a new one takes or the tile it replaces. None otherwise: one
+/// tile alone is always the focused one.
 pub(super) fn outline(ui: &Ui, key: SessionKey, kit: &Kit) -> Option<Color> {
     let over = ui.drag.as_ref().and_then(|drag| drag.over.as_ref());
     if over == Some(&DropTarget::Tile(key)) {
@@ -218,8 +352,8 @@ pub(super) fn outline(ui: &Ui, key: SessionKey, kit: &Kit) -> Option<Color> {
     if mark == Mark::NeedsYou {
         return sidebar::mark_color(mark, kit);
     }
-    let in_row = matches!(over, Some(DropTarget::Edge(_) | DropTarget::Tile(_)));
-    let focused = ui.app.focused() == Some(key) && ui.app.tiles.list().len() > 1;
+    let in_row = over.is_some_and(|over| !matches!(over, DropTarget::Group(_)));
+    let focused = ui.app.focused() == Some(key) && ui.app.tiles.len() > 1;
     (focused && !in_row).then_some(kit.c.bg_accent)
 }
 
@@ -292,35 +426,100 @@ pub fn move_step(ev: &KeyEvent) -> Option<isize> {
     }
 }
 
-/// Moves the focused tile `step` places along the row. False when it is at that end.
+/// Moves the focused tile `step` columns along the row, past a column of two as a whole; one
+/// of two gets a column of its own at the edge of its column on that side, when another
+/// column fits. False when nothing moved: at that end of the row, or with no room.
 ///
 /// The row does not wrap. The keyboard focus stays where it is (`glue::move_tile`).
 pub fn step_move(ui: &mut Ui, tx: &mut Tx, step: isize) -> bool {
     let Some(key) = ui.app.focused() else {
         return false;
     };
-    let Some(at) = ui.app.tiles.index_of(key) else {
+    let Some((at, level)) = ui.app.tiles.find(key) else {
         return false;
     };
-    let to = at as isize + step;
-    if step == 0 || to < 0 || to >= ui.app.tiles.list().len() as isize {
+    let edge = if level != TileLevel::Whole {
+        match step.signum() {
+            -1 => at,
+            1 => at + 1,
+            _ => return false,
+        }
+    } else {
+        let to = at as isize + step;
+        if step == 0 || to < 0 || to >= ui.app.tiles.columns().len() as isize {
+            return false;
+        }
+        // A tile goes in at the edge left of the column it takes the place of going left,
+        // right of it going right (`Tiles::move_to`).
+        if step > 0 {
+            to as usize + 1
+        } else {
+            to as usize
+        }
+    };
+    let spot = Spot::Edge(edge);
+    if !ui.app.can_move_tile(key, spot) {
         return false;
     }
-    // A tile goes in at the edge left of the tile it takes the place of going left, right of
-    // it going right (`Tiles::moved_index`).
-    let edge = if step > 0 {
-        to as usize + 1
-    } else {
-        to as usize
+    glue::move_tile(ui, tx, key, spot, false);
+    true
+}
+
+/// Which way a key moves the focused tile in its column: Ctrl+Alt+PageUp up (-1),
+/// Ctrl+Alt+PageDown down (1). Cmd+Alt on macOS, with no Ctrl there.
+pub fn stack_step(ev: &KeyEvent) -> Option<isize> {
+    let m = ev.mods;
+    if !m.cmd || !m.alt || m.shift || (cfg!(target_os = "macos") && m.ctrl) {
+        return None;
+    }
+    match ev.key {
+        Key::PageUp => Some(-1),
+        Key::PageDown => Some(1),
+        _ => None,
+    }
+}
+
+/// Moves the focused tile up or down as decision 8 says. False when nothing moved.
+///
+/// One of two swaps with its mate: the upper going down, the lower going up. One alone in its
+/// column joins the column on its left, or on its right when it is the first, over that
+/// column's tile going up and under it going down; nothing when that column is full or the
+/// row is too low. The keyboard focus stays where it is (`glue::move_tile`).
+pub fn step_stack(ui: &mut Ui, tx: &mut Tx, step: isize) -> bool {
+    let Some(key) = ui.app.focused() else {
+        return false;
     };
-    glue::move_tile(ui, tx, key, edge, false);
+    let tiles = &ui.app.tiles;
+    let Some((at, level)) = tiles.find(key) else {
+        return false;
+    };
+    let spot = match (level, step.signum()) {
+        (TileLevel::Top, 1) => tiles.mate(key).map(Spot::Below),
+        (TileLevel::Bottom, -1) => tiles.mate(key).map(Spot::Above),
+        (TileLevel::Whole, -1 | 1) => {
+            let to = if at == 0 { 1 } else { at - 1 };
+            let top = tiles.columns().get(to).map(|column| column.top);
+            top.map(|top| {
+                if step < 0 {
+                    Spot::Above(top)
+                } else {
+                    Spot::Below(top)
+                }
+            })
+        }
+        _ => None,
+    };
+    let Some(spot) = spot.filter(|spot| ui.app.can_move_tile(key, *spot)) else {
+        return false;
+    };
+    glue::move_tile(ui, tx, key, spot, false);
     true
 }
 
 /// Moves the focus `step` tiles along the row, round its ends, with the keyboard in that
 /// tile's input box. With fewer than two tiles nothing moves: false.
 pub fn step_focus(ui: &mut Ui, tx: &mut Tx, step: isize) -> bool {
-    let keys: Vec<SessionKey> = ui.app.tiles.list().iter().map(|tile| tile.key).collect();
+    let keys: Vec<SessionKey> = ui.app.tiles.keys();
     let Some(at) = ui
         .app
         .focused()
@@ -451,13 +650,23 @@ fn close_button(key: SessionKey, kit: &Kit) -> El {
     requests::unfocusable(button)
 }
 
-/// Keeps where the row was laid out, and gives the app its width, each when it changed.
+/// Keeps where the row was laid out, and gives the app its width and its height, each when it
+/// changed.
 fn laid_out(ui: &mut Ui, rect: [f32; 4]) {
     if ui.row_rect != Some(rect) {
         ui.row_rect = Some(rect);
     }
-    if ui.app.row_width() != Some(rect[2]) {
-        ui.app.set_row_width(rect[2]);
+    let [_, _, width, height] = rect;
+    let mut changed = false;
+    if ui.app.row_width() != Some(width) {
+        ui.app.set_row_width(width);
+        changed = true;
+    }
+    if ui.app.row_height() != Some(height) {
+        ui.app.set_row_height(height);
+        changed = true;
+    }
+    if changed {
         glue::run(ui, Vec::new());
     }
 }
@@ -468,14 +677,16 @@ mod tests {
         RequestId, SessionCommand, SessionEvent, SessionId, StoredSession, ToolCallId, ToolDetail,
         ToolOutcome, TurnSummary, UserRequest, UserRequestKind,
     };
-    use mr_core::{ItemBody, ItemId, Mark, SAVED_VERSION, Saved, SavedTile, SessionKey, Width};
+    use mr_core::{
+        ItemBody, ItemId, Mark, SAVED_VERSION, Saved, SavedTile, SessionKey, Spot, TileLevel, Width,
+    };
     use rune::prefs::Prefs;
     use rune::{Color, Key, KeyEvent, Mods, Runtime};
 
-    use super::{ROW, divider_key, tile_key};
+    use super::{ROW, divider_key, split_key, tile_key, unchanged};
     use crate::demo;
     use crate::glue::{self, Picker, Renaming, Ui};
-    use crate::testkit::{self, box_focused, tile, tile_keys};
+    use crate::testkit::{self, box_focused, columns, tile, tile_keys};
     use crate::theme;
     use crate::view::{conversation, items};
 
@@ -750,6 +961,7 @@ mod tests {
         let tile_of = |id: &str, share: f32| SavedTile {
             id: SessionId(id.into()),
             share,
+            below: None,
         };
         let mut prefs = Prefs::memory();
         let saved = Saved {
@@ -817,7 +1029,7 @@ mod tests {
     #[test]
     fn the_empty_area_shows_with_no_tile() {
         let rt = testkit::window_sized("empty-start", SIZE);
-        assert!(rt.state.app.tiles.list().is_empty());
+        assert!(rt.state.app.tiles.is_empty());
         assert!(drawn_tiles(&rt).is_empty());
         let empty = rt
             .elements()
@@ -1720,7 +1932,14 @@ mod tests {
         assert_eq!(saved_shares(&rt), None, "nothing written during the moves");
         rt.pointer_up(x - 50.0, y);
         testkit::step(&mut rt);
-        let shares: Vec<f32> = rt.state.app.tiles.list().iter().map(|t| t.share).collect();
+        let shares: Vec<f32> = rt
+            .state
+            .app
+            .tiles
+            .columns()
+            .iter()
+            .map(|c| c.share)
+            .collect();
         assert_ne!(shares, vec![1.0, 1.0]);
         assert_eq!(saved_shares(&rt), Some(shares), "written at the release");
         rt.state.prefs.remove(glue::STATE_KEY).unwrap();
@@ -1772,7 +1991,14 @@ mod tests {
         assert!(widths(&rt).iter().all(|w| *w < 420.0), "{:?}", widths(&rt));
         drag_divider(&mut rt, a, 100.0);
         assert_eq!(drawn_tiles(&rt), three);
-        let shares: Vec<f32> = rt.state.app.tiles.list().iter().map(|t| t.share).collect();
+        let shares: Vec<f32> = rt
+            .state
+            .app
+            .tiles
+            .columns()
+            .iter()
+            .map(|c| c.share)
+            .collect();
         assert_eq!(shares, vec![1.0, 1.0, 1.0], "nothing changes");
     }
 
@@ -2325,5 +2551,1169 @@ mod tests {
         assert!(name_field_focused(&rt, a));
         testkit::type_text(&mut rt, "den");
         assert_eq!(rt.state.rename.text, "Garden");
+    }
+
+    // A column of two: Task 3 of the stacked tiles plan.
+
+    /// Moves `key`'s tile to `spot` as the window moves a tile, the keyboard left where it is,
+    /// then steps.
+    fn move_to(rt: &mut Runtime<Ui>, key: SessionKey, spot: Spot) {
+        rt.update(|ui, tx| glue::move_tile(ui, tx, key, spot, false));
+        testkit::step(rt);
+    }
+
+    /// Moves `key`'s tile under `other`'s, into its column.
+    fn stack(rt: &mut Runtime<Ui>, key: SessionKey, other: SessionKey) {
+        move_to(rt, key, Spot::Below(other));
+        let (column, _) = rt.state.app.tiles.find(other).unwrap();
+        assert_eq!(
+            rt.state.app.tiles.find(key),
+            Some((column, TileLevel::Bottom))
+        );
+    }
+
+    /// The drawn rectangle of the row.
+    fn row_rect(rt: &Runtime<Ui>) -> [f32; 4] {
+        rt.presented(ROW).expect("the row is drawn").0
+    }
+
+    /// Where `key`'s tile belongs in the row as it is drawn, in window points.
+    fn laid_rect(rt: &Runtime<Ui>, key: SessionKey) -> [f32; 4] {
+        let [x, y, w, h] = row_rect(rt);
+        let laid = rt.state.app.tiles.rects([w, h]);
+        let [lx, ly, lw, lh] = laid.iter().find(|l| l.key == key).expect("in the row").rect;
+        [x + lx, y + ly, lw, lh]
+    }
+
+    /// Every tile is drawn at its rectangle in the row as it is drawn.
+    fn assert_placed(rt: &Runtime<Ui>) {
+        for key in tile_keys(rt) {
+            let (drawn, laid) = (tile_rect(rt, key), laid_rect(rt, key));
+            let off = drawn.iter().zip(laid).any(|(d, l)| (d - l).abs() > 0.01);
+            assert!(!off, "{key:?} drawn at {drawn:?}, not {laid:?}");
+        }
+    }
+
+    /// The `tiles` scene's state, its third tile moved under its second, the window not built.
+    fn stacked_scene() -> (Ui, SessionKey, SessionKey) {
+        let mut ui = demo::ui();
+        let (_, scene) = demo::SCENES
+            .iter()
+            .find(|(name, _)| *name == "tiles")
+            .unwrap();
+        scene(&mut ui);
+        let columns = ui.app.tiles.columns();
+        let (second, third) = (columns[1].top, columns[2].top);
+        let effects = ui.app.move_tile(third, Spot::Below(second));
+        glue::run(&mut ui, effects);
+        assert_eq!(ui.app.tiles.mate(second), Some(third));
+        (ui, second, third)
+    }
+
+    #[test]
+    fn a_stacked_tile_is_drawn_under_its_column_mate() {
+        let (mut rt, a, b) = two_tiles();
+        stack(&mut rt, b, a);
+        let [ax, ay, aw, ah] = tile_rect(&rt, a);
+        let [bx, by, bw, bh] = tile_rect(&rt, b);
+        let row = row_rect(&rt);
+        assert_eq!((ax, aw), (bx, bw), "the same x and width");
+        assert!(
+            (ay + ah - by).abs() < 0.01,
+            "a ends where b starts: {ay} + {ah}, {by}"
+        );
+        assert!(
+            (ah + bh - row[3]).abs() < 0.01,
+            "{ah} + {bh} is the row's {}",
+            row[3]
+        );
+        assert!((ay - row[1]).abs() < 0.01, "a at the row's top");
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn tiles_fill_the_row() {
+        let (mut rt, a, b, c) = three_tiles();
+        stack(&mut rt, c, b);
+        let d = testkit::add_session(&mut rt, "/home/alex/d");
+        testkit::show(&mut rt, c);
+        testkit::show_side(&mut rt, d);
+        assert_eq!(tile_keys(&rt), vec![a, b, c, d]);
+        assert_eq!(rt.state.app.tiles.columns().len(), 3, "[a][b/c][d]");
+        let [rx, ry, rw, rh] = row_rect(&rt);
+        let rects: Vec<[f32; 4]> = [a, b, c, d].iter().map(|&k| tile_rect(&rt, k)).collect();
+        for [x, y, w, h] in &rects {
+            assert!(
+                *x >= rx - 0.5
+                    && *y >= ry - 0.5
+                    && x + w <= rx + rw + 0.5
+                    && y + h <= ry + rh + 0.5,
+                "{:?} inside the row {:?}",
+                [x, y, w, h],
+                [rx, ry, rw, rh]
+            );
+        }
+        for (i, p) in rects.iter().enumerate() {
+            for q in &rects[i + 1..] {
+                let across = (p[0] + p[2]).min(q[0] + q[2]) - p[0].max(q[0]);
+                let down = (p[1] + p[3]).min(q[1] + q[3]) - p[1].max(q[1]);
+                assert!(across <= 0.5 || down <= 0.5, "{p:?} and {q:?} overlap");
+            }
+        }
+        // No gap: just past each edge of a tile that is not the row's own, another tile lies.
+        let in_a_tile = |x: f32, y: f32| {
+            rects
+                .iter()
+                .any(|[l, t, w, h]| x >= *l && x <= l + w && y >= *t && y <= t + h)
+        };
+        for &[x, y, w, h] in &rects {
+            for part in [0.1, 0.5, 0.9] {
+                let (along_x, along_y) = (x + w * part, y + h * part);
+                for (px, py) in [
+                    (x - 0.51, along_y),
+                    (x + w + 0.51, along_y),
+                    (along_x, y - 0.51),
+                    (along_x, y + h + 0.51),
+                ] {
+                    let in_row = px > rx && px < rx + rw && py > ry && py < ry + rh;
+                    assert!(!in_row || in_a_tile(px, py), "a gap at {px}, {py}");
+                }
+            }
+        }
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn the_first_frame_places_the_tiles() {
+        let (ui, second, third) = stacked_scene();
+        let mut rt = testkit::runtime(ui, SIZE);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(tile_keys(&rt).len(), 3);
+        let [_, uy, _, uh] = tile_rect(&rt, second);
+        assert!((uy + uh - tile_rect(&rt, third)[1]).abs() < 0.01, "stacked");
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn a_resized_window_places_the_tiles_again() {
+        let (mut rt, a, b, _) = three_tiles();
+        stack(&mut rt, b, a);
+        assert_placed(&rt);
+        let before = row_rect(&rt);
+        rt.set_viewport((1400.0, 700.0), 1.0);
+        rt.frame(1.0 / 60.0);
+        let row = row_rect(&rt);
+        assert!(
+            row[2] < before[2] && row[3] < before[3],
+            "{before:?}, then {row:?}"
+        );
+        assert_placed(&rt);
+        // The row tells the app once it was laid out.
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.app.row_height(), Some(row[3]), "the app knows");
+        assert_eq!(rt.state.app.row_width(), Some(row[2]));
+    }
+
+    #[test]
+    fn stacking_keeps_the_scroll_position_and_rebuilds_no_row() {
+        let (mut rt, a, b, c) = three_tiles();
+        for n in 1..=200 {
+            let delta = SessionEvent::TextDelta(format!("Line {n} of a"));
+            demo::emit_to(&rt.state, a, delta);
+            demo::emit_to(&rt.state, a, SessionEvent::BlockFinished);
+        }
+        testkit::step(&mut rt);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        let scroll = conversation::conversation_key(a);
+        let (x, y) = rt.find(&scroll).unwrap();
+        for _ in 0..5 {
+            rt.wheel(x, y, 600.0);
+            testkit::step(&mut rt);
+        }
+        assert_eq!(rt.scroll_at_bottom(&scroll), Some(false));
+        // The first line of a's on screen, and how far below its tile's top it is.
+        let first = |rt: &Runtime<Ui>| {
+            let [_, top, _, _] = tile_rect(rt, a);
+            rt.elements()
+                .into_iter()
+                .filter(|e| !e.exiting && e.visible[2] > 0.0 && e.visible[3] > 0.0)
+                .filter(|e| e.path.contains(&format!("/{scroll}/")))
+                .filter(|e| e.text.as_deref().is_some_and(|t| t.ends_with(" of a")))
+                .min_by(|p, q| p.rect[1].total_cmp(&q.rect[1]))
+                .map(|e| (e.text.unwrap(), e.rect[1] - top))
+                .expect("a line of a's on screen")
+        };
+        let before = first(&rt);
+        assert_ne!(before.0, "Line 200 of a", "scrolled up");
+        let rows = conversation::all_row_builds();
+        stack(&mut rt, a, b);
+        assert_eq!(tile_keys(&rt), vec![b, a, c]);
+        assert_placed(&rt);
+        assert_eq!(rt.scroll_at_bottom(&scroll), Some(false));
+        let after = first(&rt);
+        assert_eq!(after.0, before.0, "the same line first");
+        assert!(
+            (after.1 - before.1).abs() < 0.5,
+            "{before:?}, then {after:?}"
+        );
+        assert_eq!(conversation::all_row_builds(), rows, "no conversation row");
+    }
+
+    /// Types "A draft" in `key`'s box, focused by a click on its text as a person does.
+    fn draft_in(rt: &mut Runtime<Ui>, key: SessionKey) {
+        testkit::click(rt, &tile(key, "mr-input"));
+        testkit::type_text(rt, "A draft");
+        assert!(box_focused(rt, key));
+    }
+
+    /// The box of `key` has the keyboard and its draft, and a character typed lands there.
+    fn assert_still_typing(rt: &mut Runtime<Ui>, key: SessionKey) {
+        assert!(box_focused(rt, key), "the same field has the keyboard");
+        assert_eq!(glue::view_of(&rt.state, key).draft.text, "A draft");
+        testkit::type_text(rt, "!");
+        assert_eq!(glue::view_of(&rt.state, key).draft.text, "A draft!");
+        for other in tile_keys(rt).into_iter().filter(|k| *k != key) {
+            assert_eq!(glue::view_of(&rt.state, other).draft.text, "");
+        }
+    }
+
+    #[test]
+    fn a_draft_and_the_keyboard_stay_when_a_tile_is_stacked() {
+        let (mut rt, a, b, c) = three_tiles();
+        draft_in(&mut rt, a);
+        stack(&mut rt, a, b);
+        assert_eq!(tile_keys(&rt), vec![b, a, c]);
+        assert_still_typing(&mut rt, a);
+    }
+
+    #[test]
+    fn a_draft_and_the_keyboard_stay_when_a_tile_is_taken_out_of_its_column() {
+        let (mut rt, a, b, c) = three_tiles();
+        stack(&mut rt, b, a);
+        draft_in(&mut rt, b);
+        move_to(&mut rt, b, Spot::Edge(2));
+        assert_eq!(tile_keys(&rt), vec![a, c, b]);
+        assert_eq!(rt.state.app.tiles.find(b), Some((2, TileLevel::Whole)));
+        assert_still_typing(&mut rt, b);
+    }
+
+    #[test]
+    fn a_draft_and_the_keyboard_stay_when_a_tile_swaps_with_its_mate() {
+        let (mut rt, a, b) = two_tiles();
+        stack(&mut rt, b, a);
+        draft_in(&mut rt, a);
+        move_to(&mut rt, a, Spot::Below(b));
+        assert_eq!(tile_keys(&rt), vec![b, a]);
+        assert_eq!(rt.state.app.tiles.find(a), Some((0, TileLevel::Bottom)));
+        assert_still_typing(&mut rt, a);
+    }
+
+    #[test]
+    fn a_name_being_edited_goes_on_when_its_tile_is_stacked() {
+        let (mut rt, a, b) = titled_tiles();
+        edit_title(&mut rt, a);
+        testkit::type_text(&mut rt, "Gar");
+        stack(&mut rt, a, b);
+        assert_eq!(tile_keys(&rt), vec![b, a]);
+        assert_eq!(rt.state.renaming, Some(Renaming::Header(a)));
+        assert!(name_field_focused(&rt, a));
+        testkit::type_text(&mut rt, "den");
+        assert_eq!(rt.state.rename.text, "Garden");
+    }
+
+    #[test]
+    fn the_outline_is_on_the_tile_it_marks() {
+        let (mut rt, a, b) = two_tiles();
+        testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
+        ask_permission(&mut rt, a);
+        stack(&mut rt, b, a);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        assert_placed(&rt);
+        // `outlined` checks that each outline lies over its own tile's drawn rectangle.
+        assert_eq!(outlined(&rt, b), Some(theme::kit(true).c.bg_accent));
+        assert_eq!(outlined(&rt, a), Some(theme::kit(true).c.warning.icon));
+        assert_ne!(tile_rect(&rt, a), tile_rect(&rt, b));
+    }
+
+    /// Presses and lets go at the middle of `key`'s tile, below its header, then steps.
+    fn press_middle(rt: &mut Runtime<Ui>, key: SessionKey) {
+        let [x, y, w, h] = tile_rect(rt, key);
+        let (x, y) = (x + w / 2.0, y + h / 2.0);
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        testkit::step(rt);
+    }
+
+    #[test]
+    fn a_press_on_a_stacked_tile_focuses_it() {
+        let (mut rt, a, b) = two_tiles();
+        stack(&mut rt, b, a);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        press_middle(&mut rt, a);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        assert!(box_focused(&rt, a), "the keyboard in its box");
+        press_middle(&mut rt, b);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        assert!(box_focused(&rt, b));
+        testkit::click(&mut rt, &tile(a, "mr-tile-header"));
+        assert_eq!(testkit::focused(&rt), Some(a));
+        assert!(box_focused(&rt, a));
+    }
+
+    #[test]
+    fn a_lower_tiles_pickers_open_inside_the_window() {
+        let (mut rt, a, b) = two_tiles();
+        stack(&mut rt, b, a);
+        testkit::click(&mut rt, &model(b, "trigger"));
+        testkit::step(&mut rt);
+        assert_eq!(glue::view_of(&rt.state, b).open_picker, Some(Picker::Model));
+        let ([x, y, w, h], _) = rt.presented(&model(b, "content")).expect("b's list");
+        assert!(
+            x >= 0.0 && y >= 0.0 && x + w <= SIZE.0 && y + h <= SIZE.1,
+            "{:?} inside the window",
+            [x, y, w, h]
+        );
+        let [bx, _, bw, _] = tile_rect(&rt, b);
+        assert!(x >= bx && x + w <= bx + bw, "{x}, {w} inside {bx}, {bw}");
+    }
+
+    #[test]
+    fn a_request_in_a_stacked_tile_is_answered_in_its_own_session() {
+        let (mut rt, a, b) = two_tiles();
+        ask_permission(&mut rt, a);
+        ask_permission(&mut rt, b);
+        assert_eq!((waiting(&rt, a), waiting(&rt, b)), (1, 1));
+        stack(&mut rt, b, a);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        testkit::click(&mut rt, &tile(b, "mr-allow-r1"));
+        testkit::step(&mut rt);
+        assert_eq!(waiting(&rt, b), 0, "b's is answered");
+        assert_eq!(waiting(&rt, a), 1, "a's still waits");
+        testkit::click(&mut rt, &tile(a, "mr-allow-r1"));
+        testkit::step(&mut rt);
+        assert_eq!(waiting(&rt, a), 0, "then a's");
+    }
+
+    #[test]
+    fn a_divider_between_columns_is_as_high_as_the_row() {
+        let (mut rt, a, b, c) = three_tiles();
+        stack(&mut rt, b, a);
+        let row = row_rect(&rt);
+        let handle = divider_element(&rt, a).expect("the divider right of a's column");
+        assert_near(handle.rect[1], row[1], "the handle's top");
+        assert_near(handle.rect[3], row[3], "the handle's height");
+        let [ax, _, aw, _] = tile_rect(&rt, a);
+        assert_near(handle.rect[0] + 4.0, ax + aw, "centred on the edge");
+        assert!(divider_element(&rt, b).is_none(), "none for a lower tile");
+        assert!(divider_element(&rt, c).is_none(), "none after the last");
+        // Dragged, it resizes the column of two as one.
+        let half = row[2] / 2.0;
+        drag_divider(&mut rt, a, -200.0);
+        let [ax, _, aw, _] = tile_rect(&rt, a);
+        let [bx, _, bw, _] = tile_rect(&rt, b);
+        assert_near(aw, half - 200.0, "a's tile");
+        assert_eq!((ax, aw), (bx, bw), "b's tile with it");
+        assert_near(tile_rect(&rt, c)[2], half + 200.0, "c's tile");
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn a_column_of_two_in_a_low_window_is_still_drawn() {
+        let (mut rt, a, b) = two_tiles();
+        stack(&mut rt, b, a);
+        // The window is made lower than a column of two may be opened in: a row 400 high.
+        let row = row_rect(&rt);
+        rt.set_viewport((SIZE.0, SIZE.1 - (row[3] - 400.0)), 1.0);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        assert_near(row_rect(&rt)[3], 400.0, "the row's height");
+        assert_eq!(drawn_tiles(&rt), vec![tile_key(a), tile_key(b)]);
+        let (ah, bh) = (tile_rect(&rt, a)[3], tile_rect(&rt, b)[3]);
+        assert!(ah < 280.0 && bh < 280.0, "{ah} and {bh}");
+        assert!(ah > 0.0 && bh > 0.0, "{ah} and {bh}");
+        assert_placed(&rt);
+        for key in [a, b] {
+            let [x, y, w, h] = tile_rect(&rt, key);
+            let input = testkit::rect(&rt, &tile(key, "mr-input")).expect("a box");
+            let [ix, iy, iw, ih] = input;
+            assert!(
+                ix >= x - 0.5 && iy >= y - 0.5 && ix + iw <= x + w + 0.5 && iy + ih <= y + h + 0.5,
+                "{key:?}'s box {input:?} inside its tile {:?}",
+                [x, y, w, h]
+            );
+        }
+    }
+
+    // The line between the two tiles of a column: Task 4 of the stacked tiles plan.
+
+    /// `inner` lies inside `outer`, give or take half a point.
+    fn inside(inner: [f32; 4], outer: [f32; 4]) -> bool {
+        let ([ix, iy, iw, ih], [x, y, w, h]) = (inner, outer);
+        ix >= x - 0.5 && iy >= y - 0.5 && ix + iw <= x + w + 0.5 && iy + ih <= y + h + 0.5
+    }
+
+    #[test]
+    fn a_line_dragged_to_its_stop_keeps_both_boxes_in_their_tiles() {
+        let (mut rt, _, b, c) = column_of_two();
+        drag_split(&mut rt, b, -2000.0);
+        let dragged = height(&rt, b);
+        assert_near(dragged, 280.0, "b at its stop");
+        let split = rt.state.app.tile_split(b);
+        for window in [500.0, 400.0, SIZE.1] {
+            rt.set_viewport((SIZE.0, window), 1.0);
+            rt.settle_all();
+            testkit::step(&mut rt);
+            assert_placed(&rt);
+            for (key, mate) in [(b, c), (c, b)] {
+                let area = testkit::rect(&rt, &tile(key, "mr-input-area")).expect("a box");
+                let (own, other) = (tile_rect(&rt, key), tile_rect(&rt, mate));
+                assert!(
+                    inside(area, own),
+                    "in a window {window} high, {key:?}'s box {area:?} inside its tile {own:?}"
+                );
+                let down = (area[1] + area[3]).min(other[1] + other[3]) - area[1].max(other[1]);
+                assert!(
+                    down <= 0.5,
+                    "in a window {window} high, {key:?}'s box {area:?} reaches into {other:?}"
+                );
+            }
+            assert_eq!(rt.state.app.tile_split(b), split, "the split as dragged");
+        }
+        assert_near(height(&rt, b), dragged, "b as high as it was dragged");
+    }
+
+    /// `[a][b/c]`: three sessions, `c`'s tile under `b`'s, `c` focused.
+    fn column_of_two() -> (Runtime<Ui>, SessionKey, SessionKey, SessionKey) {
+        let (mut rt, a, b, c) = three_tiles();
+        stack(&mut rt, c, b);
+        assert_eq!(rt.state.app.tiles.columns().len(), 2);
+        (rt, a, b, c)
+    }
+
+    /// The line under `key`'s tile, drawn and not on its way out.
+    fn split_element(rt: &Runtime<Ui>, key: SessionKey) -> Option<rune::ElementInfo> {
+        let key = split_key(key);
+        rt.elements()
+            .into_iter()
+            .find(|e| !e.exiting && e.key.as_deref() == Some(key.as_str()))
+    }
+
+    /// The keys of every line drawn and not on its way out.
+    fn drawn_lines(rt: &Runtime<Ui>) -> Vec<String> {
+        rt.elements()
+            .into_iter()
+            .filter(|e| !e.exiting)
+            .filter_map(|e| e.key)
+            .filter(|k| k.starts_with("mr-split-"))
+            .collect()
+    }
+
+    /// Presses the line under `key`'s tile and moves the pointer `by` points down, without
+    /// letting go. Gives where the pointer is.
+    fn hold_split(rt: &mut Runtime<Ui>, key: SessionKey, by: f32) -> (f32, f32) {
+        let (x, y) = rt.find(&split_key(key)).expect("the line is drawn");
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_move(x, y + by / 2.0);
+        rt.pointer_move(x, y + by);
+        testkit::step(rt);
+        (x, y + by)
+    }
+
+    /// Drags the line under `key`'s tile `by` points down and lets go.
+    fn drag_split(rt: &mut Runtime<Ui>, key: SessionKey, by: f32) {
+        let (x, y) = hold_split(rt, key, by);
+        rt.pointer_up(x, y);
+        testkit::step(rt);
+    }
+
+    /// Presses the line under `key`'s tile twice, as a double click does, then steps.
+    fn double_press_split(rt: &mut Runtime<Ui>, key: SessionKey) {
+        let (x, y) = rt.find(&split_key(key)).expect("the line is drawn");
+        rt.pointer_move(x, y);
+        for _ in 0..2 {
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(1.0 / 120.0);
+        }
+        testkit::step(rt);
+    }
+
+    /// The height of `key`'s tile as drawn.
+    fn height(rt: &Runtime<Ui>, key: SessionKey) -> f32 {
+        tile_rect(rt, key)[3]
+    }
+
+    /// Each column's split as last written to the settings: none for a column of one.
+    fn saved_splits(rt: &Runtime<Ui>) -> Option<Vec<Option<f32>>> {
+        let saved: mr_core::Saved = rt.state.prefs.get(glue::STATE_KEY)?;
+        let splits = saved
+            .tiles
+            .iter()
+            .map(|t| t.below.as_ref().map(|b| b.split));
+        Some(splits.collect())
+    }
+
+    #[test]
+    fn the_line_between_two_tiles_drags() {
+        let (mut rt, a, b, c) = column_of_two();
+        let handle = split_element(&rt, b).expect("b's line");
+        assert_eq!(handle.role, "separator");
+        assert_eq!(handle.label.as_deref(), Some("Tile height"));
+        assert!(!handle.focusable, "no Tab stop");
+        let [bx, by, bw, bh] = tile_rect(&rt, b);
+        assert_near(handle.rect[3], 8.0, "the handle's height");
+        assert_near(handle.rect[0], bx, "the handle's left");
+        assert_near(handle.rect[2], bw, "as wide as the column");
+        assert_near(handle.rect[1] + 4.0, by + bh, "centred on the line");
+        let (upper, lower) = (height(&rt, b), height(&rt, c));
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        let (x, y) = hold_split(&mut rt, b, 100.0);
+        assert_near(height(&rt, b), upper + 100.0, "b while held");
+        assert_eq!(saved_splits(&rt), None, "nothing written during the moves");
+        rt.pointer_up(x, y);
+        testkit::step(&mut rt);
+        assert_near(height(&rt, b), upper + 100.0, "b");
+        assert_near(height(&rt, c), lower - 100.0, "c");
+        assert_placed(&rt);
+        let [_, by, _, bh] = tile_rect(&rt, b);
+        let handle = testkit::rect(&rt, &split_key(b)).unwrap();
+        assert_near(handle[1] + 4.0, by + bh, "the handle follows the line");
+        let split = rt.state.app.tile_split(b);
+        assert_ne!(split, Some(0.5));
+        assert_eq!(
+            saved_splits(&rt),
+            Some(vec![None, split]),
+            "written at the release"
+        );
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        testkit::step(&mut rt);
+        assert_eq!(saved_splits(&rt), None, "and only then");
+        assert_eq!(
+            tile_rect(&rt, a)[3],
+            row_rect(&rt)[3],
+            "a as high as the row"
+        );
+    }
+
+    #[test]
+    fn a_line_dragged_back_saves_nothing() {
+        let (mut rt, _, b, c) = column_of_two();
+        let before = (rt.state.app.tile_split(b), height(&rt, b), height(&rt, c));
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        let (x, y) = hold_split(&mut rt, b, 100.0);
+        assert_ne!(rt.state.app.tile_split(b), before.0, "moved while held");
+        rt.pointer_move(x, y - 100.0);
+        testkit::step(&mut rt);
+        rt.pointer_up(x, y - 100.0);
+        testkit::step(&mut rt);
+        let after = (rt.state.app.tile_split(b), height(&rt, b), height(&rt, c));
+        assert_eq!(after, before);
+        assert_eq!(saved_splits(&rt), None, "nothing written");
+        // A press that moves nothing writes nothing either.
+        let (x, y) = rt.find(&split_key(b)).unwrap();
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        testkit::step(&mut rt);
+        assert_eq!(saved_splits(&rt), None, "a press alone");
+    }
+
+    #[test]
+    fn the_line_stops_at_the_least_height() {
+        let (mut rt, _, b, c) = column_of_two();
+        let row = row_rect(&rt)[3];
+        drag_split(&mut rt, b, -2000.0);
+        assert_near(height(&rt, b), 280.0, "b at its least");
+        assert_near(height(&rt, c), row - 280.0, "c");
+        drag_split(&mut rt, b, 4000.0);
+        assert_near(height(&rt, c), 280.0, "c at its least");
+        assert_near(height(&rt, b), row - 280.0, "b");
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn escape_puts_the_line_back() {
+        let (mut rt, _, b, c) = column_of_two();
+        // From the even split, then from one a drag left 130 points lower.
+        for first in [None, Some(130.0)] {
+            if let Some(by) = first {
+                drag_split(&mut rt, b, by);
+            }
+            let before = (
+                rt.state.app.tile_split(b),
+                tile_rect(&rt, b),
+                tile_rect(&rt, c),
+            );
+            rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+            let (x, y) = hold_split(&mut rt, b, -100.0);
+            assert_ne!(rt.state.app.tile_split(b), before.0, "moved while held");
+            testkit::press(&mut rt, Key::Escape);
+            rt.pointer_up(x, y);
+            testkit::step(&mut rt);
+            let after = (
+                rt.state.app.tile_split(b),
+                tile_rect(&rt, b),
+                tile_rect(&rt, c),
+            );
+            assert_eq!(after, before, "exactly as before the press, from {first:?}");
+            assert_eq!(saved_splits(&rt), None, "nothing written");
+        }
+        assert_ne!(rt.state.app.tile_split(b), Some(0.5));
+    }
+
+    #[test]
+    fn a_double_press_on_the_line_evens_the_two() {
+        let (mut rt, _, b, c) = column_of_two();
+        drag_split(&mut rt, b, 150.0);
+        assert_ne!(rt.state.app.tile_split(b), Some(0.5));
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        double_press_split(&mut rt, b);
+        assert_eq!(rt.state.app.tile_split(b), Some(0.5));
+        assert_near(height(&rt, b), height(&rt, c), "the same height");
+        assert_placed(&rt);
+        assert_eq!(saved_splits(&rt), Some(vec![None, Some(0.5)]), "saved");
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        rt.frame(1.0);
+        double_press_split(&mut rt, b);
+        assert_eq!(rt.state.app.tile_split(b), Some(0.5));
+        assert_eq!(saved_splits(&rt), None, "a second one changes nothing");
+    }
+
+    #[test]
+    fn the_line_takes_neither_focus() {
+        let (mut rt, a, b, _) = column_of_two();
+        testkit::click(&mut rt, &tile(a, "mr-input"));
+        testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        assert!(box_focused(&rt, a));
+        let (x, y) = hold_split(&mut rt, b, 100.0);
+        assert_eq!(testkit::focused(&rt), Some(a), "a stays focused while held");
+        assert!(box_focused(&rt, a));
+        rt.pointer_up(x, y);
+        testkit::step(&mut rt);
+        double_press_split(&mut rt, b);
+        assert_eq!(testkit::focused(&rt), Some(a), "the focused tile stays");
+        assert!(box_focused(&rt, a));
+        testkit::type_text(&mut rt, "for a");
+        assert_eq!(glue::view_of(&rt.state, a).draft.text, "for a");
+        assert_eq!(glue::view_of(&rt.state, b).draft.text, "");
+    }
+
+    #[test]
+    fn where_the_line_meets_a_divider_the_divider_drags() {
+        let (mut rt, a, b, _) = column_of_two();
+        let half = rt.state.app.row_width().unwrap() / 2.0;
+        let split = rt.state.app.tile_split(b);
+        let [bx, by, _, bh] = tile_rect(&rt, b);
+        // Over both handles: the divider's right half and the line's left end.
+        let (x, y) = (bx + 2.0, by + bh);
+        let inside = |[l, t, w, h]: [f32; 4]| x > l && x < l + w && y > t && y < t + h;
+        assert!(
+            inside(testkit::rect(&rt, &divider_key(a)).unwrap()),
+            "on the divider"
+        );
+        assert!(
+            inside(testkit::rect(&rt, &split_key(b)).unwrap()),
+            "on the line"
+        );
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_move(x - 50.0, y + 50.0);
+        rt.pointer_move(x - 100.0, y + 100.0);
+        testkit::step(&mut rt);
+        rt.pointer_up(x - 100.0, y + 100.0);
+        testkit::step(&mut rt);
+        assert_near(widths(&rt)[0], half - 100.0, "a's column");
+        assert_eq!(rt.state.app.tile_split(b), split, "the line stays");
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn dragging_the_line_rebuilds_no_row() {
+        let (mut rt, _, b, c) = column_of_two();
+        for key in [b, c] {
+            for n in 1..=200 {
+                demo::emit_to(&rt.state, key, SessionEvent::TextDelta(format!("Line {n}")));
+                demo::emit_to(&rt.state, key, SessionEvent::BlockFinished);
+            }
+        }
+        testkit::step(&mut rt);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        let (upper, rows) = (height(&rt, b), conversation::all_row_builds());
+        assert!(rows > 0, "rows on screen in both");
+        let (x, y) = rt.find(&split_key(b)).expect("the line is drawn");
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        for n in 1..=10 {
+            rt.pointer_move(x, y + 10.0 * n as f32);
+            testkit::step(&mut rt);
+        }
+        assert_near(height(&rt, b), upper + 100.0, "b while held");
+        rt.pointer_up(x, y + 100.0);
+        testkit::step(&mut rt);
+        assert_near(height(&rt, b), upper + 100.0, "b");
+        assert_eq!(conversation::all_row_builds(), rows, "no conversation row");
+    }
+
+    #[test]
+    fn a_drag_pressed_before_the_size_was_known_changed_nothing() {
+        // A press before the row was laid out keeps a length that is not a number.
+        assert!(unchanged(f32::NAN, Some(300.0)));
+        assert!(unchanged(f32::NAN, None));
+        assert!(unchanged(300.0, Some(300.0)));
+        assert!(!unchanged(300.0, Some(301.0)));
+        assert!(!unchanged(300.0, None));
+    }
+
+    #[test]
+    fn the_line_of_a_low_row_does_nothing() {
+        let stored = |id: &str| StoredSession {
+            id: SessionId(id.into()),
+            folder: format!("/home/alex/{id}").into(),
+            title: format!("Session {id}"),
+            last_active_unix: demo::NOW_UNIX - demo::DAY,
+        };
+        let below = mr_core::SavedBelow {
+            id: SessionId("b1".into()),
+            split: 0.6,
+        };
+        let column = SavedTile {
+            id: SessionId("a1".into()),
+            share: 1.0,
+            below: Some(below),
+        };
+        let mut prefs = Prefs::memory();
+        let saved = Saved {
+            version: SAVED_VERSION,
+            shown: Some(SessionId("a1".into())),
+            tiles: vec![column],
+            ..Saved::default()
+        };
+        prefs.set(glue::STATE_KEY, &saved).unwrap();
+        let mut ui = demo::ui_with(None, prefs);
+        let fake = ui.fake.clone().unwrap();
+        fake.set_sessions(vec![stored("a1"), stored("b1")]);
+        glue::setup(&mut ui, std::sync::Arc::new(|| {}));
+        let mut rt = testkit::runtime(ui, (SIZE.0, 500.0));
+        for _ in 0..20 {
+            testkit::step(&mut rt);
+        }
+        let keys = tile_keys(&rt);
+        let [a, b] = keys[..] else {
+            panic!("the column came back: {keys:?}")
+        };
+        assert_eq!(rt.state.app.tiles.mate(a), Some(b));
+        assert!(row_rect(&rt)[3] < 560.0, "{:?}", row_rect(&rt));
+        let before = (
+            rt.state.app.tile_split(a),
+            tile_rect(&rt, a),
+            tile_rect(&rt, b),
+        );
+        assert_eq!(before.0, Some(0.6));
+        assert_eq!(before.1[3], before.2[3], "drawn even in a row this low");
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        for by in [-60.0, 60.0] {
+            drag_split(&mut rt, a, by);
+            let after = (
+                rt.state.app.tile_split(a),
+                tile_rect(&rt, a),
+                tile_rect(&rt, b),
+            );
+            assert_eq!(after, before, "dragged {by}");
+        }
+        assert_eq!(saved_splits(&rt), None, "nothing written");
+    }
+
+    #[test]
+    fn a_column_of_one_has_no_line() {
+        let (mut rt, a, b, c) = three_tiles();
+        assert!(drawn_lines(&rt).is_empty(), "{:?}", drawn_lines(&rt));
+        stack(&mut rt, c, b);
+        assert_eq!(drawn_lines(&rt), vec![split_key(b)]);
+        assert!(split_element(&rt, a).is_none() && split_element(&rt, c).is_none());
+        move_to(&mut rt, c, Spot::Edge(2));
+        assert!(drawn_lines(&rt).is_empty(), "{:?}", drawn_lines(&rt));
+    }
+
+    /// The window as last drawn, rendered on the GPU: 8-bit RGBA rows, one pixel a point.
+    fn drawn_pixels(rt: &mut Runtime<Ui>) -> Vec<u8> {
+        use rune::render::{Gpu, OFFSCREEN_FORMAT, Offscreen, Renderer};
+        let gpu = Gpu::headless();
+        let size = (SIZE.0 as u32, SIZE.1 as u32);
+        let format = if rt.srgb_blend() {
+            OFFSCREEN_FORMAT.remove_srgb_suffix()
+        } else {
+            OFFSCREEN_FORMAT
+        };
+        let mut renderer = Renderer::new(&gpu.device, format);
+        renderer.set_srgb_blend(rt.srgb_blend());
+        let target = Offscreen::with_format(&gpu.device, size.0, size.1, format);
+        renderer.upload_images(&gpu.device, &gpu.queue, &mut rt.images);
+        renderer.prepare_surfaces(&gpu.device, &gpu.queue, &rt.surfaces, size);
+        renderer.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &mut rt.text.atlas,
+            &rt.instances,
+            size,
+        );
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        renderer.draw(&mut encoder, &target.view, rt.clear_color());
+        target.copy(&mut encoder);
+        renderer.submit(&gpu.queue, encoder);
+        target.read(&gpu.device)
+    }
+
+    #[test]
+    fn the_upper_tile_of_two_draws_a_line_on_its_lower_edge() {
+        let (mut rt, a, b, c) = column_of_two();
+        let d = testkit::add_session(&mut rt, "/home/alex/d");
+        testkit::show(&mut rt, c);
+        testkit::show_side(&mut rt, d);
+        // [a][b/c][d], d focused: neither tile of the column, nor a, has an outline.
+        assert_eq!(testkit::focused(&rt), Some(d));
+        for key in [a, b, c] {
+            assert_eq!(outlined(&rt, key), None);
+        }
+        let pixels = drawn_pixels(&mut rt);
+        let at = |x: f32, y: f32| {
+            let i = (y as usize * SIZE.0 as usize + x as usize) * 4;
+            <[u8; 4]>::try_from(&pixels[i..i + 4]).unwrap()
+        };
+        // Along the lower edge of a tile, 30 points in from its left: the edge's last row of
+        // pixels, and rows 3 points above and below it.
+        let edge = |key: SessionKey| {
+            let [x, y, _, h] = tile_rect(&rt, key);
+            let (x, bottom) = (x + 30.0, y + h);
+            (
+                at(x, bottom - 3.0),
+                at(x, bottom - 0.5),
+                at(x, bottom + 3.0),
+            )
+        };
+        let (above, line, below) = edge(b);
+        assert_eq!(above, below, "the tiles' own ground on either side");
+        assert_ne!(line, above, "b's lower edge is a line");
+        let (above, last, _) = edge(a);
+        assert_eq!(last, above, "a, alone in its column, has none");
+        let (above, last, _) = edge(c);
+        assert_eq!(last, above, "nor has c, the lower of two");
+    }
+
+    // A tile moved into, out of and within a column by the keyboard: Task 6 of the stacked
+    // tiles plan.
+
+    /// Ctrl+Alt+PageUp, or Cmd+Alt+PageUp on macOS.
+    fn stack_up() -> KeyEvent {
+        KeyEvent {
+            key: Key::PageUp,
+            mods: Mods {
+                alt: true,
+                ..testkit::ctrl()
+            },
+        }
+    }
+
+    /// Ctrl+Alt+PageDown, or Cmd+Alt+PageDown on macOS.
+    fn stack_down() -> KeyEvent {
+        KeyEvent {
+            key: Key::PageDown,
+            mods: Mods {
+                alt: true,
+                ..testkit::ctrl()
+            },
+        }
+    }
+
+    /// Gives `ev` to the window's keys: it is taken, and nothing in the row changes.
+    fn taken_and_nothing_moves(rt: &mut Runtime<Ui>, ev: KeyEvent) {
+        let (before, version) = (columns(rt), rt.state.app.tiles.version());
+        rt.update(|ui, tx| assert!(super::super::on_key(ui, &ev, tx), "taken: {ev:?}"));
+        testkit::step(rt);
+        assert_eq!(columns(rt), before, "nothing moves: {ev:?}");
+        assert_eq!(rt.state.app.tiles.version(), version, "{ev:?}");
+    }
+
+    /// Presses `ev` as the user does, then steps.
+    fn key(rt: &mut Runtime<Ui>, ev: KeyEvent) {
+        rt.key(ev);
+        testkit::step(rt);
+    }
+
+    #[test]
+    fn ctrl_shift_page_down_passes_a_column_of_two() {
+        let (mut rt, a, b, c) = three_tiles();
+        stack(&mut rt, c, b);
+        focus(&mut rt, a);
+        key(&mut rt, move_right());
+        assert_eq!(columns(&rt), vec![vec![b, c], vec![a]]);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        key(&mut rt, move_left());
+        assert_eq!(columns(&rt), vec![vec![a], vec![b, c]], "and back");
+    }
+
+    #[test]
+    fn ctrl_shift_page_down_takes_a_tile_out_of_its_column() {
+        let (mut rt, a, b) = two_tiles();
+        stack(&mut rt, b, a);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        key(&mut rt, move_right());
+        assert_eq!(columns(&rt), vec![vec![a], vec![b]]);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        stack(&mut rt, b, a);
+        key(&mut rt, move_left());
+        assert_eq!(columns(&rt), vec![vec![b], vec![a]]);
+        assert_eq!(testkit::focused(&rt), Some(b));
+    }
+
+    #[test]
+    fn with_no_room_the_key_is_taken_and_nothing_moves() {
+        let mut rt = testkit::window_sized("empty", (1300.0, 900.0));
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        let b = testkit::add_session(&mut rt, "/home/alex/b");
+        let c = testkit::add_session(&mut rt, "/home/alex/c");
+        testkit::show(&mut rt, a);
+        testkit::show_side(&mut rt, b);
+        stack(&mut rt, b, a);
+        testkit::show_side(&mut rt, c);
+        assert_eq!(columns(&rt), vec![vec![a, b], vec![c]]);
+        assert!(!rt.state.app.room_for_tile());
+        for key in [a, b] {
+            focus(&mut rt, key);
+            taken_and_nothing_moves(&mut rt, move_left());
+            taken_and_nothing_moves(&mut rt, move_right());
+            assert_eq!(testkit::focused(&rt), Some(key));
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_page_down_puts_a_tile_under_its_left_neighbour() {
+        let (mut rt, a, b) = two_tiles();
+        key(&mut rt, stack_down());
+        assert_eq!(columns(&rt), vec![vec![a, b]]);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn ctrl_alt_page_up_puts_it_over() {
+        let (mut rt, a, b) = two_tiles();
+        key(&mut rt, stack_up());
+        assert_eq!(columns(&rt), vec![vec![b, a]]);
+        assert_eq!(testkit::focused(&rt), Some(b));
+    }
+
+    #[test]
+    fn the_first_column_joins_the_second() {
+        for (ev, column) in [(stack_down(), [1, 0]), (stack_up(), [0, 1])] {
+            let (mut rt, a, b) = two_tiles();
+            focus(&mut rt, a);
+            key(&mut rt, ev.clone());
+            let keys = [a, b];
+            assert_eq!(
+                columns(&rt),
+                vec![column.map(|i| keys[i]).to_vec()],
+                "{ev:?}"
+            );
+            assert_eq!(testkit::focused(&rt), Some(a));
+        }
+    }
+
+    #[test]
+    fn in_a_column_of_two_the_keys_swap() {
+        let (mut rt, a, b) = two_tiles();
+        stack(&mut rt, b, a);
+        focus(&mut rt, a);
+        // The upper: down swaps, up does nothing.
+        taken_and_nothing_moves(&mut rt, stack_up());
+        key(&mut rt, stack_down());
+        assert_eq!(columns(&rt), vec![vec![b, a]]);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        // Now the lower: down does nothing, up swaps.
+        taken_and_nothing_moves(&mut rt, stack_down());
+        key(&mut rt, stack_up());
+        assert_eq!(columns(&rt), vec![vec![a, b]]);
+        assert_eq!(testkit::focused(&rt), Some(a));
+    }
+
+    #[test]
+    fn a_full_neighbour_takes_nothing() {
+        let (mut rt, a, b, c) = three_tiles();
+        stack(&mut rt, b, a);
+        focus(&mut rt, c);
+        taken_and_nothing_moves(&mut rt, stack_up());
+        taken_and_nothing_moves(&mut rt, stack_down());
+        assert_eq!(columns(&rt), vec![vec![a, b], vec![c]]);
+        assert_eq!(testkit::focused(&rt), Some(c));
+    }
+
+    #[test]
+    fn a_low_window_stacks_nothing_by_key() {
+        let mut rt = testkit::window_sized("empty", (1800.0, 500.0));
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        let b = testkit::add_session(&mut rt, "/home/alex/b");
+        testkit::show(&mut rt, a);
+        testkit::show_side(&mut rt, b);
+        assert!(!mr_core::Tiles::fits_two(row_rect(&rt)[3]));
+        for key in [b, a] {
+            focus(&mut rt, key);
+            taken_and_nothing_moves(&mut rt, stack_up());
+            taken_and_nothing_moves(&mut rt, stack_down());
+        }
+        assert_eq!(columns(&rt), vec![vec![a], vec![b]]);
+    }
+
+    #[test]
+    fn one_tile_alone_does_nothing() {
+        let mut rt = testkit::window_sized("empty", SIZE);
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        taken_and_nothing_moves(&mut rt, stack_up());
+        taken_and_nothing_moves(&mut rt, stack_down());
+        assert_eq!(columns(&rt), vec![vec![a]]);
+    }
+
+    #[test]
+    fn the_keyboard_stays_in_the_box_when_its_tile_is_stacked_by_key() {
+        let (mut rt, a, b) = two_tiles();
+        draft_in(&mut rt, b);
+        key(&mut rt, stack_down());
+        assert_eq!(columns(&rt), vec![vec![a, b]]);
+        assert_still_typing(&mut rt, b);
+        key(&mut rt, stack_up());
+        assert_eq!(columns(&rt), vec![vec![b, a]], "the swap, from the box");
+        assert!(box_focused(&rt, b));
+    }
+
+    #[test]
+    fn the_stack_keys_wait() {
+        let (mut rt, a, b, c) = three_tiles();
+        let all = [stack_up(), stack_down()];
+        // While a picker's list is open.
+        testkit::click(&mut rt, &model(c, "trigger"));
+        testkit::step(&mut rt);
+        assert_eq!(glue::view_of(&rt.state, c).open_picker, Some(Picker::Model));
+        for ev in all.clone() {
+            taken_and_nothing_moves(&mut rt, ev);
+        }
+        rt.update(|ui, _| glue::view_mut(ui, c).open_picker = None);
+        testkit::step(&mut rt);
+        // While a row's menu is open.
+        let (x, y) = rt.find(&format!("mr-row-{}", a.0)).unwrap();
+        rt.secondary_down(x, y);
+        rt.secondary_up(x, y);
+        testkit::step(&mut rt);
+        assert!(rt.state.side_menu.is_some(), "the row's menu is open");
+        for ev in all.clone() {
+            taken_and_nothing_moves(&mut rt, ev);
+        }
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        assert!(rt.state.side_menu.is_none());
+        // While a row is dragged.
+        let [x, y, w, h] = row_rect(&rt);
+        testkit::hold_row(&mut rt, a, (x + w / 2.0, y + h / 2.0));
+        assert!(rt.state.drag.is_some(), "a row is dragged");
+        for ev in all.clone() {
+            taken_and_nothing_moves(&mut rt, ev);
+        }
+        assert!(rt.state.drag.is_some(), "the drag goes on");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![b], vec![c]]);
+        // On another screen they are not taken.
+        rt.update(|ui, _| {
+            let effects = ui.app.account_checked(mr_agent::Account::Missing);
+            glue::run(ui, effects);
+        });
+        testkit::step(&mut rt);
+        for ev in all {
+            rt.update(|ui, tx| assert!(!super::super::on_key(ui, &ev, tx), "not taken"));
+            testkit::step(&mut rt);
+        }
+        assert_eq!(
+            columns(&rt),
+            vec![vec![a], vec![b], vec![c]],
+            "nothing moves"
+        );
+    }
+
+    #[test]
+    fn f6_goes_column_by_column_the_upper_first() {
+        let (mut rt, a, b, c) = three_tiles();
+        stack(&mut rt, b, a);
+        assert_eq!(columns(&rt), vec![vec![a, b], vec![c]]);
+        focus(&mut rt, a);
+        for next in [b, c, a] {
+            testkit::press(&mut rt, Key::Function(6));
+            testkit::step(&mut rt);
+            assert_eq!(testkit::focused(&rt), Some(next), "F6");
+            assert!(box_focused(&rt, next));
+        }
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        for next in [c, b, a] {
+            testkit::press_with(&mut rt, Key::Function(6), shift);
+            testkit::step(&mut rt);
+            assert_eq!(testkit::focused(&rt), Some(next), "Shift+F6");
+            assert!(box_focused(&rt, next));
+        }
+    }
+
+    // A key that moves the tiles while a handle is held: the fix wave after the whole-branch
+    // review of the stacked tiles plan.
+
+    /// Each column's share, left to right.
+    fn shares(rt: &Runtime<Ui>) -> Vec<f32> {
+        let columns = rt.state.app.tiles.columns();
+        columns.iter().map(|column| column.share).collect()
+    }
+
+    #[test]
+    fn a_held_divider_puts_nothing_back_after_a_key_moved_the_tiles() {
+        let (mut rt, a, b, c) = three_tiles();
+        focus(&mut rt, a);
+        let (x, y) = hold_divider(&mut rt, a, -60.0);
+        assert!(rt.state.divider_press.is_some(), "kept at the press");
+        key(&mut rt, move_right());
+        assert_eq!(columns(&rt), vec![vec![b], vec![a], vec![c]]);
+        assert_eq!(rt.state.divider_press, None, "forgotten");
+        let moved = shares(&rt);
+        testkit::press(&mut rt, Key::Escape);
+        rt.pointer_up(x, y);
+        testkit::step(&mut rt);
+        assert_eq!(shares(&rt), moved, "nothing put back");
+        let before = widths(&rt);
+        drag_divider(&mut rt, b, -100.0);
+        assert_near(widths(&rt)[0], before[0] - 100.0, "the next drag");
+        assert_placed(&rt);
+    }
+
+    #[test]
+    fn a_held_line_puts_nothing_back_after_a_key_moved_the_tiles() {
+        let (mut rt, _, b, c) = column_of_two();
+        focus(&mut rt, b);
+        let (x, y) = hold_split(&mut rt, b, 100.0);
+        assert!(rt.state.split_press.is_some(), "kept at the press");
+        key(&mut rt, stack_down());
+        assert_eq!(columns(&rt)[1], vec![c, b], "swapped");
+        assert_eq!(rt.state.split_press, None, "forgotten");
+        key(&mut rt, stack_up());
+        assert_eq!(columns(&rt)[1], vec![b, c], "and back");
+        let moved = rt.state.app.tile_split(b);
+        testkit::press(&mut rt, Key::Escape);
+        rt.pointer_up(x, y);
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.app.tile_split(b), moved, "nothing put back");
+        let before = height(&rt, b);
+        drag_split(&mut rt, b, -100.0);
+        assert_near(height(&rt, b), before - 100.0, "the next drag");
+        assert_placed(&rt);
     }
 }

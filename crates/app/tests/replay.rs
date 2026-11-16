@@ -405,7 +405,7 @@ fn recordings_played_in_three_tiles_at_once_each_show_what_they_show_alone() {
             .collect();
         let (app, together) = replay_together(&three, Place::Side);
         assert_eq!(
-            app.tiles.list().len(),
+            app.tiles.len(),
             3,
             "{}, {} and {} are in three tiles",
             three[0].name,

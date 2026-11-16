@@ -11,8 +11,10 @@
 //! Escape (`view::on_key`) and `glue::tidy_sidebar` end those. Each ends it with nothing left
 //! behind: no chip, no line, no outline, and no press swallowed later.
 
-use mr_core::{GroupId, Place, SessionKey};
-use rune::{Drag, El, Phase, Picked, PointerPress, Transition, Tx, el, row as row_el, text};
+use mr_core::{GroupId, Laid, Part, Place, SessionKey, Spot, TileLevel, part_at};
+use rune::{
+    Drag, El, Phase, Picked, PointerPress, Spring, Transition, Tx, el, row as row_el, text,
+};
 use rune_kit::Kit;
 
 use crate::glue::{self, DragFrom, DropTarget, Renaming, RowDrag, Ui};
@@ -30,7 +32,10 @@ const CHIP: &str = "mr-drag-chip";
 const EDGE: &str = "mr-drop-edge";
 const WATCH: &str = "mr-drag-watch";
 
-/// How thick the line where a tile would open is.
+/// The outline of the half a dropped tile will take.
+const HALF: &str = "mr-drop-half";
+
+/// How thick the line where a tile would open is, and the outline of a half.
 const EDGE_WIDTH: f32 = 2.0;
 
 /// Where the chip sits from the pointer, right and below it.
@@ -67,11 +72,11 @@ pub fn row(key: SessionKey) -> impl Fn(&mut Ui, &mut Drag, &mut Tx) + 'static {
 /// The handler for a tile header's `on_drag`.
 ///
 /// As a row's ([`row`]), with the same slop, guards and overlay, and the same `Ui::drag`, but
-/// it moves the tile along the row: over the tile row the target is the nearest edge, unless
-/// the tile would stay where it is there ([`move_target`]); elsewhere there is none, and the
-/// sidebar is never asked. The release over an edge moves the tile there, focuses it and puts
-/// the keyboard in its input box; over nothing, or cancelled, it does nothing. With one tile
-/// in the row, or while the header's name is edited, no drag starts.
+/// it moves the tile in the row: over the tile row the target is a column of its own at an
+/// edge, or a place over or under another tile ([`move_target`]); elsewhere there is none, and
+/// the sidebar is never asked. The release over a target moves the tile there, focuses it and
+/// puts the keyboard in its input box; over nothing, or cancelled, it does nothing. With one
+/// tile in the row, or while the header's name is edited, no drag starts.
 ///
 /// It sets no press to swallow: the press Rune runs after a release inside the header (when
 /// the drag came back to where it started, so nothing moved) only focuses the tile, as a click.
@@ -136,12 +141,8 @@ fn held(ui: &mut Ui, drag: &mut Drag, tx: &mut Tx, from: DragFrom, key: SessionK
             match from {
                 DragFrom::Row => drop_row(ui, tx, key, held),
                 DragFrom::Header => {
-                    if let Some(RowDrag {
-                        over: Some(DropTarget::Edge(edge)),
-                        ..
-                    }) = held
-                    {
-                        glue::move_tile(ui, tx, key, edge, true);
+                    if let Some(spot) = held.and_then(|held| spot_of(held.over.as_ref()?)) {
+                        glue::move_tile(ui, tx, key, spot, true);
                     }
                 }
             }
@@ -156,7 +157,7 @@ fn can_start(ui: &Ui, from: DragFrom, key: SessionKey) -> bool {
         DragFrom::Row => true,
         DragFrom::Header => {
             ui.app.tiles.contains(key)
-                && ui.app.tiles.list().len() > 1
+                && ui.app.tiles.len() > 1
                 && ui.renaming != Some(Renaming::Header(key))
         }
     }
@@ -172,6 +173,8 @@ fn drop_row(ui: &mut Ui, tx: &mut Tx, key: SessionKey, held: Option<RowDrag>) {
     let place = match held.over {
         Some(DropTarget::Edge(i)) => Place::At(i),
         Some(DropTarget::Tile(k)) => Place::Tile(k),
+        Some(DropTarget::Above(k)) => Place::Above(k),
+        Some(DropTarget::Below(k)) => Place::Below(k),
         Some(DropTarget::Group(id)) => {
             let effects = ui.app.move_session(key, &id);
             glue::run(ui, effects);
@@ -244,29 +247,88 @@ pub fn group_of_path(ui: &Ui, path: &str) -> Option<GroupId> {
 }
 
 /// What a drop at `at` would do in the tile row, when `at` is inside it: nothing for a session
-/// already in a tile; with room for another tile, one at the nearest edge; else the session
-/// in the tile under the pointer takes its place.
+/// already in a tile. Else, with `t` the tile under the pointer and its half the pointer is
+/// in: over the middle half of `t`'s width, a new tile in that half, when `t`'s column could
+/// take one; else, with room for another column, one at the nearest edge; else that half of
+/// `t`, when its column could take a tile, over its whole width; else the session takes `t`'s
+/// place.
 pub fn target_in_tiles(ui: &Ui, key: SessionKey, at: [f32; 2]) -> Option<DropTarget> {
-    let [x, _, width, _] = ui.row_rect.filter(|_| in_row(ui, at))?;
-    let tiles = &ui.app.tiles;
-    if tiles.contains(key) {
+    let (width, at, laid) = under(ui, at)?;
+    if ui.app.tiles.contains(key) {
         return None;
     }
-    if ui.app.room_for_tile() {
-        return Some(DropTarget::Edge(tiles.edge_at(width, at[0] - x)));
+    // `can_put` holds only for a tile that has its column to itself.
+    let half = laid
+        .filter(|laid| ui.app.can_put(Spot::Below(laid.key)))
+        .map(|laid| (half_of(&laid, at), part_at(laid.rect, at)));
+    if let Some((half, Part::Upper | Part::Lower)) = half {
+        return Some(half);
     }
-    let index = tiles.tile_at(width, at[0] - x)?;
-    Some(DropTarget::Tile(tiles.list()[index].key))
+    if ui.app.room_for_tile() {
+        return Some(DropTarget::Edge(ui.app.tiles.edge_at(width, at[0])));
+    }
+    if let Some((half, _)) = half {
+        return Some(half);
+    }
+    Some(DropTarget::Tile(laid?.key))
 }
 
-/// Where a drop at `at` would move `key`'s tile, when `at` is inside the tile row: the nearest
-/// edge, unless the tile would stay where it is (`Tiles::moved_index`). Whether another tile
-/// would fit plays no part: no tile is added.
+/// Where a drop at `at` would move `key`'s tile, when `at` is inside the tile row. With `t`
+/// the tile under the pointer: over the middle half of another `t`'s width, the place over or
+/// under `t` by the half of `t` the pointer is in; over its column mate, the place that swaps
+/// the two. Else the nearest edge. Either only when the tile would move there
+/// (`Tiles::would_move`): so over its own tile a tile that has its column shows nothing, and a
+/// tile of a column of two shows the nearer edge of its column when another column fits.
 pub fn move_target(ui: &Ui, key: SessionKey, at: [f32; 2]) -> Option<DropTarget> {
-    let [x, _, width, _] = ui.row_rect.filter(|_| in_row(ui, at))?;
-    let edge = ui.app.tiles.edge_at(width, at[0] - x);
-    ui.app.tiles.moved_index(key, edge)?;
-    Some(DropTarget::Edge(edge))
+    let (width, at, laid) = under(ui, at)?;
+    let tiles = &ui.app.tiles;
+    let moves =
+        |target: &DropTarget| spot_of(target).is_some_and(|spot| ui.app.can_move_tile(key, spot));
+    let half = laid
+        .filter(|laid| laid.key != key)
+        .filter(|laid| matches!(part_at(laid.rect, at), Part::Upper | Part::Lower))
+        .map(|laid| {
+            if tiles.mate(key) != Some(laid.key) {
+                half_of(&laid, at)
+            } else if matches!(tiles.find(key), Some((_, TileLevel::Bottom))) {
+                // The two swap: the lower goes over its mate, the upper under it.
+                DropTarget::Above(laid.key)
+            } else {
+                DropTarget::Below(laid.key)
+            }
+        });
+    if let Some(half) = half.filter(moves) {
+        return Some(half);
+    }
+    Some(DropTarget::Edge(tiles.edge_at(width, at[0]))).filter(moves)
+}
+
+/// When `at` is inside the tile row as last laid out: the row's width, `at` from the row's
+/// top left, and the tile under it.
+fn under(ui: &Ui, at: [f32; 2]) -> Option<(f32, [f32; 2], Option<Laid>)> {
+    let [x, y, width, height] = ui.row_rect.filter(|_| in_row(ui, at))?;
+    let at = [at[0] - x, at[1] - y];
+    Some((width, at, ui.app.tiles.tile_at([width, height], at)))
+}
+
+/// Over or under `laid`'s tile, by the half of it `at` is in; `at` is from the row's top left.
+fn half_of(laid: &Laid, at: [f32; 2]) -> DropTarget {
+    let [_, top, _, h] = laid.rect;
+    if at[1] < top + h / 2.0 {
+        DropTarget::Above(laid.key)
+    } else {
+        DropTarget::Below(laid.key)
+    }
+}
+
+/// The place in the row a target in it names; none for a tile or a group.
+fn spot_of(target: &DropTarget) -> Option<Spot> {
+    match target {
+        DropTarget::Edge(edge) => Some(Spot::Edge(*edge)),
+        DropTarget::Above(key) => Some(Spot::Above(*key)),
+        DropTarget::Below(key) => Some(Spot::Below(*key)),
+        DropTarget::Tile(_) | DropTarget::Group(_) => None,
+    }
 }
 
 /// Whether `at` is inside the tile row as last laid out.
@@ -284,9 +346,10 @@ fn menu_open(ui: &Ui) -> bool {
 ///
 /// While a row or a header is dragged, `layer` gets its session's title in a small raised chip
 /// right of and below the pointer; for a drop at an edge (a tile opened there, or the dragged
-/// one moved there), a line in the accent colour at that edge of the tile row, its full height
-/// (a tile the drop would take shows its outline, `tiles::outline`). Both are inert: they take
-/// no press and no hover from what is under them.
+/// one moved there), a line in the accent colour at that edge of the tile row, its full height;
+/// for a drop over or under a tile, an outline in the accent around the place the session will
+/// take ([`half_rect`]; a tile the drop would take shows its own outline, `tiles::outline`).
+/// All are inert: they take no press and no hover from what is under them.
 ///
 /// Last, the watcher: an element over the whole window that has only `on_pointer_move`, which
 /// Rune hands every move of a held pointer to, under the rest of the window so it takes no
@@ -338,6 +401,18 @@ pub fn overlay(ui: &Ui, kit: &Kit, layer: &mut Vec<El>) {
                 .inert(),
         );
     }
+    if let Some(half) = half_rect(ui, drag) {
+        let [left, top, w, h] = half;
+        layer.push(
+            el().key(HALF)
+                .absolute(left, top)
+                .size(w, h)
+                .border(EDGE_WIDTH, c.bg_accent)
+                .transition(Transition::none())
+                .motion(Spring::NONE)
+                .inert(),
+        );
+    }
     layer.push(
         el().key(WATCH)
             .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
@@ -345,6 +420,39 @@ pub fn overlay(ui: &Ui, kit: &Kit, layer: &mut Vec<El>) {
             .transition(Transition::none())
             .on_pointer_move(|ui: &mut Ui, _: PointerPress| watch(ui)),
     );
+}
+
+/// The place `drag` would put its session in over or under a tile, in window points, from the
+/// tile row as last laid out: that tile's upper half for [`DropTarget::Above`], its lower for
+/// [`DropTarget::Below`], and all of it when it is the dragged tile's column mate, which the
+/// two swap. None for any other target, and while the target no longer holds: the place no
+/// longer takes a tile (for a row) or the tile would no longer move there (for a header).
+fn half_rect(ui: &Ui, drag: &RowDrag) -> Option<[f32; 4]> {
+    let (spot, key, upper) = match drag.over.as_ref()? {
+        DropTarget::Above(key) => (Spot::Above(*key), *key, true),
+        DropTarget::Below(key) => (Spot::Below(*key), *key, false),
+        _ => return None,
+    };
+    let holds = match drag.from {
+        DragFrom::Row => ui.app.can_put(spot),
+        DragFrom::Header => ui.app.can_move_tile(drag.key, spot),
+    };
+    if !holds {
+        return None;
+    }
+    let [x, y, width, height] = ui.row_rect?;
+    let laid = ui.app.tiles.rects([width, height]);
+    let [lx, ly, lw, lh] = laid.iter().find(|laid| laid.key == key)?.rect;
+    if ui.app.tiles.mate(drag.key) == Some(key) {
+        return Some([x + lx, y + ly, lw, lh]);
+    }
+    let upper_h = lh / 2.0;
+    let rect = if upper {
+        [x + lx, y + ly, lw, upper_h]
+    } else {
+        [x + lx, y + ly + upper_h, lw, lh - upper_h]
+    };
+    Some(rect)
 }
 
 /// The watcher's part of the kit's guard (`rune-kit/src/grip.rs`), which is private to the
@@ -371,24 +479,26 @@ fn watch(ui: &mut Ui) {
 #[cfg(test)]
 mod tests {
     use mr_agent::{SessionCommand, SessionEvent, SessionId, StoredSession};
-    use mr_core::{FromBackend, GroupId, SessionKey};
+    use mr_core::{FromBackend, GroupId, SessionKey, Spot};
     use rune::{Key, KeyEvent, Mods, Runtime};
     use rune_kit::shell::ROW_HEIGHT;
 
     use super::super::{conversation, sidebar, tiles};
     use crate::glue::{self, DragFrom, DropTarget, MenuTarget, Renaming, Ui};
     use crate::testkit::{
-        self, CONTACT, FINISHED, GARDEN, NEEDS_YOU, WEBSITE, WORKING, box_focused, group_named,
-        group_of, row_key, tile, tile_keys, titled,
+        self, CONTACT, FINISHED, GARDEN, NEEDS_YOU, WEBSITE, WORKING, box_focused, columns,
+        group_named, group_of, row_key, tile, tile_keys, titled,
     };
     use crate::theme;
 
     /// The window most tests here open: 1,800 by 900, the sidebar open.
     const SIZE: (f32, f32) = (1800.0, 900.0);
 
-    /// The key of the title by the pointer, of the line where a tile would open.
+    /// The key of the title by the pointer, of the line where a tile would open and of the
+    /// outline of the half a dropped tile will take.
     const CHIP: &str = "mr-drag-chip";
     const EDGE: &str = "mr-drop-edge";
+    const HALF: &str = "mr-drop-half";
 
     /// Three sessions in a window of `size`: `a` in the first tile and `b` in a second to its
     /// side, which has the focus; `c` only in the sidebar.
@@ -426,11 +536,12 @@ mod tests {
         rt.state.drag.as_ref().and_then(|drag| drag.over.clone())
     }
 
-    /// Nothing of a drag is left: none in state, no chip, no line, no watcher.
+    /// Nothing of a drag is left: none in state, no chip, no line, no outline, no watcher.
     fn nothing_left(rt: &Runtime<Ui>) {
         assert_eq!(rt.state.drag, None, "no drag in state");
         assert!(!testkit::drawn(rt, CHIP), "no chip");
         assert!(!testkit::drawn(rt, EDGE), "no line");
+        assert!(!testkit::drawn(rt, HALF), "no outline of a half");
         assert!(!testkit::drawn(rt, "mr-drag-watch"), "no watcher");
     }
 
@@ -503,7 +614,8 @@ mod tests {
 
     #[test]
     fn without_room_the_drop_swaps_the_tile_under_the_pointer() {
-        let (mut rt, a, b, c) = three((1300.0, 900.0));
+        // Too low for two tiles in a column, too: else the drop would open one there.
+        let (mut rt, a, b, c) = three((1300.0, 500.0));
         assert!(!rt.state.app.room_for_tile());
         rt.update(|ui, _| glue::focus_tile(ui, a, true));
         testkit::step(&mut rt);
@@ -864,7 +976,7 @@ mod tests {
 
     #[test]
     fn a_tile_that_needs_the_user_shows_it_is_the_drop_target() {
-        let (mut rt, a, b, c) = three((1300.0, 900.0));
+        let (mut rt, a, b, c) = three((1300.0, 500.0));
         let request = mr_agent::UserRequest {
             id: mr_agent::RequestId("r1".into()),
             kind: mr_agent::UserRequestKind::Permission {
@@ -1045,8 +1157,9 @@ mod tests {
 
     #[test]
     fn dragging_rebuilds_no_conversation_row() {
-        // With room the drag passes edges; without, it passes over tiles it would take.
-        for size in [SIZE, (1300.0, 900.0)] {
+        // With room the drag passes edges; without, and too low for two tiles in a column, it
+        // passes over tiles it would take.
+        for size in [SIZE, (1300.0, 500.0)] {
             let (mut rt, a, b, c) = three(size);
             for key in [a, b] {
                 testkit::emit_to(&mut rt, key, SessionEvent::TextDelta("A reply".into()));
@@ -1461,9 +1574,9 @@ mod tests {
         }
         let lines = sidebar::line_builds();
         let [x, _, w, _] = row_rect(&rt);
-        rt.pointer_move(x + w / 2.0, mid_y(&rt));
+        rt.pointer_move(x + w / 2.0, mid_y(&rt) + 100.0);
         testkit::step(&mut rt);
-        assert!(matches!(over(&rt), Some(DropTarget::Edge(_))));
+        assert_eq!(over(&rt), Some(DropTarget::Below(garden)));
         assert_eq!(
             sidebar::line_builds(),
             lines,
@@ -1859,9 +1972,16 @@ mod tests {
         testkit::press_with(&mut rt, Key::Command('n'), testkit::ctrl_shift());
         testkit::press_with(&mut rt, Key::PageUp, testkit::ctrl_shift());
         testkit::press_with(&mut rt, Key::PageDown, testkit::ctrl_shift());
+        let ctrl_alt = Mods {
+            alt: true,
+            ..testkit::ctrl()
+        };
+        testkit::press_with(&mut rt, Key::PageUp, ctrl_alt);
+        testkit::press_with(&mut rt, Key::PageDown, ctrl_alt);
         assert_eq!(rt.state.folder_menu, None, "no folder menu");
         assert!(rt.resolve_file_dialog(None).is_err(), "no folder picker");
         assert_eq!(tile_keys(&rt), vec![a, b, c], "nothing closed or moved");
+        assert_eq!(columns(&rt).len(), 3, "nothing stacked");
         assert_eq!(testkit::focused(&rt), Some(c), "the focus stays");
         assert_eq!(over(&rt), Some(DropTarget::Edge(1)), "the drag goes on");
         testkit::move_held(&mut rt, (to.0 + 5.0, to.1));
@@ -1915,5 +2035,654 @@ mod tests {
         let order: Vec<SessionId> = saved.tiles.iter().map(|tile| tile.id.clone()).collect();
         assert_eq!(order, ids.to_vec());
         assert_eq!(saved.shown, Some(id(&rt, a)));
+    }
+
+    // Above or below a tile: Task 5 of the stacked tiles plan.
+
+    /// Sessions in `/home/alex/a`, `/home/alex/b` and on, `count` of them, in a window of
+    /// `size`: the first in the first tile and the second in a second to its side, which has
+    /// the focus; the others only in the sidebar.
+    fn sessions_in(size: (f32, f32), count: usize) -> (Runtime<Ui>, Vec<SessionKey>) {
+        let mut rt = testkit::window_sized("empty", size);
+        let keys: Vec<SessionKey> = ["a", "b", "c", "d", "e"][..count]
+            .iter()
+            .map(|name| testkit::add_session(&mut rt, &format!("/home/alex/{name}")))
+            .collect();
+        testkit::show(&mut rt, keys[0]);
+        testkit::show_side(&mut rt, keys[1]);
+        assert_eq!(tile_keys(&rt), keys[..2]);
+        (rt, keys)
+    }
+
+    /// Shows `key`'s session in a new tile under `other`'s, as "Open below" does, then steps.
+    fn open_below(rt: &mut Runtime<Ui>, key: SessionKey, other: SessionKey) {
+        rt.update(|ui, tx| glue::show(ui, tx, key, mr_core::Place::Below(other), true));
+        testkit::step(rt);
+        assert_eq!(rt.state.app.tiles.mate(other), Some(key));
+    }
+
+    /// `key`'s tile as drawn: x, y, width, height.
+    fn tile_rect(rt: &Runtime<Ui>, key: SessionKey) -> [f32; 4] {
+        rt.presented(&tiles::tile_key(key)).expect("drawn").0
+    }
+
+    /// The point `fx` of the way across `key`'s tile and `fy` of the way down.
+    fn in_tile(rt: &Runtime<Ui>, key: SessionKey, fx: f32, fy: f32) -> (f32, f32) {
+        let [x, y, w, h] = tile_rect(rt, key);
+        (x + w * fx, y + h * fy)
+    }
+
+    /// Whether `key`'s tile shows its outline.
+    fn outlined(rt: &Runtime<Ui>, key: SessionKey) -> bool {
+        testkit::element(rt, &tile(key, "mr-tile-outline")).is_some()
+    }
+
+    #[test]
+    fn a_row_dropped_on_the_lower_half_of_a_tile_opens_under_it() {
+        let (mut rt, a, b, c) = three(SIZE);
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        let to = in_tile(&rt, a, 0.5, 0.75);
+        testkit::hold_row(&mut rt, c, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(a)));
+        assert!(!saved(&rt), "nothing written during the drag");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a, c], vec![b]]);
+        assert_eq!(testkit::focused(&rt), Some(c));
+        assert!(box_focused(&rt, c), "the new tile's box has the keyboard");
+        assert!(saved(&rt), "the state is saved");
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn a_row_dropped_on_the_upper_half_of_a_tile_opens_over_it() {
+        let (mut rt, a, b, c) = three(SIZE);
+        let to = in_tile(&rt, b, 0.5, 0.25);
+        testkit::hold_row(&mut rt, c, to);
+        assert_eq!(over(&rt), Some(DropTarget::Above(b)));
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![c, b]]);
+        assert_eq!(testkit::focused(&rt), Some(c));
+        assert!(box_focused(&rt, c));
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn near_where_two_tiles_meet_a_row_still_opens_a_column() {
+        let (mut rt, a, b, c) = three(SIZE);
+        for fy in [0.1, 0.25, 0.75, 0.9] {
+            let to = in_tile(&rt, a, 0.85, fy);
+            testkit::hold_row(&mut rt, c, to);
+            assert_eq!(over(&rt), Some(DropTarget::Edge(1)), "{fy} of the way down");
+            assert!(testkit::drawn(&rt, EDGE), "the line is drawn");
+            assert!(!testkit::drawn(&rt, HALF), "no half is outlined");
+            if fy < 0.9 {
+                testkit::press(&mut rt, Key::Escape);
+                testkit::release(&mut rt);
+                nothing_left(&rt);
+            }
+        }
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![c], vec![b]]);
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn the_half_a_tile_will_take_is_outlined() {
+        let (mut rt, a, b, c) = three(SIZE);
+        let kit = theme::kit(true);
+        assert!(outlined(&rt, b), "the focused tile is outlined");
+        let to = in_tile(&rt, a, 0.5, 0.75);
+        testkit::hold_row(&mut rt, c, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(a)));
+        let [x, y, w, h] = tile_rect(&rt, a);
+        let half = testkit::rect(&rt, HALF).expect("the half is outlined");
+        let lower = [x, y + h / 2.0, w, h / 2.0];
+        let off = half.iter().zip(lower).any(|(d, l)| (d - l).abs() > 0.5);
+        assert!(!off, "the lower half of a's tile, {lower:?}: {half:?}");
+        assert!(!testkit::drawn(&rt, EDGE), "no line");
+        assert_eq!(tiles::outline(&rt.state, b, kit), None);
+        assert!(!outlined(&rt, b), "the focused tile's outline gave way");
+        assert!(!outlined(&rt, a));
+        // Up into the upper half: the outline goes with it.
+        let to = in_tile(&rt, a, 0.5, 0.25);
+        testkit::move_held(&mut rt, to);
+        assert_eq!(over(&rt), Some(DropTarget::Above(a)));
+        let half = testkit::rect(&rt, HALF).expect("the half is outlined");
+        let upper = [x, y, w, h / 2.0];
+        let off = half.iter().zip(upper).any(|(d, l)| (d - l).abs() > 0.5);
+        assert!(!off, "the upper half of a's tile, {upper:?}: {half:?}");
+        testkit::release(&mut rt);
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn a_full_column_gives_the_edge() {
+        let (mut rt, keys) = sessions_in(SIZE, 4);
+        let [a, _, c, d] = keys[..] else {
+            unreachable!()
+        };
+        open_below(&mut rt, c, a);
+        assert!(rt.state.app.room_for_tile());
+        for key in [a, c] {
+            let to = in_tile(&rt, key, 0.5, 0.5);
+            testkit::hold_row(&mut rt, d, to);
+            assert!(
+                matches!(over(&rt), Some(DropTarget::Edge(_))),
+                "{:?}",
+                over(&rt)
+            );
+            assert!(testkit::drawn(&rt, EDGE), "the line is drawn");
+            assert!(!testkit::drawn(&rt, HALF), "no half is outlined");
+            testkit::press(&mut rt, Key::Escape);
+            testkit::release(&mut rt);
+            nothing_left(&rt);
+        }
+    }
+
+    #[test]
+    fn with_no_room_and_no_split_a_tile_is_replaced() {
+        let (mut rt, keys) = sessions_in((1300.0, 900.0), 5);
+        let [a, b, c, d, e] = keys[..] else {
+            unreachable!()
+        };
+        open_below(&mut rt, c, a);
+        open_below(&mut rt, d, b);
+        assert!(!rt.state.app.room_for_tile());
+        let to = in_tile(&rt, d, 0.5, 0.5);
+        testkit::hold_row(&mut rt, e, to);
+        assert_eq!(over(&rt), Some(DropTarget::Tile(d)));
+        assert!(!testkit::drawn(&rt, HALF), "no half is outlined");
+        assert!(!testkit::drawn(&rt, EDGE), "no line");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a, c], vec![b, e]]);
+        assert_eq!(testkit::focused(&rt), Some(e));
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn with_no_room_for_a_column_the_whole_tile_stacks() {
+        let (mut rt, a, b, c) = three((1300.0, 900.0));
+        assert!(!rt.state.app.room_for_tile());
+        let to = in_tile(&rt, a, 0.1, 0.25);
+        testkit::hold_row(&mut rt, c, to);
+        assert_eq!(over(&rt), Some(DropTarget::Above(a)));
+        assert!(testkit::drawn(&rt, HALF), "the half is outlined");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![c, a], vec![b]]);
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn a_low_window_stacks_nothing() {
+        let (mut rt, a, b, c) = three((1800.0, 500.0));
+        assert!(!mr_core::Tiles::fits_two(row_rect(&rt)[3]));
+        let to = in_tile(&rt, a, 0.5, 0.75);
+        testkit::hold_row(&mut rt, c, to);
+        assert!(
+            matches!(over(&rt), Some(DropTarget::Edge(_))),
+            "{:?}",
+            over(&rt)
+        );
+        assert!(!testkit::drawn(&rt, HALF), "no half is outlined");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt).len(), 3, "a column of its own");
+        assert!(columns(&rt).iter().all(|column| column.len() == 1));
+        assert!(tile_keys(&rt).contains(&c) && tile_keys(&rt).contains(&b));
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn a_session_in_a_tile_has_no_target_over_a_half() {
+        let (mut rt, a, b, _) = three(SIZE);
+        let to = in_tile(&rt, b, 0.5, 0.75);
+        testkit::hold_row(&mut rt, a, to);
+        assert!(rt.state.drag.is_some());
+        assert_eq!(over(&rt), None);
+        assert!(!testkit::drawn(&rt, HALF), "no half is outlined");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![b]]);
+        assert_eq!(testkit::focused(&rt), Some(a), "its tile is focused");
+        assert!(box_focused(&rt, a));
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn a_drop_on_a_tile_that_closed_meanwhile_does_nothing() {
+        let (mut rt, a, b, c) = three(SIZE);
+        let to = in_tile(&rt, a, 0.5, 0.75);
+        testkit::hold_row(&mut rt, c, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(a)));
+        rt.update(|ui, _| {
+            let effects = ui.app.close_tile(a, mr_core::Leaving::Keep);
+            glue::run(ui, effects);
+        });
+        testkit::step(&mut rt);
+        assert!(!testkit::drawn(&rt, HALF), "no half of a closed tile");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![b]], "no tile opens");
+        assert_eq!(testkit::focused(&rt), Some(b));
+        nothing_left(&rt);
+        testkit::click(&mut rt, &row_key(c));
+        testkit::step(&mut rt);
+        assert_eq!(tile_keys(&rt), vec![c], "the next click works");
+        assert_eq!(testkit::focused(&rt), Some(c));
+    }
+
+    #[test]
+    fn escape_cancels_a_drop_on_a_half() {
+        let (mut rt, a, b, c) = three(SIZE);
+        let to = in_tile(&rt, a, 0.5, 0.75);
+        testkit::hold_row(&mut rt, c, to);
+        assert!(testkit::drawn(&rt, CHIP) && testkit::drawn(&rt, HALF));
+        testkit::press(&mut rt, Key::Escape);
+        nothing_left(&rt);
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![b]], "nothing opens");
+        assert_eq!(testkit::focused(&rt), Some(b));
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn dragging_over_the_halves_rebuilds_no_conversation_row() {
+        let (mut rt, a, b, c) = three(SIZE);
+        for key in [a, b] {
+            testkit::emit_to(&mut rt, key, SessionEvent::TextDelta("A reply".into()));
+            testkit::emit_to(&mut rt, key, SessionEvent::BlockFinished);
+        }
+        rt.settle_all();
+        testkit::step(&mut rt);
+        let to = in_tile(&rt, a, 0.5, 0.25);
+        testkit::hold_row(&mut rt, c, to);
+        let rows = conversation::all_row_builds();
+        let lines = sidebar::line_builds();
+        let steps = [
+            (a, 0.75, DropTarget::Below(a)),
+            (a, 0.25, DropTarget::Above(a)),
+            (b, 0.25, DropTarget::Above(b)),
+            (b, 0.75, DropTarget::Below(b)),
+        ];
+        for (key, fy, target) in steps {
+            let to = in_tile(&rt, key, 0.5, fy);
+            testkit::move_held(&mut rt, to);
+            assert_eq!(over(&rt), Some(target));
+        }
+        assert_eq!(conversation::all_row_builds(), rows, "no conversation row");
+        assert_eq!(sidebar::line_builds(), lines, "no sidebar line");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::release(&mut rt);
+        nothing_left(&rt);
+    }
+
+    /// A request for permission to run a command in `key`'s session, as r1: it needs the user.
+    fn ask_permission(rt: &mut Runtime<Ui>, key: SessionKey) {
+        let request = mr_agent::UserRequest {
+            id: mr_agent::RequestId("r1".into()),
+            kind: mr_agent::UserRequestKind::Permission {
+                tool: "Bash".into(),
+                detail: mr_agent::ToolDetail::Command {
+                    command: "touch a.txt".into(),
+                },
+                always_allow_label: None,
+            },
+        };
+        testkit::emit_to(rt, key, SessionEvent::TurnStarted);
+        testkit::emit_to(rt, key, SessionEvent::NeedsUser(request));
+    }
+
+    #[test]
+    fn a_tile_that_needs_the_user_keeps_its_amber_while_a_half_of_it_is_the_target() {
+        let (mut rt, a, b, c) = three(SIZE);
+        ask_permission(&mut rt, b);
+        let kit = theme::kit(true);
+        let amber = sidebar::mark_color(mr_core::Mark::NeedsYou, kit);
+        assert!(amber.is_some());
+        for (fy, target) in [(0.75, DropTarget::Below(b)), (0.25, DropTarget::Above(b))] {
+            let to = in_tile(&rt, b, 0.5, fy);
+            testkit::hold_row(&mut rt, c, to);
+            assert_eq!(over(&rt), Some(target));
+            assert!(testkit::drawn(&rt, HALF), "the half is outlined");
+            assert_eq!(
+                tiles::outline(&rt.state, b, kit),
+                amber,
+                "{fy}: amber stays"
+            );
+            assert!(outlined(&rt, b), "{fy}: b's outline is drawn");
+            assert_eq!(tiles::outline(&rt.state, a, kit), None);
+            testkit::press(&mut rt, Key::Escape);
+            testkit::release(&mut rt);
+            nothing_left(&rt);
+        }
+        assert_eq!(columns(&rt), vec![vec![a], vec![b]]);
+    }
+
+    #[test]
+    fn a_half_whose_column_filled_meanwhile_is_not_outlined() {
+        // A row's drag.
+        let (mut rt, keys) = sessions_in(SIZE, 4);
+        let [a, b, c, d] = keys[..] else {
+            unreachable!()
+        };
+        let to = in_tile(&rt, a, 0.5, 0.75);
+        testkit::hold_row(&mut rt, c, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(a)));
+        assert!(testkit::drawn(&rt, HALF));
+        rt.update(|ui, tx| glue::show(ui, tx, d, mr_core::Place::Below(a), false));
+        testkit::step(&mut rt);
+        assert_eq!(
+            over(&rt),
+            Some(DropTarget::Below(a)),
+            "the pointer did not move"
+        );
+        assert!(!testkit::drawn(&rt, HALF), "no half of a full column");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a, d], vec![b]], "c opens nowhere");
+        nothing_left(&rt);
+        // A header's drag.
+        let (mut rt, a, b, c) = three_tiles();
+        let to = in_tile(&rt, c, 0.5, 0.75);
+        hold_header(&mut rt, a, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(c)));
+        assert!(testkit::drawn(&rt, HALF));
+        move_to(&mut rt, b, Spot::Below(c));
+        assert_eq!(
+            over(&rt),
+            Some(DropTarget::Below(c)),
+            "the pointer did not move"
+        );
+        assert!(!testkit::drawn(&rt, HALF), "no half of a full column");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![c, b]], "a stays");
+        nothing_left(&rt);
+    }
+
+    // A tile moved into, out of and within a column: Task 6 of the stacked tiles plan.
+
+    /// Moves `key`'s tile to `spot` as the keys do, the keyboard left where it is, then steps.
+    fn move_to(rt: &mut Runtime<Ui>, key: SessionKey, spot: Spot) {
+        rt.update(|ui, tx| glue::move_tile(ui, tx, key, spot, false));
+        testkit::step(rt);
+    }
+
+    /// `[a/b][c]` in a window of `size`: `b`'s tile under `a`'s, `c` in a column to their right,
+    /// focused, its box with the keyboard.
+    fn two_and_one(size: (f32, f32)) -> (Runtime<Ui>, SessionKey, SessionKey, SessionKey) {
+        let (mut rt, a, b, c) = three(size);
+        move_to(&mut rt, b, Spot::Below(a));
+        testkit::show_side(&mut rt, c);
+        assert_eq!(columns(&rt), vec![vec![a, b], vec![c]]);
+        assert_eq!(testkit::focused(&rt), Some(c));
+        (rt, a, b, c)
+    }
+
+    /// Whether `drawn` is `expected`, each within half a point.
+    fn near(drawn: [f32; 4], expected: [f32; 4]) -> bool {
+        drawn
+            .iter()
+            .zip(expected)
+            .all(|(d, e)| (d - e).abs() <= 0.5)
+    }
+
+    #[test]
+    fn a_header_dropped_on_the_lower_half_of_another_tile_stacks_it_there() {
+        let (mut rt, a, b, c) = three_tiles();
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        let to = in_tile(&rt, c, 0.5, 0.75);
+        hold_header(&mut rt, a, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(c)));
+        assert!(!saved(&rt), "nothing written during the drag");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![b], vec![c, a]]);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        assert!(box_focused(&rt, a), "the keyboard in a's box");
+        assert!(saved(&rt), "the state is saved");
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn a_tile_of_two_dragged_to_an_edge_gets_a_column() {
+        let (mut rt, a, b, c) = two_and_one(SIZE);
+        // Over its own tile, the nearer edge of its column.
+        let to = in_tile(&rt, b, 0.1, 0.5);
+        hold_header(&mut rt, b, to);
+        assert_eq!(over(&rt), Some(DropTarget::Edge(0)));
+        assert!(testkit::drawn(&rt, EDGE), "the line is drawn");
+        let to = right_end(&rt);
+        testkit::move_held(&mut rt, to);
+        assert_eq!(over(&rt), Some(DropTarget::Edge(2)));
+        assert!(testkit::drawn(&rt, EDGE), "the line is drawn");
+        assert!(!testkit::drawn(&rt, HALF), "no half is outlined");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![c], vec![b]]);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        assert!(box_focused(&rt, b));
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn with_no_room_a_tile_of_two_has_no_edge() {
+        for (fy, target, after) in [(0.75, false, false), (0.25, true, true)] {
+            let (mut rt, a, b, c) = two_and_one((1300.0, 900.0));
+            assert!(!rt.state.app.room_for_tile());
+            let to = in_tile(&rt, b, 0.5, 0.5);
+            hold_header(&mut rt, b, to);
+            let [x, y, w, h] = row_rect(&rt);
+            for i in 0..=16 {
+                for fy in [0.1, 0.4, 0.6, 0.9] {
+                    let to = (x + 1.0 + (w - 2.0) * i as f32 / 16.0, y + h * fy);
+                    testkit::move_held(&mut rt, to);
+                    let at = format!("at {to:?}: {:?}", over(&rt));
+                    assert!(!matches!(over(&rt), Some(DropTarget::Edge(_))), "{at}");
+                    assert!(!testkit::drawn(&rt, EDGE), "no line {at}");
+                }
+            }
+            let to = in_tile(&rt, c, 0.5, fy);
+            testkit::move_held(&mut rt, to);
+            let expected = if target {
+                DropTarget::Above(c)
+            } else {
+                DropTarget::Below(c)
+            };
+            assert_eq!(over(&rt), Some(expected));
+            assert!(testkit::drawn(&rt, HALF), "the half is outlined");
+            testkit::release(&mut rt);
+            let column = if after { vec![b, c] } else { vec![c, b] };
+            assert_eq!(columns(&rt), vec![vec![a], column]);
+            assert_eq!(testkit::focused(&rt), Some(b));
+            nothing_left(&rt);
+        }
+    }
+
+    #[test]
+    fn dropped_on_its_mate_a_tile_swaps_and_both_keep_their_heights() {
+        let (mut rt, a, b, c) = two_and_one(SIZE);
+        rt.update(|ui, tx| {
+            tx.instant();
+            ui.app.put_split(a, 0.4);
+        });
+        testkit::step(&mut rt);
+        let height = |rt: &Runtime<Ui>, key: SessionKey| tile_rect(rt, key)[3];
+        let (ah, bh) = (height(&rt, a), height(&rt, b));
+        assert!(bh > ah + 50.0, "b is higher: {ah}, {bh}");
+        let to = in_tile(&rt, a, 0.5, 0.6);
+        hold_header(&mut rt, b, to);
+        assert_eq!(over(&rt), Some(DropTarget::Above(a)));
+        let half = testkit::rect(&rt, HALF).expect("the place b takes is outlined");
+        let whole = tile_rect(&rt, a);
+        assert!(near(half, whole), "all of a's tile, {whole:?}: {half:?}");
+        assert!(!testkit::drawn(&rt, EDGE), "no line");
+        // Anywhere over the middle of its mate, the upper half too.
+        let to = in_tile(&rt, a, 0.5, 0.2);
+        testkit::move_held(&mut rt, to);
+        assert_eq!(over(&rt), Some(DropTarget::Above(a)));
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![b, a], vec![c]]);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        assert!(box_focused(&rt, b));
+        assert!((height(&rt, b) - bh).abs() < 0.5, "b keeps its height");
+        assert!((height(&rt, a) - ah).abs() < 0.5, "a keeps its height");
+        nothing_left(&rt);
+        // And back, the upper tile dropped on the lower.
+        let to = in_tile(&rt, a, 0.5, 0.5);
+        hold_header(&mut rt, b, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(a)));
+        let half = testkit::rect(&rt, HALF).expect("the place b takes is outlined");
+        assert!(near(half, tile_rect(&rt, a)), "all of a's tile: {half:?}");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a, b], vec![c]]);
+        assert!((height(&rt, b) - bh).abs() < 0.5, "b keeps its height");
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn over_its_own_tile_a_whole_tile_shows_nothing() {
+        let (mut rt, a, b, c) = three_tiles();
+        let to = in_tile(&rt, b, 0.5, 0.5);
+        hold_header(&mut rt, b, to);
+        for (fx, fy) in [
+            (0.5, 0.25),
+            (0.5, 0.75),
+            (0.1, 0.5),
+            (0.9, 0.5),
+            (0.5, 0.05),
+        ] {
+            let to = in_tile(&rt, b, fx, fy);
+            testkit::move_held(&mut rt, to);
+            assert!(rt.state.drag.is_some());
+            assert_eq!(over(&rt), None, "at {fx}, {fy}");
+            assert!(!testkit::drawn(&rt, EDGE), "no line at {fx}, {fy}");
+            assert!(!testkit::drawn(&rt, HALF), "no outline at {fx}, {fy}");
+        }
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![b], vec![c]]);
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn along_the_headers_edges_and_halves_both_show() {
+        let (mut rt, a, b, _) = three_tiles();
+        let (_, y) = testkit::find(&rt, &tile(a, "mr-tile-title")).unwrap();
+        let level = |rt: &Runtime<Ui>, fx: f32| (in_tile(rt, b, fx, 0.5).0, y);
+        // B's left quarter: the nearest edge is A's own.
+        let to = level(&rt, 0.1);
+        hold_header(&mut rt, a, to);
+        assert_eq!(over(&rt), None);
+        assert!(!testkit::drawn(&rt, EDGE) && !testkit::drawn(&rt, HALF));
+        // B's middle: its upper half.
+        let to = level(&rt, 0.5);
+        testkit::move_held(&mut rt, to);
+        assert_eq!(over(&rt), Some(DropTarget::Above(b)));
+        let [x, top, w, h] = tile_rect(&rt, b);
+        let upper = [x, top, w, h / 2.0];
+        let half = testkit::rect(&rt, HALF).expect("the half is outlined");
+        assert!(near(half, upper), "b's upper half, {upper:?}: {half:?}");
+        assert!(!testkit::drawn(&rt, EDGE), "no line");
+        // B's right quarter: the edge right of it.
+        let to = level(&rt, 0.9);
+        testkit::move_held(&mut rt, to);
+        assert_eq!(over(&rt), Some(DropTarget::Edge(2)));
+        assert!(testkit::drawn(&rt, EDGE), "the line is drawn");
+        assert!(!testkit::drawn(&rt, HALF), "no half is outlined");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::release(&mut rt);
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn a_move_into_a_column_keeps_what_is_in_the_tile() {
+        let (mut rt, a, b, c) = three_tiles();
+        for n in 1..=200 {
+            let delta = SessionEvent::TextDelta(format!("Line {n} of a"));
+            crate::demo::emit_to(&rt.state, a, delta);
+            crate::demo::emit_to(&rt.state, a, SessionEvent::BlockFinished);
+        }
+        for key in [b, c] {
+            testkit::emit_to(&mut rt, key, SessionEvent::TextDelta("A reply".into()));
+            testkit::emit_to(&mut rt, key, SessionEvent::BlockFinished);
+        }
+        testkit::step(&mut rt);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        testkit::click(&mut rt, &tile(a, "mr-input"));
+        testkit::type_text(&mut rt, "A draft");
+        testkit::step(&mut rt);
+        let scroll = format!("mr-conversation-{}", a.0);
+        let (x, y) = rt.find(&scroll).unwrap();
+        for _ in 0..5 {
+            rt.wheel(x, y, 600.0);
+            testkit::step(&mut rt);
+        }
+        assert_eq!(rt.scroll_at_bottom(&scroll), Some(false));
+        // The first line of a's on screen, and how far below its tile's top it is.
+        let first = |rt: &Runtime<Ui>| {
+            let [_, top, _, _] = tile_rect(rt, a);
+            rt.elements()
+                .into_iter()
+                .filter(|e| !e.exiting && e.visible[2] > 0.0 && e.visible[3] > 0.0)
+                .filter(|e| e.path.contains(&format!("/{scroll}/")))
+                .filter(|e| e.text.as_deref().is_some_and(|t| t.ends_with(" of a")))
+                .min_by(|p, q| p.rect[1].total_cmp(&q.rect[1]))
+                .map(|e| (e.text.unwrap(), e.rect[1] - top))
+                .expect("a line of a's on screen")
+        };
+        let before = first(&rt);
+        assert_ne!(before.0, "Line 200 of a", "scrolled up");
+        let rows = conversation::all_row_builds();
+        let to = in_tile(&rt, c, 0.5, 0.75);
+        hold_header(&mut rt, a, to);
+        testkit::release(&mut rt);
+        testkit::step(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![b], vec![c, a]]);
+        assert_eq!(conversation::all_row_builds(), rows, "no conversation row");
+        assert_eq!(rt.scroll_at_bottom(&scroll), Some(false));
+        let after = first(&rt);
+        assert_eq!(after.0, before.0, "the same line first");
+        assert!(
+            (after.1 - before.1).abs() < 0.5,
+            "{before:?}, then {after:?}"
+        );
+        assert_eq!(glue::view_of(&rt.state, a).draft.text, "A draft");
+        assert!(box_focused(&rt, a), "the keyboard in a's box");
+        testkit::type_text(&mut rt, "!");
+        assert_eq!(glue::view_of(&rt.state, a).draft.text, "A draft!");
+        assert_eq!(glue::view_of(&rt.state, c).draft.text, "");
+    }
+
+    #[test]
+    fn a_tile_whose_target_closed_during_the_drag_is_not_moved() {
+        let (mut rt, a, b, c) = three_tiles();
+        let to = in_tile(&rt, c, 0.5, 0.75);
+        hold_header(&mut rt, a, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(c)));
+        rt.update(|ui, _| {
+            let effects = ui.app.close_tile(c, mr_core::Leaving::Keep);
+            glue::run(ui, effects);
+        });
+        testkit::step(&mut rt);
+        assert!(rt.state.drag.is_some(), "a's drag goes on");
+        assert!(!testkit::drawn(&rt, HALF), "no half of a closed tile");
+        testkit::release(&mut rt);
+        assert_eq!(columns(&rt), vec![vec![a], vec![b]], "nothing moves");
+        assert_eq!(testkit::focused(&rt), Some(b));
+        nothing_left(&rt);
+    }
+
+    #[test]
+    fn escape_cancels_a_move_onto_a_half() {
+        let (mut rt, a, b, c) = three_tiles();
+        let to = in_tile(&rt, b, 0.5, 0.75);
+        hold_header(&mut rt, a, to);
+        assert_eq!(over(&rt), Some(DropTarget::Below(b)));
+        assert!(testkit::drawn(&rt, CHIP) && testkit::drawn(&rt, HALF));
+        testkit::press(&mut rt, Key::Escape);
+        nothing_left(&rt);
+        testkit::release(&mut rt);
+        assert_eq!(
+            columns(&rt),
+            vec![vec![a], vec![b], vec![c]],
+            "nothing moves"
+        );
+        assert_eq!(testkit::focused(&rt), Some(c));
+        assert!(box_focused(&rt, c), "the keyboard stays where it was");
+        nothing_left(&rt);
     }
 }

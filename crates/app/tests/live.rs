@@ -621,7 +621,7 @@ impl Live {
 
     /// The sessions in the tiles, left to right.
     fn tile_keys(&self) -> Vec<SessionKey> {
-        self.app.tiles.list().iter().map(|tile| tile.key).collect()
+        self.app.tiles.keys()
     }
 
     /// The test's sessions in this run: its own, and the one to the side once there is one.

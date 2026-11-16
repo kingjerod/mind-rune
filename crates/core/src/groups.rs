@@ -621,7 +621,7 @@ mod tests {
 
     use super::*;
     use crate::session::{Phase, Session};
-    use crate::tiles::Place;
+    use crate::tiles::{Place, RowSize};
 
     const NOW: i64 = 1_800_000_000;
     const DAY: i64 = 86_400;
@@ -656,7 +656,7 @@ mod tests {
     fn tiles(keys: &[SessionKey]) -> Tiles {
         let mut tiles = Tiles::default();
         for &key in keys {
-            tiles.put(key, Place::Side, None);
+            tiles.put(key, Place::Side, RowSize::default());
         }
         tiles
     }

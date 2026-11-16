@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::backend::FromBackend;
 use crate::conversation::NoticeKind;
 use crate::groups::{GroupId, Groups, Recency, SidebarModel, sidebar_model};
-use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedTile, remember_folder};
+use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile, remember_folder};
 use crate::session::{HistoryState, Phase, Session};
 use crate::sessions::{Entry, Prompt, SessionKey, Sessions};
-use crate::tiles::{Place, Put, Tile, Tiles};
+use crate::tiles::{Column, Place, Put, RowSize, Spot, Tiles, Under};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -165,8 +165,8 @@ pub struct App {
     usage_asked_unix: Option<i64>,
     /// What `sidebar` was built from; `None` before the first [`App::settle`].
     settled: Option<Settled>,
-    /// The width of the tile row as the window last laid it out; `None` until it has.
-    row_width: Option<f32>,
+    /// The size of the tile row as the window last laid it out; each `None` until it has.
+    row: RowSize,
     /// The tiles open when the last run ended, as read, while they may still be opened again:
     /// until a listing knows them all or is complete, or anything is put in a tile.
     restore: Option<Waiting>,
@@ -195,6 +195,7 @@ impl Waiting {
             ([], Some(id)) => vec![SavedTile {
                 id: id.clone(),
                 share: 1.0,
+                below: None,
             }],
             _ => self.tiles.clone(),
         }
@@ -257,7 +258,7 @@ impl App {
             looked: false,
             usage_asked_unix: None,
             settled: None,
-            row_width: None,
+            row: RowSize::default(),
             restore,
             restored: None,
             closed_by_app: saved.closed_by_app,
@@ -277,16 +278,31 @@ impl App {
 
     /// The width of the tile row, as the window last laid it out.
     pub fn set_row_width(&mut self, width: f32) {
-        self.row_width = Some(width);
+        self.row.width = Some(width);
     }
 
     pub fn row_width(&self) -> Option<f32> {
-        self.row_width
+        self.row.width
+    }
+
+    /// The row's height, as the window last laid it out.
+    pub fn set_row_height(&mut self, height: f32) {
+        self.row.height = Some(height);
+    }
+
+    pub fn row_height(&self) -> Option<f32> {
+        self.row.height
+    }
+
+    /// What is known of the row's size.
+    pub fn row_size(&self) -> RowSize {
+        self.row
     }
 
     /// A tile more would fit. True while the row's width is not known.
     pub fn room_for_tile(&self) -> bool {
-        self.row_width
+        self.row
+            .width
             .is_none_or(|width| self.tiles.fits_another(width))
     }
 
@@ -303,7 +319,7 @@ impl App {
         self.account = Some(account);
         let mut effects = Vec::new();
         if signed_in
-            && self.tiles.list().is_empty()
+            && self.tiles.is_empty()
             && let Some(folder) = self.launch.folder.clone()
         {
             // There is no tile yet, so nothing leaves one.
@@ -539,40 +555,58 @@ impl App {
     }
 
     /// Opens the tiles that were open when the last run ended, when there is no tile, without
-    /// starting a program: once every one's session is known, or once the complete listing has
-    /// come, the known ones in their order with their shares. Each is marked as [`App::show`]
-    /// marks a session. The focus goes to the one focused then when it is among them, else to
-    /// the first. Once it ran, or once anything is in a tile, it is not tried again.
+    /// starting a program: once every one's session is known, the lower tiles' too, or once the
+    /// complete listing has come, the known ones in their columns with their shares and splits;
+    /// a column of two with one session not known shows the other alone. Each is marked as
+    /// [`App::show`] marks a session. The focus goes to the one focused then when it is among
+    /// them, else to the first column's upper tile. Once it ran, or once anything is in a tile,
+    /// it is not tried again.
     fn restore_tiles(&mut self, complete: bool) -> Vec<Effect> {
         let Some(waiting) = self.restore.take() else {
             return Vec::new();
         };
-        if !self.tiles.list().is_empty() {
+        if !self.tiles.is_empty() {
             return Vec::new();
         }
         let saved = waiting.row();
-        let known: Vec<Tile> = saved
-            .iter()
-            .filter_map(|tile| {
-                let key = self.sessions.by_id(&tile.id)?;
-                Some(Tile {
-                    key,
-                    share: tile.share,
-                })
-            })
-            .collect();
-        if known.len() < saved.len() && !complete {
+        let mut ids = saved.iter().flat_map(|tile| {
+            std::iter::once(&tile.id).chain(tile.below.as_ref().map(|below| &below.id))
+        });
+        if !complete && ids.any(|id| self.sessions.by_id(id).is_none()) {
             self.restore = Some(waiting);
             return Vec::new();
         }
+        let known: Vec<Column> = saved
+            .iter()
+            .filter_map(|tile| {
+                let under = tile.below.as_ref().and_then(|below| {
+                    Some(Under {
+                        key: self.sessions.by_id(&below.id)?,
+                        split: below.split,
+                    })
+                });
+                // Of two, one not known leaves the other alone.
+                let (top, under) = match (self.sessions.by_id(&tile.id), under) {
+                    (Some(top), under) => (top, under),
+                    (None, Some(under)) => (under.key, None),
+                    (None, None) => return None,
+                };
+                Some(Column {
+                    share: tile.share,
+                    top,
+                    under,
+                })
+            })
+            .collect();
         if known.is_empty() {
             return Vec::new();
         }
         let focused = waiting.shown.and_then(|id| self.sessions.by_id(&id));
         self.tiles.restore(known, focused);
         self.restored = self.focused();
-        let keys: Vec<SessionKey> = self.tiles.list().iter().map(|tile| tile.key).collect();
-        keys.into_iter()
+        self.tiles
+            .keys()
+            .into_iter()
             .filter_map(|key| self.mark_shown(key))
             .collect()
     }
@@ -664,13 +698,14 @@ impl App {
     /// its tile focused. The session counts as seen and is offered the models known, and a
     /// stored history not read yet is asked for. The session taken out of its tile, if any, is
     /// closed and forgotten when it is empty, unless `leaving` says to keep it. Asks to save
-    /// when a tile opened beside the focused one or at a place. A session shown in the focused
-    /// tile, the first tile included, is saved with the next change that asks.
+    /// when a tile opened beside the focused one, at a place, or over or under a tile. A session
+    /// shown in the focused tile, the first tile included, is saved with the next change that
+    /// asks.
     pub fn show(&mut self, key: SessionKey, place: Place, leaving: Leaving) -> Vec<Effect> {
         if self.focused() == Some(key) || self.sessions.get(key).is_none() {
             return Vec::new();
         }
-        let put = self.tiles.put(key, place, self.row_width);
+        let put = self.tiles.put(key, place, self.row_size());
         if put == Put::Nothing {
             return Vec::new();
         }
@@ -695,8 +730,9 @@ impl App {
         Vec::new()
     }
 
-    /// Takes `key`'s tile out of the row; its session leaves as `leaving` says. The focus goes
-    /// to the tile on its right, else on its left. Asks to save.
+    /// Takes `key`'s tile out of the row; its session leaves as `leaving` says. When that tile
+    /// had the focus, the focus goes to the other tile of its column when it has two; else to
+    /// the upper tile of the column on its right, else of the one on its left. Asks to save.
     pub fn close_tile(&mut self, key: SessionKey, leaving: Leaving) -> Vec<Effect> {
         if !self.remove_tile(key) {
             return Vec::new();
@@ -709,10 +745,10 @@ impl App {
         effects
     }
 
-    /// Moves `key`'s tile to `edge` (see `Tiles::move_to`); the tile takes the focus and its
-    /// session counts as seen. Asks to save. Nothing, and no effect, when nothing moved.
-    pub fn move_tile(&mut self, key: SessionKey, edge: usize) -> Vec<Effect> {
-        if !self.tiles.move_to(key, edge) {
+    /// Moves `key`'s tile to `spot` (see `Tiles::move_to`); it takes the focus and its session
+    /// counts as seen. Asks to save. Nothing, and no effect, when nothing moved.
+    pub fn move_tile(&mut self, key: SessionKey, spot: Spot) -> Vec<Effect> {
+        if !self.tiles.move_to(key, spot, self.row_size()) {
             return Vec::new();
         }
         if let Some(mut entry) = self.sessions.get_mut(key) {
@@ -721,28 +757,68 @@ impl App {
         vec![self.save_state()]
     }
 
-    /// Makes `left`'s tile `width` points wide against the tile on its right (see
+    /// Makes `left`'s column `width` points wide against the column on its right (see
     /// `Tiles::resize`). Nothing happens while the row's width is not known.
     /// Asks for no save: the view asks once, when the drag ends.
     pub fn resize_tile(&mut self, left: SessionKey, width: f32) {
-        if let Some(row_width) = self.row_width {
+        if let Some(row_width) = self.row.width {
             self.tiles.resize(left, width, row_width);
         }
     }
 
-    /// Gives `left`'s tile and the one on its right `shares`, as [`App::tile_pair`] read them
+    /// Gives `left`'s column and the one on its right `shares`, as [`App::tile_pair`] read them
     /// before a drag of the divider between them: a cancelled drag puts them back exactly,
     /// whatever the least width. Asks for no save.
     pub fn put_tile_pair(&mut self, left: SessionKey, shares: [f32; 2]) {
         self.tiles.set_pair(left, shares);
     }
 
-    /// The shares of `left`'s tile and of the one on its right; none for the last tile.
+    /// The shares of `left`'s column and of the one on its right; none for the last column.
     pub fn tile_pair(&self, left: SessionKey) -> Option<[f32; 2]> {
-        let list = self.tiles.list();
-        let index = self.tiles.index_of(left)?;
-        let right = list.get(index + 1)?;
-        Some([list[index].share, right.share])
+        let columns = self.tiles.columns();
+        let (index, _) = self.tiles.find(left)?;
+        let right = columns.get(index + 1)?;
+        Some([columns[index].share, right.share])
+    }
+
+    /// Whether a session that is in no tile could be shown at `spot` now (`Tiles::takes`).
+    pub fn can_put(&self, spot: Spot) -> bool {
+        self.tiles.takes(spot, self.row)
+    }
+
+    /// Whether `key`'s tile could be moved to `spot` now (`Tiles::would_move`).
+    pub fn can_move_tile(&self, key: SessionKey, spot: Spot) -> bool {
+        self.tiles.would_move(key, spot, self.row)
+    }
+
+    /// Makes `top`'s tile `height` points high against the tile under it (see
+    /// `Tiles::resize_split`). Nothing happens while the row's height is not known. Asks for no
+    /// save: the view asks once, when the drag ends.
+    pub fn resize_split(&mut self, top: SessionKey, height: f32) {
+        if let Some(row_height) = self.row.height {
+            self.tiles.resize_split(top, height, row_height);
+        }
+    }
+
+    /// Puts a split back as `tile_split` read it: a cancelled drag puts it back exactly,
+    /// whatever the least height. Asks for no save.
+    pub fn put_split(&mut self, top: SessionKey, split: f32) {
+        self.tiles.set_split(top, split);
+    }
+
+    /// The upper tile's part of its column's height, when `top` is the upper of two.
+    pub fn tile_split(&self, top: SessionKey) -> Option<f32> {
+        self.tiles.split(top)
+    }
+
+    /// Gives the two tiles of `top`'s column the same height; asks for a save when that
+    /// changed anything.
+    pub fn even_split(&mut self, top: SessionKey) -> Vec<Effect> {
+        if self.tiles.set_split(top, 0.5) {
+            vec![self.save_state()]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Every tile gets the same width; asks for a save when that changed anything.
@@ -792,8 +868,9 @@ impl App {
     /// are the window's: they are left at their defaults.
     ///
     /// Once the complete listing has been merged, a placement whose session the app does not
-    /// know is left out. Every tile whose session the store has is kept, in order, and the
-    /// focused session by its id, or the first kept tile's when the focused one is not kept;
+    /// know is left out. Every tile whose session the store has is kept, column by column, one
+    /// of two whose mate is not kept as a column of one; and the focused session by its id, or
+    /// the first kept column's upper tile when the focused one is not kept;
     /// while the last run's tiles may still open again, they are kept as they were read. Of
     /// the sessions the last run closed, only those it closed recently enough that a change it
     /// made could still look new to the activity check are kept ([`App::close`] adds this
@@ -811,12 +888,25 @@ impl App {
                 };
                 let tiles: Vec<SavedTile> = self
                     .tiles
-                    .list()
+                    .columns()
                     .iter()
-                    .filter_map(|tile| {
+                    .filter_map(|column| {
+                        let below = column.under.and_then(|under| {
+                            Some(SavedBelow {
+                                id: stored(under.key)?,
+                                split: under.split,
+                            })
+                        });
+                        // Of two, one the store does not have leaves the other alone.
+                        let (id, below) = match (stored(column.top), below) {
+                            (Some(id), below) => (id, below),
+                            (None, Some(below)) => (below.id, None),
+                            (None, None) => return None,
+                        };
                         Some(SavedTile {
-                            id: stored(tile.key)?,
-                            share: tile.share,
+                            id,
+                            share: column.share,
+                            below,
                         })
                     })
                     .collect();
@@ -1094,9 +1184,8 @@ impl App {
     pub fn settle(&mut self) {
         let gone: Vec<SessionKey> = self
             .tiles
-            .list()
-            .iter()
-            .map(|tile| tile.key)
+            .keys()
+            .into_iter()
             .filter(|key| self.sessions.get(*key).is_none())
             .collect();
         for key in gone {
@@ -1438,7 +1527,7 @@ mod tests {
     use super::*;
     use crate::conversation::ItemBody;
     use crate::groups::Group;
-    use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, SavedTile};
+    use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, SavedBelow, SavedTile};
     use crate::session::testing::info;
     use crate::sessions::Mark;
 
@@ -2390,7 +2479,7 @@ mod tests {
 
     /// The sessions in the tiles, left to right.
     fn tile_keys(app: &App) -> Vec<SessionKey> {
-        app.tiles.list().iter().map(|tile| tile.key).collect()
+        app.tiles.keys()
     }
 
     /// The sidebar's row of `key`'s session.
@@ -2656,7 +2745,7 @@ mod tests {
     #[test]
     fn moving_a_tile_focuses_it_and_asks_for_a_save() {
         let (mut app, a, b) = two_tiles();
-        let effects = app.move_tile(b, 0);
+        let effects = app.move_tile(b, Spot::Edge(0));
         assert_eq!(effects, vec![save(&app)]);
         assert_eq!((tile_keys(&app), app.focused()), (vec![b, a], Some(b)));
     }
@@ -2665,9 +2754,13 @@ mod tests {
     fn a_move_of_nothing_asks_for_nothing() {
         let (mut app, a, b) = two_tiles();
         for edge in [0, 1] {
-            assert_eq!(app.move_tile(a, edge), vec![], "edge {edge}");
+            assert_eq!(app.move_tile(a, Spot::Edge(edge)), vec![], "edge {edge}");
         }
-        assert_eq!(app.move_tile(SessionKey(99), 0), vec![], "no tile");
+        assert_eq!(
+            app.move_tile(SessionKey(99), Spot::Edge(0)),
+            vec![],
+            "no tile"
+        );
         assert_eq!((tile_keys(&app), app.focused()), (vec![a, b], Some(a)));
     }
 
@@ -2676,7 +2769,7 @@ mod tests {
         let (mut app, _, b) = two_tiles();
         app.event(open_of(&app, b), done(), 0.0);
         assert_eq!(mark(&app, b), Mark::Finished);
-        app.move_tile(b, 0);
+        app.move_tile(b, Spot::Edge(0));
         assert_ne!(mark(&app, b), Mark::Finished);
     }
 
@@ -2692,13 +2785,209 @@ mod tests {
         assert!(app.tiles.resize(a1, 1500.0, 3000.0));
         assert!(app.tiles.resize(a2, 750.0, 3000.0));
         assert_near(&shares(&app), &[1.5, 0.75, 0.75]);
-        app.move_tile(a1, 3);
+        app.move_tile(a1, Spot::Edge(3));
         let saved = app.saved();
         assert_eq!(
             saved.tiles,
             vec![tile("a2", 0.75), tile("b1", 0.75), tile("a1", 1.5)]
         );
         assert_eq!(saved.shown, Some(id("a1")));
+    }
+
+    /// The tiles column by column, each column's upper tile first.
+    fn tile_columns(app: &App) -> Vec<Vec<SessionKey>> {
+        app.tiles
+            .columns()
+            .iter()
+            .map(|column| {
+                std::iter::once(column.top)
+                    .chain(column.under.map(|under| under.key))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `[a/c][b]`, `c` focused, from [`two_tiles`]: `c` is the stored `s9`.
+    fn stacked_tiles() -> (App, SessionKey, SessionKey, SessionKey) {
+        let (mut app, a, b) = two_tiles();
+        let c = app.sessions.add(stored("s9"), NOW - 60);
+        app.show(c, Place::Below(a), Leaving::ForgetIfEmpty);
+        (app, a, b, c)
+    }
+
+    #[test]
+    fn a_session_opens_under_the_focused_tile() {
+        let (mut app, a, b) = two_tiles();
+        app.set_row_height(900.0);
+        assert_eq!(app.row_height(), Some(900.0));
+        let c = app.sessions.add(stored("s9"), NOW - 60);
+        let effects = app.show(c, Place::Below(a), Leaving::ForgetIfEmpty);
+        assert_eq!(effects, vec![reads_s9(c), save(&app)]);
+        assert_eq!(
+            (tile_columns(&app), app.focused()),
+            (vec![vec![a, c], vec![b]], Some(c))
+        );
+    }
+
+    #[test]
+    fn no_tile_opens_under_a_tile_of_a_low_row() {
+        let (mut app, a, b) = two_tiles();
+        let version = app.tiles.version();
+        app.set_row_height(500.0);
+        assert_eq!(app.tiles.version(), version, "the tiles stay as they are");
+        assert_eq!(
+            app.row_size(),
+            RowSize {
+                width: None,
+                height: Some(500.0)
+            }
+        );
+        let c = app.sessions.add(stored("s9"), NOW - 60);
+        assert!(!app.can_put(Spot::Below(a)));
+        for place in [Place::Below(a), Place::Above(a)] {
+            assert_eq!(
+                app.show(c, place, Leaving::ForgetIfEmpty),
+                vec![],
+                "{place:?}"
+            );
+            assert_eq!(app.tiles.version(), version, "{place:?}");
+        }
+        assert_eq!(
+            (tile_columns(&app), app.focused()),
+            (vec![vec![a], vec![b]], Some(a))
+        );
+        assert!(!app.sessions.get(c).unwrap().touched, "it was not shown");
+    }
+
+    #[test]
+    fn can_put_and_can_move_say_what_show_and_move_do() {
+        // A row with room for neither a column nor a split, then one with room for both.
+        let sizes = [(1000.0, 500.0), (1300.0, 900.0)];
+        let spots = |a, b, c| {
+            [
+                Spot::Edge(0),
+                Spot::Edge(1),
+                Spot::Edge(2),
+                Spot::Edge(5),
+                Spot::Above(a),
+                Spot::Below(a),
+                Spot::Above(b),
+                Spot::Below(b),
+                Spot::Above(c),
+                Spot::Below(c),
+                Spot::Below(SessionKey(99)),
+            ]
+        };
+        let setup = |(width, height)| {
+            let (mut app, a, b, c) = stacked_tiles();
+            app.set_row_width(width);
+            app.set_row_height(height);
+            (app, a, b, c)
+        };
+        // How many could not and could, of the puts and of the moves.
+        let (mut puts, mut moves) = ([0; 2], [0; 2]);
+        for size in sizes {
+            let (_, a, b, c) = setup(size);
+            for spot in spots(a, b, c) {
+                let (mut app, ..) = setup(size);
+                let can = app.can_put(spot);
+                let place = match spot {
+                    Spot::Edge(edge) => Place::At(edge),
+                    Spot::Above(key) => Place::Above(key),
+                    Spot::Below(key) => Place::Below(key),
+                };
+                let d = app.sessions.add(stored("s8"), NOW - 60);
+                app.show(d, place, Leaving::ForgetIfEmpty);
+                assert_eq!(can, app.tiles.contains(d), "{size:?} {spot:?}");
+                puts[usize::from(can)] += 1;
+                for key in [a, b, c] {
+                    let (mut app, ..) = setup(size);
+                    let can = app.can_move_tile(key, spot);
+                    let before = app.tiles.clone();
+                    let effects = app.move_tile(key, spot);
+                    assert_eq!(can, !effects.is_empty(), "{size:?} {key:?} {spot:?}");
+                    assert_eq!(can, app.tiles != before, "{size:?} {key:?} {spot:?}");
+                    moves[usize::from(can)] += 1;
+                }
+            }
+        }
+        assert!(
+            puts.iter().chain(&moves).all(|&n| n > 0),
+            "{puts:?} {moves:?}"
+        );
+    }
+
+    #[test]
+    fn moving_a_tile_into_a_column_asks_for_a_save() {
+        let (mut app, a, b) = two_tiles();
+        let effects = app.move_tile(b, Spot::Below(a));
+        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(
+            (tile_columns(&app), app.focused()),
+            (vec![vec![a, b]], Some(b))
+        );
+        let effects = app.move_tile(b, Spot::Edge(1));
+        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(
+            (tile_columns(&app), app.focused()),
+            (vec![vec![a], vec![b]], Some(b))
+        );
+    }
+
+    #[test]
+    fn a_tile_moved_into_a_column_counts_as_seen() {
+        let (mut app, a, b) = two_tiles();
+        app.event(open_of(&app, b), done(), 0.0);
+        assert_eq!(mark(&app, b), Mark::Finished);
+        app.move_tile(b, Spot::Above(a));
+        assert_eq!(tile_columns(&app), vec![vec![b, a]]);
+        assert_ne!(mark(&app, b), Mark::Finished);
+    }
+
+    #[test]
+    fn closing_the_focused_lower_tile_focuses_the_upper() {
+        let (mut app, a, b, c) = stacked_tiles();
+        app.event(open_of(&app, a), done(), 0.0);
+        assert_eq!(mark(&app, a), Mark::Finished, "c has the focus");
+        let effects = app.close_tile(c, Leaving::Keep);
+        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(
+            (tile_columns(&app), app.focused()),
+            (vec![vec![a], vec![b]], Some(a))
+        );
+        assert_ne!(mark(&app, a), Mark::Finished, "it counts as seen");
+    }
+
+    #[test]
+    fn the_split_is_resized_without_a_save_and_evened_with_one() {
+        let (mut app, a, _, c) = stacked_tiles();
+        assert_eq!(app.tile_split(a), Some(0.5));
+        app.resize_split(a, 300.0);
+        assert_eq!(
+            app.tile_split(a),
+            Some(0.5),
+            "the row's height is not known"
+        );
+        app.set_row_height(900.0);
+        app.resize_split(a, 300.0);
+        assert_near(&[app.tile_split(a).unwrap()], &[1.0 / 3.0]);
+        app.resize_split(a, 100.0);
+        assert_near(&[app.tile_split(a).unwrap()], &[280.0 / 900.0]);
+        app.put_split(a, 0.25);
+        assert_eq!(app.tile_split(a), Some(0.25));
+        assert_eq!(app.tile_split(c), None, "the lower tile has no split");
+        let effects = app.even_split(a);
+        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(app.tile_split(a), Some(0.5));
+    }
+
+    #[test]
+    fn evening_an_even_split_asks_for_nothing() {
+        let (mut app, a, b, c) = stacked_tiles();
+        for key in [a, b, c, SessionKey(99)] {
+            assert_eq!(app.even_split(key), vec![], "{key:?}");
+        }
+        assert_eq!(app.tile_split(a), Some(0.5));
     }
 
     #[test]
@@ -4008,6 +4297,7 @@ mod tests {
         SavedTile {
             id: id(text),
             share,
+            below: None,
         }
     }
 
@@ -4023,7 +4313,11 @@ mod tests {
     }
 
     fn shares(app: &App) -> Vec<f32> {
-        app.tiles.list().iter().map(|tile| tile.share).collect()
+        app.tiles
+            .columns()
+            .iter()
+            .map(|column| column.share)
+            .collect()
     }
 
     fn assert_near(found: &[f32], expected: &[f32]) {
@@ -4287,6 +4581,158 @@ mod tests {
             read,
             "the recent listing does not know them all"
         );
+    }
+
+    /// A saved column of `top` over `below`, the upper tile `split` of its height.
+    fn column(top: &str, share: f32, below: &str, split: f32) -> SavedTile {
+        SavedTile {
+            below: Some(SavedBelow {
+                id: id(below),
+                split,
+            }),
+            ..tile(top, share)
+        }
+    }
+
+    /// `[a1/a2][b1]` of [`three_stored`], listed in full, the upper tile a quarter of its
+    /// column, `a2` focused.
+    fn stacked_stored() -> App {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let [a1, a2, b1] = ["a1", "a2", "b1"].map(|text| by_id(&app, text));
+        app.show(a1, Place::Focused, Leaving::ForgetIfEmpty);
+        app.show(b1, Place::Side, Leaving::ForgetIfEmpty);
+        app.show(a2, Place::Below(a1), Leaving::ForgetIfEmpty);
+        app.put_split(a1, 0.25);
+        app
+    }
+
+    #[test]
+    fn a_column_of_two_is_saved_with_its_split() {
+        let app = stacked_stored();
+        let saved = app.saved();
+        assert_eq!(
+            (saved.tiles, saved.shown),
+            (
+                vec![column("a1", 1.0, "a2", 0.25), tile("b1", 1.0)],
+                Some(id("a2"))
+            )
+        );
+    }
+
+    #[test]
+    fn a_column_whose_upper_session_is_not_stored_saves_the_lower_alone() {
+        let (mut app, a1) = shows_stored();
+        app.new_session(
+            "/home/alex/notes".into(),
+            Place::Above(a1),
+            Leaving::ForgetIfEmpty,
+        );
+        let new = app.focused().unwrap();
+        assert_eq!(tile_columns(&app), vec![vec![new, a1]]);
+        let saved = app.saved();
+        assert_eq!(
+            (saved.tiles, saved.shown),
+            (vec![tile("a1", 1.0)], Some(id("a1")))
+        );
+    }
+
+    #[test]
+    fn a_column_whose_lower_session_is_not_stored_saves_the_upper_alone() {
+        let (mut app, a1) = shows_stored();
+        app.new_session(
+            "/home/alex/notes".into(),
+            Place::Below(a1),
+            Leaving::ForgetIfEmpty,
+        );
+        let new = app.focused().unwrap();
+        assert_eq!(tile_columns(&app), vec![vec![a1, new]]);
+        let saved = app.saved();
+        assert_eq!(
+            (saved.tiles, saved.shown),
+            (vec![tile("a1", 1.0)], Some(id("a1")))
+        );
+    }
+
+    #[test]
+    fn a_saved_column_of_two_comes_back() {
+        let app = stacked_stored();
+        let saved = app.saved();
+        let json = serde_json::to_string(&saved).unwrap();
+        let read: Saved = serde_json::from_str(&json).unwrap();
+        let mut again = restored(read.checked());
+        let effects = listing(&mut again, None, three_stored());
+        let [a1, a2, b1] = ["a1", "a2", "b1"].map(|text| by_id(&again, text));
+        assert_eq!(tile_columns(&again), vec![vec![a1, a2], vec![b1]]);
+        assert_eq!(again.tile_split(a1), Some(0.25));
+        assert_eq!(again.focused(), Some(a2));
+        assert_eq!(
+            effects,
+            vec![reads(a1, "a1"), reads(a2, "a2"), reads(b1, "b1")],
+            "no Open"
+        );
+        assert!(
+            [a1, a2, b1]
+                .iter()
+                .all(|&key| session(&again, key).phase == Phase::Resting)
+        );
+        assert_eq!(again.saved(), saved);
+    }
+
+    #[test]
+    fn a_saved_column_with_one_session_gone_comes_back_as_one_tile() {
+        let saved = with_tiles(
+            vec![
+                column("gone", 2.0, "a2", 0.3),
+                column("b1", 1.0, "lost", 0.3),
+            ],
+            "gone",
+        );
+        let mut app = restored(saved);
+        list_both(&mut app, three_stored());
+        let (a2, b1) = (by_id(&app, "a2"), by_id(&app, "b1"));
+        assert_eq!(
+            (tile_columns(&app), app.focused()),
+            (vec![vec![a2], vec![b1]], Some(a2))
+        );
+        assert_near(&shares(&app), &[4.0 / 3.0, 2.0 / 3.0]);
+        let saved = app.saved();
+        assert_eq!(
+            (saved.tiles, saved.shown),
+            (
+                vec![tile("a2", 4.0 / 3.0), tile("b1", 2.0 / 3.0)],
+                Some(id("a2"))
+            )
+        );
+    }
+
+    #[test]
+    fn restoring_waits_for_a_lower_tiles_session() {
+        let saved = with_tiles(vec![column("a1", 1.0, "old", 0.4)], "old");
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 60);
+        let old = store("old", "Old work", "/home/alex/notes", NOW - 90 * DAY);
+
+        let mut app = restored(saved.clone());
+        let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1.clone()]);
+        assert_eq!(effects, vec![Effect::ListSessions { since_unix: None }]);
+        assert_eq!(
+            (tile_keys(&app), app.focused()),
+            (vec![], None),
+            "the old one may still come"
+        );
+        assert_eq!(app.saved().tiles, saved.tiles, "kept as it was read");
+        listing(&mut app, None, vec![a1.clone(), old.clone()]);
+        let (a1_key, old_key) = (by_id(&app, "a1"), by_id(&app, "old"));
+        assert_eq!(
+            (tile_columns(&app), app.focused()),
+            (vec![vec![a1_key, old_key]], Some(old_key))
+        );
+        assert_eq!(app.tile_split(a1_key), Some(0.4));
+
+        let mut app = restored(saved);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1, old]);
+        let both = vec![vec![by_id(&app, "a1"), by_id(&app, "old")]];
+        assert_eq!(tile_columns(&app), both, "every one is known: no wait");
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 use std::borrow::Cow;
 
-use mr_core::{Effect, GroupId, Line, Mark, Place, Row, Section, SessionKey, SidebarModel};
+use mr_core::{Effect, GroupId, Line, Mark, Place, Row, Section, SessionKey, SidebarModel, Spot};
 use rune::{
     Anim, Color, Cx, El, GrowthSpec, Key, KeyEvent, PointerPress, Spring, TextEdit, TextStyle,
     Transition, Tx, col, el, icon, memo, row, text, text_input,
@@ -679,7 +679,9 @@ pub fn menu(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, layer: &mut Vec<El>) {
 /// A row's menu: "Move to group", whose submenu lists every group but the row's own, in the
 /// sidebar's order and the hidden ones after them, then "New group…"; "Open to the side",
 /// which cannot be chosen while there is no room for a tile or the session is in one already;
-/// and "Rename", which edits the session's name in its row.
+/// "Open below", which opens it under the focused tile and cannot be chosen while the session
+/// is in a tile, no tile is focused or the focused tile's column could not take another; and
+/// "Rename", which edits the session's name in its row.
 fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu> {
     let entry = ui.app.sessions.get(key)?;
     let own = ui.app.groups.group_of(entry);
@@ -730,11 +732,20 @@ fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu
             chosen(ui);
             glue::show(ui, tx, key, Place::Side, true);
         });
+    let under = |focused: SessionKey| ui.app.can_put(Spot::Below(focused));
+    let below = MenuItem::new("Open below")
+        .disabled(ui.app.tiles.contains(key) || !ui.app.focused().is_some_and(under))
+        .on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
+            chosen(ui);
+            if let Some(focused) = ui.app.focused() {
+                glue::show(ui, tx, key, Place::Below(focused), true);
+            }
+        });
     let rename = MenuItem::new("Rename").on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
         chosen(ui);
         start_rename(ui, tx, Renaming::Row(key));
     });
-    Some(menu.item(move_to).item(side).item(rename))
+    Some(menu.item(move_to).item(side).item(below).item(rename))
 }
 
 /// A header's menu: "New session", "Rename", "Hide group", "Delete group".
@@ -812,8 +823,8 @@ mod tests {
     use crate::demo::{self, RUNE_CLAUDE, SKETCHES};
     use crate::glue::{self, MenuTarget, Renaming, Ui};
     use crate::testkit::{
-        self, FINISHED, GARDEN, NEEDS_YOU, WEBSITE, WORKING, box_focused, group_named, group_of,
-        tile_keys, titled,
+        self, FINISHED, GARDEN, NEEDS_YOU, WEBSITE, WORKING, box_focused, columns, group_named,
+        group_of, tile_keys, titled,
     };
     use crate::theme;
 
@@ -1445,7 +1456,7 @@ mod tests {
         );
         assert_eq!(
             texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Rename"]
+            ["Move to group", "Open to the side", "Open below", "Rename"]
         );
         let focused = focused_key(&rt).unwrap_or_default();
         assert!(
@@ -2068,7 +2079,7 @@ mod tests {
         let rt = testkit::window("group-menu");
         assert_eq!(
             texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Rename"]
+            ["Move to group", "Open to the side", "Open below", "Rename"]
         );
         assert_eq!(
             texts_in(&rt, SUBMENU),
@@ -2196,7 +2207,7 @@ mod tests {
         right_click(&mut rt, &row(finished));
         assert_eq!(
             texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Rename"]
+            ["Move to group", "Open to the side", "Open below", "Rename"]
         );
         assert!(enabled(&rt, SIDE_ITEM));
         testkit::click(&mut rt, SIDE_ITEM);
@@ -2218,7 +2229,7 @@ mod tests {
         right_click(&mut rt, &row(finished));
         assert_eq!(
             texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Rename"]
+            ["Move to group", "Open to the side", "Open below", "Rename"]
         );
         assert!(!enabled(&rt, SIDE_ITEM), "no room");
         testkit::press(&mut rt, Key::Escape);
@@ -2277,12 +2288,82 @@ mod tests {
         assert!(box_focused(&rt, new));
     }
 
+    // Open below: Task 5 of the stacked tiles plan.
+
+    /// The "Open below" item of a row's menu.
+    const BELOW_ITEM: &str = "mr-side-menu-item2";
+
+    /// Opens the menu of `key`'s row: whether "Open below" can be chosen there. The menu is
+    /// left open.
+    fn below_enabled(rt: &mut Runtime<Ui>, key: SessionKey) -> bool {
+        right_click(rt, &row(key));
+        assert_eq!(
+            texts_in(rt, MENU),
+            ["Move to group", "Open to the side", "Open below", "Rename"]
+        );
+        enabled(rt, BELOW_ITEM)
+    }
+
+    #[test]
+    fn the_menu_opens_a_session_below_the_focused_tile() {
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let garden = titled(&rt, GARDEN);
+        let finished = titled(&rt, FINISHED);
+        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
+        assert!(below_enabled(&mut rt, finished));
+        testkit::click(&mut rt, BELOW_ITEM);
+        testkit::step(&mut rt);
+        assert!(rt.state.side_menu.is_none());
+        assert!(!open(&rt, MENU));
+        assert_eq!(columns(&rt), [vec![garden, finished]]);
+        assert_eq!(testkit::focused(&rt), Some(finished));
+        assert!(box_focused(&rt, finished), "its input box has the focus");
+        assert!(saved(&rt), "the state is saved");
+    }
+
+    #[test]
+    fn open_below_is_disabled_when_it_cannot_be() {
+        // The session in a tile already.
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let garden = titled(&rt, GARDEN);
+        let finished = titled(&rt, FINISHED);
+        let asking = titled(&rt, NEEDS_YOU);
+        assert!(!below_enabled(&mut rt, garden), "in a tile already");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        // The focused tile's column full.
+        assert!(below_enabled(&mut rt, finished));
+        testkit::click(&mut rt, BELOW_ITEM);
+        testkit::step(&mut rt);
+        assert_eq!(columns(&rt), [vec![garden, finished]]);
+        assert!(!below_enabled(&mut rt, asking), "the column is full");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        // A row too low for two.
+        let mut rt = testkit::window_sized("sessions", (1800.0, 500.0));
+        let finished = titled(&rt, FINISHED);
+        assert!(!below_enabled(&mut rt, finished), "too low");
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        // No tile at all.
+        let mut rt = testkit::window_sized("sessions", WIDE);
+        let garden = titled(&rt, GARDEN);
+        let finished = titled(&rt, FINISHED);
+        rt.update(|ui, _| {
+            let effects = ui.app.close_tile(garden, mr_core::Leaving::Keep);
+            glue::run(ui, effects);
+        });
+        testkit::step(&mut rt);
+        assert!(tile_keys(&rt).is_empty());
+        assert!(!below_enabled(&mut rt, finished), "no tile");
+    }
+
     // Renaming a session in its row: Task 10 of plan 4.
 
     const RESTING: &str = "Fixing the contact form";
 
     /// The "Rename" item of a row's menu.
-    const RENAME_ITEM: &str = "mr-side-menu-item2";
+    const RENAME_ITEM: &str = "mr-side-menu-item3";
 
     /// Opens the menu of `key`'s row and chooses "Rename".
     fn rename_row(rt: &mut Runtime<Ui>, key: SessionKey) {

@@ -74,11 +74,12 @@ fn pane(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, key: SessionKey, layer: &mu
 /// Ctrl+Shift+N for one to the side, F6 and Shift+F6 move to the next and the previous tile, and
 /// Ctrl+W closes the focused one, once per press, the last three unless a picker's list or a
 /// menu is open (a text field leaves all of them alone); Ctrl+Shift+PageUp and
-/// Ctrl+Shift+PageDown move the focused tile one place along the row, also held, on the same
-/// terms, and are taken on the main screen even when it is at that end; and Escape shuts the
-/// folder menu when it is open, or else stops the focused tile's running turn (a focused text
-/// area catches its own Escape, which never gets here). With neither, Escape is left alone. An
-/// open picker or menu, and the field a name is edited in, take Escape before this. Ctrl+N and
+/// Ctrl+Shift+PageDown move the focused tile one place along the row, and Ctrl+Alt+PageUp and
+/// Ctrl+Alt+PageDown up or down in a column, also held, on the same terms, and are taken on the
+/// main screen even when nothing moves; and Escape shuts the folder menu when it is open, or
+/// else stops the focused tile's running turn (a focused text area catches its own Escape,
+/// which never gets here). With neither, Escape is left alone. An open picker or menu, and the
+/// field a name is edited in, take Escape before this. Ctrl+N and
 /// Ctrl+Shift+N keep a name being edited first; F6 keeps it as the field loses the keyboard,
 /// and Ctrl+W drops it with the tile whose header it was edited in. While a sidebar row or a
 /// tile's header is dragged, the drag takes them first ([`drag_key`]).
@@ -118,6 +119,15 @@ pub fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         return true;
     }
+    if let Some(step) = tiles::stack_step(ev) {
+        if ui.app.screen != Screen::Main {
+            return false;
+        }
+        if !list_open(ui) {
+            tiles::step_stack(ui, tx, step);
+        }
+        return true;
+    }
     if tiles::is_close_key(ev)
         && ui.app.screen == Screen::Main
         && let Some(key) = ui.app.focused()
@@ -141,7 +151,7 @@ pub fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
 /// A key while a sidebar row or a tile's header is dragged (ruling R8): Escape ends the drag
 /// and does nothing else, also when Rune cannot cancel it itself because the pressed row has
 /// left the list; the window's other keys (Ctrl+N, Ctrl+Shift+N, F6, Shift+F6, Ctrl+W and the
-/// two that move a tile) wait. True when the key was one of these.
+/// four that move a tile) wait. True when the key was one of these.
 fn drag_key(ui: &mut Ui, ev: &KeyEvent) -> bool {
     if input::is_escape(ev) {
         ui.drag = None;
@@ -151,6 +161,7 @@ fn drag_key(ui: &mut Ui, ev: &KeyEvent) -> bool {
         || folder::is_side_session_key(ev)
         || tiles::tile_step(ev).is_some()
         || tiles::move_step(ev).is_some()
+        || tiles::stack_step(ev).is_some()
         || tiles::is_close_key(ev)
 }
 

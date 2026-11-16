@@ -120,7 +120,10 @@ the rest. A group can be hidden from its context menu, and hidden groups are res
 ### 5.2 Tiles (middle)
 
 - The middle is a single row of **tiles**. Each tile is one whole session: header,
-  conversation, input box. **(call)** One row only; no stacking tiles vertically in v1.
+  conversation, input box. The first version had one row only, as the designer's call.
+  Jerod, 2026-11-15: a column of the row can hold two tiles, one above the other, and never
+  more; a column with one tile keeps the full height.
+- Tiles can be put in another order (Jerod, 2026-11-15): a tile is dragged by its header.
 - Clicking a session in the sidebar shows it in the focused tile. **(call)** "Open to the
   side" opens it in a new tile: drag the row into the middle, or use the row's context menu,
   or Ctrl-click the row.
@@ -185,6 +188,9 @@ the rest. A group can be hidden from its context menu, and hidden groups are res
   to the next turn. A choice whose label does not name a model, such as "Default
   (recommended)", shows the model's name beside it (Jerod, 2026-11-13: the user must be able
   to tell which model they are paying for).
+- **Effort level** beside the model (Jerod, 2026-11-13: "Opus 5.5 Medium or Fable 5.2
+  High"): always visible for a model that has one, and changeable there. The user must be
+  able to tell which effort they are paying for, as with the model.
 - **Permission mode picker** beside it: Ask before edits, Accept edits, Plan, Auto. Auto was
   added on 2026-11-13 at Jerod's request and is offered when the model in use supports it.
   **(call)** Bypass mode is offered only when the user's own Claude Code settings allow it.
@@ -274,8 +280,10 @@ fonts. OpenCode's theme crate is a reference for proportions only.
 **Left for later, designer's call (Jerod has not been asked)**
 
 - Desktop notifications when a session needs the user while the window is in the background.
-- Stacking tiles vertically, or more than one window.
-- Reordering tiles and groups by dragging.
+- More than two tiles in a column, or more than one window. (Two tiles in a column came
+  in on 2026-11-15, at Jerod's request.)
+- Reordering groups by dragging. (Reordering tiles came in on 2026-11-15, at Jerod's
+  request.)
 - Search across sessions.
 - macOS and Windows builds. Linux is first because it is Jerod's machine. Nothing in the
   design should prevent the others.

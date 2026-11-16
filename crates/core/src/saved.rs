@@ -30,7 +30,7 @@ pub struct Saved {
     pub recent_folders: Vec<PathBuf>,
     /// The focused session, by the agent's id.
     pub shown: Option<SessionId>,
-    /// The tiles, left to right. `shown` is the focused one.
+    /// The columns of tiles, left to right. `shown` is the focused tile.
     pub tiles: Vec<SavedTile>,
     /// The sidebar's width in points; the window's own default when `None`.
     pub sidebar_width: Option<f32>,
@@ -46,31 +46,72 @@ pub struct Saved {
     pub names: Vec<(SessionId, String)>,
 }
 
-/// One tile as kept between runs.
+/// One column of tiles as kept between runs: its tile, or the upper of its two, and the lower.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedTile {
     pub id: SessionId,
-    /// Its part of the row against the others'. One that is missing or not a number reads as
-    /// 1, so the rest of the state is still read.
+    /// The column's part of the row against the others'. One that is missing or not a number
+    /// reads as 1, so the rest of the state is still read.
     #[serde(default = "one", deserialize_with = "share_or_one")]
     pub share: f32,
+    /// The lower tile, when the column has two. One that cannot be read reads as none, so the
+    /// rest of the state is still read.
+    #[serde(default, deserialize_with = "below_that_reads")]
+    pub below: Option<SavedBelow>,
+}
+
+/// The lower tile of a column as kept between runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedBelow {
+    pub id: SessionId,
+    /// The upper tile's part of the column's height. Missing or not a number reads as 0.5.
+    #[serde(default = "half", deserialize_with = "split_or_half")]
+    pub split: f32,
 }
 
 fn one() -> f32 {
     1.0
 }
 
-/// A number, or 1 for anything else: JSON has no NaN, and serde_json writes one as `null`.
+fn half() -> f32 {
+    0.5
+}
+
 fn share_or_one<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    number_or(deserializer, one())
+}
+
+fn split_or_half<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    number_or(deserializer, half())
+}
+
+/// A number, or `or` for anything else: JSON has no NaN, and serde_json writes one as `null`.
+fn number_or<'de, D: serde::Deserializer<'de>>(deserializer: D, or: f32) -> Result<f32, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Share {
+    enum Number {
         Number(f32),
         Other(serde::de::IgnoredAny),
     }
-    Ok(match Share::deserialize(deserializer)? {
-        Share::Number(share) => share,
-        Share::Other(_) => one(),
+    Ok(match Number::deserialize(deserializer)? {
+        Number::Number(number) => number,
+        Number::Other(_) => or,
+    })
+}
+
+/// A lower tile with an id; none for anything else.
+fn below_that_reads<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SavedBelow>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Below {
+        Below(SavedBelow),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Below::deserialize(deserializer)? {
+        Below::Below(below) => Some(below),
+        Below::Other(_) => None,
     })
 }
 
@@ -130,7 +171,8 @@ mod tests {
     use super::*;
 
     /// A saved state with a folder group, a custom group, a placement, two recent folders, two
-    /// tiles, the first focused, and a name kept for the second.
+    /// columns, the first of two tiles, its upper one focused, and a name kept for the second
+    /// column's tile.
     fn sample() -> Saved {
         Saved {
             version: SAVED_VERSION,
@@ -156,10 +198,15 @@ mod tests {
                 SavedTile {
                     id: SessionId("a1".into()),
                     share: 1.5,
+                    below: Some(SavedBelow {
+                        id: SessionId("a2".into()),
+                        split: 0.25,
+                    }),
                 },
                 SavedTile {
                     id: SessionId("b1".into()),
                     share: 0.5,
+                    below: None,
                 },
             ],
             sidebar_width: Some(300.0),
@@ -170,7 +217,7 @@ mod tests {
     }
 
     /// How [`sample`] is written, as the window keeps it under its settings key.
-    const SAMPLE_JSON: &str = r#"{"version":1,"groups":[{"id":{"Custom":2},"name":"Side projects","collapsed":false,"hidden":false},{"id":{"Folder":"/home/alex/project"},"name":"Parser","collapsed":true,"hidden":false}],"placed":[["a1",{"Custom":2}]],"next_custom":3,"recent_folders":["/home/alex/project","/home/alex/notes"],"shown":"a1","tiles":[{"id":"a1","share":1.5},{"id":"b1","share":0.5}],"sidebar_width":300.0,"sidebar_collapsed":false,"closed_by_app":[["a1",1800000000]],"names":[["b1","Garden"]]}"#;
+    const SAMPLE_JSON: &str = r#"{"version":1,"groups":[{"id":{"Custom":2},"name":"Side projects","collapsed":false,"hidden":false},{"id":{"Folder":"/home/alex/project"},"name":"Parser","collapsed":true,"hidden":false}],"placed":[["a1",{"Custom":2}]],"next_custom":3,"recent_folders":["/home/alex/project","/home/alex/notes"],"shown":"a1","tiles":[{"id":"a1","share":1.5,"below":{"id":"a2","split":0.25}},{"id":"b1","share":0.5,"below":null}],"sidebar_width":300.0,"sidebar_collapsed":false,"closed_by_app":[["a1",1800000000]],"names":[["b1","Garden"]]}"#;
 
     #[test]
     fn a_saved_state_survives_a_round_trip() {
@@ -205,6 +252,102 @@ mod tests {
         assert_eq!(shares, vec![1.0, 1.0, 1.0, 2.5]);
         assert_eq!(read.groups, sample().groups[..1]);
         assert_eq!(read.next_custom, 3);
+    }
+
+    /// The columns of `read` as ids: each upper tile's, and its lower tile's when it has one.
+    fn columns(read: &Saved) -> Vec<(&str, Option<&str>)> {
+        read.tiles
+            .iter()
+            .map(|tile| {
+                let below = tile.below.as_ref().map(|below| below.id.0.as_str());
+                (tile.id.0.as_str(), below)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tile_saved_before_stacks_reads_as_a_column_of_one() {
+        let json = r#"{"version":1,"shown":"a1","tiles":[{"id":"a1","share":1.5},{"id":"b1","share":0.5}]}"#;
+        let read: Saved = serde_json::from_str(json).unwrap();
+        assert_eq!(columns(&read), vec![("a1", None), ("b1", None)]);
+        let shares: Vec<f32> = read.tiles.iter().map(|tile| tile.share).collect();
+        assert_eq!(shares, vec![1.5, 0.5]);
+        assert_eq!(read.shown, Some(SessionId("a1".into())));
+    }
+
+    #[test]
+    fn a_below_that_cannot_be_read_is_left_out() {
+        for below in [
+            "5",
+            r#"{"split":0.3}"#,
+            r#"{"id":7,"split":0.3}"#,
+            r#""a2""#,
+            "null",
+        ] {
+            let json = format!(
+                r#"{{"version":1,"next_custom":3,"tiles":[{{"id":"a1","share":2.0,"below":{below}}},{{"id":"b1","below":{{"id":"b2","split":0.3}}}}]}}"#
+            );
+            let read: Saved =
+                serde_json::from_str(&json).unwrap_or_else(|error| panic!("{below}: {error}"));
+            assert_eq!(
+                columns(&read),
+                vec![("a1", None), ("b1", Some("b2"))],
+                "{below}"
+            );
+            assert_eq!(read.tiles[0].share, 2.0, "{below}");
+            assert_eq!(read.next_custom, 3, "{below}");
+        }
+    }
+
+    #[test]
+    fn a_split_that_is_not_a_number_reads_as_a_half() {
+        for split in [
+            "",
+            r#","split":null"#,
+            r#","split":"x""#,
+            r#","split":[0.3]"#,
+        ] {
+            let json = format!(
+                r#"{{"version":1,"next_custom":3,"tiles":[{{"id":"a1","below":{{"id":"a2"{split}}}}}]}}"#
+            );
+            let read: Saved =
+                serde_json::from_str(&json).unwrap_or_else(|error| panic!("{split}: {error}"));
+            assert_eq!(
+                read.tiles[0].below,
+                Some(SavedBelow {
+                    id: SessionId("a2".into()),
+                    split: 0.5,
+                }),
+                "{split}"
+            );
+            assert_eq!(read.next_custom, 3, "{split}");
+        }
+    }
+
+    #[test]
+    fn a_column_of_two_survives_a_round_trip() {
+        let tiles = vec![
+            SavedTile {
+                id: SessionId("a1".into()),
+                share: 0.75,
+                below: Some(SavedBelow {
+                    id: SessionId("a2".into()),
+                    split: 0.3,
+                }),
+            },
+            SavedTile {
+                id: SessionId("b1".into()),
+                share: 1.25,
+                below: None,
+            },
+        ];
+        let saved = Saved {
+            version: SAVED_VERSION,
+            tiles,
+            ..Saved::default()
+        };
+        let read: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(read, saved);
     }
 
     #[test]

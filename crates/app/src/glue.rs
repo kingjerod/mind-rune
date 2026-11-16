@@ -12,8 +12,8 @@ use mr_agent::{Agent, FakeAgent, RequestId};
 use mr_core::EntryMut;
 use mr_core::{
     App, Backend, DEFAULT_WIDTH, Effect, FromBackend, GroupId, ItemBody, ItemId, Launch, Leaving,
-    Line, Phase, Place, RequestState, SAVED_VERSION, Saved, Screen, Session, SessionKey, ToBackend,
-    Width,
+    Line, Phase, Place, RequestState, SAVED_VERSION, Saved, Screen, Session, SessionKey, Spot,
+    ToBackend, Width,
 };
 use rune::prefs::Prefs;
 use rune::runtime::Waker;
@@ -88,6 +88,11 @@ pub enum DropTarget {
     Tile(SessionKey),
     /// Into this group.
     Group(GroupId),
+    /// Over this tile, in its column: a new tile there for a row's drag, the dragged tile
+    /// there for a header's.
+    Above(SessionKey),
+    /// Under this tile, in its column.
+    Below(SessionKey),
 }
 
 /// What a drag in [`Ui::drag`] took hold of.
@@ -221,11 +226,16 @@ pub struct Ui {
     blank: SessionView,
     /// The sessions in tiles as of the last [`run`].
     was_tiled: Vec<SessionKey>,
+    /// The tiles' placement as of the last [`run`] (`Tiles::placement`).
+    was_placed: u64,
     /// The tile row as last laid out, in window points: x, y, width, height.
     pub row_rect: Option<[f32; 4]>,
     /// The shares of the two tiles beside the divider being dragged, as they were at its press:
-    /// what a cancelled drag puts back.
+    /// what a cancelled drag puts back. Forgotten when the tiles' placement changes ([`run`]).
     pub divider_press: Option<[f32; 2]>,
+    /// The split of the column whose line is being dragged, as it was at the press. Forgotten
+    /// as `divider_press` is.
+    pub split_press: Option<f32>,
     /// The sidebar's menu, while it is open.
     pub side_menu: Option<SideMenu>,
     /// The sidebar row or the tile header being dragged (`view::drag`).
@@ -311,8 +321,10 @@ impl Ui {
             fake_time: 0.0,
             blank: SessionView::new(0),
             was_tiled: Vec::new(),
+            was_placed: 0,
             row_rect: None,
             divider_press: None,
+            split_press: None,
             side_menu: None,
             drag: None,
             swallow_row_press: false,
@@ -367,13 +379,14 @@ pub fn view_mut(ui: &mut Ui, key: SessionKey) -> &mut SessionView {
 }
 
 /// What becomes of the session `place` would take out of its tile: kept while text is typed
-/// in its input box, else forgotten when it is empty. `Side` and `At` take none out, but
-/// `Side` swaps the focused tile's session when there is no room, so it is read as `Focused`.
+/// in its input box, else forgotten when it is empty. `Side`, `At`, `Above` and `Below` take
+/// none out, but `Side` swaps the focused tile's session when there is no room, so it is read
+/// as `Focused`.
 pub fn leaving(ui: &Ui, place: Place) -> Leaving {
     let out = match place {
         Place::Focused | Place::Side => ui.app.focused(),
         Place::Tile(key) => Some(key),
-        Place::At(_) => None,
+        Place::At(_) | Place::Above(_) | Place::Below(_) => None,
     };
     let typed = out.is_some_and(|left| {
         view_of(ui, left)
@@ -464,7 +477,7 @@ pub fn typing_in(ui: &Ui) -> Option<SessionKey> {
             || (ui.rename.focused && ui.renaming == Some(Renaming::Header(*key)))
     };
     let focused = ui.app.focused().filter(typing);
-    focused.or_else(|| ui.app.tiles.list().iter().map(|tile| tile.key).find(typing))
+    focused.or_else(|| ui.app.tiles.keys().into_iter().find(typing))
 }
 
 /// The input box of `key`'s session takes the keyboard focus, while the session is in a tile
@@ -505,14 +518,15 @@ pub fn close_tile(ui: &mut Ui, tx: &mut Tx, key: SessionKey) {
     }
 }
 
-/// Moves `key`'s tile to `edge`, at once, with the keyboard in its input box when `typing`.
+/// Moves `key`'s tile to `spot`, at once, with the keyboard in its input box when `typing`.
 ///
-/// The tile takes the focus and keeps its width (`App::move_tile`). With `typing`, the keyboard
-/// goes to its box as [`focus_tile`] puts it there; without, it stays where it is. Nothing in
-/// the tile is made anew: the tiles are keyed, so Rune moves the tile's elements with it, and
-/// a field in it keeps the keyboard and what was typed. Nothing happens when nothing would move.
-pub fn move_tile(ui: &mut Ui, tx: &mut Tx, key: SessionKey, edge: usize, typing: bool) {
-    if ui.app.tiles.moved_index(key, edge).is_none() {
+/// The tile takes the focus (`App::move_tile`; `Tiles::move_to` says what its width becomes).
+/// With `typing`, the keyboard goes to its box as [`focus_tile`] puts it there; without, it
+/// stays where it is. Nothing in the tile is made anew: the tiles are keyed, so Rune moves the
+/// tile's elements with it, and a field in it keeps the keyboard and what was typed. Nothing
+/// happens when nothing would move.
+pub fn move_tile(ui: &mut Ui, tx: &mut Tx, key: SessionKey, spot: Spot, typing: bool) {
+    if !ui.app.can_move_tile(key, spot) {
         return;
     }
     tx.instant();
@@ -520,7 +534,7 @@ pub fn move_tile(ui: &mut Ui, tx: &mut Tx, key: SessionKey, edge: usize, typing:
     if typing {
         take_keyboard(ui, key);
     }
-    let effects = ui.app.move_tile(key, edge);
+    let effects = ui.app.move_tile(key, spot);
     run(ui, effects);
 }
 
@@ -717,11 +731,24 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
     ui.app.settle();
     tidy_views(ui);
     tidy_sidebar(ui);
+    tidy_handles(ui);
     if let Some(typing) = typing_in(ui)
         && ui.app.focused() != Some(typing)
     {
         let effects = ui.app.focus_tile(typing);
         run(ui, effects);
+    }
+}
+
+/// What a held divider or line keeps for a cancel is forgotten when the tiles' placement
+/// changed since the last [`run`]: a tile came, went or moved, or the focus did. Put back, it
+/// could land on another pair of tiles. The drag itself goes on.
+fn tidy_handles(ui: &mut Ui) {
+    let placement = ui.app.tiles.placement();
+    if placement != ui.was_placed {
+        ui.was_placed = placement;
+        ui.divider_press = None;
+        ui.split_press = None;
     }
 }
 
@@ -803,7 +830,7 @@ fn tidy_views(ui: &mut Ui) {
         ..
     } = ui;
     views.retain(|key, _| app.sessions.get(*key).is_some());
-    let tiled: Vec<SessionKey> = app.tiles.list().iter().map(|tile| tile.key).collect();
+    let tiled: Vec<SessionKey> = app.tiles.keys();
     if tiled != *was_tiled {
         for left in was_tiled.iter().filter(|key| !tiled.contains(key)) {
             if let Some(view) = views.get_mut(left) {

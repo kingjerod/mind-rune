@@ -19,7 +19,7 @@ use mr_agent::{
 };
 use mr_core::{
     Effect, FromBackend, GroupId, HistoryState, ItemBody, Launch, Leaving, Mark, Phase, Place,
-    Screen, SessionKey, ThinkingTime,
+    Screen, SessionKey, Spot, ThinkingTime,
 };
 use rune::PointerPress;
 use rune::prefs::Prefs;
@@ -128,7 +128,9 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("tiles", tiles),
     ("tiles-needs-you", tiles_needs_you),
     ("tiles-drag", tiles_drag),
+    ("tiles-stack-drag", tiles_stack_drag),
     ("tiles-move", tiles_move),
+    ("tiles-stacked", tiles_stacked),
     ("tile-rename", tile_rename),
 ];
 
@@ -1221,7 +1223,7 @@ fn tiles(ui: &mut Ui) {
 fn focus_tile(ui: &mut Ui, key: SessionKey) {
     let effects = ui.app.focus_tile(key);
     glue::run(ui, effects);
-    let tiled: Vec<SessionKey> = ui.app.tiles.list().iter().map(|tile| tile.key).collect();
+    let tiled: Vec<SessionKey> = ui.app.tiles.keys();
     for tiled in tiled {
         glue::view_mut(ui, tiled).draft.focused = tiled == key;
     }
@@ -1280,8 +1282,8 @@ fn tiles_needs_you(ui: &mut Ui) {
 const DRAG_AT: [f32; 2] = [1_040.0, 380.0];
 
 /// The tile row of a window of 1,800 by 900, as the window lays it out: x, y, width, height.
-/// The snapshot test runs `tiles-drag` and `tiles-move` at that size (`WIDE` in
-/// `tests/snapshots.rs`).
+/// The snapshot test runs `tiles-drag`, `tiles-stack-drag` and `tiles-move` at that size
+/// (`WIDE` in `tests/snapshots.rs`).
 const WIDE_ROW: [f32; 4] = [260.0, 48.0, 1_532.0, 844.0];
 
 /// Two tiles, for a window of 1,800 by 900: the `tiles` scene with its middle tile closed, and
@@ -1312,6 +1314,20 @@ fn tiles_drag(ui: &mut Ui) {
     });
 }
 
+/// Where the `tiles-stack-drag` scene's pointer is, in window points: in the tile row of a
+/// window of 1,800 by 900, over the lower half of the first tile's middle.
+const STACK_AT: [f32; 2] = [643.0, 680.0];
+
+/// The `tiles-drag` scene with the row dragged on, over the lower half of the first tile's
+/// middle, where the outline marks the half a tile would open in.
+fn tiles_stack_drag(ui: &mut Ui) {
+    tiles_drag(ui);
+    let first = ui.app.tiles.columns()[0].top;
+    let drag = ui.drag.as_mut().expect("the row is dragged");
+    drag.at = STACK_AT;
+    drag.over = Some(DropTarget::Below(first));
+}
+
 /// Where the `tiles-move` scene's pointer is, in window points: in the headers of a window of
 /// 1,800 by 900, a little right of the edge between the second tile and the third.
 const MOVE_AT: [f32; 2] = [1_300.0, 66.0];
@@ -1320,7 +1336,7 @@ const MOVE_AT: [f32; 2] = [1_300.0, 66.0];
 /// header to the edge between the second and the third, where the line shows it would go.
 fn tiles_move(ui: &mut Ui) {
     tiles(ui);
-    let first = ui.app.tiles.list()[0].key;
+    let first = ui.app.tiles.columns()[0].top;
     // As for `tiles-drag`: the line is placed from the row's last layout, which a snapshot's
     // one frame comes too late for.
     ui.row_rect = Some(WIDE_ROW);
@@ -1333,6 +1349,18 @@ fn tiles_move(ui: &mut Ui) {
         missed: 0,
         from: DragFrom::Header,
     });
+}
+
+/// The `tiles` scene's three tiles, for a window of 1,800 by 900, the third moved under the
+/// second: a column of two whose upper tile's permission request waits, its lower tile, at
+/// work, focused.
+fn tiles_stacked(ui: &mut Ui) {
+    tiles(ui);
+    let columns = ui.app.tiles.columns();
+    let (asks, working) = (columns[1].top, columns[2].top);
+    let effects = ui.app.move_tile(working, Spot::Below(asks));
+    glue::run(ui, effects);
+    focus_tile(ui, working);
 }
 
 /// The `conversation` scene with its title being edited in the tile's header, as a double click

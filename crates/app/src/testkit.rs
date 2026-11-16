@@ -110,7 +110,19 @@ fn under_tile(path: &str, tile: &str, inner: &str) -> bool {
 
 /// The sessions in the tiles, left to right.
 pub fn tile_keys(rt: &Runtime<Ui>) -> Vec<SessionKey> {
-    rt.state.app.tiles.list().iter().map(|t| t.key).collect()
+    rt.state.app.tiles.keys()
+}
+
+/// The row's columns, each its tiles from the top.
+pub fn columns(rt: &Runtime<Ui>) -> Vec<Vec<SessionKey>> {
+    let columns = rt.state.app.tiles.columns();
+    columns
+        .iter()
+        .map(|column| {
+            let under = column.under.map(|under| under.key);
+            std::iter::once(column.top).chain(under).collect()
+        })
+        .collect()
 }
 
 /// Whether the keyboard focus is in `key`'s input box.

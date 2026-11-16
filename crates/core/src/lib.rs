@@ -22,10 +22,13 @@ pub use conversation::{
     thinking_label,
 };
 pub use groups::{Group, GroupId, Groups, Line, Row, Section, SidebarModel, sidebar_model};
-pub use saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedTile};
+pub use saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile};
 pub use session::{HistoryState, Phase, Session, answer_words, mode_label, model_option_label};
 pub use sessions::{Entry, EntryMut, Mark, Prompt, SessionKey, Sessions};
-pub use tiles::{MIN_TILE_WIDTH, Place, Tile, Tiles};
+pub use tiles::{
+    Column, Laid, Level as TileLevel, MIN_TILE_HEIGHT, MIN_TILE_WIDTH, Part, Place, RowSize, Spot,
+    Tiles, Under, part_at,
+};
 pub use tools::{
     Clip, OUTPUT_CHARS, OUTPUT_LINES, ToolCall, ToolFamily, ToolGroup, clip, family, fenced,
     file_name, line_counts, unified_diff,

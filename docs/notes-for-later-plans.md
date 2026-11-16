@@ -1,8 +1,160 @@
 # Notes for later plans
 
-Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions) and plan 4 (tiles). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles) and the stacked tiles plan (two tiles in a column). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
 
-Plan 4's sections come first, then plan 3's. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+The stacked tiles plan's section comes first, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## Jerod's look at stacked tiles
+
+The stacked tiles plan (`docs/superpowers/plans/2026-11-15-stacked-tiles.md`) is built on the branch `stacked-tiles`, cut from `main`: the plan's fix `1e98a28`, the six tasks from `d7bff95` to `64c2921` (with one fix commit, `b9e1137`), these notes (`73add90`), and the fix wave after the whole-branch review (`8a4d1f5` to `9c09bb4`, and the commit that brought these notes up to date). On 2026-11-15 Jerod said to merge it into `main` before looking: `main` was moved forward to it (`c2746d0`), the branch `stacked-tiles` is gone, and nothing is pushed. None of the eight things to try was reported on when it was merged; they stay open, and a defect found in them is fixed on `main` or in the next plan. Each task's review passed. The whole-branch review found nothing critical and asked for fixes, which one wave made (see "The whole-branch review of stacked tiles", at the end of this section). After that wave `cargo test --workspace` gives 892 passed, 0 failed, 2 ignored (the live tests, not run). Jerod runs, in their own terminal, on `main`:
+
+```bash
+cargo run --release -p mindrune
+```
+
+With no folder the window shows again the tiles it had when it last closed: the same columns, the same tiles one above the other, the same heights and widths, the same one focused, without starting any program. Tiles saved by plan 4 come back as before, one to a column. Nothing makes a column of two by itself: a drop, "Open below", or Ctrl+Alt+PageUp and PageDown do (the things to try below). A build from before this merge that reads a file saved after it shows each column's upper tile only, and its next save drops the lower ones.
+
+The screenshots of the two new scenes are in `target/snap/stack/` (`tiles-stacked` and `tiles-stack-drag`, dark and light), not in git.
+
+### The live test
+
+None is needed for this look, and the live test is not changed (decision 14). Stacking is a matter of the window and the core alone: nothing about it reaches Claude Code. Plan 4's live test stands as "Jerod's look at plan 4" describes it.
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- A column holds two tiles at most. A third is never added to it, by any way in.
+- A column is split only while the window is about 616 points high or more: the row of tiles, which is the window less the band above it and the frame, must be 560. In a lower window the ways to stack are disabled or give what they gave before.
+- In a window too low for two tiles of 280 points the two tiles of a column are drawn even, whatever their line was set to, and the line comes back as it was set when the window is made taller.
+- Moving a tile sideways by its header now needs the outer quarter of a neighbour. Let go over a neighbour's middle half, the tile joins that column. In plan 4 any point past the middle reordered.
+- By the keyboard a tile joins only the column on its left (the right one when it is the first), cannot go from one column of two straight into another, and cannot leave a column of two when no further column fits. The header can do the second.
+- "Open to the side", Ctrl+click and Ctrl+Shift+N never stack, also when no column fits and a tile could be split. A new session cannot be started below a tile.
+- A long draft can still run out of a short tile. Ten lines typed in a tile 280 points high end about 9 points past it, and more with a message waiting above the box; in the lowest window, where the two tiles of a column are about 172 points high, about five lines do. Nothing typed is lost, and a taller window gives the room back.
+- A tile cannot be dragged from one window to another; there is one window.
+- While a row or a header is dragged the sidebar does not scroll by itself, as before.
+
+The other points of plan 4's "Before looking" still hold. Its first, that tiles cannot be stacked, is what this plan changes.
+
+### What to try in the window
+
+1. A session dragged onto the lower half of a tile opens under it; onto the upper half, over it; near where two tiles meet, it still opens a column. Seen: not yet recorded.
+2. "Open below" in a row's menu opens a session under the focused tile. Seen: not yet recorded.
+3. The line between two tiles drags, stops at a sensible height, and evens out on a double click. Seen: not yet recorded.
+4. A tile dragged by its header onto another tile joins its column; dragged to an edge it gets a column of its own; dropped on its mate the two swap. Seen: not yet recorded.
+5. Ctrl+Shift+PageUp and PageDown, and Ctrl+Alt+PageUp and PageDown, move the focused tile as said; F6 goes through the tiles in reading order. Seen: not yet recorded.
+6. Closing one of two gives the other the column. Seen: not yet recorded.
+7. Close and open the app: the same columns, the same heights, the same focus. Seen: not yet recorded.
+8. On the ultrawide: how many tiles are comfortable now, and is a half-height tile enough to work in? Seen: not yet recorded.
+
+### Every decision of the stacked tiles plan, with what was built
+
+The first decision is Jerod's; the others are the planner's, and Jerod has not seen them.
+
+1. **Two at most (Jerod, 2026-11-15).** Built: a `Column` has room for one lower tile (`under: Option<Under>`), so a third cannot be held, and the saved form (`SavedTile.below`) has room for one too. Every way in refuses a third: a drop over a full column opens a column at an edge, or replaces a tile when no column fits; "Open below" is disabled; the keys do nothing.
+2. **Height.** Built: `MIN_TILE_HEIGHT` is 280 and `Tiles::fits_two` asks for a row of 560. The line's drag stops each tile at 280 (`Tiles::resize_split`) and does nothing in a lower row. A column keeps its split, not its heights; none is closed. Changed after the whole-branch review: the plan said both tiles shrink in proportion in a lower window, and an upper tile could then be too short for its own input box. Now what is drawn keeps both tiles at least 280 high while the row fits two, and in a lower row draws the two the same height (`upper_height` in `crates/core/src/tiles.rs`, which `Tiles::rects` uses). The split as set is kept, in the model and in the saved state, so a window made taller shows it again. While the row's height is not known yet, stacking is allowed.
+3. **A new lower or upper tile takes half its column.** Built: a split of 0.5. The line is a handle 8 points high over the upper tile's lower edge, as wide as the column, with the role "separator", the label "Tile height" and `Cursor::ResizeRow`; it takes neither the keyboard nor the tile focus. A double press calls `App::even_split`. A double click on a divider still evens the widths only (`Tiles::even` leaves the splits).
+4. **Where a dragged row lands.** Built in `view::drag::target_in_tiles`, in this order: over the middle of a tile that can be split, its half; else, with room for a column, the nearest edge; else, over the whole width of a tile that can be split, its half; else the tile is replaced. Three tests of plan 4 that pinned a replacement in a window 1,300 by 900 now run 1,300 by 500, where it still happens; at 1,300 by 900 the tile now stacks.
+5. **What shows during the drag.** Built: `mr-drop-half`, an outline 2 points wide in the accent, in the overlay layer, around the half the session will take, at once and with no line at any edge. While any target is in the tile row the focused tile's accent outline is not drawn; amber stays, also on a tile whose half is the target. The outline is drawn only while its target still holds (a ruling, below).
+6. **"Open below".** Built in `view::sidebar::row_menu`, after "Open to the side": it opens the session under the focused tile with the keyboard in its box. It is disabled when the session is in a tile, when no tile is focused, and when `App::can_put(Spot::Below(focused))` is false (a full column, a low row). "Open to the side", Ctrl+click and Ctrl with a folder are unchanged.
+7. **Moving a tile by its header.** Built in `view::drag::move_target`. Over the middle of another tile: its half, when that move is allowed. Over the middle of its column mate: the spot that swaps the two, outlined around all of the mate's tile, the place the dragged tile will take. Else the nearest edge of the row, when that move is allowed, as for any tile: for a tile of two that is an edge of its own column only while the pointer is over its own column (the dragged tile itself, or the outer quarters of its mate). When no further column fits, a tile of two shows no line anywhere. A tile alone in its column, over itself, shows nothing, as before.
+8. **Moving a tile by the keyboard.** Built in `view::tiles::step_move` and `step_stack`, as the decision says; `move_step` and `stack_step` read the keys. On `Screen::Main` the keys are taken also when nothing moved. They wait while a list or a menu is open or a drag runs, and leave the keyboard where it is.
+9. **F6 and Shift+F6** go column by column, the upper tile first. Built: `view::tiles::step_focus` goes through `Tiles::keys`.
+10. **Closing.** Built in `Tiles::remove`. Out of a column of two the other tile has the column. The focus moves only when the closed tile had it: to the other tile of its column of two; else, its column gone, to the upper tile of the column now in its place, else of the one on its left.
+11. **Widths belong to columns.** Built in `Tiles::move_to`: a tile that joins a column drops its column's share, and the other columns share the row in proportion. A tile out of a column of two gets the mean of the shares, and the columns are then kept to 420 points as when a tile is added. A tile that moves with its column keeps its share.
+12. **Heights stay with the tiles when two swap.** Built: the swap sets the split to `1 - split`.
+13. **Saving.** Built: one `SavedTile` per column, with `below` for its lower tile and the split. It is saved when a tile opens above or below, moves or closes, when the line is let go at another height than at its press, when a double press changed the split, and when the window closes. A session the store does not have is left out as before; of two, the other is kept as a column of one. The restore waits for the lower tiles' sessions too, and a column whose upper session is gone shows the lower one alone.
+14. **The live test is not changed.** Built: `crates/app/tests/live.rs` only follows the renamed calls of Task 1; it was compiled, not run.
+
+### Rulings made while the plan ran
+
+The controller made these, each recorded in the run's ledger:
+
+- **A test got a wider row.** Before Task 1, the plan's test `a_tile_leaves_its_column_for_one_of_its_own` asked for shares 2 and 3 in a row 1,600 wide, where the rule that keeps every column at 420 points raises A and changes them. The plan was fixed (`1e98a28`): the test's first case is in a row 2,600 wide, and a second case pins the raise at 1,600. The rule stays, the same as for a tile added to the row.
+- **The two drags share one function.** The plan said the line's drag follows the divider's "phase for phase". Rather than a second copy, `view::tiles::drag_handle` runs both, given what differs as a `HandleDrag` (`DIVIDER_DRAG`, `SPLIT_DRAG`): the axis, the press slot (`Ui.divider_press`, `Ui.split_press`) and the app's intents. The function `view::tiles::drag_divider` is gone (a test helper of that name in `view/tiles.rs` stays); the divider's behaviour and its tests did not change.
+- **The low-window test stacks first.** The core refuses to make a column of two once the row is known to be lower than 560 points, so `a_column_of_two_in_a_low_window_is_still_drawn` stacks in a window 1,800 by 900 and then makes it low. That is also how a user gets there.
+- **The tiles' level is exported as `mr_core::TileLevel`.** Inside the core it is `tiles::Level` (`Whole`, `Top`, `Bottom`), but `mr_core::Level` is already the usage level (`Normal`, `Warning`, `Alarm`).
+- **Points carried from one task's review into the next**, each into the task that worked in the same code:
+  - From Task 1 into Task 2: `App::close_tile`'s doc reworded for columns, and the `allow(dead_code)` taken off `Tiles::resize_split` and `set_split`.
+  - From Task 3 into Task 4: two tests. `the_upper_tile_of_two_draws_a_line_on_its_lower_edge` pins that line by a pixel of a rendered frame, since Rune's test interface does not show an element's borders. `a_column_of_two_in_a_low_window_is_still_drawn` also checks that each input box lies inside its tile.
+  - From Task 5 into Task 6: the test helper `columns` moved to `testkit.rs` (it was in `drag.rs` and `sidebar.rs` word for word); the half's outline is drawn only while its target still holds; a test that a tile that needs you keeps its amber while a half of it is the target.
+
+### Things to look at
+
+- The line under the upper tile of two cannot be seen where both tiles of the column have an outline (the focused one and one that needs you, as in the `tiles-stacked` scene): the two outlines, 2 points each, cover the line of 1 point. The handle is there all the same. Is the line easy to find when you want to drag it?
+- A tile dragged by its header over its column mate shows the outline around all of the mate's tile. Its place is tested; nobody has looked at it on screen. Does it say "these two swap"?
+
+### Left by the tasks
+
+Found by the per-task reviews and reports, and not fixed. None blocks anything.
+
+The core (`crates/core`):
+
+- The rule "of two, one missing leaves the other alone" is written twice, as a `match` in `App::restore_tiles` and in `App::saved` (`app.rs`).
+- `app.rs` is 5,159 lines, mostly tests.
+
+The window (`crates/app/src/view`):
+
+- Every frame in which the row's size changes uses both of Rune's re-run passes (`PASSES = 2` in Rune's `runtime/layout_read.rs`), with or without a column of two, so no layout read may be chained behind a tile's rectangle. See "What plan 5 must know".
+- The line at an edge (`mr-drop-edge`) is still drawn from a target that may have gone stale since the last move, as before this plan. The release checks again, so nothing wrong is done; the half's outline does check.
+- `stack_step` and `move_step`, and their two blocks in `view::on_key`, differ by one modifier.
+- In `view::tiles::row` the closures' parameter `laid` shadows the list of the same name.
+- `view/tiles.rs` is 3,719 lines and `view/drag.rs` 2,688, mostly tests.
+
+Tests:
+
+- `the_upper_tile_of_two_draws_a_line_on_its_lower_edge` renders a frame on the GPU (`Gpu::headless()`) inside a unit test. On a machine with no GPU or software adapter it fails, where before only the snapshot test needed one.
+- No test cancels the line's drag by a lost pointer; Escape is tested.
+- The case where, with no room for a column, a whole tile stacks (the third rule of `target_in_tiles`) has no test that no conversation row is built again.
+- The `tiles-stack-drag` scene's pointer, `STACK_AT` in `demo.rs`, is placed by hand and not tied to `target_in_tiles`, as `DRAG_AT` and `MOVE_AT` are not.
+- In `with_no_room_a_tile_of_two_has_no_edge` (`drag.rs`) an inner `fy` shadows the outer one, and each case's tuple holds two equal bools. The test helper `key` in `view/tiles.rs` is shadowed by locals of the same name.
+
+### The whole-branch review of stacked tiles
+
+After the seven tasks a final reviewer read the whole branch, `e90a9fe..73add90`, for problems that live between tasks. It read all the code of `crates/core/src/tiles.rs`, `view/tiles.rs` and `view/drag.rs` outside the tests, every changed part of `app.rs`, `saved.rs`, `glue.rs`, `view/mod.rs`, `view/sidebar.rs`, `testkit.rs` and `demo.rs`, the plan, these notes and the parts of Rune the layout reads and the page keys go through; it sampled the tests and looked at two of the screenshots. In a copy of the sources it counted the runs of `view::tiles::row` and added six throwaway tests, and its numbers come from those. Its verdict: ready to merge with fixes. Nothing critical; one Important finding, in these notes; five Minor. It found no way to put a third tile in a column, to leave a column empty or to rebuild a tile. One fix wave followed, with the controller's rulings.
+
+#### What was fixed
+
+- **The notes on Rune's re-run passes** (the review's Important finding). They said only a window that starts with a column of two uses both passes, and that one more chained read would be a frame late at start. Measured, every frame in which the row's size changes uses both, and a read past them stays stale. Both places now say so ("Left by the tasks" and "What plan 5 must know").
+- **A short tile's input box ran out of its tile** (Minor 1). With the line dragged to a stop and the window then made low, an upper tile was drawn 114 points high in a window 400 high, its box over the lower tile's header. A ruling: what is drawn keeps both tiles of a column at least 280 points high while the row fits two, and draws them the same height in a lower row; the split kept in the model and in the saved state is not changed, so a taller window shows it as it was set (`upper_height`, used by `Tiles::rects`). Decision 2's "both tiles shrink in proportion" is replaced by it. If wrong, it costs one function: Jerod may have wanted the proportion kept in a low window. Tested in the core (`the_drawn_split_keeps_both_tiles_usable`) and in the window (`a_line_dragged_to_its_stop_keeps_both_boxes_in_their_tiles`).
+- **A cancel after the row changed put sizes back on another pair** (Minor 2). With a divider or the line held, a key that moved a tile and then Escape put the shares or the split kept at the press onto whatever pair was there now. A ruling: when the tiles' placement changes, by any way, `glue::run` forgets what a held divider or line keeps (`glue::tidy_handles`), so the cancel puts nothing back; the window's keys are not held back while a handle is held. If wrong, it costs this: a key pressed mid-hold still acts, as in plan 4. A change of the focus alone also counts as a change of placement, so Escape after F6 mid-hold puts nothing back either. Tested by `a_held_divider_puts_nothing_back_after_a_key_moved_the_tiles` and `a_held_line_puts_nothing_back_after_a_key_moved_the_tiles`.
+- **A press on a handle before the row's size was known saved at its release** (from Task 4). A start that is not a number now counts as no change (`view::tiles::unchanged`).
+- **`App::close_tile`'s doc** now says the focus moves only when the closed tile had it (from Task 2).
+- **No test that dragging the line builds no conversation row** (Minor 5): `dragging_the_line_rebuilds_no_row` makes ten moves of the line with two long conversations.
+- **Lines of these notes that were untrue or missing** (Minor 3 and the six points of Task 7's review): a drag test does have the target's column fill before the drop (`a_half_whose_column_filled_meanwhile_is_not_outlined`, `view/drag.rs`); the 560 points are said as the window Jerod sees; "Before looking" says what changed for moving by the header and the keyboard, that "Open to the side" never stacks, and how a low window draws a column of two; the keys make a column of two too; decisions 7 and 10 say what was built; "What plan 5 must know" says which statements of plan 4's bullets no longer hold; the function `drag_divider` is named as such.
+- **"Neighbours meet exactly"** (Minor 4) holds for the numbers `Tiles::rects` gives, not for what Rune draws; "What plan 5 must know" says so.
+
+#### What was left, and why
+
+The review asked for none of these to be fixed before the merge. They are in "Left by the tasks" above:
+
+- From Tasks 1 and 2: the rule "of two, one missing leaves the other alone" written twice, and the size of `app.rs`.
+- From Task 3: the shadowed `laid` in `view::tiles::row`, and the size of `view/tiles.rs`.
+- From Task 4: the pixel test that needs a GPU adapter (the snapshot test needs one already, so `cargo test --workspace` is no worse off), and no lost-pointer test for the line (it goes through `drag.cancelled()` as Escape does, which is tested).
+- From Task 5: no test that rule 3 of `target_in_tiles` rebuilds no row, and `STACK_AT` placed by hand.
+- From Task 6: the line at an edge drawn from a target that may be stale (while a half's target is stale no accent shows anywhere until the next move, and the release does nothing), the shadowed names in the tests, and `stack_step` and `move_step` with their two blocks in `view::on_key`.
+
+The one re-review of the fix wave found every finding addressed and three small things more. There is no second wave, so they are left, by a ruling each:
+
+- **A line pushed against its stop where it is already drawn there saves nothing at its release.** Since the drawn split is kept inside the least heights, a split of 0.2 in a row 600 points high is drawn at 280. Pushing the line up against that stop sets the split to 280 of 600 in the model, the drawn height stays 280, and `view::tiles::unchanged` compares drawn heights, so the release asks for no save. The saved state has the new split with the next save, at the latest when the window closes. If the app dies in between, the old split comes back, which draws the same in that window. Left: it costs nothing a user sees. The fix is to compare the split, not the drawn height, at the release.
+- **A long draft in a short tile** still runs out of its tile, as "Before looking" says. The fix of this wave covers the split, not the height of the text area, which grows to ten lines whatever its tile's height (`view/input.rs`). Left for the plan that next works on the input box: plan 6 (attachments) adds chips to it and must settle how high the box may grow in a short tile.
+- **The sentence over "What the final review set aside"** said each item was set aside because a decision already covers it. Several were set aside for other reasons. It now says so.
+
+#### What the final review set aside
+
+The review declined to judge these, each for the reason its line gives: a decision of the plan or of plan 4 already says how it is, or it is outside the plan, or only the real window can say. Each stands as built, and each is a small change if Jerod wants it otherwise after the look.
+
+- Whether the middle half of a tile's width is the right share for stacking, against the outer quarters for a column (decision 4): stands as built.
+- Whether Ctrl+Alt+PageUp and PageDown are free on Jerod's desktop: only the real window can say; Rune's own page keys refuse Ctrl and Alt, so nothing in the app takes them first. Stands as built.
+- A tile alone in its column joins the column on its left by the keyboard, and the one on its right only when it is the first (decision 8): stands as built.
+- "Open to the side" and Ctrl+click replace the focused session when no column fits, though a split would fit (decision 6): stands as built.
+- No way to start a new session below a tile: outside the plan; stands as built.
+- A double press on the line evens the two also in a row too low to drag in, and the handle shows the resize cursor there: the plan speaks only of the drag. Stands as built.
+- The line cannot be seen where both tiles of a column are outlined: a question for Jerod under "Things to look at"; stands as built.
+- A session swapped into a tile of a column by a plain click asks for no save: plan 4's ruling 6; stands as built.
+- A stale edge target after a column went shifts the drop by one column when the pointer has not moved since: as before this branch; stands as built.
+- A frame in which the window is resized costs one view run more than in plan 4: the cost of placing every tile by its rectangle; nothing in it grows with a conversation's length. Stands as built.
+- A tile announced as a button, and the drop line's glide: plan 4's open items, untouched here; stand as built.
 
 ## Jerod's look at plan 4
 
@@ -112,7 +264,7 @@ The seven things to try of "Jerod's look at plan 3" were carried into this look 
 
 ## What plan 5 must know
 
-Plan 5 adds attachments, the right panel, Remote Control and running in the background. What plan 4 built that it meets:
+Plan 5 was to add attachments, the right panel, Remote Control and running in the background. On 2026-11-15 it was cut in three: plan 5 is the right panel, Remote Control and the effort level (`docs/superpowers/plans/2026-11-15-panel-remote-effort.md`), plan 6 attachments, plan 7 running in the background. Stacked tiles (`docs/superpowers/plans/2026-11-15-stacked-tiles.md`) are built before plan 5. What plan 4 built that these meet:
 
 - **The tiles are in the core.** `crates/core/src/tiles.rs` holds `Tiles`: the tiles left to right, each a session's key and a share of the row, and the focused tile. `App.tiles` is one `Tiles`, never assigned after `App::new` (`Tiles::restore` replaces it in place when the saved arrangement comes back). Two counters say what changed: `version` with every change, `placement` with every change but of widths; `App::settle` rebuilds the sidebar on `placement` only. `Place` says where a session is shown (`Focused`, `Side`, `At(i)`, `Tile(key)`); `App::show(key, place, leaving)` is the one way in, and a session already in a tile only has its tile focused. `App::focused()` is the focused tile's session. Room is `MIN_TILE_WIDTH` (420 points) per tile, against the row's width the window reports (`App::set_row_width`); `App::room_for_tile` says yes while that width is not known. `App::resize_tile`, `even_tiles`, `put_tile_pair`, `move_tile` and `close_tile` change the row. A tile is moved to an edge of the row as it is before the move, counted as `Tiles::edge_at` counts them: `Tiles::moved_index` says where it would sit, and none at its own two edges; `Tiles::move_to` moves it there with its share and focuses it, counting once on `placement`. `App::move_tile` also counts its session as seen and asks to save. A turn that ends in a tile that is not focused sets `Entry.unseen`, which is `Mark::Finished` until that tile is focused.
 - **What is kept.** `Saved.tiles` holds the tiles by the agent's id with their shares, `Saved.shown` the focused one, and `Saved.names` the names the user gave that no program has confirmed yet. `App::saved` keeps a tile only when the store has its session (`Session::is_stored`: it came from the store, or a message was handed over), since a new session nothing was sent in has an id the store does not know and would hold the restore back until the complete listing; `Saved.shown` is the focused session's id when its tile is kept, else the first kept tile's id, else none. `SAVED_VERSION` stays 1; a share that cannot be read reads as 1, the share of every tile in an even row (the tile is kept), a name entry that cannot be read is left out. Shares are scaled to a mean of 1 when restored.
@@ -123,6 +275,15 @@ Plan 5 adds attachments, the right panel, Remote Control and running in the back
 - **Keys inside a tile.** Rune's key paths match only an unbroken run of keys (`a/b` names `b` only when `a` is its nearest keyed ancestor), so `mr-tile-7/mr-send` names nothing in a Rune lookup. A lookup Rune makes inside a tile uses a key that carries the session's number (`mr-conversation-7`, `mr-model-7`, `mr-mode-7`) or climbs the real chain of keys (`items::toggle_path`). `testkit::tile(key, inner)` paths are for the test helpers only, which resolve them themselves. The plan's Global Constraint and its Rune fact on keys were wrong on this point.
 - **Focus in the window.** `glue::run` ends by handing the tile focus back to the tile whose field holds the keyboard, in the same handler, so no other tile's outline flashes. A field that leaves the screen while it has the keyboard is rebuilt with the same text and caret (`glue::let_go`), losing its undo history: Rune would otherwise take the returning field for the old one.
 - **Renaming.** `App::rename` names a session at once and sends `Rename` to its program when one runs; else the name is kept in `Saved.names` and told to the next program that starts. A title the program sends later is ignored until a restart; a listing that gives the user's name confirms it, and a complete listing drops the kept names of sessions it does not give. The window has one name field, `Ui.rename`, for whatever `Ui.renaming` says (a group, a row, a header), with `glue::start_rename`, `end_rename` and `finish_rename`. Starting another rename keeps what was typed in the first, groups included. A typed name is lost by Escape, or by closing its tile while its field still has the keyboard. When the place of a session's rename goes (its row or its tile), the name is kept if its field had already lost the keyboard and no sidebar menu is open, and dropped otherwise; a group's rename is always dropped when its group is no longer listed (`glue::tidy_sidebar`).
+
+The stacked tiles plan changed the tiles after plan 4. What it built, which plan 5 meets as well; where a bullet above says otherwise, these hold:
+
+- **The tiles are columns.** `Tiles::columns` gives the row's `Column`s left to right: each has a share of the row's width, its tile or the upper of two (`top`), and the lower one with the upper's part of the height (`under: Option<Under>`, `Under { key, split }`). A third tile in a column cannot be held. `Tiles::keys` gives every tile's session column by column, the upper before the lower. `len`, `find` (the column and the level, `mr_core::TileLevel`: `Whole`, `Top`, `Bottom`) and `mate` take the place of plan 4's `Tiles::list`, `index_of` and `moved_index`, which are gone with `Tile`. Widths, edges, room and `MIN_TILE_WIDTH` count columns. `Tiles::rects(size)` gives every tile a `Laid` (`key`, `column`, `level`, and `rect` as `[x, y, w, h]` from the row's top left), in the order of `keys`; every edge is put on the f32 grid of the row's length, so neighbours meet exactly and the last tile ends exactly at the row's edge. That holds for the numbers `Tiles::rects` gives. Rune draws to 1/64 of a point, so two drawn tiles can overlap by about 0.016 points: plan 5 must not rely on a drawn rectangle being equal to one from `rects`. The two of a column are drawn from their split kept so that each is at least `MIN_TILE_HEIGHT` high while the row fits two, and the same height in a lower row; `Tiles::split` gives the split as it was set, which can differ from what is drawn. A place a tile can go is a `Spot`: `Edge(e)`, `Above(key)`, `Below(key)`; `Place` gains `Above` and `Below`. `Tiles::takes` and `would_move` say whether a put or a move would do anything, and `App::can_put` and `App::can_move_tile` ask them with the row's size as the app knows it. `App::move_tile(key, spot)` and `glue::move_tile(ui, tx, key, spot, typing)` take a `Spot` where they took an edge. `MIN_TILE_HEIGHT` (280) and `Tiles::fits_two` say when a column may be split. Two statements of plan 4's first bullet no longer hold: `Tiles::placement` leaves out changes of the split as it leaves out widths, and the intents that change the row now include `App::resize_split`, `put_split` and `even_split` (`App::tile_split` reads a split).
+- **Every tile is a direct child of `mr-tiles`, placed by its rectangle.** `view::tiles::row` reads the row's size with `cx.layout_size(ROW)` and gives each tile `.absolute(x, y).size(w, h)` from `Tiles::rects`. Only the pass before the row was ever laid out, which is never drawn, lays them out by the columns' shares. The reason is how Rune identifies an element: by the path of its ancestors' keys. A tile that moved under another parent (a column of its own, say) would be a new element, and Rune would drop what it kept for it: its scroll offset, the keyboard focus, a selection, a virtual list's measurements. Placed this way a tile never changes its parent, so stacking it, taking it out of a column or swapping it rebuilds nothing in it. The dividers (`mr-divider-{n}`, the row's full height) and the line between two tiles (`mr-split-{n}`, with the upper tile's number) are placed from the same rectangles. Whatever plan 5 adds to the row must keep every tile a direct child of `mr-tiles`. The limit, as the whole-branch review measured it: every frame in which the row's size changes uses both of Rune's re-run passes (`PASSES = 2` in Rune's `runtime/layout_read.rs`), with or without a column of two: the row's size, then the tiles' rectangles, then `view::width::current`'s read of its tile. When the passes run out Rune marks the reads as seen (`settle_layout_reads`), so a read chained behind a tile's rectangle is not a frame late: it stays stale until something else commits. So no layout read may be chained behind a tile's rectangle. The right panel of plan 5 takes room from the row, which is exactly this case. A frame in which the window is resized costs one view run more than in plan 4.
+- **The row's height is known to the app.** `App` holds a `RowSize { width, height }`. `view::tiles::laid_out` reports both, through `App::set_row_width` and `App::set_row_height`, a frame after the layout (it is an `on_layout`); `App::row_height` and `App::row_size` read them. What is not known holds nothing back: while the height is not known, stacking is allowed. The view places the tiles from its own read, so a resized window, or a panel that takes room from the row, places them right in the frame it draws.
+- **A file dropped on a tile can find its tile** with `Tiles::tile_at(size, at)`, the point measured from the row's top left: it gives the `Laid` of the tile under the point, or none outside the row. `view::drag::under` does this for both drags, from `Ui.row_rect`. `part_at(rect, at)` says which `Part` of a tile a point is in (`Left` and `Right` for the outer quarters, `Upper` and `Lower` for the halves of the middle). `glue::DropTarget` has `Above(key)` and `Below(key)`, and `mr-drop-half` (`view::drag::overlay`) outlines a half or a whole tile in the accent. A header's target is no longer only an edge of the tile row, as plan 4's bullet on the drag says: it is also the upper or lower half of another tile's middle, and over the middle of its column mate the spot that swaps the two (`view::drag::move_target`).
+- **What is kept.** `Saved.tiles` holds one `SavedTile` per column; `below` (`SavedBelow { id, split }`) is its lower tile, written as `null` for a column of one. A `below` that cannot be read is none, a split missing or not a number is 0.5, and the rest of the state is still read. `SAVED_VERSION` stays 1.
+- **The keys that are now taken.** Ctrl+Alt+PageUp and Ctrl+Alt+PageDown (Cmd+Alt on macOS) move the focused tile up and down (`view::tiles::stack_step`, `step_stack`). Ctrl+Shift+PageUp and PageDown now also take a tile out of a column of two (`step_move`). On `Screen::Main` all four are taken also when nothing moves, and they wait while a list or a menu is open or a drag runs (`view::drag_key`). Plan 5's Ctrl+Alt+B does not meet them. F6 and Shift+F6 go through `Tiles::keys`. A double press on the line between two tiles evens their heights. The window's keys still act while a divider or the line is held; when anything changes the tiles' placement, `glue::run` forgets what the held handle keeps for a cancel (`Ui.divider_press`, `Ui.split_press`, in `glue::tidy_handles`), so a cancel after it puts nothing back. The element keys new with this plan are `mr-split-{n}` and `mr-drop-half`. The sidebar row's menu reads "Move to group", "Open to the side", "Open below", "Rename".
 
 ### Every decision of plan 4, with what was built
 
@@ -361,6 +522,8 @@ After the fourteen tasks a final reviewer read the whole branch for problems tha
 - **Two things the check of the fixes itself found, both small and left as they are.** First: when the app closes it notes the closing time for every session it ran in that run, also for one whose program had ended long before. If another app wrote to such a session in between, and the app is closed and opened again within two minutes, the first message to it is not asked about. Noting the program's own last report for a session that was not running at the close would settle it. Second: one project folder in the store that stays unreadable now makes every listing fail, so no stored session is listed, where before only that folder was missing. Skipping it while counting the listing as not complete would list the rest and still keep the saved placements.
 
 ### What plan 5 must do first
+
+Since the cut of 2026-11-15 this is for plan 7 (running in the background), the plan that stops idle programs; the plan 5 of that day does not.
 
 Plan 5 stops idle programs quietly. Two things the review found are rare today and become ordinary then:
 

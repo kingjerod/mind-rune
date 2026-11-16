@@ -34,13 +34,15 @@ const SCENES: &[(&str, Option<&str>)] = &[
     ("tiles", Some(WIDE)),
     ("tiles-needs-you", Some(WIDE)),
     ("tiles-drag", Some(WIDE)),
+    ("tiles-stack-drag", Some(WIDE)),
     ("tiles-move", Some(WIDE)),
+    ("tiles-stacked", Some(WIDE)),
     ("tile-rename", None),
 ];
 
 /// A window wide enough for three tiles of more than 420 points each beside the sidebar. The
-/// `tiles-drag` and `tiles-move` scenes place their line for this size: see `WIDE_ROW` in
-/// `src/demo.rs`.
+/// `tiles-drag`, `tiles-stack-drag` and `tiles-move` scenes place their line or outline for
+/// this size: see `WIDE_ROW` in `src/demo.rs`.
 const WIDE: &str = "1800x900";
 
 /// An image smaller than this is taken to be blank.
