@@ -13,18 +13,22 @@
 use std::sync::Arc;
 
 use mr_agent::{
-    Account, FakeAgent, FakeStep, HistoryItem, LimitWindow, ModelOption, PermissionMode, Question,
-    QuestionOption, RequestId, SessionEvent, SessionId, StoredHistory, StoredSession, ToolCallId,
-    ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
+    Account, ContextBreakdown, ContextKind, ContextPart, FakeAgent, FakeStep, HistoryItem,
+    LimitWindow, ModelOption, PermissionMode, Question, QuestionOption, RemoteAccess,
+    RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StoredHistory,
+    StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest,
+    UserRequestKind,
 };
 use mr_core::{
-    Effect, FromBackend, GroupId, HistoryState, ItemBody, Launch, Leaving, Mark, Phase, Place,
-    Screen, SessionKey, Spot, ThinkingTime,
+    Branch, Effect, FromBackend, GroupId, HistoryState, ItemBody, Launch, Leaving, Mark, Phase,
+    Place, Remote, Screen, SessionKey, Spot, ThinkingTime,
 };
 use rune::PointerPress;
 use rune::prefs::Prefs;
 
-use crate::glue::{self, DragFrom, DropTarget, MenuTarget, Renaming, RowDrag, SideMenu, Ui};
+use crate::glue::{
+    self, DragFrom, DropTarget, MenuTarget, Picker, Renaming, RowDrag, SideMenu, Ui,
+};
 
 /// The folder the demo's session is opened in.
 const FOLDER: &str = "/home/alex/project";
@@ -67,6 +71,7 @@ pub(crate) fn ui_with(folder: Option<&str>, prefs: Prefs) -> Ui {
     ui.unix_clock = || NOW_UNIX;
     ui.app.now_unix = NOW_UNIX;
     ui.folder_exists = |_| true;
+    ui.reads_branches = false;
     ui
 }
 
@@ -104,6 +109,7 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("signed-out", signed_out),
     ("not-installed", not_installed),
     ("empty", empty),
+    ("effort", effort),
     ("limit", limit),
     ("conversation", conversation),
     ("streaming", streaming),
@@ -132,6 +138,9 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("tiles-move", tiles_move),
     ("tiles-stacked", tiles_stacked),
     ("tile-rename", tile_rename),
+    ("panel", panel),
+    ("panel-remote", panel_remote),
+    ("panel-refused", panel_refused),
 ];
 
 /// Replaces the state with a fresh demo state.
@@ -220,6 +229,17 @@ fn empty(ui: &mut Ui) {
         ui.focused_session().is_some_and(|s| s.phase == Phase::Idle)
     });
     usage(ui, 0.37, 0.10);
+}
+
+/// Like `empty`, with the effort picker's list open on Low, Medium and High, Medium in use.
+fn effort(ui: &mut Ui) {
+    empty(ui);
+    pump_until(ui, "the effort in use", |ui| {
+        ui.focused_session()
+            .is_some_and(|s| s.effort.as_deref() == Some("medium"))
+    });
+    let key = ui.app.focused().expect("a session is shown");
+    glue::view_mut(ui, key).open_picker = Some(Picker::Effort);
 }
 
 /// Like `empty`, with the five-hour window used up and the weekly one at 82%.
@@ -1013,6 +1033,7 @@ pub(crate) fn parser_history() -> StoredHistory {
         earlier_left_out: true,
         model: Some("fake-model-fast".into()),
         permission_mode: Some(PermissionMode::Plan),
+        effort: None,
     }
 }
 
@@ -1026,6 +1047,7 @@ fn look_models() -> Vec<ModelOption> {
             resolved: "fake-model".into(),
             stands_for: Some("Fake 1".into()),
             auto_mode: true,
+            effort_levels: vec!["low".into(), "medium".into(), "high".into()],
         },
         ModelOption {
             id: "fast".into(),
@@ -1033,6 +1055,7 @@ fn look_models() -> Vec<ModelOption> {
             resolved: "fake-model-fast".into(),
             stands_for: None,
             auto_mode: false,
+            effort_levels: Vec::new(),
         },
     ]
 }
@@ -1138,7 +1161,8 @@ fn thinking_on() -> Vec<FakeStep> {
 }
 
 /// A new session in `folder`, shown, whose first message `message` plays `steps`; Claude names
-/// it `title`. Pumps until the turn has started.
+/// it `title`. Pumps until the turn has started and the fake has the message, so the reply a
+/// later scene scripts is not taken for this one's.
 fn live(ui: &mut Ui, folder: &str, message: &str, title: &str, steps: Vec<FakeStep>) {
     live_at(ui, Place::Focused, folder, message, title, steps);
 }
@@ -1161,8 +1185,14 @@ fn live_at(
     });
     fake(ui).reply(steps);
     say(ui, message, title);
+    let id = ui.focused_session().and_then(|s| s.id.clone());
     pump_until(ui, "its turn under way", |ui| {
-        ui.focused_session()
+        let sent = fake(ui)
+            .sent()
+            .into_iter()
+            .any(|(to, command)| Some(to) == id && matches!(command, SessionCommand::Send { .. }));
+        sent && ui
+            .focused_session()
             .is_some_and(|s| matches!(s.phase, Phase::Working | Phase::NeedsUser))
     });
 }
@@ -1369,6 +1399,155 @@ fn tile_rename(ui: &mut Ui) {
     conversation(ui);
     let key = ui.app.focused().expect("a session is shown");
     glue::start_rename(ui, Renaming::Header(key));
+}
+
+/// The message the `panel` scene's focused session goes on with, and the reply that ends it.
+const EDITS_MESSAGE: &str = "Make the parser say where each error is";
+const EDITS_REPLY: &str = "Each error now names its line and column, and the notes say so.";
+
+/// The `tiles` scene's three tiles, for a window of 1,800 by 900, with the right panel open
+/// beside them, naming the focused session. That is the first tile's, focused, which has gone
+/// on with a turn that changed four files, one of them outside its folder: the panel shows 37%
+/// of its context used and what that is made of, $0.42 spent and the four files.
+fn panel(ui: &mut Ui) {
+    tiles(ui);
+    let first = ui.app.tiles.columns()[0].top;
+    focus_tile(ui, first);
+    let edit = |id: &str, path: &str, old: &str, new: &str| {
+        let detail = ToolDetail::FileEdit {
+            path: path.into(),
+            old_text: old.into(),
+            new_text: new.into(),
+        };
+        [tool(id, "Edit", detail), done(id, "The file was updated.")]
+    };
+    let write = ToolDetail::FileWrite {
+        path: format!("{FOLDER}/tests/errors.rs"),
+        content: (1..=12).map(|n| format!("// case {n}\n")).collect(),
+    };
+    let mut steps = vec![SessionEvent::TurnStarted];
+    steps.extend(edit(
+        "e1",
+        &format!("{FOLDER}/src/parser.rs"),
+        "    Err(Error::new(message))\n",
+        "    let at = self.position();\n    Err(Error::new(message).at(at.line, at.column))\n",
+    ));
+    steps.extend(edit(
+        "e2",
+        &format!("{FOLDER}/src/error.rs"),
+        "pub struct Error {\n    message: String,\n}\n",
+        "pub struct Error {\n    message: String,\n    line: usize,\n    column: usize,\n}\n",
+    ));
+    steps.extend([tool("w1", "Write", write), done("w1", "File created.")]);
+    steps.extend(edit(
+        "e3",
+        "/home/alex/notes/parser.md",
+        "",
+        "Errors name their line and column.\nEach one has a test in tests/errors.rs.\n",
+    ));
+    steps.extend([
+        SessionEvent::TextDelta(EDITS_REPLY.into()),
+        SessionEvent::BlockFinished,
+        SessionEvent::TurnFinished(TurnSummary {
+            cost_usd: 0.42,
+            context_used: Some(0.37),
+            duration_ms: 24_000,
+            interrupted: false,
+        }),
+    ]);
+    fake(ui).reply(steps.into_iter().map(|e| FakeStep::at(0.0, e)).collect());
+    let effects = ui.app.submit(first, EDITS_MESSAGE);
+    glue::run(ui, effects);
+    pump_until(ui, "the turn that changed four files", |ui| {
+        ui.focused_session()
+            .is_some_and(|s| s.phase == Phase::Idle && s.conversation.changes().files().len() == 4)
+    });
+    // What the program counted after the turn: 74,000 of 200,000 used, the 37% above.
+    let breakdown = panel_breakdown();
+    emit_to(ui, first, SessionEvent::ContextBreakdown(breakdown.clone()));
+    pump_until(ui, "the breakdown of the context", |ui| {
+        ui.focused_session()
+            .is_some_and(|s| s.context_parts.as_ref() == Some(&breakdown))
+    });
+    // What the library thread would answer for a repository on `main`.
+    let branch = FromBackend::Branch {
+        folder: FOLDER.into(),
+        branch: Some(Branch::Named("main".into())),
+    };
+    let effects = ui.app.receive(branch, ui.fake_time);
+    glue::run(ui, effects);
+    ui.panel.set_open(true);
+}
+
+/// What the `panel` scene's session's context is made of: its used parts sum to 74,000 of a
+/// window of 200,000.
+fn panel_breakdown() -> ContextBreakdown {
+    let part = |name: &str, tokens: u64, kind: ContextKind| ContextPart {
+        name: name.into(),
+        tokens,
+        kind,
+    };
+    ContextBreakdown {
+        parts: vec![
+            part("System prompt", 3_000, ContextKind::Used),
+            part("System tools", 12_000, ContextKind::Used),
+            part("Memory files", 700, ContextKind::Used),
+            part("Skills", 2_000, ContextKind::Used),
+            part("Messages", 56_300, ContextKind::Used),
+            part("Autocompact buffer", 33_000, ContextKind::Buffer),
+            part("Free space", 93_000, ContextKind::Free),
+        ],
+        window: 200_000,
+    }
+}
+
+/// The address the demo's sessions are reachable at by Remote Control. It is never shown.
+const REMOTE_ADDRESS: &str = "https://example.org/session";
+
+/// The `panel` scene with Remote Control turned on for the focused tile's session, as its
+/// switch turns it on: the program connects, then says it is reachable. The tile's header says
+/// "Remote", and the panel offers "Copy link".
+fn panel_remote(ui: &mut Ui) {
+    let key = remote_asked(ui);
+    emit_to(ui, key, SessionEvent::RemoteAccess(RemoteAccess::Starting));
+    emit_to(
+        ui,
+        key,
+        SessionEvent::RemoteAccess(RemoteAccess::On {
+            url: Some(REMOTE_ADDRESS.into()),
+        }),
+    );
+    pump_until(ui, "Remote Control on", |ui| {
+        ui.focused_session()
+            .is_some_and(|s| matches!(s.remote, Remote::On { .. }))
+    });
+}
+
+/// The `panel` scene with Remote Control asked for in the focused tile's session and refused
+/// for want of a full claude.ai sign-in: the switch is off again, and the reason is under it
+/// and in the conversation.
+fn panel_refused(ui: &mut Ui) {
+    let key = remote_asked(ui);
+    emit_to(ui, key, SessionEvent::RemoteAccess(RemoteAccess::Starting));
+    let refused = RemoteAccess::Failed {
+        reason: "/login".into(),
+        why: RemoteFailure::Login,
+    };
+    emit_to(ui, key, SessionEvent::RemoteAccess(refused));
+    pump_until(ui, "Remote Control refused", |ui| {
+        ui.focused_session()
+            .is_some_and(|s| s.remote_said.is_some())
+    });
+}
+
+/// The `panel` scene, its focused tile's session asking for Remote Control. Returns that
+/// session.
+fn remote_asked(ui: &mut Ui) -> SessionKey {
+    panel(ui);
+    let key = ui.app.focused().expect("a session is shown");
+    let effects = ui.app.set_remote(key, true);
+    glue::run(ui, effects);
+    key
 }
 
 /// The key of the session the agent knows as `id`.

@@ -13,6 +13,7 @@ mod drag;
 mod folder;
 mod input;
 mod items;
+mod panel;
 mod requests;
 mod resting;
 mod shell;
@@ -70,8 +71,9 @@ fn pane(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, key: SessionKey, layer: &mu
 }
 
 /// `AppSpec::on_key`, for keys no focused text field took: the kit's sidebar shortcut shows and
-/// hides the sidebar; on the main screen, Ctrl+N asks for a new session's folder, and
-/// Ctrl+Shift+N for one to the side, F6 and Shift+F6 move to the next and the previous tile, and
+/// hides the sidebar; on the main screen, Ctrl+Alt+B shows and hides the right panel once per
+/// press, Ctrl+N asks for a new session's folder, and Ctrl+Shift+N for one to the side, F6 and
+/// Shift+F6 move to the next and the previous tile, and
 /// Ctrl+W closes the focused one, once per press, the last three unless a picker's list or a
 /// menu is open (a text field leaves all of them alone); Ctrl+Shift+PageUp and
 /// Ctrl+Shift+PageDown move the focused tile one place along the row, and Ctrl+Alt+PageUp and
@@ -86,6 +88,15 @@ fn pane(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, key: SessionKey, layer: &mu
 pub fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if shell::is_sidebar_toggle(ev) {
         ui.sidebar.toggle();
+        return true;
+    }
+    if shell::is_panel_toggle(ev) {
+        if ui.app.screen != Screen::Main {
+            return false;
+        }
+        if !tx.key_repeat() {
+            panel::toggle(ui);
+        }
         return true;
     }
     if ui.drag.is_some() {

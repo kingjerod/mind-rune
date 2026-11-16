@@ -1,6 +1,6 @@
 # Protocol notes
 
-What the real `claude` program did when driven through `mindrune-probe` on 2026-11-10. Tasks 10 to 16 of plan 1 and plans 2 to 4 treat this file as the source of truth. Where it disagrees with an earlier assumption, this file wins. The last section, "Stored sessions", was added by plan 3 from the store on disk rather than from the probe.
+What the real `claude` program did when driven through `mindrune-probe` on 2026-11-10. Tasks 10 to 16 of plan 1 and plans 2 to 5 treat this file as the source of truth. Where it disagrees with an earlier assumption, this file wins. Two sections were added later: "Stored sessions", by plan 3, from the store on disk rather than from the probe, and the last, "Read in the program for plan 5", from the program's own text. Nothing in that last section was seen live, and it marks each point as seen, read in the program or guessed.
 
 Lines without a prefix below are what `claude` sent. They come from the scrubbed fixtures in `crates/claude/tests/fixtures/live/`, with some fields left out for brevity and long strings cut with `…`; the fixtures hold the full records. Lines starting with `> ` are what the probe sent. Those come from the raw recordings and are in no fixture, because the scrubber keeps only what `claude` sent. In the fixtures, UUIDs are replaced with numbered placeholders, the e-mail and home path are replaced, lists longer than six entries are cut to three, the MCP server and plugin lists are cut to one, thinking signatures are replaced, the `get_usage` reply keeps only its `five_hour` and `seven_day` windows and drops its `behaviors` block, and one file path that the stream had split across two lines was fixed by hand.
 
@@ -45,7 +45,7 @@ Came back, in this order (a `system`/`background_tasks_changed` record also arri
 ```
 
 - `bridge_state` values in order: `ready`, then `connected`. The reply to the request arrives between them.
-- The reply's body holds `session_url` (the page on claude.ai for this session), `connect_url`, `environment_id`, `bridge_epoch` and `bridge_session_id`.
+- The reply's body holds `session_url` (the page on claude.ai for this session), `connect_url`, `environment_id`, `bridge_epoch` and `bridge_session_id`. With a non-empty `environment_id`, `connect_url` is an address of the session too. Since the fix wave after plan 5's review the probe's `raw` mode shows the values of `session_url`, `connect_url` and `bridge_session_id` as `<hidden>` in the terminal, wherever in a line they sit; its recording keeps them.
 - A turn sent while connected ran normally.
 
 Sent: `rc off`. Came back: only the reply. No `bridge_state` line follows.
@@ -57,8 +57,9 @@ Sent: `rc off`. Came back: only the reply. No `bridge_state` line follows.
 Turning it on a second time in the same session worked the same way, with `bridge_epoch` 2 and, in the raw recording, a different `session_url`.
 
 - The `initialize` reply carries `remote_control_available: true`.
-- **Not yet confirmed by a person:** that the session shows up at claude.ai/code. The controller could not check (not signed in to claude.ai in its browser) and Jerod was away. The protocol evidence above was accepted as passing the gate.
+- **Not yet confirmed by a person:** that the session shows up at claude.ai/code. The controller could not check (not signed in to claude.ai in its browser) and Jerod was away. The protocol evidence above was accepted as passing the gate. Plan 5 built the switch on it; the check by a person is now two steps in `docs/notes-for-later-plans.md`, "Jerod's look at plan 5".
 - The `failed` state and the `remote_control_auth` error code were seen on 2026-11-10 before the full login existed, when only the token sign-in was present. They are not in these fixtures.
+- The other states, the other refusal codes and what the adapter gives for each were read in the program for plan 5: see "Read in the program for plan 5".
 
 Fixture: `v1-remote.jsonl`. Differs from the plan: no. Task 13 gets the state names `ready` (starting) and `connected` (on), and takes the URL from the reply.
 
@@ -256,7 +257,7 @@ For comparison, the event sent during a turn:
 {"totalTokens":27212,"maxTokens":1000000,"percentage":3,"model":"claude-haiku-5-5","autoCompactThreshold":967000,"isAutoCompactEnabled":true}
 ```
 
-`list_models` works. Each entry looks like this. The same list is in the `initialize` reply under `models`.
+`list_models` works. Each entry looks like this. The same list is in the `initialize` reply under `models`; since plan 5 the adapter reads `supportsEffort` and `supportedEffortLevels` from it.
 
 ```json
 {"value":"default","resolvedModel":"claude-fable-5-2","displayName":"Default (recommended)","description":"Fable 5.2","supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"],"supportsAdaptiveThinking":true,"supportsAutoMode":true,"supportsThinkingOff":false}
@@ -334,6 +335,7 @@ Each stored session is one file of JSON lines, `~/.claude/projects/<folder>/<ses
 - Records that carry conversation have `type` `user` or `assistant`, a `uuid` and a `parentUuid`. Other record types (`system`, `attachment`) also have `uuid` and `parentUuid`, and a `user` or `assistant` record's parent is often one of those. So the chain must be followed through every record that has a `uuid`, not only through `user` and `assistant`.
 - A file can hold abandoned branches: two records with the same `parentUuid`. The conversation is the chain that ends at the last `user` or `assistant` record of the file that is not a side chain (`isSidechain: true`). The file's order is not the conversation's order, and a record's parent is not always the line before it.
 - Compaction writes a `system` record with `subtype: "compact_boundary"`, `parentUuid: null` and `logicalParentUuid` naming the record before it. Following `logicalParentUuid` keeps the chain whole across it. It is followed by a `user` record with `isCompactSummary: true` (also `isVisibleInTranscriptOnly: true`) whose text is the summary; that record must give no item, or the summary would appear as something the user typed. The app shows "Earlier messages were summarised here to save room." in its place.
+- The effort level of a reply is `effort`, a top-level string on each `assistant` record, not under `message` (checked on 2026-11-15 by key shapes, in one stored session of 2,455 `assistant` records). Plan 5 takes the `effort` of the last `assistant` record on the chain that has one as the level a stored session goes on with.
 - The model that answered is `message.model` on an `assistant` record. A program-made message (for example after an interrupted turn) has the model `<synthetic>`, which is skipped when the session's model is read from its history.
 - A record `{"type":"permission-mode","permissionMode":"auto","sessionId":…}` is written when the mode changes. The names are the wire names (`default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`). These records have no `uuid`. The app takes Plan, Accept edits and Auto from a history, but never `bypassPermissions` or a name it does not know: such a session wakes in the program's default mode.
 - Records written during a turn carry `entrypoint`: how the program was started. Seen in the real store on 2026-11-14: `cli` (the terminal program), `claude-desktop`, `sdk-cli` (this app, and `claude -p`), and `sdk-ts` (a program driving the TypeScript SDK; here a plugin, 722 one-request sessions). The first records of a file (`queue-operation`, `session-owner`) name none. `sdk-py` was not seen and is assumed by analogy.
@@ -360,3 +362,95 @@ What reading them taught:
 - **A record with the same top-level link key twice** (`uuid`, `parentUuid` and the like) is skipped as broken. Not seen in the store.
 - **The same session id in two project folders** gives whichever file is found first.
 - **A rewrite of a file within the same second that keeps its exact length** would not be described again. Session files only grow by appending, so this does not happen in practice.
+
+## Read in the program for plan 5
+
+Added by plan 5 (the effort level, the right panel and Remote Control) on 2026-11-16. No agent ran `claude` for it. Its facts were read in the program's own text, version `2.1.323`, mostly in the descriptions of its own schemas; the recordings above come from `2.1.319`. Each point is marked:
+
+- **Seen**: in a fixture or a raw recording above, or in the store on disk.
+- **Read in the program**: read in its text, never seen working.
+- **Guess**: inferred, not read.
+
+Lines below that start with `> ` are what the adapter sends; the others are what the program would send. All of them are written by hand from the program's text, with made-up values and some keys left out: none is a recording. Plan 5's live test prints a line for most points, and each point says which line settles it. Until Jerod has run the live test, every point marked "read in the program" is open.
+
+### Effort level
+
+- **Seen.** The `initialize` reply's `models[]` entries carry `supportsEffort` and `supportedEffortLevels` (V9 shows one). **Read in the program:** both keys are there only for a model that takes levels, the levels are some of `low`, `medium`, `high`, `xhigh` and `max` in that order, and no entry names a default level. The adapter takes `supportedEffortLevels` as the model's levels only when `supportsEffort` is `true`.
+- **Seen.** The `system`/`init` records of `2.1.319` have no `effort` key, only `per_turn_effort_active: true`. **Read in the program:** `init` has an optional `effort`, described as present on Remote Control's own frames. The adapter does not read it.
+- **Read in the program.** A level at start: `--effort <level>`. An unknown value is ignored with a warning on stderr. The adapter passes it whenever the session has a level, also with `--resume`: nothing was found in the program that restores a level on resume.
+- **Read in the program.** A change in a running session:
+
+  ```json
+  > {"type":"control_request","request_id":"rc_7","request":{"subtype":"apply_flag_settings","settings":{"effortLevel":"high"}}}
+  {"type":"control_response","response":{"subtype":"success","request_id":"rc_7"}}
+  ```
+
+  The reply is a bare success, also for a value the program ignored. `max` is taken for the session only. A level the model cannot do is lowered to `high` when it is used. `apply_flag_settings` is in the set of requests the program handles while a turn runs; **guess:** so it can be sent during a turn and holds from the next request. Settled by: `live: effort changed to <level> in N ms`, for the change and for going back. A change sent during a turn stays unseen: the live test changes the level between turns.
+- **Read in the program.** Reading the level in use:
+
+  ```json
+  > {"type":"control_request","request_id":"rc_8","request":{"subtype":"get_settings"}}
+  {"type":"control_response","response":{"subtype":"success","request_id":"rc_8","response":{"applied":{"model":"claude-haiku-5-5","effort":"high"}}}}
+  ```
+
+  The reply also has `effective` and `sources`, left out here. `applied.effort` is a level or `null`; the program describes `applied` as what the next message will use. The adapter asks after the session starts, after a `set_model` reply, after every `result` and after every `apply_flag_settings` reply. It reads only `applied.effort` and keeps nothing else of the reply. When a level was asked for and another is read, it says "Claude Code goes on with <level>". Only the reading that follows the latest choice says it: when two choices come in quick succession the program may take both before the first reading, which then finds the second level; a reading after an older choice gives the level it finds and no failure (since the fix wave after plan 5's review). Settled by: `live: effort at start: <level>`.
+- **Read in the program.** Which level a turn uses, the first that is set: `CLAUDE_CODE_EFFORT_LEVEL`, a level for that turn, the session's level (from the flag or from `apply_flag_settings`), the model's default. A `maxEffortLevel` in the settings caps any of them. Medium certainty on the order of the middle two. This is why the adapter reads the level back.
+- **Never sent:** `update_settings`. It writes the user's settings file.
+- **Seen in the store** (2026-11-15, the key shapes of one stored session, 2,455 `assistant` records): each `assistant` record has a top-level string `effort`, none under `message`. See "Stored sessions".
+
+### Context and cost
+
+- **Seen.** `assistant.message.usage` has `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` and `output_tokens`. `result.modelUsage` maps each model to, among other keys, its `contextWindow` and `costUSD`. `result.total_cost_usd` is the session's running total at each finished turn.
+- **Read in the program.** Claude Code's own share of the context window, as its status line shows it: `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` of the last message that has usage, over the window of the model in use, at most 100%. Output tokens are not counted. Since plan 5 the adapter counts the same way, over the `contextWindow` that `modelUsage` gives for the model of that message, else over the largest window named. Since the fix wave after plan 5's review it takes the reading only from a top-level `assistant` record that has `usage` and whose model is not `<synthetic>`, the name the program gives a record it makes itself (as for a stopped turn), with a usage of nothing; any other record leaves the last reading as it is. Before that wave a record without usage cleared the reading, so no share came with the turn's end, and a synthetic one gave 0%. Neither record was seen live; the tests write them by hand. **Guess:** that window is the one the program means. Before plan 5 the adapter added the output tokens and divided by the largest window. Settled in part by: `live: context <N>% and cost known: yes`, which shows that a share and a cost arrive with a turn's end. Whether the share equals the program's own is not printed.
+- **Read in the program.** A resumed session's total goes on from its stored total: the program writes a `cost-state` record and restores it on resume. For a fork this is not known.
+
+### Remote Control
+
+- **Seen** (V1): `ready`, the reply with `session_url`, then `connected`. Turning it off gives only the reply.
+- **Read in the program.** All the values of `bridge_state` found, and what the adapter gives for each:
+  - `ready`: starting.
+  - `connected`: on, with the address the reply gave. After a drop it carries `recovered: true`, which the adapter does not read.
+  - `reconnecting`: the connection dropped and is tried again. The adapter gives "reconnecting" and keeps the address.
+  - `failed`, with `failure_kind` `auth`, `terminal`, `ended_elsewhere` or `network` (`terminal` when none is given): a failure. The adapter takes `auth` as a sign-in problem, `ended_elsewhere` as ended from another place, and the rest as other.
+  - `policy_disabled`: refused by an organisation's policy, at start or later in the session. A failure of its own.
+  - Any other value gives nothing. **Guess:** there may be more values; no list of them was found in the program.
+
+  Its shape, from the program's text:
+
+  ```json
+  {"type":"system","subtype":"bridge_state","state":"failed","detail":"/login","failure_kind":"auth","bridge_epoch":1,"session_id":"00000000-0000-4000-8000-000000000002"}
+  ```
+
+- **Read in the program.** A refused request to turn it on:
+
+  ```json
+  {"type":"control_response","response":{"subtype":"error","request_id":"rc_9","error":"A made-up refusal","error_code":"remote_control_ended_elsewhere"}}
+  ```
+
+  `error_code` is `remote_control_auth`, `remote_control_terminal`, `remote_control_ended_elsewhere` or `remote_control_policy_disabled`, or it is missing (a network failure, or a policy not known yet). The adapter takes the codes as it takes the states. A `bridge_state` record usually comes before the error reply, so one refusal arrives twice; the core shows it once. A refused request to turn it off is a failed command, and Remote Control stays on. **Seen, not recorded:** a `failed` state and `remote_control_auth` on 2026-11-10, with only the token sign-in (V1). Settled in part by: `live: remote control: refused (<why>)`, should a refusal come; the live test listens 2 seconds more after the first refusal and prints every kind it heard, in order, as in `refused (Other, then Login)`. Which copy comes first decides the words the app shows (the reply's code and the state's `failure_kind` are read by different fields), so that line settles the mapping.
+- **Read in the program.** For a sign-in problem `detail` is the bare text `/login`, not a sentence. The app never shows it: it says "Remote Control needs a full claude.ai sign-in. Run `claude auth login` in a terminal, then turn it on again."
+- **Read in the program.** Turning it on needs no turn first: the program starts Remote Control with the messages it has, none included. The app asks for a session that wants it as soon as its program has started, before the first message. Settled by: `live: remote control before a first turn: on in N ms`. If that line says otherwise, a new session must ask when its first turn has ended.
+- **Read in the program.** A drop the host did not ask for gives `reconnecting`, then `connected` with `recovered: true`, or `failed`. A change of policy gives `policy_disabled`; a change of sign-in gives `failed` with `terminal`. After `failed`, the next request to turn it on starts again. The live test does not settle these: they need a dropped connection or a policy.
+- **Read in the program.** A prompt typed on another device goes on the program's own queue and runs as any turn; **guess:** the host sees the usual `init`, stream events, `assistant` and `result`. No `user` record for that prompt reaches stdout unless the program was started with `--replay-user-messages`. With it, every turn's prompt is echoed, the host's own included, as a `user` record with `isReplay: true`, and no field was found that says for certain where a prompt came from. The research lists an optional `origin` key on the echoed record, its meaning not established: whether the recording has it, and what it holds for a prompt typed here and for one typed on another device, is one of the things Task 13 reads from it. So the window shows the reply without its prompt, and Task 13 waits for a recording (`docs/notes-for-later-plans.md`, "The check with a second device").
+- **Read in the program.** A permission request answered on another device ends with a `control_cancel_request` for it, the record of V7, which the adapter already gives as a withdrawn request.
+- **Read in the program.** The flag `--remote-control` and the setting `remoteControlAtStartup` exist. Whether either acts in `-p` stream-json mode was not established. The app sends `remote_control` itself.
+
+### Branch and files changed
+
+- **Seen.** Nothing on stdout names the git branch: no `gitBranch` in any fixture or recording, and `init` has no branch. Stored records carry `gitBranch`, which the app does not read. The app reads the branch from the repository's own files (`.git`, or a worktree's `.git` file with its `gitdir:` line, then `HEAD`), never by running git.
+- **Read in the program.** No request gives what this session changed, file by file. `get_workspace_diff` is the working tree's diff against a base, and is internal; `rewind_files` with `dry_run` needs file checkpointing and gives totals only. So the app counts the session's own Edit and Write calls that succeeded, from their inputs, as their rows in the conversation do. The program counts its own totals from the hunks of each result's `structuredPatch`, so the two can differ a little: for an edit with `replace_all` over many places, and for a file overwritten by Write.
+
+## The context breakdown
+
+Added on 2026-11-16, after plan 5, for the rows under "Context" in the panel. Marked as in "Read in the program for plan 5". No agent ran `claude` for it.
+
+- **Seen** (V9). The request works:
+
+  ```json
+  > {"type":"control_request","request_id":"p2","request":{"subtype":"get_context_usage"}}
+  ```
+
+  Its reply (line 14 of `v9-control.jsonl`, whose `categories` the scrubber cut to three rows) has `categories`, a list of rows such as `{"id":"system_tools","name":"System tools","tokens":5870,"color":"inactive","kind":"used"}`, and `maxTokens`, the window. Only those two keys are read, and of a row only `name`, `tokens` and `kind`. Not read: `memoryFiles`, `mcpTools`, `skills` and `agents` (they hold paths and names), `gridRows`, `percentage`, `totalTokens` and the rest.
+- **Seen.** Rows of the kind `used`. **Read in the program:** `kind` is also `free` (one row, "Free space", the rest of the window), `buffer` (the room kept for compacting, "Autocompact buffer" or "Compact buffer") or `deferred` (tool descriptions kept out of the window, listed for awareness and left out of the program's sums). The rows come in this order of ids: `system_prompt`, `system_tools`, `mcp_tools`, `mcp_instructions`, `mcp_tools_deferred`, `system_tools_deferred`, `custom_agents`, `memory_files`, `skills`, `messages`, then the buffer, then `free_space`; a used row with no tokens is left out by the program.
+- **What the adapter does.** It asks after the session starts and after every `result`, whether the turn ended well or not, in the same list as the reading of the effort level and after it. From a success reply with `categories` and a `maxTokens` above nothing it gives the `used`, `buffer` and `free` rows in the program's order; a `deferred` row, a row of a kind it does not know and a row without a `name` or whole `tokens` are dropped. A refusal, a reply without the two keys, or one with no row left gives nothing, and nothing in the conversation. The panel shows each row with tokens; before a session's first turn here, its share over the bar is the used rows over the window.
+- **Not known.** Whether the program answers before the first turn, when nothing has been sent yet: V9 asked mid-session. Settled by the live test's two lines, `live: context breakdown at start: …` and `live: context breakdown after a turn: …`, each a count of parts and their kinds, or `none`. Whether `free` and `buffer` rows come as read is settled by the kinds they print.

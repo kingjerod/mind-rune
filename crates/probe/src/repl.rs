@@ -115,6 +115,8 @@ pub struct RawOptions {
     pub mode: Option<String>,
     pub record: Option<PathBuf>,
     pub full_login: bool,
+    /// Passed to the program after the probe's own arguments, in this order.
+    pub extra_args: Vec<String>,
 }
 
 /// What the probe needs to answer a `can_use_tool` request later.
@@ -190,7 +192,7 @@ pub fn run_raw(options: RawOptions) -> Result<(), String> {
     let fresh_id = SessionId(uuid::Uuid::new_v4().to_string());
     let config = SpawnConfig {
         program: options.program,
-        args: build_args(&spec, Some(&fresh_id)),
+        args: program_args(&spec, &fresh_id, &options.extra_args),
         cwd: options.cwd,
         env: child_env(std::env::vars().collect(), options.full_login),
     };
@@ -206,7 +208,7 @@ pub fn run_raw(options: RawOptions) -> Result<(), String> {
                 recorder.line("< ", &line);
                 remember_permission_request(&line, &pending);
                 // A closed stdout must not stop the session.
-                let _ = writeln!(io::stdout().lock(), "< {line}");
+                let _ = writeln!(io::stdout().lock(), "< {}", echoed(&line));
             },
             move |info| {
                 let _ = events.send(Event::ChildExited(info));
@@ -268,6 +270,58 @@ pub fn run_raw(options: RawOptions) -> Result<(), String> {
             Err(_) => return Ok(()),
         }
     }
+}
+
+/// The keys whose values say where a session can be reached by Remote Control.
+const ADDRESS_KEYS: [&str; 3] = ["session_url", "connect_url", "bridge_session_id"];
+
+/// `line` as the terminal shows it: a JSON line with the value of every key in
+/// [`ADDRESS_KEYS`], at any depth, replaced by `<hidden>`. A line with none of them, or one
+/// that is not JSON, is shown as it is. The recording keeps the raw line.
+fn echoed(line: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return line.to_string();
+    };
+    if hide_addresses(&mut value) {
+        value.to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+/// Replaces the value of every key in [`ADDRESS_KEYS`] in `value` by `<hidden>`. True when
+/// one was found.
+fn hide_addresses(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let mut hid = false;
+            for (key, inner) in map.iter_mut() {
+                if ADDRESS_KEYS.contains(&key.as_str()) {
+                    *inner = Value::String("<hidden>".into());
+                    hid = true;
+                } else {
+                    hid |= hide_addresses(inner);
+                }
+            }
+            hid
+        }
+        Value::Array(items) => {
+            // Every item, not only up to the first with an address.
+            let mut hid = false;
+            for item in items {
+                hid |= hide_addresses(item);
+            }
+            hid
+        }
+        _ => false,
+    }
+}
+
+/// The program's arguments: the probe's own for `spec`, then `extra` as given.
+fn program_args(spec: &StartSpec, fresh_id: &SessionId, extra: &[String]) -> Vec<String> {
+    let mut args = build_args(spec, Some(fresh_id));
+    args.extend_from_slice(extra);
+    args
 }
 
 struct Session {
@@ -420,6 +474,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_echo_hides_a_sessions_address_wherever_it_sits() {
+        // Made up, in the shape of the reply to turning Remote Control on.
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"rc_1","response":{"session_url":"https://example.org/session","connect_url":"https://example.org/session?env=e1","environment_id":"e1","bridge_session_id":"b1"}}}"#;
+        let shown = echoed(reply);
+        assert!(!shown.contains("example.org"), "{shown}");
+        assert!(!shown.contains("\"b1\""), "{shown}");
+        let value: Value = serde_json::from_str(&shown).unwrap();
+        let inner = &value["response"]["response"];
+        for key in ["session_url", "connect_url", "bridge_session_id"] {
+            assert_eq!(inner[key], "<hidden>", "{key}");
+        }
+        assert_eq!(inner["environment_id"], "e1", "the rest is kept");
+        assert_eq!(value["response"]["request_id"], "rc_1");
+        // Nested in an array, and at the top.
+        let line = r#"{"session_url":"https://example.org/session","list":[{"connect_url":"https://example.org/session"},{"session_url":"https://example.org/session"}]}"#;
+        assert!(!echoed(line).contains("example.org"));
+        // A line with nothing to hide, or that is not JSON, is echoed as it is.
+        let plain = r#"{"type":"system", "subtype":"init"}"#;
+        assert_eq!(echoed(plain), plain);
+        let text = "not json: https://example.org/session";
+        assert_eq!(echoed(text), text);
+    }
+
+    #[test]
     fn commands_parse() {
         assert_eq!(
             parse_command("say hello there"),
@@ -445,6 +523,19 @@ mod tests {
         assert_eq!(parse_command("deny req_1"), Ok(Cmd::Deny("req_1".into())));
         assert!(parse_command("dance").is_err());
         assert!(parse_command("rc maybe").is_err());
+    }
+
+    #[test]
+    fn the_extra_arguments_come_after_the_probes_own_in_their_order() {
+        let mut spec = StartSpec::new("/p");
+        spec.model = Some("opus".into());
+        let id = SessionId("11111111-1111-4111-8111-111111111111".into());
+        let extra = vec!["--replay-user-messages".to_string(), "--debug".to_string()];
+        let args = program_args(&spec, &id, &extra);
+        let own = build_args(&spec, Some(&id));
+        assert_eq!(args[..own.len()], own[..]);
+        assert_eq!(args[own.len()..], extra[..]);
+        assert_eq!(program_args(&spec, &id, &[]), own);
     }
 
     #[test]

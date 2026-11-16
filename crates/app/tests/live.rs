@@ -18,18 +18,26 @@
 //! `claude` accepts the Auto permission mode. Then it prints how long the two listings took,
 //! what the look gave, and how long the largest of a few recent stored histories took to read.
 //! None of these fails the test, except not getting back to "Ask before edits" after trying
-//! Auto. Then a second session opens to the side, in the same folder, and is sent one message:
-//! each session must hold its own reply and not the other's. The first session is renamed: its
-//! program must confirm the name, and a listing of the store must then give it. The first run
-//! then closes, as the window closes, keeping what it would save: both tiles, the first
-//! focused.
+//! Auto. Then it prints what was read in the program for plan 5 and never seen working, none of
+//! it a way to fail: the effort level the session started with, what came of choosing another
+//! of the model's levels and of going back, the share of the context window in use and whether
+//! the cost is known, what the context was made of at the start and after the turn (how many
+//! parts and of which kinds, never their names), and what came of turning Remote Control on and
+//! off again. Then a second
+//! session opens to the side, in the same folder; once it is ready, and before its first
+//! message, Remote Control is turned on and off in it too, and what came of that is printed.
+//! Then it is sent one message: each session must hold its own reply and not the other's. The
+//! first session is renamed: its program must confirm the name, and a listing of the store must
+//! then give it. The first run then closes, as the window closes, keeping what it would save:
+//! both tiles, the first focused.
 //!
 //! The second run starts with what the first kept, so it shows the test's session again from
 //! the store. Both tiles must come back, the first focused and under its new name. The first
 //! message and its reply must be in the history read back, a second message must wake the
-//! session, resuming the same id, and get its reply. What the first run kept also says that
-//! this app closed the session, so the second run is not expected to ask whether another app
-//! has it open; it prints whether it did.
+//! session, resuming the same id, and get its reply; it prints the effort level the app passed
+//! when it resumed the session and the level the program then said. What the first run kept
+//! also says that this app closed the session, so the second run is not expected to ask
+//! whether another app has it open; it prints whether it did.
 //!
 //! Every way out of the test, a failed assertion included, closes both sessions, so no `claude`
 //! is left running, and every wait has a deadline that says what it waited for. Of the user's
@@ -42,7 +50,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mr_agent::{
-    Account, Agent, CommandKind, PermissionMode, SessionCommand, SessionEvent, SessionId,
+    Account, Agent, CommandKind, ContextBreakdown, ContextKind, PermissionMode, RemoteAccess,
+    RemoteFailure, SessionCommand, SessionEvent, SessionId,
 };
 use mr_claude::ClaudeAgent;
 use mr_core::{
@@ -102,6 +111,19 @@ const RENAME_LIMIT: Duration = Duration::from_secs(30);
 /// How long a listing of the store may take to give the new name, asked again each second.
 const NAMED_LIMIT: Duration = Duration::from_secs(30);
 
+/// How long the program may take to say the effort level, at start or after a choice.
+const EFFORT_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long the program may take to say what the context is made of after the first turn.
+const BREAKDOWN_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long Remote Control may take to be on or refused, and to be off again.
+const REMOTE_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long the test goes on listening after a refusal of Remote Control, for the other copies
+/// of it, which may give another kind of failure.
+const REFUSAL_LISTEN: Duration = Duration::from_secs(2);
+
 #[test]
 #[ignore = "starts the real claude; run with MINDRUNE_LIVE=1 and --ignored"]
 fn a_real_turn_the_store_the_look_and_the_session_resumed() {
@@ -126,6 +148,10 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     live.report_listings();
     live.report_look();
     live.report_histories();
+    live.report_effort();
+    live.report_context_and_cost();
+    live.report_breakdown();
+    live.report_remote(live.key.expect("the test's session"), "remote control");
     live.side_turn();
     live.rename();
     let id = live.id().expect("the session has the agent's id");
@@ -205,6 +231,46 @@ struct Live {
     asked_for_name: bool,
     /// Whether the first listing that answered since gave that name.
     listed_name: Option<bool>,
+    /// Every effort level the agent said for the test's session, in order, with when.
+    efforts: Vec<(Instant, Option<String>)>,
+    /// What the programs of the test's sessions said of Remote Control, in order, with when.
+    remotes: Vec<(SessionKey, Instant, RemoteSaid)>,
+    /// Whether a turn of the test's session has ended in this run.
+    turn_ended: bool,
+    /// Every breakdown of the context the test's session was given, in order, each with whether
+    /// a turn had ended before it came.
+    breakdowns: Vec<(bool, ContextBreakdown)>,
+}
+
+/// What a program said of Remote Control, without the address it may carry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RemoteSaid {
+    Off,
+    Starting,
+    On,
+    Reconnecting,
+    Failed(RemoteFailure),
+    /// A command about it was refused.
+    Refused,
+}
+
+impl RemoteSaid {
+    fn from_event(event: &SessionEvent) -> Option<RemoteSaid> {
+        match event {
+            SessionEvent::RemoteAccess(access) => Some(match access {
+                RemoteAccess::Off => RemoteSaid::Off,
+                RemoteAccess::Starting => RemoteSaid::Starting,
+                RemoteAccess::On { .. } => RemoteSaid::On,
+                RemoteAccess::Reconnecting => RemoteSaid::Reconnecting,
+                RemoteAccess::Failed { why, .. } => RemoteSaid::Failed(*why),
+            }),
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetRemoteAccess,
+                ..
+            } => Some(RemoteSaid::Refused),
+            _ => None,
+        }
+    }
 }
 
 impl Live {
@@ -250,6 +316,10 @@ impl Live {
             opened: None,
             asked_for_name: false,
             listed_name: None,
+            efforts: Vec::new(),
+            remotes: Vec::new(),
+            turn_ended: false,
+            breakdowns: Vec::new(),
         };
         if let Some(account) = account {
             effects.retain(|effect| *effect != Effect::CheckAccount);
@@ -449,8 +519,10 @@ impl Live {
     }
 
     /// Opens a second session to the side of the test's, in the same folder, as "Open to the
-    /// side" does, sends it [`SIDE_MESSAGE`] and waits for its reply. Each session must hold its
-    /// own message and reply only. The test's tile is focused again afterwards.
+    /// side" does, turns Remote Control on and off in it once it is ready (see
+    /// [`Live::report_remote`]), then sends it [`SIDE_MESSAGE`] and waits for its reply. Each
+    /// session must hold its own message and reply only. The test's tile is focused again
+    /// afterwards.
     fn side_turn(&mut self) {
         let key = self.key.expect("the test's session");
         let asked = Instant::now();
@@ -473,6 +545,10 @@ impl Live {
             TURN_LIMIT.as_secs(),
             self.phase_of(side)
         );
+        // Not counted in the time to the reply.
+        let paused = Instant::now();
+        self.report_remote(side, "remote control before a first turn");
+        let paused = paused.elapsed();
         let effects = self.app.submit(side, SIDE_MESSAGE);
         assert!(!effects.is_empty(), "the message to the side was not sent");
         self.carry_out(effects);
@@ -488,7 +564,7 @@ impl Live {
                 self.items_of(side)
             );
         }
-        let took = asked.elapsed();
+        let took = asked.elapsed().saturating_sub(paused);
 
         let said = |items: &[ItemBody], message: &str| {
             items
@@ -585,6 +661,250 @@ impl Live {
             took.as_millis(),
             listed_from.elapsed().as_millis()
         );
+    }
+
+    /// Prints the effort level the test's session started with, from the agent's first word on
+    /// it. Then chooses another of the model's levels, as the effort picker does, and the first
+    /// level again, printing what came of each. Fails on nothing.
+    fn report_effort(&mut self) {
+        self.wait_for(EFFORT_LIMIT, |live| !live.efforts.is_empty());
+        let start = match self.efforts.first() {
+            Some((_, level)) => {
+                eprintln!(
+                    "live: effort at start: {}",
+                    level.as_deref().unwrap_or("none")
+                );
+                level.clone()
+            }
+            None => {
+                eprintln!(
+                    "live: effort at start: not said within {} s",
+                    EFFORT_LIMIT.as_secs()
+                );
+                None
+            }
+        };
+        let levels = self
+            .session()
+            .map(|session| session.effort_levels().to_vec())
+            .unwrap_or_default();
+        if levels.is_empty() {
+            eprintln!("live: effort: the app knows no levels for this model");
+            return;
+        }
+        let Some(other) = levels
+            .into_iter()
+            .find(|level| Some(level) != start.as_ref())
+        else {
+            eprintln!("live: effort did not change: the model lists no other level");
+            return;
+        };
+        self.change_effort(&other);
+        match start {
+            Some(start) if self.session().and_then(|s| s.effort.as_ref()) == Some(&start) => {
+                eprintln!("live: effort did not change: {start} is still in use");
+            }
+            Some(start) => self.change_effort(&start),
+            None => eprintln!("live: effort did not change: there is no level to go back to"),
+        }
+    }
+
+    /// Chooses `level` for the test's session and prints the level the agent then said and
+    /// how long that took, or why it did not change. Fails on nothing.
+    fn change_effort(&mut self, level: &str) {
+        let key = self.key.expect("the test's session");
+        let (said_before, refused_before) = (self.efforts.len(), self.refusals.len());
+        let asked = Instant::now();
+        let effects = self.app.choose_effort(key, level);
+        let sent = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Send {
+                    command: SessionCommand::SetEffort(_),
+                    ..
+                }
+            )
+        });
+        self.carry_out(effects);
+        if !sent {
+            eprintln!("live: effort did not change: the app sent nothing for {level}");
+            return;
+        }
+        let refused = |live: &Live| {
+            live.refusals[refused_before..]
+                .iter()
+                .any(|(what, _)| *what == CommandKind::SetEffort)
+        };
+        self.wait_for(EFFORT_LIMIT, |live| {
+            live.efforts.len() > said_before || refused(live)
+        });
+        if refused(self) {
+            let reason = self.refusal(CommandKind::SetEffort).unwrap_or_default();
+            eprintln!("live: effort did not change: {reason}");
+        } else if let Some((at, said)) = self.efforts.get(said_before) {
+            eprintln!(
+                "live: effort changed to {} in {} ms",
+                said.as_deref().unwrap_or("none"),
+                at.duration_since(asked).as_millis()
+            );
+        } else {
+            eprintln!(
+                "live: effort did not change: no answer in {} s",
+                EFFORT_LIMIT.as_secs()
+            );
+        }
+    }
+
+    /// Prints the share of the context window in use and whether the cost is known, as the
+    /// first turn left them. Fails on nothing.
+    fn report_context_and_cost(&self) {
+        let session = self.session().expect("the test's session");
+        let context = match session.context_used {
+            Some(used) => format!("{}%", (used * 100.0).round().clamp(0.0, 100.0) as u8),
+            None => "unknown".to_string(),
+        };
+        eprintln!(
+            "live: context {context} and cost known: {}",
+            if session.cost_usd.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
+
+    /// Prints what the program said the context was made of after the session started and
+    /// after its first turn: how many parts and of which kinds, or none. Waits
+    /// [`BREAKDOWN_LIMIT`] for the one after the turn. Names no part. Fails on nothing.
+    fn report_breakdown(&mut self) {
+        self.wait_for(BREAKDOWN_LIMIT, |live| {
+            live.breakdowns.iter().any(|(after, _)| *after)
+        });
+        for (after, lead) in [(false, "at start"), (true, "after a turn")] {
+            let found = self
+                .breakdowns
+                .iter()
+                .find(|(turn_ended, _)| *turn_ended == after)
+                .map(|(_, breakdown)| breakdown);
+            match found {
+                Some(breakdown) => {
+                    let mut kinds: Vec<&str> = Vec::new();
+                    for part in &breakdown.parts {
+                        let kind = match part.kind {
+                            ContextKind::Used => "used",
+                            ContextKind::Buffer => "buffer",
+                            ContextKind::Free => "free",
+                        };
+                        if !kinds.contains(&kind) {
+                            kinds.push(kind);
+                        }
+                    }
+                    eprintln!(
+                        "live: context breakdown {lead}: {} parts (kinds: {})",
+                        breakdown.parts.len(),
+                        kinds.join(", ")
+                    );
+                }
+                None => eprintln!("live: context breakdown {lead}: none"),
+            }
+        }
+    }
+
+    /// Turns Remote Control on for `key`'s session, as its switch does, and prints whether the
+    /// program said it is on and how long that took, or that it refused and why, or that it did
+    /// not answer. A refusal can come more than once, as a state and as a reply: the test
+    /// listens [`REFUSAL_LISTEN`] longer and prints every kind of failure it heard, in order.
+    /// Then turns it off and prints what came of that. Every line starts with `lead`. The
+    /// address is never printed: only the state's name. Fails on nothing.
+    fn report_remote(&mut self, key: SessionKey, lead: &str) {
+        let from = self.remotes.len();
+        let asked = Instant::now();
+        let effects = self.app.set_remote(key, true);
+        let sent = sends_remote(&effects);
+        self.carry_out(effects);
+        if !sent {
+            eprintln!("live: {lead}: the app sent nothing to turn it on");
+            return;
+        }
+        let settled = |said: RemoteSaid| matches!(said, RemoteSaid::On | RemoteSaid::Failed(_));
+        self.wait_for(REMOTE_LIMIT, |live| {
+            live.remote_said(key, from)
+                .into_iter()
+                .any(|(_, said)| settled(said))
+        });
+        let said = self.remote_said(key, from);
+        match said.iter().find(|&&(_, said)| settled(said)) {
+            Some((at, RemoteSaid::On)) => eprintln!(
+                "live: {lead}: on in {} ms",
+                at.duration_since(asked).as_millis()
+            ),
+            Some((_, RemoteSaid::Failed(_))) => {
+                self.wait_for(REFUSAL_LISTEN, |_| false);
+                let mut kinds: Vec<String> = Vec::new();
+                for (_, said) in self.remote_said(key, from) {
+                    if let RemoteSaid::Failed(why) = said {
+                        let kind = format!("{why:?}");
+                        if !kinds.contains(&kind) {
+                            kinds.push(kind);
+                        }
+                    }
+                }
+                eprintln!("live: {lead}: refused ({})", kinds.join(", then "));
+            }
+            _ => match said.last() {
+                Some((_, last)) => eprintln!(
+                    "live: {lead}: no answer in {} s (last: {last:?})",
+                    REMOTE_LIMIT.as_secs()
+                ),
+                None => eprintln!("live: {lead}: no answer in {} s", REMOTE_LIMIT.as_secs()),
+            },
+        }
+        self.remote_off(key, lead);
+    }
+
+    /// Turns Remote Control off for `key`'s session and prints what came of it. A program that
+    /// has not answered being turned on is asked too, by the app itself: a late "on" must not
+    /// outlive the check.
+    fn remote_off(&mut self, key: SessionKey, lead: &str) {
+        let from = self.remotes.len();
+        let effects = self.app.set_remote(key, false);
+        if !sends_remote(&effects) {
+            self.carry_out(effects);
+            eprintln!("live: {lead}: off, as it already was");
+            return;
+        }
+        self.carry_out(effects);
+        let settled = |said: RemoteSaid| matches!(said, RemoteSaid::Off | RemoteSaid::Refused);
+        self.wait_for(REMOTE_LIMIT, |live| {
+            live.remote_said(key, from)
+                .into_iter()
+                .any(|(_, said)| settled(said))
+        });
+        let said = self.remote_said(key, from);
+        match said.iter().find(|&&(_, said)| settled(said)) {
+            Some((_, RemoteSaid::Off)) => eprintln!("live: {lead}: off"),
+            Some(_) => eprintln!("live: {lead}: turning it off was refused"),
+            None => eprintln!(
+                "live: {lead}: turning it off had no answer in {} s",
+                REMOTE_LIMIT.as_secs()
+            ),
+        }
+    }
+
+    /// What `key`'s program said of Remote Control from the `from`th word noted on, with when.
+    fn remote_said(&self, key: SessionKey, from: usize) -> Vec<(Instant, RemoteSaid)> {
+        self.remotes[from..]
+            .iter()
+            .filter(|(of, _, _)| *of == key)
+            .map(|&(_, at, said)| (at, said))
+            .collect()
+    }
+
+    /// The test's session whose program has the open number `open`.
+    fn key_of(&self, open: u64) -> Option<SessionKey> {
+        self.ours()
+            .into_iter()
+            .find(|key| self.app.sessions.get(*key).and_then(|entry| entry.open) == Some(open))
     }
 
     /// Checks that the second run brought back both tiles of the first, `id`'s session (named
@@ -772,6 +1092,19 @@ impl Live {
             "live: resumed with {label} in {}",
             mode_label(&session.mode)
         );
+        self.report_resumed_effort(&spec);
+    }
+
+    /// Prints the level the app passed with `--effort` when it resumed the session, from its
+    /// stored history, and the first level its program then said. Fails on nothing.
+    fn report_resumed_effort(&mut self, spec: &mr_agent::StartSpec) {
+        let passed = spec.effort.as_deref().unwrap_or("none").to_string();
+        self.wait_for(EFFORT_LIMIT, |live| !live.efforts.is_empty());
+        let says = match self.efforts.first() {
+            Some((_, level)) => level.as_deref().unwrap_or("none").to_string(),
+            None => format!("nothing within {} s", EFFORT_LIMIT.as_secs()),
+        };
+        eprintln!("live: resumed with effort {passed}, the program says {says}");
     }
 
     /// The test's session in this run.
@@ -821,6 +1154,12 @@ impl Live {
 
     /// Notes what `message` says that the test reports on, before the `App` takes it.
     fn note(&mut self, message: &FromBackend) {
+        if let FromBackend::Event { open, event } = message
+            && let Some(key) = self.key_of(*open)
+            && let Some(said) = RemoteSaid::from_event(event)
+        {
+            self.remotes.push((key, Instant::now(), said));
+        }
         match message {
             FromBackend::Event { open, event } if Some(*open) == self.open() => match event {
                 SessionEvent::CommandFailed { what, reason } => {
@@ -828,8 +1167,17 @@ impl Live {
                 }
                 SessionEvent::TitleChanged(title) => self.titles.push(title.clone()),
                 SessionEvent::PermissionModeChanged(mode) => self.modes.push(mode.clone()),
+                SessionEvent::EffortChanged(level) => {
+                    self.efforts.push((Instant::now(), level.clone()));
+                }
                 SessionEvent::UsageLimits(limits) if limits.session.is_some() => {
                     self.session_usage = true;
+                }
+                SessionEvent::TurnFinished(_) | SessionEvent::TurnFailed { .. } => {
+                    self.turn_ended = true;
+                }
+                SessionEvent::ContextBreakdown(breakdown) => {
+                    self.breakdowns.push((self.turn_ended, breakdown.clone()));
                 }
                 _ => {}
             },
@@ -1032,6 +1380,7 @@ impl Live {
                     ToBackend::ReadHistory { key, id, max_items }
                 }
                 Effect::CheckActivity { key, id } => ToBackend::CheckActivity { key, id },
+                Effect::ReadBranch { folder } => ToBackend::ReadBranch { folder },
                 Effect::Look { folder } => {
                     if folder != self.folder {
                         eprintln!(
@@ -1205,6 +1554,19 @@ fn finished_replies(items: &[ItemBody]) -> Vec<&String> {
             _ => None,
         })
         .collect()
+}
+
+/// Whether `effects` send a Remote Control command.
+fn sends_remote(effects: &[Effect]) -> bool {
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Send {
+                command: SessionCommand::SetRemoteAccess { .. },
+                ..
+            }
+        )
+    })
 }
 
 /// How a listing stands, in a word: how many it gave, failed, not answered or not asked.

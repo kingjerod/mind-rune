@@ -8,6 +8,14 @@
 #   need-permission            -> a turn that asks to run Bash (request req_p); it
 #                                 finishes only when an allow reply for req_p arrives
 #   "subtype":"set_model"      -> a success reply naming claude-sonnet-5-5
+#   "subtype":"apply_flag_settings"
+#                              -> a success reply with no body; its effortLevel is kept
+#   "subtype":"get_settings"   -> a success reply whose applied.effort is the level last
+#                                 set, medium before any (written by hand: never seen live)
+#   "subtype":"get_context_usage"
+#                              -> a success reply whose categories are two used rows, a
+#                                 deferred one, the buffer and the free space (written by
+#                                 hand in the shape seen live, values made up)
 #   "subtype":"get_usage"      -> a success reply with the two rate-limit windows
 #   "subtype":"generate_session_title"
 #                              -> the title "Listing the folder" announced, then the same
@@ -24,6 +32,12 @@ request_id() {
   printf '%s\n' "$1" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p'
 }
 
+effort_level() {
+  printf '%s\n' "$1" | sed -n 's/.*"effortLevel":"\([^"]*\)".*/\1/p'
+}
+
+EFFORT=medium
+
 MODELS='[{"value":"default","displayName":"Default","resolvedModel":"claude-haiku-5-5"},{"value":"sonnet","displayName":"Sonnet","resolvedModel":"claude-sonnet-5-5"}]'
 INIT='{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku-5-5","permissionMode":"default","claude_code_version":"2.1.319","cwd":"/work"}'
 MSG_START='{"type":"stream_event","event":{"type":"message_start","message":{}}}'
@@ -38,6 +52,7 @@ TOOL_CALL='{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use
 PERMISSION_REQUEST='{"type":"control_request","request_id":"req_p","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"t_p"}}'
 TOOL_DONE='{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t_p","content":"a.txt"}]}}'
 USAGE='{"subscription_type":"max","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":37,"resets_at":"2026-11-11T08:19:59.618411+00:00"},"seven_day":{"utilization":10,"resets_at":"2026-11-15T20:59:59.618435+00:00"}}}'
+CONTEXT='{"categories":[{"id":"system_prompt","name":"System prompt","tokens":3000,"color":"promptBorder","kind":"used"},{"id":"messages","name":"Messages","tokens":46000,"color":"purple","kind":"used"},{"id":"mcp_tools_deferred","name":"MCP tools","tokens":1200,"color":"cyan","kind":"deferred"},{"id":"autocompact_buffer","name":"Autocompact buffer","tokens":33000,"color":"inactive","kind":"buffer"},{"id":"free_space","name":"Free space","tokens":918000,"color":"promptBorder","kind":"free"}],"totalTokens":49000,"maxTokens":1000000,"percentage":5}'
 HOOK_REQUEST='{"type":"control_request","request_id":"req_h","request":{"subtype":"hook_callback","callback_id":"cb_1","input":{}}}'
 
 if [ -n "${ANTHROPIC_CANARY+x}" ]; then
@@ -60,10 +75,20 @@ while IFS= read -r line; do
   elif [[ "$line" == *'"subtype":"set_model"'* ]]; then
     id=$(request_id "$line")
     printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"model":"claude-sonnet-5-5"}}}\n' "$id"
+  elif [[ "$line" == *'"subtype":"apply_flag_settings"'* ]]; then
+    id=$(request_id "$line")
+    EFFORT=$(effort_level "$line")
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s"}}\n' "$id"
+  elif [[ "$line" == *'"subtype":"get_settings"'* ]]; then
+    id=$(request_id "$line")
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"effective":{},"sources":[],"applied":{"model":"claude-haiku-5-5","effort":"%s"}}}}\n' "$id" "$EFFORT"
   elif [[ "$line" == *'"subtype":"generate_session_title"'* ]]; then
     id=$(request_id "$line")
     printf '%s\n' '{"type":"system","subtype":"session_title_changed","title":"Listing the folder","session_id":"s1"}'
     printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"title":"Listing the folder"}}}\n' "$id"
+  elif [[ "$line" == *'"subtype":"get_context_usage"'* ]]; then
+    id=$(request_id "$line")
+    printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$CONTEXT"
   elif [[ "$line" == *'"subtype":"get_usage"'* ]]; then
     id=$(request_id "$line")
     printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$USAGE"

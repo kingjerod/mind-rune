@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The scenes that make up the window's screens: one session's, in the order it meets them,
-/// then those with many sessions, the sidebar's menus, a stored session's, and tiles side by
-/// side. Each runs in the binary's own window size unless a size is given, as `--size` takes it.
+/// then those with many sessions, the sidebar's menus, a stored session's, tiles side by side,
+/// and the right panel beside them. Each runs in the binary's own window size unless a size is given, as `--size` takes it.
 const SCENES: &[(&str, Option<&str>)] = &[
     ("checking", None),
     ("signed-out", None),
     ("not-installed", None),
     ("empty", None),
+    ("effort", None),
     ("limit", None),
     ("conversation", None),
     ("streaming", None),
@@ -38,6 +39,9 @@ const SCENES: &[(&str, Option<&str>)] = &[
     ("tiles-move", Some(WIDE)),
     ("tiles-stacked", Some(WIDE)),
     ("tile-rename", None),
+    ("panel", Some(WIDE)),
+    ("panel-remote", Some(WIDE)),
+    ("panel-refused", Some(WIDE)),
 ];
 
 /// A window wide enough for three tiles of more than 420 points each beside the sidebar. The

@@ -2,13 +2,17 @@
 //! the test calls `advance`, and then in order of due time.
 //!
 //! It keeps the contract the real adapter keeps: `Started` (with a fixed list
-//! of two made-up models) first, a new id for a fork and the old one for a
-//! plain resume, and `Exited` after `Close`, with every later command refused.
+//! of two made-up models) first and `EffortChanged` after it, a new id for a
+//! fork and the old one for a plain resume, and `Exited` after `Close`, with
+//! every later command refused.
 //! Like the real adapter it also refuses an `Answer` whose request is not
 //! waiting, and accepts a second `Close` until the first one's `Exited` has
-//! been delivered. A `Send` plays the next reply queued with `reply`, a
+//! been delivered. After `Started` and `EffortChanged`, and after every `TurnFinished` of a
+//! scripted reply, it gives a fixed `ContextBreakdown` (see [`fake_breakdown`]).
+//! A `Send` plays the next reply queued with `reply`, a
 //! `SuggestTitle` the next answer queued with `title_reply`, and a `Rename` is
-//! answered with `TitleChanged`, as the real program answers it.
+//! answered with `TitleChanged`, as the real program answers it. A `SetModel`
+//! or a `SetEffort` is recorded and not answered: a test answers it with `emit`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -18,7 +22,10 @@ use crate::agent::{
     StoredSession,
 };
 use crate::command::SessionCommand;
-use crate::event::{ModelOption, PermissionMode, SessionEvent, SessionInfo};
+use crate::event::{
+    ContextBreakdown, ContextKind, ContextPart, ModelOption, PermissionMode, SessionEvent,
+    SessionInfo,
+};
 use crate::ids::{RequestId, SessionId};
 
 /// One event of a scripted reply, due `after` seconds after the `Send`.
@@ -319,10 +326,12 @@ impl Agent for FakeAgent {
         }
         let models = fake_models();
         let asked = spec.model.as_deref().unwrap_or("default");
-        let model = models
-            .iter()
-            .find(|option| option.id == asked)
-            .map_or_else(|| asked.to_string(), |option| option.resolved.clone());
+        let option = models.iter().find(|option| option.id == asked);
+        let model = option.map_or_else(|| asked.to_string(), |option| option.resolved.clone());
+        // A model that takes levels starts at the one asked for, else at `medium`.
+        let effort = option
+            .filter(|option| !option.effort_levels.is_empty())
+            .map(|_| spec.effort.unwrap_or_else(|| "medium".into()));
         let info = SessionInfo {
             id: id.clone(),
             folder: spec.folder,
@@ -332,6 +341,8 @@ impl Agent for FakeAgent {
             models,
         };
         inner.schedule(0.0, &id, SessionEvent::Started(info));
+        inner.schedule(0.0, &id, SessionEvent::EffortChanged(effort));
+        inner.schedule(0.0, &id, SessionEvent::ContextBreakdown(fake_breakdown()));
         Ok(Box::new(FakeHandle {
             id,
             agent: self.clone(),
@@ -339,8 +350,30 @@ impl Agent for FakeAgent {
     }
 }
 
+/// What the context of every fake session is made of: 26,000 of a window of 200,000 used.
+fn fake_breakdown() -> ContextBreakdown {
+    let part = |name: &str, tokens: u64, kind: ContextKind| ContextPart {
+        name: name.into(),
+        tokens,
+        kind,
+    };
+    ContextBreakdown {
+        parts: vec![
+            part("System prompt", 3_000, ContextKind::Used),
+            part("System tools", 12_000, ContextKind::Used),
+            part("Memory files", 1_000, ContextKind::Used),
+            part("Skills", 2_000, ContextKind::Used),
+            part("Messages", 8_000, ContextKind::Used),
+            part("Autocompact buffer", 33_000, ContextKind::Buffer),
+            part("Free space", 141_000, ContextKind::Free),
+        ],
+        window: 200_000,
+    }
+}
+
 /// The models every fake session offers. The first, like the real default, has a name that
-/// does not say which model it is, and supports the `Auto` mode; the second does not.
+/// does not say which model it is, supports the `Auto` mode and takes three effort levels;
+/// the second does neither.
 fn fake_models() -> Vec<ModelOption> {
     vec![
         ModelOption {
@@ -349,6 +382,7 @@ fn fake_models() -> Vec<ModelOption> {
             resolved: "fake-model".into(),
             stands_for: Some("Fake 1".into()),
             auto_mode: true,
+            effort_levels: vec!["low".into(), "medium".into(), "high".into()],
         },
         ModelOption {
             id: "fast".into(),
@@ -356,6 +390,7 @@ fn fake_models() -> Vec<ModelOption> {
             resolved: "fake-model-fast".into(),
             stands_for: None,
             auto_mode: false,
+            effort_levels: Vec::new(),
         },
     ]
 }
@@ -413,7 +448,12 @@ impl SessionHandle for FakeHandle {
             match inner.replies.pop_front() {
                 Some(steps) => {
                     for step in steps {
+                        let finished = matches!(step.event, SessionEvent::TurnFinished(_));
                         inner.schedule(step.after, &self.id, step.event);
+                        if finished {
+                            let breakdown = SessionEvent::ContextBreakdown(fake_breakdown());
+                            inner.schedule(step.after, &self.id, breakdown);
+                        }
                     }
                 }
                 None => inner.schedule(
@@ -445,7 +485,7 @@ mod tests {
     use super::*;
     use crate::agent::HistoryItem;
     use crate::command::Answer;
-    use crate::event::{CommandKind, TurnSummary, UserRequest, UserRequestKind};
+    use crate::event::{CommandKind, ContextKind, TurnSummary, UserRequest, UserRequestKind};
     use crate::ids::RequestId;
 
     fn collect() -> (Arc<Mutex<Vec<SessionEvent>>>, EventSink) {
@@ -488,9 +528,14 @@ mod tests {
             })
             .unwrap();
         fake.advance(0.6);
-        assert_eq!(seen.lock().unwrap().len(), 3); // Started, TurnStarted, TextDelta
+        // Started, EffortChanged, ContextBreakdown, TurnStarted, TextDelta
+        assert_eq!(seen.lock().unwrap().len(), 5);
         fake.advance(0.5);
-        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            7,
+            "TurnFinished and its breakdown"
+        );
         assert_eq!(fake.sent().len(), 1);
     }
 
@@ -556,6 +601,7 @@ mod tests {
                 earlier_left_out: false,
                 model: Some("fake-model-1".into()),
                 permission_mode: Some(PermissionMode::Plan),
+                effort: None,
             },
         );
 
@@ -637,6 +683,151 @@ mod tests {
     }
 
     #[test]
+    fn the_fake_says_its_effort_after_it_starts() {
+        let fake = FakeAgent::new();
+        let (plain, sink) = collect();
+        fake.open(StartSpec::new("/p"), sink).unwrap();
+        let (high, sink) = collect();
+        let mut spec = StartSpec::new("/p");
+        spec.effort = Some("high".into());
+        fake.open(spec, sink).unwrap();
+        let (fast, sink) = collect();
+        let mut spec = StartSpec::new("/p");
+        spec.model = Some("fast".into());
+        fake.open(spec, sink).unwrap();
+        fake.advance(0.0);
+        let second = |seen: &Mutex<Vec<SessionEvent>>| {
+            let seen = seen.lock().unwrap();
+            assert!(matches!(seen[0], SessionEvent::Started(_)));
+            assert_eq!(seen.len(), 3, "and the breakdown");
+            seen[1].clone()
+        };
+        assert_eq!(
+            second(&plain),
+            SessionEvent::EffortChanged(Some("medium".into()))
+        );
+        assert_eq!(
+            second(&high),
+            SessionEvent::EffortChanged(Some("high".into()))
+        );
+        assert_eq!(second(&fast), SessionEvent::EffortChanged(None));
+    }
+
+    #[test]
+    fn the_fake_gives_its_breakdown_after_it_starts_and_after_every_finished_turn() {
+        let fake = FakeAgent::new();
+        let (seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        let breakdowns = |seen: &Mutex<Vec<SessionEvent>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, SessionEvent::ContextBreakdown(_)))
+                .count()
+        };
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3, "Started, EffortChanged, ContextBreakdown");
+            let SessionEvent::ContextBreakdown(breakdown) = &seen[2] else {
+                panic!("expected the breakdown third, got {:?}", seen[2]);
+            };
+            assert_eq!(breakdown.window, 200_000);
+            let parts: Vec<(&str, u64, ContextKind)> = breakdown
+                .parts
+                .iter()
+                .map(|p| (p.name.as_str(), p.tokens, p.kind))
+                .collect();
+            assert_eq!(
+                parts,
+                [
+                    ("System prompt", 3_000, ContextKind::Used),
+                    ("System tools", 12_000, ContextKind::Used),
+                    ("Memory files", 1_000, ContextKind::Used),
+                    ("Skills", 2_000, ContextKind::Used),
+                    ("Messages", 8_000, ContextKind::Used),
+                    ("Autocompact buffer", 33_000, ContextKind::Buffer),
+                    ("Free space", 141_000, ContextKind::Free),
+                ]
+            );
+        }
+        let finished = SessionEvent::TurnFinished(TurnSummary {
+            cost_usd: 0.1,
+            context_used: None,
+            duration_ms: 1,
+            interrupted: false,
+        });
+        fake.reply(vec![
+            FakeStep::at(0.0, SessionEvent::TurnStarted),
+            FakeStep::at(1.0, finished.clone()),
+        ]);
+        handle
+            .send(SessionCommand::Send {
+                text: "hi".into(),
+                attachments: vec![],
+            })
+            .unwrap();
+        fake.advance(0.5);
+        assert_eq!(breakdowns(&seen), 1, "not inside the turn");
+        fake.advance(0.5);
+        let seen_now = seen.lock().unwrap().clone();
+        assert_eq!(seen_now[seen_now.len() - 2], finished);
+        assert!(matches!(
+            seen_now.last(),
+            Some(SessionEvent::ContextBreakdown(_))
+        ));
+        // A failed turn, and an event a test emits, give none.
+        fake.reply(vec![FakeStep::at(
+            0.0,
+            SessionEvent::TurnFailed {
+                reason: "no".into(),
+            },
+        )]);
+        handle
+            .send(SessionCommand::Send {
+                text: "again".into(),
+                attachments: vec![],
+            })
+            .unwrap();
+        fake.emit(&SessionId("fake-1".into()), finished);
+        fake.advance(0.0);
+        assert_eq!(breakdowns(&seen), 2);
+    }
+
+    #[test]
+    fn the_fake_records_a_change_of_effort_and_answers_nothing() {
+        let fake = FakeAgent::new();
+        let (seen, sink) = collect();
+        let handle = fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        let before = seen.lock().unwrap().len();
+        assert_eq!(
+            handle.send(SessionCommand::SetEffort("high".into())),
+            Ok(())
+        );
+        fake.advance(10.0);
+        assert_eq!(seen.lock().unwrap().len(), before);
+        assert!(
+            fake.sent()
+                .iter()
+                .any(|(_, c)| *c == SessionCommand::SetEffort("high".into()))
+        );
+    }
+
+    #[test]
+    fn the_fakes_default_model_takes_three_levels_and_fast_none() {
+        let fake = FakeAgent::new();
+        let (seen, sink) = collect();
+        fake.open(StartSpec::new("/p"), sink).unwrap();
+        fake.advance(0.0);
+        let models = started(&seen).models;
+        assert_eq!(models[0].id, "default");
+        assert_eq!(models[0].effort_levels, ["low", "medium", "high"]);
+        assert_eq!(models[1].id, "fast");
+        assert!(models[1].effort_levels.is_empty());
+    }
+
+    #[test]
     fn a_fork_gets_a_new_id_and_a_plain_resume_keeps_its_own() {
         let fake = FakeAgent::new();
         let old = SessionId("old".into());
@@ -675,9 +866,10 @@ mod tests {
             detail: String::new(),
         };
         assert_eq!(seen.lock().unwrap().last(), Some(&exited));
-        assert_eq!(seen.lock().unwrap().len(), 3); // Started, TurnStarted, Exited
+        // Started, EffortChanged, ContextBreakdown, TurnStarted, Exited
+        assert_eq!(seen.lock().unwrap().len(), 5);
         fake.advance(10.0);
-        assert_eq!(seen.lock().unwrap().len(), 3, "nothing after Exited");
+        assert_eq!(seen.lock().unwrap().len(), 5, "nothing after Exited");
         for command in [SessionCommand::Stop, SessionCommand::Close] {
             assert_eq!(handle.send(command), Err(AgentError::Closed));
         }
@@ -697,8 +889,8 @@ mod tests {
             SessionEvent::TitleChanged("B".into()),
         );
         fake.advance(0.0);
-        assert_eq!(a.lock().unwrap().len(), 1);
-        assert_eq!(b.lock().unwrap().len(), 2);
+        assert_eq!(a.lock().unwrap().len(), 3);
+        assert_eq!(b.lock().unwrap().len(), 4);
     }
 
     #[test]
@@ -752,7 +944,11 @@ mod tests {
         // Nothing scripted: no answer at all, as when the agent offers no title.
         assert_eq!(handle.send(suggest()), Ok(()));
         fake.advance(10.0);
-        assert_eq!(seen.lock().unwrap().len(), 1, "only Started");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "only Started, EffortChanged and ContextBreakdown"
+        );
         fake.title_reply(vec![FakeStep::at(
             0.5,
             SessionEvent::TitleChanged("Fixing the parser".into()),
@@ -766,7 +962,7 @@ mod tests {
         )]);
         assert_eq!(handle.send(suggest()), Ok(()));
         fake.advance(0.4);
-        assert_eq!(seen.lock().unwrap().len(), 1, "due half a second after");
+        assert_eq!(seen.lock().unwrap().len(), 3, "due half a second after");
         fake.advance(0.1);
         assert_eq!(
             seen.lock().unwrap().last(),

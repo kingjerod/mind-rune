@@ -18,9 +18,9 @@ pub use account::{StatusInfo, detect, parse_status, plan_label};
 pub use agent::ClaudeAgent;
 pub use args::build_args;
 pub use encode::{
-    PermissionReply, control_request, generate_session_title, get_usage, initialize, interrupt,
-    permission_reply, remote_control, rename_session, set_model, set_permission_mode,
-    unsupported_reply, user_message,
+    PermissionReply, control_request, generate_session_title, get_context_usage, get_settings,
+    get_usage, initialize, interrupt, permission_reply, remote_control, rename_session, set_effort,
+    set_model, set_permission_mode, unsupported_reply, user_message,
 };
 pub use env::child_env;
 pub use history::{

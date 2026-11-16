@@ -11,9 +11,10 @@ use crate::ids::{RequestId, SessionId, ToolCallId};
 ///
 /// - `Started` comes at most once, before any turn. It is the first event,
 ///   except that on a resumed session `TitleChanged` can arrive before it. It
-///   may arrive before `open` has returned. If the program exits before it is
-///   ready (a session id that cannot be resumed, a bad flag), `Exited` is the
-///   only event, and `open` may also have returned an error.
+///   may arrive before `open` has returned, and `EffortChanged` follows it. If
+///   the program exits before it is ready (a session id that cannot be
+///   resumed, a bad flag), `Exited` is the only event, and `open` may also have
+///   returned an error.
 /// - Then turns: `TurnStarted`, the turn's text, thinking, tool and request
 ///   events, and one `TurnFinished` or `TurnFailed`. A turn the user stopped
 ///   ends in `TurnFinished` with `interrupted: true`, and its open text or
@@ -21,8 +22,8 @@ use crate::ids::{RequestId, SessionId, ToolCallId};
 ///   starts with `ThinkingStarted`, before any `ThinkingDelta`, and
 ///   `BlockFinished` ends it, whether or not any thinking text came.
 /// - `UsageLimits`, `RemoteAccess`, `TitleChanged`, `ModelChanged`,
-///   `PermissionModeChanged` and `CommandFailed` can come between turns or
-///   inside one.
+///   `EffortChanged`, `PermissionModeChanged`, `ContextBreakdown` and
+///   `CommandFailed` can come between turns or inside one.
 /// - `Exited` comes last, exactly once, also after a normal `Close`. It ends any
 ///   open turn and every request still waiting for the user; no separate
 ///   `TurnFailed` or `RequestWithdrawn` is sent for them.
@@ -60,7 +61,17 @@ pub enum SessionEvent {
     RemoteAccess(RemoteAccess),
     TitleChanged(String),
     ModelChanged(String),
+    /// The effort level the next message will use; none when the model takes none.
+    /// It follows `Started`, and comes again whenever the level the agent reads differs from
+    /// the last one it gave, as after a `SessionCommand::SetEffort` or a change of model.
+    /// After a `SetEffort` that was refused or not taken, a
+    /// `CommandFailed { what: CommandKind::SetEffort, .. }` says so, with no `EffortChanged`
+    /// when the level in use did not change.
+    EffortChanged(Option<String>),
     PermissionModeChanged(PermissionMode),
+    /// What the context is made of, as the program last counted it. Given whenever the program
+    /// answers, after `Started` and after a turn ends; never an error when it does not.
+    ContextBreakdown(ContextBreakdown),
     /// A SetModel, Rename etc. was refused.
     CommandFailed {
         what: CommandKind,
@@ -82,6 +93,7 @@ pub enum CommandKind {
     SetRemoteAccess,
     RefreshUsage,
     SuggestTitle,
+    SetEffort,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -110,6 +122,8 @@ pub struct ModelOption {
     pub stands_for: Option<String>,
     /// Whether the `Auto` permission mode can be used with this model.
     pub auto_mode: bool,
+    /// The effort levels this model takes, lowest first; empty when it takes none.
+    pub effort_levels: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -202,6 +216,33 @@ pub struct TurnSummary {
     pub interrupted: bool,
 }
 
+/// What the context window holds, part by part, in the program's order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    pub parts: Vec<ContextPart>,
+    /// The size of the window, in tokens.
+    pub window: u64,
+}
+
+/// One part of the context, such as the system prompt or the messages.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextPart {
+    pub name: String,
+    pub tokens: u64,
+    pub kind: ContextKind,
+}
+
+/// What a part of the context is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextKind {
+    /// It fills the window.
+    Used,
+    /// The rest of the window.
+    Free,
+    /// The room kept for compacting.
+    Buffer,
+}
+
 /// A `None` window means "not reported this time", not zero use.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimits {
@@ -219,16 +260,40 @@ pub struct LimitWindow {
 impl LimitWindow {
     /// `used` as a whole percentage, rounded to nearest and clamped to 0..=100.
     pub fn percent(&self) -> u8 {
-        (self.used * 100.0).round().clamp(0.0, 100.0) as u8
+        percent(self.used)
     }
+}
+
+/// A fraction as a whole percentage, rounded to nearest and clamped to 0..=100.
+pub fn percent(fraction: f32) -> u8 {
+    (fraction * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RemoteAccess {
     Off,
     Starting,
-    On { url: Option<String> },
-    Failed { reason: String, needs_login: bool },
+    On {
+        url: Option<String>,
+    },
+    /// The connection dropped and is being made again.
+    Reconnecting,
+    Failed {
+        reason: String,
+        why: RemoteFailure,
+    },
+}
+
+/// Why Remote Control was refused or ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteFailure {
+    /// The sign-in is not a full claude.ai login.
+    Login,
+    /// The organisation's policy turns it off.
+    Policy,
+    /// It was ended for this session from another place.
+    Elsewhere,
+    Other,
 }
 
 #[cfg(test)]
@@ -270,6 +335,14 @@ mod tests {
     fn the_new_words_survive_a_round_trip_through_json() {
         let events = vec![
             SessionEvent::ThinkingStarted,
+            SessionEvent::ContextBreakdown(ContextBreakdown {
+                parts: vec![ContextPart {
+                    name: "Messages".into(),
+                    tokens: 8_000,
+                    kind: ContextKind::Used,
+                }],
+                window: 200_000,
+            }),
             SessionEvent::CommandFailed {
                 what: CommandKind::SetModel,
                 reason: "no such model".into(),

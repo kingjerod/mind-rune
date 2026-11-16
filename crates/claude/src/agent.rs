@@ -1,10 +1,11 @@
 //! [`ClaudeAgent`]: the [`Agent`] implementation that runs the `claude` program.
 //!
 //! One session is one child process. Its reader thread turns each output line
-//! into events with a [`Translator`] and hands them to the sink; the session
-//! handle writes commands to the child. The translator is the only state both
-//! sides touch, and its lock is never held while writing to the child or
-//! calling the sink.
+//! into events with a [`Translator`] and hands them to the sink, then sends the
+//! requests the translator asks for; the session handle writes commands to the
+//! child. The translator and the counter of request ids are the only state both
+//! sides touch, and the translator's lock is never held while writing to the
+//! child or calling the sink.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ use crate::account::detect;
 use crate::args::build_args;
 use crate::encode::{
     control_request, generate_session_title, get_usage, initialize, interrupt, permission_reply,
-    remote_control, rename_session, set_model, set_permission_mode, unsupported_reply,
+    remote_control, rename_session, set_effort, set_model, set_permission_mode, unsupported_reply,
     user_message,
 };
 use crate::env::child_env;
@@ -162,6 +163,7 @@ impl Agent for ClaudeAgent {
         };
 
         let translator = Arc::new(Mutex::new(Translator::for_session(start)));
+        let next_request = Arc::new(AtomicU64::new(1));
         let sink = Arc::new(Mutex::new(sink));
         let exited = Arc::new(AtomicBool::new(false));
         // The reader needs the process to answer requests, and the process
@@ -171,6 +173,7 @@ impl Agent for ClaudeAgent {
 
         let reader = Reader {
             translator: Arc::clone(&translator),
+            next_request: Arc::clone(&next_request),
             sink: Arc::clone(&sink),
             process: Arc::clone(&process_link),
             ignored: Mutex::new(HashSet::new()),
@@ -188,7 +191,7 @@ impl Agent for ClaudeAgent {
         let session = ClaudeSession {
             process,
             translator,
-            next_request: AtomicU64::new(1),
+            next_request,
             exited,
             closing: AtomicBool::new(false),
         };
@@ -200,6 +203,8 @@ impl Agent for ClaudeAgent {
 /// Everything the thread reading the child's output needs.
 struct Reader {
     translator: Arc<Mutex<Translator>>,
+    /// Shared with the session handle, so the requests of both have their own ids.
+    next_request: Arc<AtomicU64>,
     sink: Arc<Mutex<EventSink>>,
     process: Arc<OnceLock<Weak<ClaudeProcess>>>,
     /// The kinds of unrecognised line already reported on stderr.
@@ -221,10 +226,36 @@ impl Reader {
             }
             _ => {}
         }
-        // The lock ends with this statement, before the sink is called.
-        let events = lock(&self.translator).push(message);
+        // The lock ends with this block, before the sink is called. What is read is never
+        // printed or kept here: the reply to `get_settings` holds the user's settings, and the
+        // one to `get_context_usage` names their memory files.
+        let (events, requests) = {
+            let mut translator = lock(&self.translator);
+            (translator.push(message), translator.take_requests())
+        };
         for event in events {
             emit(&self.sink, event);
+        }
+        self.send(requests);
+    }
+
+    /// Sends the requests the translator asked for, as the session handle sends its own.
+    fn send(&self, requests: Vec<(Tracked, Value)>) {
+        if requests.is_empty() {
+            return;
+        }
+        let Some(process) = self.process.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        for (tracked, body) in requests {
+            // A request that cannot be written is dropped: the session is ending.
+            let _ = request(
+                &self.translator,
+                &self.next_request,
+                &process,
+                Some(tracked),
+                body,
+            );
         }
     }
 
@@ -276,20 +307,36 @@ fn emit(sink: &Mutex<EventSink>, event: SessionEvent) {
 struct ClaudeSession {
     process: Arc<ClaudeProcess>,
     translator: Arc<Mutex<Translator>>,
-    next_request: AtomicU64,
+    next_request: Arc<AtomicU64>,
     exited: Arc<AtomicBool>,
     closing: AtomicBool,
 }
 
+/// Sends a control request under the next id, `rc_1`, `rc_2`, …. What it asks
+/// for is tracked first, so the reply cannot arrive before it is expected.
+fn request(
+    translator: &Mutex<Translator>,
+    next_request: &AtomicU64,
+    process: &ClaudeProcess,
+    tracked: Option<Tracked>,
+    body: Value,
+) -> Result<(), AgentError> {
+    let id = format!("rc_{}", next_request.fetch_add(1, Ordering::SeqCst));
+    if let Some(tracked) = tracked {
+        lock(translator).track(&id, tracked);
+    }
+    process.write_line(&control_request(&id, body))
+}
+
 impl ClaudeSession {
-    /// Sends a control request under the next id, `rc_1`, `rc_2`, …. What it asks
-    /// for is tracked first, so the reply cannot arrive before it is expected.
     fn request(&self, tracked: Option<Tracked>, body: Value) -> Result<(), AgentError> {
-        let id = format!("rc_{}", self.next_request.fetch_add(1, Ordering::SeqCst));
-        if let Some(tracked) = tracked {
-            lock(&self.translator).track(&id, tracked);
-        }
-        self.process.write_line(&control_request(&id, body))
+        request(
+            &self.translator,
+            &self.next_request,
+            &self.process,
+            tracked,
+            body,
+        )
     }
 
     /// Closes the child's input and returns at once. A child still running after
@@ -352,6 +399,9 @@ impl SessionHandle for ClaudeSession {
                 self.request(Some(Tracked::SuggestTitle), generate_session_title(&from))
             }
             SessionCommand::RefreshUsage => self.request(Some(Tracked::Usage), get_usage()),
+            SessionCommand::SetEffort(level) => {
+                self.request(Some(Tracked::SetEffort(level.clone())), set_effort(&level))
+            }
             SessionCommand::Close => self.close(),
         }
     }

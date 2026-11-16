@@ -59,6 +59,8 @@ pub struct StartSpec {
     pub fork: bool,
     pub model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    /// The effort level to start with; the agent's own default when none.
+    pub effort: Option<String>,
 }
 
 impl StartSpec {
@@ -69,6 +71,7 @@ impl StartSpec {
             fork: false,
             model: None,
             permission_mode: None,
+            effort: None,
         }
     }
 }
@@ -110,6 +113,8 @@ pub struct StoredHistory {
     pub model: Option<String>,
     /// The mode the session was last in, when the history names one.
     pub permission_mode: Option<PermissionMode>,
+    /// The effort level of its last reply, when the store says.
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

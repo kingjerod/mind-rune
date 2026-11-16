@@ -1,8 +1,298 @@
 # Notes for later plans
 
-Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles) and the stacked tiles plan (two tiles in a column). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column) and plan 5 (the effort level, the right panel and Remote Control). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
 
-The stacked tiles plan's section comes first, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+Plan 5's section comes first, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## Jerod's look at plan 5
+
+Plan 5 (`docs/superpowers/plans/2026-11-15-panel-remote-effort.md`) adds the effort level beside the model, a panel on the right that describes the focused session, and a Remote Control switch with a mark in the tile's header. It is built on the branch `plan-5-panel-remote-effort`, cut from `main` at `0dc6d25`, the commit that records the merge of stacked tiles. The branch holds Tasks 1 to 12 in seventeen commits, from `cbda79e` to `ae29e10`, three of them fixes after a review (`7821362`, `b07dbfe`, `4938524`), these notes (`48acd5d`), and the fix wave after the whole-branch review (`0623aec`, `311a540`, `4041c30`, `20571e6`, `4dff2c9`, and the commit that brought these notes up to date), and a last commit by the controller with the rulings of the run (`docs/superpowers/plans/2026-11-15-plan-5-rulings.md`) and what the re-review of the fix wave left. One commit on it is not this plan's: `8b4c632`, the MindRune icon under `assets/`, put there by another session of Jerod's that works in the same checkout. Task 13 was not built (see "Left by plan 5"). Each task's review passed. The whole-branch review found nothing critical and asked for fixes, which one wave made (see "The whole-branch review of plan 5", at the end of this section). On 2026-11-16 Jerod had it merged into `main` (a fast-forward to `4afab10`, with the context breakdown they asked for during their look); the branch is gone and nothing is pushed. After that wave `cargo test --workspace` gives 1040 passed, 0 failed, 2 ignored (the live tests, not run).
+
+Unlike stacked tiles, this look needs the live test, and it comes first. Much of what the effort picker and the switch rest on was read in the program's text and never seen working; the live test's lines say whether it holds. Jerod runs, in their own terminal, on `main`:
+
+```bash
+MINDRUNE_LIVE=1 cargo test -p mindrune --test live -- --ignored --nocapture
+```
+
+```bash
+cargo run --release -p mindrune
+```
+
+The window starts as before: with no folder it shows again the tiles it had when it last closed. The panel is hidden on the first start. Once shown or hidden, it comes back that way, and as wide as it was left.
+
+`cargo test --workspace` writes the screenshots of the four new scenes (`effort`, `panel`, `panel-remote` and `panel-refused`, dark and light) to `target/snap/final`. Those made while building, with a few more (the input box at 560 by 400 among them), are in `target/snap/p5/`; the three panel scenes as the fix wave left them are there as `fix-panel-*.png`. Neither is in git.
+
+### The live test
+
+It needs Claude Code installed and signed in, as before, and starts the real `claude` four times, as plan 4's does. It turns Remote Control on in its own two sessions for a moment (decision 16), so two test sessions show at claude.ai/code for a few seconds each. Nothing else about what stays behind changed: see "Jerod's look at plan 4".
+
+What it now prints, besides the lines of plans 3 and 4, on stderr, one per line. None of them fails the test, and every wait has a deadline of 30 seconds and says what it waited for. N is in milliseconds. The address of a Remote Control session is never printed.
+
+In the first session, after the histories line, the effort level:
+
+- `live: effort at start: <level>`, from the first level the program gave. `none` means the model takes no level; `not said within 30 s` means no level came.
+- `live: effort changed to <level> in N ms`, after choosing another of the model's levels, then the same line for going back. In a normal run: `effort at start: X`, `effort changed to Y in N ms`, `effort changed to X in N ms`.
+- `live: effort did not change: <reason>` in place of a change. The reasons: `Claude Code goes on with <level>` (the level read back is not the one asked for), `no answer in 30 s`, `the model lists no other level`, `the app sent nothing for <level>`, for going back `<level> is still in use` or `there is no level to go back to`, or the program's own error text, when it refuses the request or the reading after it fails.
+- `live: effort: the app knows no levels for this model`, in place of both changes, when the model list the app holds gives the model in use no level at all. `the model lists no other level` is then kept for a model with a single level.
+
+Then context and cost, as the first turn left them:
+
+- `live: context <N>% and cost known: yes|no`, or `live: context unknown and cost known: yes|no`.
+
+Then Remote Control in the first session, after its first turn (the lead `remote control`), and in the second session once it is ready and before its first message (the lead `remote control before a first turn`). Each place prints one line for turning it on and, but after `the app sent nothing to turn it on`, one for turning it off:
+
+- `live: <lead>: on in N ms`.
+- `live: <lead>: refused (<why>)`, where `<why>` is `Login`, `Policy`, `Elsewhere` or `Other`. A refusal comes twice, as a state and as a reply, and the two give the kind by different fields: after the first the test listens 2 seconds more and prints every kind it heard, in order, as in `refused (Other, then Login)`. The program's own reason is not printed.
+- `live: <lead>: no answer in 30 s`, when nothing came; `no answer in 30 s (last: <state>)` when something came but neither on nor a refusal, for example `Starting`.
+- `live: <lead>: the app sent nothing to turn it on`.
+- Then `live: <lead>: off`, or `turning it off was refused`, `turning it off had no answer in 30 s`, or `off, as it already was` (after a refusal nothing needs turning off). A program that has not answered being turned on is asked to turn it off all the same, by the app itself since the fix wave.
+
+The time spent on Remote Control in the second session is taken out of plan 4's "the session to the side replied in X ms".
+
+In the second run, after plan 4's `live: resumed with <model> in <mode>`:
+
+- `live: resumed with effort <level or none>, the program says <level or none>`: the level the app passed with `--effort` when it resumed the session, read from its stored history, and the first level the resumed program said; `the program says nothing within 30 s` when none came.
+
+What each line settles:
+
+- `effort at start` with a level: the program answers `get_settings` with `applied.effort`, and the adapter reads it. `none` for a model that lists levels, or `not said within 30 s`, means the read does not work as the program's text says.
+- `effort changed to` twice: `apply_flag_settings` with `effortLevel` changes the running session's level. `did not change: Claude Code goes on with` means it did not. If either of these two lines shows that the program does not do what its text says, the effort picker cannot be trusted, and Tasks 2, 4 and 5 are reopened before the plan is merged. So does a `did not change` line that gives the program's own error text: the request or the reading is refused.
+- `effort: the app knows no levels for this model`: the `initialize` reply gives the model no `supportedEffortLevels`, so the picker is not drawn for it. Not a failure of the program, but nothing about the effort was tried.
+- `context <N>%` and `cost known: yes`: a share of the context window and the cost arrive with the end of a turn, counted the new way.
+- `remote control: on`: the new states and the switch's path work after a turn. `refused (Login)` most likely means the sign-in is not a full claude.ai one; it is not a failure of the test.
+- `remote control before a first turn: on`: Remote Control can be turned on before a session's first turn. If it is refused or has no answer there and the first session's is on, the fix is one condition in `Session::apply`: a new session that wants it asks when its first turn has ended, not at `Started`.
+- `remote control: off`: turning it off answers with a bare success, as seen on 2026-11-10.
+- `refused (A, then B)` with two kinds: the state and the reply disagree, and which arrives first decides the words the app shows (Minor 6 of the review, below). One kind: they agree.
+- `resumed with effort X, the program says X`: `--effort` is taken on resume. `the program says Y` with another level means the flag is ignored on resume (or the program's cap lowered it); `says nothing` means the reading after start did not come. A flag the program rejected would end it at start, and the resume would fail the test loudly.
+
+Four things stay unseen after the live test: a change of effort sent while a turn runs (the test changes it between turns), that a message is made at the level read back (the test reads the level, it sends no message at the changed level), the states `reconnecting` and `policy_disabled` (they need a dropped connection or a policy), and anything typed on another device (the check below).
+
+What fails it is what failed plan 4's; this plan adds no way to fail.
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- A prompt typed on a phone or at claude.ai/code runs, and its reply streams into the tile, but the prompt itself is not shown above the reply. That is Task 13, which waits for a recording (see "Left by plan 5").
+- The Remote Control switch does not start a session's program. On a session that is resting it is remembered, the panel says "Turns on when the session starts.", and it is turned on with the next message.
+- Remote Control is not turned on again by itself after the app is closed and opened, but for new sessions when "On for new sessions" is set.
+- Closing the window still ends every session's program, so Remote Control ends with it. Running in the background is plan 7.
+- The list of changed files is what the session's own edits say, not what git says, and it knows only the part of a long session that is loaded. A notebook edit is not counted.
+- The branch is read when the focus moves, when the app starts and when a turn ends in the focused session. A branch switched in a terminal shows at the next of these.
+- An effort level chosen on a session that rests, and never sent before the app closes, is not kept: the next start shows the level the session's history gives.
+- The panel cannot show what a file's changes are. It lists the files and their counts only.
+- With "On for new sessions" set, a new session that is left empty still shows at claude.ai/code for as long as its program runs.
+- The demo window (`cargo run -p mindrune -- --demo`, its scenes and the screenshots) uses a fake agent that answers neither the Remote Control switch nor an effort choice by itself: a press there shows "Connecting…", or a choice changes nothing, until a scene says what the program said. Its folders are made up, so it reads no branch from the disk; the `panel` scene gives "main" itself.
+
+### What to try in the window
+
+1. The effort level shows beside the model in every tile, and a change holds for the next message. Seen: looks good (Jerod, 2026-11-16).
+2. An old session opens with the effort it last used. Seen: looks good (Jerod, 2026-11-16).
+3. The button at the top right and Ctrl+Alt+B show the panel; it comes back as it was after a restart. Seen: looks good (Jerod, 2026-11-16).
+4. The panel follows the focused tile: folder, branch, model, effort, mode. Seen: looks good (Jerod, 2026-11-16).
+5. Context and cost appear after a turn; the files a session changed are listed with their counts. Seen: works (Jerod, 2026-11-16); a breakdown of the context is asked for, see below.
+6. The Remote Control switch turns on, the tile says "Remote", and "Copy link" gives a working address. Seen: looks good (Jerod, 2026-11-16).
+7. "On for new sessions" makes the next new session start with it. Seen: looks good (Jerod, 2026-11-16).
+8. On the ultrawide: is the panel worth its width, and should it start open? Seen: looks good (Jerod, 2026-11-16).
+
+### What Jerod reported on 2026-11-16
+
+Jerod ran the window on the branch. They first asked when the context figure shows up, and were told: after a session's first turn ends. Their answer: "Ok that part works. I do want the breakdown by messages, system tools etc. Everything else looks good." So the eight things above are recorded as seen, on that one sentence. It says nothing of what the live test printed, of the check with a second device, or of the "Things to look at" below; those stay open until Jerod says so. The eighth thing asked two questions (is the panel worth its width, should it start open); no change was asked for, so it stays hidden at first.
+
+The one thing asked for is new: under "Context" the panel is to show what the context is made of (system prompt, system tools, messages and so on), as Claude Code's own `/context` does. That is built after plan 5 as a piece of its own; see "The context breakdown" in `docs/protocol-notes.md` once it is there.
+
+That breakdown is now built on the branch, after `91555e4`. Under the bar of "Context" the panel lists each part the program counts, in its order, with its tokens and its share of the window (`12.0k (6%)`, `717 (<1%)`); the autocompact buffer and the free space are in the muted colour. The app asks for it after a session starts and after every turn, with the request `get_context_usage` seen in V9; parts with no tokens are not listed, and the tool descriptions the program keeps out of the window (its "deferred" rows) are left out, as its own sums leave them out. What to look at: the rows themselves, against `/context` in a terminal for the same session; and a stored session woken again by a message, which now shows a share over the bar from the moment its program has started, while its first turn here still runs, taken from the breakdown, where it said "not known yet" until that turn ended (if the program answers at start: the live test's line `live: context breakdown at start` says whether it does). A resting session starts no program, so it still says "not known yet". After a turn the share over the bar is still the turn's own figure, which can differ a little from the sum of the used rows.
+
+Shown the breakdown's demo screenshot and asked whether to merge, Jerod said: "Merge to main". Plan 5 with the breakdown went into `main` by a fast-forward to `4afab10`; on `main` the tests give 1054 passed, 0 failed, 2 ignored, and formatting and lints are clean. Nothing is pushed. The rows were merged before Jerod saw them in the real window, and the live test's output is still not reported: a defect found in either is fixed on `main`.
+
+### The check with a second device
+
+This answers the oldest open check in these notes, "Remote Control, seen by a person" (under "Open checks that need Jerod"). Two steps.
+
+1. In the window, turn Remote Control on in a session: the switch in the panel. Wait until the tile's header says "Remote" in the accent colour. Then, at claude.ai/code or in the Claude app on another device: is the session listed, and does a prompt typed there run here? Its reply should stream into the tile; the prompt itself will not show above it (Task 13). "Copy link" puts the session's address on the clipboard: opened in a browser, does it go to that session? Turn the switch off at the end.
+2. For Task 13, a recording, made in a terminal in the repository, with a folder of your choice for `SOME_FOLDER`:
+
+   ```bash
+   cargo run -p mr-probe -- raw --cwd SOME_FOLDER --full-login --arg --replay-user-messages --record target/rec/p5-remote.txt
+   ```
+
+   Then type, one at a time, waiting for each to be answered: `say Reply with the word one.`, then `rc on`, then a prompt typed on the other device (one that asks to run a command, so that a permission request may come), a permission request answered on the other device if one comes, then `rc off`, then `quit`.
+
+   The file `target/rec/p5-remote.txt` will hold the Remote Control address of that test session: the probe's `raw` mode records every line the program sends. The terminal's echo of those lines shows the address's values (`session_url`, `connect_url`, `bridge_session_id`) as `<hidden>`; the file keeps them. Both also hold the account's e-mail address and your home path. Do not paste either anywhere. The file stays in `target/rec/`, which is never committed. Task 13 reads only the names and shapes of its records, and writes its test lines by hand with made-up values.
+
+### Every decision of plan 5, with what was built
+
+The seventeen decisions are the planner's; Jerod has not seen them.
+
+1. **The panel starts hidden.** Built: the kit's trailing pane (`SplitView::inspector`), hidden until shown. The button `mr-panel-toggle` sits at the top right of the band above the tiles, labelled "Show panel" or "Hide panel", with the shortcut in its tooltip; it is no Tab stop. Ctrl+Alt+B (Cmd+Alt+B on macOS) does the same on the main screen, once per press, not on a held key. The panel is 300 points wide at first, and its grip takes it from 240 to 480; it collapses below half its least width, and a double press on the grip gives it 300 again, all the kit's own. Whether it is open and its width are kept in `Saved.panel_open` and `Saved.panel_width`, saved at once on a toggle; a drag of the grip is saved with the next save, as the sidebar's is.
+2. **Opening the panel makes every tile narrower.** Built: none is closed. The row of tiles narrows by 292 points for a panel of 300, since the kit drops the main card's 8-point frame on its right while a pane borders it. Every tile is drawn where `Tiles::rects` places it in every frame of the panel's motion, and with both panes open in a window 560 wide nothing panics, no tile closes and the button still closes the panel.
+3. **The effort level is a picker of its own.** Built in `view/input.rs`: a kit `Select` between the model and the mode, keyed `mr-effort-{n}`. It shows the level Claude Code reports, as Low, Medium, High, Extra high or Max (`Session::effort_label`), and "Effort" while none is known; its list holds the levels the model in use takes, in the model's order. For a model that takes none it is not drawn, and an open list of it shuts.
+4. **A change of effort holds from the next message.** Built: a choice sends `apply_flag_settings` with `effortLevel`, and the adapter then reads the level back with `get_settings`, since the first reply confirms nothing. It also reads it after the session starts, after a change of model and after every turn. The picker changes once the level read back says so. When Claude Code goes on with another level, the conversation says "Could not change the effort level: Claude Code goes on with high" (or "with no effort level"), and the picker keeps the level in use. Of two choices in quick succession only the reading after the last can say so, and a choice is compared with the level last asked for while that is on its way, so going back to the level in use during a change asks for it (both since the fix wave). On a resting session the choice is taken at once and sent with `--effort` when the program starts. Nothing asks again by itself.
+5. **A stored session goes on with the effort it last used.** Built: the history gives the `effort` of the last `assistant` record that names one, and the session passes it with `--effort` when it wakes. A level the model is known not to take is forgotten while the session rests. The list has no "default" entry.
+6. **In a tile too narrow for three pickers the mode is cut first, then the effort, and the model's name last.** Built: the mode sits in a slot that takes the free room, so it gives up width first; the effort then shrinks to 48 points; the model gets what the others leave (`input::model_room`). At 48 points a trigger shows only an ellipsis and its chevron (see "Things to look at").
+7. **The switch shows what was asked at once.** Built in `view/panel/mod.rs`: the switch `mr-panel-remote` shows on while Remote Control is wanted or while the program says it is not off, and a press asks for the opposite of what it shows. The session remembers what its running program was last asked until the program's answer settles it, so a second press before the first was answered is sent too (since the fix wave). The line under it says "Connecting…" from the press on. A refusal puts it back to off, with the reason under the switch and as a line in the conversation, once, also when the program tells it twice. The reasons are the plan's own words; a bare `/login` from the program is never shown.
+8. **The switch never starts a program.** Built: on a resting or opening session the wish is kept and the line says "Turns on when the session starts."; the session asks when its program has started, after a rename and before the queued message.
+9. **What was asked is kept for the run of the app.** Built: `Session.remote_wanted` survives the program's end, so a program started again for the session turns Remote Control on again. It is not saved.
+10. **"On for new sessions".** Built: a second switch under the first, `mr-panel-remote-new`, off by default, saved in `Saved.remote_for_new`. It holds for sessions made with "New session" and for the session of a folder given at launch, not for stored sessions or a copy made by "Continue as a copy". It also shows when no session is open, and is disabled, as the first switch is, when the agent has no Remote Control ("Remote Control is not available.").
+11. **The mark.** Built in `view/tiles.rs`: "Remote" (`mr-tile-remote`) between the state word and the close button, in the accent while on and muted while connecting or reconnecting. It takes its room from the title. A press on it is a press on the header.
+12. **"Copy link".** Built: a small button beside the line, only while Remote Control is on and the address is known. It copies the address at the moment of the press. The address is not drawn, not a tooltip, not a label and not in the accessibility tree; the probe's `events` command prints it as `<hidden>`, and its `raw` mode's terminal echo hides the values of `session_url`, `connect_url` and `bridge_session_id`.
+13. **Cost and context.** Built: "Context" in the panel reads "37% of context used" over a thin bar built and coloured by the sidebar's own usage line (the same levels at 75 and 90), and "Cost so far: $0.42", "less than $0.01" or "$0.00". Until a turn has ended they read "Context use is not known yet." and "Cost is not known yet.". The adapter now counts context as Claude Code's status line does: the input side of the last message that has usage and is not one the program made itself (`<synthetic>`), without output tokens, over the window of the model that answered, else the largest window named, at most 100%.
+14. **Files changed.** Built: `Conversation::changes` in the core counts the Edit and Write calls that succeeded, per file, with the counts their rows show, as each finishes; a stored session's edits are counted once, when its history is read, and come first. The panel lists them under "Files changed" with their number: each path relative to the session's folder when it lies inside it, cut at its start, with the whole path as its tooltip, and its counts in a diff's colours, a count of 0 left out. With no file it says "No files changed yet." for a new session or a history that was read, and "Files changed are not known yet." while a stored session's history is not read, is being read or could not be read; edits made meanwhile show as rows. When the start of the history is not loaded, a last line says "Changes in earlier messages that are not loaded are not listed.".
+15. **The branch.** Built in `crates/core/src/git.rs`: read from the repository's own files on the library thread, never by running git. It climbs at most 64 folders to a `.git` folder, or a `.git` file of a worktree that names its folder, and reads `HEAD`. The panel shows the name, or "detached at" and seven characters, and no line outside a repository or when `HEAD` cannot be read. One answer is kept per folder. The row appears when the answer arrives. The demo window reads none (`Ui.reads_branches`).
+16. **The live test gains printed lines and no new way to fail.** Built: the lines above, in `crates/app/tests/live.rs`. It was compiled, not run.
+17. **A prompt from another device is built only from a recording.** Not built: there is no recording yet (see "Left by plan 5").
+
+### Rulings made while the plan ran
+
+The controller made these, each recorded in the run's ledger with what it costs if it was wrong. All of them, with those made after the reviews, are in `docs/superpowers/plans/2026-11-15-plan-5-rulings.md`:
+
+- **The level is said only when it is new.** The seam's doc comments promised an `EffortChanged` in answer to every `SetEffort`; Task 2's rule gives one only for the session's first reading or a level that differs from the last. Task 2's rule stands, the two doc comments say so, and the core never waits for an answer. If wrong: two doc comments.
+- **The level a session starts with is the level it shows.** A session that rests again after its program said a level starts with that level, not with its history's older one. If wrong: one condition in `start_spec`.
+- **A test for the panel's room.** The panel takes room from the row of tiles, which is a frame that uses both of Rune's re-run passes. Task 7 added `opening_the_panel_leaves_nothing_a_frame_behind`, and the panel makes no layout read. If wrong: one test.
+- **The session focused at start gets its branch read.** If wrong: one file read at start.
+- **The panel slides as the sidebar does.** The kit moves the pane's width on its spring, in about 0.6 seconds. It stands as built, for this look. If wrong: `tx.instant()` on the key's path, and `on_press_tx` on the button.
+- **The switch shows on whenever Remote Control is on**, also when something other than the switch turned it on, so the switch never disagrees with the mark. A reason under the switch is cleared when the program says it is connecting, on or reconnecting. If wrong: one condition in the view and three lines in the core.
+- **A copy keeps the wish.** A copy made by "Continue as a copy" keeps a wish switched on for the resting original; the preference never reaches a copy. If wrong: one line in `answer_prompt`.
+- **No address is printed.** The probe's `events` command hides the address; since the fix wave its `raw` mode's terminal echo hides it too, while the file it records keeps the raw lines. If wrong: one match arm in the probe, and one replace in the echo.
+- **The switches got an edge.** In the light theme an off switch was a white track on a near-white panel, about 1.1:1. The app now draws a 1-point edge round each of the panel's two switches in `icon_muted` (5.33:1 sampled in light), since no border colour of the theme reaches 3:1. The kit's colours and the theme are unchanged. If wrong: a look Jerod changes in one place.
+- **"Files changed are not known yet."** while a stored session's history is not read or its read failed, as the context and cost lines say of theirs; built in the fix wave. If wrong: one string.
+- **The panel's row keys carry `mr-`**: `mr-panel-label` and `mr-panel-value`. A review's fix, not a choice between answers; if wrong: two keys.
+- **The panel's tests are in a file of their own**, `crates/app/src/view/panel/tests.rs`; the panel is `view/panel/mod.rs`. If wrong: a file moved back.
+- **`tempfile` is a dev-dependency of `mr-core`**, for the branch tests' folders. If wrong: one line of `Cargo.toml`.
+- **Tasks ran out of the plan's order** where they shared no file: Task 9 during Task 4's review, Task 8 during Task 4's re-review, and Task 12's probe and live test parts ("Task 12a") during Task 7's review, its notes ("Task 12b", these) after Task 11. If wrong: nothing; the commits are the ones the plan names.
+- **The plan ends without Task 13**, by the plan's own rule: no recording was on disk after Task 11. If wrong: nothing built is lost; Task 13 waits for the recording either way.
+
+### Things to look at
+
+Each was decided by the build, not by the plan or the design:
+
+- The panel slides open and shut in about 0.6 seconds, as the sidebar does: the kit's own motion. Plan 4 made tiles come and go at once. Is the slide welcome here?
+- The row of tiles narrows by 292 points for a panel of 300, not by 300: the kit drops the main card's right frame while the pane is open. Can you see the difference?
+- At 560 by 400 the mode and effort triggers are at their least width, 48 points, and show only an ellipsis and a chevron, no letter. Is that enough, or should they get more room at the cost of the model's name?
+- Escape in the effort list sends the keyboard back to the input box. Escape in the model and mode lists leaves it on their trigger, as before this plan. Should they agree?
+- The panel's button, while the panel shows, looks only faintly pressed, in the dark theme most of all. Can you tell whether the panel is open from the button?
+- In the light theme an off switch is an outlined pill whose knob is white on white. Does it read as a switch that is off?
+- The switch shows on whenever Remote Control is on, also when it came on by a way other than the switch. After a press to turn it off it stays on until the program answers, which it does at once; a second press in that moment asks for off again, which is on its way already, so nothing more is sent. A second press before the program answered a press to turn it on sends off, and the switch ends off once the program has answered both. Does the switch ever seem not to obey?
+- Between a press to turn it on and the program's first word, the switch shows on but the header has no mark yet. Does the mark come soon enough?
+- A press on a switch or on "Copy link" gives the keyboard to the focused tile's input box. A press while a name is being edited in a tile's header ends that edit; the name typed so far is kept. Should the edit stay open?
+- Opening another tile's effort list does not focus that tile, unlike the model and mode lists; the focus stays where you type. Does it feel odd that the three lists differ?
+- While a stored session's history is not read yet, is being read or could not be read, "Files changed" says "Files changed are not known yet.", in the same muted type as "No files changed yet.". Is that the right wording?
+- The files are listed in the order their edits finished, not sorted, and not in the order of the rows: a stored call whose result comes late lands after live edits. Is that order useful?
+- The branch is read on the library thread, after any history read queued there, so behind a long history it can show a moment late. Is the delay noticeable?
+- The conversation writes "−0" for an edit that removed nothing, where the panel leaves the 0 out. Should the two agree?
+- On Windows Ctrl+Alt is AltGr, so on some layouts Ctrl+Alt+B types a character and only the button opens the panel. It does not apply on Linux, but it is the same chord on Windows as on Linux.
+- Screen readers hear the panel as "Inspector", the kit's name for its pane, which the app cannot set. A change to the kit would be needed.
+- "Cost so far" is Claude Code's own running total for the session. On a subscription it is not money spent: it is what the session would have cost at the API's prices. Should it show for such an account, or say what it is?
+
+### Left by plan 5
+
+**Task 13 was not built.** No recording is at `target/rec/p5-remote.txt`. Until it is built, a prompt typed on another device runs and its reply streams into the tile, but the prompt itself is not shown above the reply. The recording made in step 2 of "The check with a second device" is what unblocks it: Task 13 is built only from that recording, and only if it shows that a prompt from another device arrives as a record the app can tell from its own prompts with certainty.
+
+**Judged by the whole-branch review and left.** What the review said of each, and why it waits, is in "The whole-branch review of plan 5" below:
+
+- The adapter's reader thread writes to the program's stdin (the `get_settings` reads), under the stdin lock. For plan 6.
+- A stored session's edits are diffed once on the window's thread when its history loads (measured: Minor 9 below).
+- The branch's climb is by the folder's name: a folder that is a link to a folder inside a repository finds no branch (one that links to a repository's root is found).
+- `outside_a_repository_there_is_none` assumes the system's temporary folder is not inside a repository.
+- Ctrl+Alt+B, like the sidebar's key, is handled before the check for a running drag, so the row can change size under a drag.
+- A second copy of a refusal that arrives after a new press is taken as a new refusal. The two copies come one after the other, so the gap is small. Remembering what was asked (the fix of I-1) does not tell the copies apart: no reply says which request it answers.
+
+**Found by the tasks and not fixed.** None blocks anything.
+
+The seam and the adapter (`crates/agent`, `crates/claude`):
+
+- The fake reports the effort it was started with even when its model does not list it.
+- The history's effort does not skip program-made (`<synthetic>`) records, as its model does, and as the context reading now does. The test stub would answer `""` for an `effortLevel` of null.
+- A `contextWindow` of 0 for the model in use gives no context, where the largest window would do. The fixture replay test names one model only.
+
+The core (`crates/core`):
+
+- When `App::settle` removes the focused tile of a session gone from the store, the focus moves and no branch is asked for.
+- `a_stored_session_and_a_copy_do_not_get_the_preference` should also check the copy's queued message.
+- A check in a `from_history` test runs twice and tests nothing; the conversation's test reaches into the session's internals.
+- `session.rs` is about 2,500 lines and `translate.rs` about 3,250, most of them tests.
+
+The window (`crates/app/src/view`):
+
+- After a choice in the effort list the keyboard goes to the focused tile's input box, also when it was in that tile's "Something else" field or a rename. With an ended session in the focused tile, closing another tile's effort list leaves the keyboard on that trigger.
+- With no session open, a press on "On for new sessions" leaves the keyboard on the switch.
+- The panel builds one row per file each time it is built: it grows with the number of files, not with the conversation.
+- A share or cost that is not a number is not guarded. The program does not send one.
+- `TRACK_RADIUS` in the panel copies the kit's radius for its smallest switch, and would stop matching if the kit changed it.
+- `view/panel/mod.rs` is about 570 lines and `view/panel/tests.rs` about 1,500.
+
+Tests and the probe:
+
+- No smallest-window test without an effort picker (the fake's model `fast`); the two-tile effort test opens a list by its toggle, not by a click; no test for Ctrl+Alt+B held down or on the sign-in screens.
+- The long-folder and long-path tests check that the row stays inside the pane, not which end was cut; `Level::of` has no test of its own; a tiles test has the sidebar's width 260 written in.
+- Two rewrapped comments run long or break oddly (`tests/snapshots.rs`, `view/mod.rs`).
+- The live test does not print the program's reason for an `Other` refusal; it has two words no run can print (`(last: Refused)`, `(last: Off)`) and a near-copy of its Remote Control send for the effort. An older panic in it prints the whole conversation, which would hold a refusal's reason as a line. `live.rs` is about 1,530 lines.
+
+### The whole-branch review of plan 5
+
+After the twelve tasks a final reviewer read the whole branch, `0dc6d25..48acd5d`, for problems that live between tasks. It read in full the seam and the adapter's changes, every production hunk of `app.rs`, `session.rs` up to its tests, `saved.rs`, `usage.rs`, `changes.rs`, `conversation.rs`, `git.rs`, `glue.rs`, the panel, the probe, `process.rs`, these notes' first section and the new parts of `protocol-notes.md`; it sampled the tests, the live test, the demo's scenes and six screenshots. It answered two doubts by scratch tests in a copy of the sources outside the checkout, made with `git archive`, and its numbers come from those. Its verdict: ready to merge with fixes. Nothing critical; two Important findings, ten Minor. One fix wave followed, with the controller's rulings. The real `claude` was never started.
+
+#### What was fixed
+
+- **An "off" pressed before the program answered an "on" was not sent** (Important, I-1), so Remote Control came on against the user's last press, a double click on the switch being enough. A session now remembers what its running program was last asked (`Session.remote_asked`) until the program's answer settles it (on for an ask of on, off for an ask of off, a failure, a refused command, or the program's end), and a press is compared with that while an ask is on its way. Nothing of it sets the wish. The switch still shows on for as long as the program says so: after a quick on then off it goes off, comes back on with "Connecting…" and then "On. Reachable from claude.ai/code and the Claude app." and the header's mark when the late answer arrives, and goes off for good when the off is answered. If wrong: one field and its clearing rules. Tests: `turning_it_off_before_the_program_answered_asks_too`, `turning_it_on_again_while_the_off_is_in_flight_asks_too`, `what_was_asked_is_forgotten_when_the_program_ends`, and in the panel `a_second_press_before_the_answer_turns_it_off`. The live test no longer sends the off itself.
+- **A session whose turns all came from another device counted as empty** (Important, I-2): closing its tile ended its program and forgot it, and a restart started it without its conversation. A session is now stored once its program ran a turn, whoever sent the prompt (`Session.ran_turn`, set at `TurnStarted`): it rests after a clean end, resumes its id, keeps its tile in the saved state and is not forgotten when left. Tests: `a_turn_nobody_here_sent_makes_the_session_stored`, `a_session_driven_from_another_device_is_kept`. The check with a second device stays as written.
+- **Two effort choices in quick succession reported a failure that was none, and going back to the level in use during a change sent nothing** (Minor 1). The adapter keeps the level the latest choice asked for, and only the reading after it can say "goes on with"; the session compares a choice with the level last asked for while that is on its way. Tests: `two_choices_in_a_row_report_only_the_last`, `taking_a_choice_back_while_it_is_in_flight_asks_for_the_old_level`.
+- **The context share could drop to 0% or go stale** after a record that is no reply (Minor 4, with the deferred finding of Task 3): it is now taken only from a record that has usage and is not program-made. Tests: `a_record_without_usage_keeps_the_last_reading`, `a_synthetic_record_does_not_count_as_context`.
+- **"No files changed yet." stated as fact what was not known** (from Task 11): it now reads "Files changed are not known yet." until the history is read. Test: `files_are_not_known_until_the_history_is_read`.
+- **The percentage was worked out twice** (from Task 11): the panel and `LimitWindow::percent` share `mr_agent::percent`.
+- **No scene showed the Branch row, and the demo read the real disk for its made-up folders** (Minor 7). The demo reads no branch (`Ui.reads_branches`), and the `panel` scene gives "main" itself, so its screenshots show the row. Building the scene in a unit test showed that a demo session's first message could reach the fake after a later scene had scripted its reply, which it then took; `live_at` now waits until the fake has the message.
+- **The live test** prints every kind of a refused Remote Control (from Task 12a), says when the app knows no levels for the model (from Task 12a), and in the second run prints the level passed with `--effort` on resume and the level the program then said (Minor 2). The first run's turns are in the order they were.
+- **The probe's terminal echo hides a session's address** (from Task 12a, widened by Minor 3): the values of `session_url`, `connect_url` and `bridge_session_id`, wherever in a line they sit. The recording keeps raw lines.
+- **Missing tests** (Minor 10): the branch is asked for after a failed turn and after an unclean end in the focused session; a new session passes no effort (`a_new_session_starts_with_no_effort`).
+- **These notes**: the eight findings of their own review (every ruling has its cost, the live test's lines are listed as they can print, the chord on Windows, a file's size, the recording's e-mail address and home path, the `origin` key, the context reading in `protocol-notes.md`), and this section.
+
+#### What was left, and why
+
+- **"Connecting…" has no end when the program never answers** (Minor 5). The line stands as long as the wish does. A second press hides it and, since I-1's fix, tells the program. If the live test prints `no answer in 30 s`, this is to be settled then.
+- **Which copy of a refusal arrives first decides the words** (Minor 6). The reply's `error_code` and the state's `failure_kind` are read by different fields; a reply without a code before a state with `auth` would show "Remote Control stopped: …" and never the sign-in help. Decided after the live run, which now prints every kind it hears.
+- **`App.branches` is never pruned** (Minor 8): one entry per folder that had a branch while focused, bounded by the folders of the store.
+- **A stored edit of thousands of wholly different lines costs a visible hitch once** (Minor 9). Measured by the reviewer in a release build: 600 stored edits of 200 lines take 41 ms in all through `Conversation::from_history`; one edit of 2,000 lines rewritten whole 23 ms, of 5,000 lines 141 ms. An unoptimised build is about ten times slower, which is why the look uses `--release`. No time limit is to be added; the counts move to the library thread only if a real session shows a stall.
+- **The adapter's reader thread writes to the program's input** (the `get_settings` reads, under the stdin lock). A deadlock needs a line larger than the pipe's buffer being written by another thread, the reader wanting to write, and the program writing more than a pipe's worth before it reads that line; the reviewer could build no realistic case today. For plan 6: with attachments a line can be megabytes, so the reader is to hand its requests to the one thread that writes (one writer, a queue) instead of taking the stdin lock itself.
+- **The deferred items the review's triage marks "No"**: the branch's climb by the folder's name (narrower than first written: only a link to a folder inside a repository misses), the temporary folder assumed outside a repository, Ctrl+Alt+B before the drag check, `settle`'s focus move asking no branch, the fake's effort for a model without levels, the history's effort and `<synthetic>` records, a `contextWindow` of 0, `TRACK_RADIUS`, the size of files, and the keyboard after an effort choice with a rename open. They are in "Left by plan 5" above.
+- **A late second copy of a refusal after a new press** (from Task 6). The review thought remembering what was asked would cover it; it does not, since no reply says which request it answers. Left, as "Left by plan 5" says.
+
+#### The re-review of the fix wave
+
+One more reviewer, on the most capable model, read the six commits of the fix wave and ran four scratch cases in a copy outside the checkout. Every finding is addressed and nothing critical or important is new. There is no second wave, so what it found open is left as it is. All of it is small, and the rulings are 23 to 28 in `docs/superpowers/plans/2026-11-15-plan-5-rulings.md`.
+
+- **Four fast presses on the switch (on, off, on, off) can leave Remote Control on.** The first "on"'s answer settles the second. The switch and the header show that it is on; one more press turns it off.
+- **Three quick effort choices can end on the choice before the last, or show one false "Could not change the effort level" line.** The picker shows the level really in use; choose again.
+- **A request the program never answers leaves its control inert.** After an unanswered "off" the switch stays on and more presses send nothing until the session is restarted; the same for an effort level never answered. It needs a program that drops a request, which was never seen. The live test prints `no answer in 30 s` if it happens.
+- **A session driven only from another device reads "New session"** in its header and sidebar row until Claude Code names it. It is kept and resumed correctly.
+- **The probe's terminal echo hides the session's address under three field names only.** Treat the terminal, like the recording file, as possibly holding it.
+- **After a compaction the context bar keeps its old share until the next reply**, as Claude Code's own status line does.
+
+#### What the final review declined to judge
+
+Each line is the review's, followed by the controller's ruling.
+
+- Whether "Cost so far: $0.42" is the right thing to show an account on a subscription, for whom it is not money spent: the spec asks for the session's cost and the plan takes Claude Code's own total. The line stays as Claude Code's own total; "Things to look at" asks Jerod.
+- A stored session woken before its history has been read, or after its read failed, starts with neither its model nor its effort: the same race the model has had since plan 3. Older than this plan; left.
+- "On for new sessions" switched on while an empty new session is focused does not reach that session: the plan says "sessions made with New session", and the session exists already. Stands as built.
+- With the preference on, a new session left empty still shows at claude.ai/code for as long as its program runs: inherent in the preference. Stands as built; "Before looking" says it.
+- An Edit with `replace_all` and a Write over an existing file count as their rows count, not as git would. Stands as built (decision 14).
+- The pressed look of the panel's button, the 48-point triggers at 560 by 400, Escape in the effort list against the other two lists, AltGr on Windows, the pane's name for screen readers: in "Things to look at", for Jerod.
+- A level chosen while a change is confirmed and the program then exits is lost: a narrow race with no data at stake. Stands as built.
+- The test doubles' differences from the real program (the fake's effort for a model without levels, the stub's answer for a null level). Stand as built.
+- The size of `session.rs`, `translate.rs`, `live.rs` and the panel's tests: for a later tidy.
+- Commit `8b4c632`, the icon: not this plan's.
+
+#### What rests on what was never seen
+
+The review's table, short. Every one fails soft: no hang, no repeat, no loop.
+
+- **`apply_flag_settings` with `effortLevel` changes the level.** If refused: one line, the picker stays. If ignored: "Could not change the effort level: Claude Code goes on with X", the picker stays on X. If unanswered: nothing changes and nothing is said. The live test's `effort changed to` shows the program reports the level, not that a message uses it.
+- **`get_settings` gives `applied.effort`.** If it fails: silent; a new session's picker reads "Effort" for good, a stored one shows its history's level, and every choice ends in "Could not change the effort level: …". Another shape reads as no level. The picker is then useless and Tasks 2, 4 and 5 are reopened. Settled by `effort at start`.
+- **Remote Control before a first turn.** If refused: a "Remote Control stopped: …" line in a session with no message yet, the wish dropped, and with the preference on in every new session. If unanswered: "Connecting…" without end (Minor 5). Settled by the second session's line.
+- **`reconnecting`, `policy_disabled` and the codes.** An unknown state changes nothing, so a dropped connection keeps "Remote" in the accent and "On. Reachable …" until the next state, a claim that is then false. An unknown code reads "Remote Control stopped: {reason}". The live test does not settle these.
+- **Listed at claude.ai/code and driven from there.** If not, "On. Reachable from claude.ai/code and the Claude app." is false. If it is, a session driven only from there is now kept (I-2). Jerod's check settles it.
+- **A prompt from another device reaches this side as a record.** Nothing is built on it (Task 13); the reply shows without its prompt. The recording settles it.
+- **`--effort` at start and on resume** (found by the review, not in the plan's table). A flag the program rejected would end it at start and fail the live test's resume loudly; a value silently ignored showed nowhere. Now settled by `live: resumed with effort X, the program says Y`.
 
 ## Jerod's look at stacked tiles
 
@@ -798,7 +1088,7 @@ Structure:
 
 ## Open checks that need Jerod
 
-- **Remote Control, seen by a person.** Turning it on works at the protocol level and returns a claude.ai link. Nobody has yet confirmed the session is listed at claude.ai/code and can be driven from there. Do this before plan 4 builds the switch.
+- **Remote Control, seen by a person.** Turning it on works at the protocol level and returns a claude.ai link. Nobody has yet confirmed the session is listed at claude.ai/code and can be driven from there. Do this before plan 4 builds the switch. *Plan 5 built the switch without this check. The check is now two steps for Jerod: "The check with a second device", in "Jerod's look at plan 5". Its second step makes the recording Task 13 needs.*
 - **Listing speed on the real history.** `stored_sessions` was never timed against the real `~/.claude/projects` (over 1,000 files). A permission check refused the run for an agent. Plan 3's sidebar assumes it finishes in well under 10 seconds. Listing reads only file metadata, and `describe` reads at most about 512 KB per file. *Plan 3's live test now prints how long both listings take; open until Jerod runs it.*
 - **The repository.** On 2026-11-11 Jerod had the git data removed from this folder and set the repository up again; plan 1's work is the first commit on `main`, and plan 2 is on the branch `plan-2-one-session`, not pushed. Commit ids and the branch name `plan-1-foundations` in older notes point at history that no longer exists. Keep `.gitignore`: it keeps `target/` and `.superpowers/` out of the repository, and `target/rec/` holds raw session recordings that must not be committed.
 

@@ -45,6 +45,7 @@ const DEMO_TICK: Duration = Duration::from_millis(50);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Picker {
     Model,
+    Effort,
     Mode,
 }
 
@@ -208,6 +209,8 @@ pub struct Ui {
     pub backend: Option<Backend>,
     pub prefs: Prefs,
     pub sidebar: PaneState,
+    /// The right panel: 300 points wide at first, 240 to 480, hidden at first.
+    pub panel: PaneState,
     /// How each session shown in this run is shown, by its key. A session that is gone loses
     /// its view at the next [`run`].
     pub views: HashMap<SessionKey, SessionView>,
@@ -216,6 +219,9 @@ pub struct Ui {
     /// Whether a folder is there, asked when a message would wake a resting session in it.
     /// The demo's folders are made up, so the demo says yes to every one.
     pub folder_exists: fn(&Path) -> bool,
+    /// Whether a folder's branch is read from the disk. The demo's folders are made up, so the
+    /// demo reads none: a scene gives its answer itself.
+    pub reads_branches: bool,
     /// Messages for the backend that arrived before `setup` started it.
     waiting: Vec<ToBackend>,
     /// The `now` of the last `poll`.
@@ -284,8 +290,8 @@ impl Ui {
 
     /// As [`Ui::new`], which says the line this returns, when there is one, on stderr. What was
     /// kept from the last run is read from `prefs` here, in place of `launch.saved`: the
-    /// sidebar's width and whether it is collapsed are applied to the sidebar, the rest goes to
-    /// the app.
+    /// sidebar's width and whether it is collapsed are applied to the sidebar, the right panel's
+    /// width and whether it shows to the panel, the rest goes to the app.
     pub(crate) fn open(
         agent: Arc<dyn Agent>,
         fake: Option<FakeAgent>,
@@ -300,6 +306,13 @@ impl Ui {
         if saved.sidebar_collapsed {
             sidebar = sidebar.collapsed();
         }
+        let mut panel = PaneState::new(300.0).range(240.0, 480.0);
+        if let Some(width) = saved.panel_width {
+            panel = panel.with_width(width);
+        }
+        if !saved.panel_open {
+            panel = panel.collapsed();
+        }
         launch.saved = saved;
         let width = prefs
             .get::<Width>(WIDTH_KEY)
@@ -313,9 +326,11 @@ impl Ui {
             backend: None,
             prefs,
             sidebar,
+            panel,
             views: HashMap::new(),
             unix_clock,
             folder_exists: Path::is_dir,
+            reads_branches: true,
             waiting: Vec::new(),
             last_poll: None,
             fake_time: 0.0,
@@ -483,7 +498,7 @@ pub fn typing_in(ui: &Ui) -> Option<SessionKey> {
 /// The input box of `key`'s session takes the keyboard focus, while the session is in a tile
 /// and its box takes text: not once it has ended, when the box drawn is a disabled one. False
 /// when it does not.
-fn type_in(ui: &mut Ui, key: SessionKey) -> bool {
+pub fn type_in(ui: &mut Ui, key: SessionKey) -> bool {
     let typing = ui.app.tiles.contains(key)
         && ui
             .app
@@ -677,9 +692,9 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
 }
 
 /// Carries effects out: backend messages are sent, the width is saved, and so is the state kept
-/// between runs, with the sidebar's width and whether it is collapsed. A look in a folder that
-/// is not there runs in the home folder. Messages for the backend wait until `setup` has
-/// started it.
+/// between runs, with the widths of the sidebar and the right panel and whether each shows. A
+/// look in a folder that is not there runs in the home folder. Messages for the backend wait
+/// until `setup` has started it.
 ///
 /// Every change to the `App` (an intent, or a message taken in) is followed by a call to this,
 /// so it ends by bringing the sidebar's model up to date (`App::settle`, which also takes out
@@ -703,6 +718,8 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
             Effect::SaveState(mut saved) => {
                 saved.sidebar_width = Some(ui.sidebar.width());
                 saved.sidebar_collapsed = !ui.sidebar.is_open();
+                saved.panel_width = Some(ui.panel.width());
+                saved.panel_open = ui.panel.is_open();
                 if let Err(error) = ui.prefs.set(STATE_KEY, &*saved) {
                     eprintln!("mindrune: could not save the groups and recent folders: {error}");
                 }
@@ -722,6 +739,8 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
                 folder: ui.app.home().to_path_buf(),
             },
             Effect::Look { folder } => ToBackend::Look { folder },
+            Effect::ReadBranch { .. } if !ui.reads_branches => continue,
+            Effect::ReadBranch { folder } => ToBackend::ReadBranch { folder },
         };
         match &ui.backend {
             Some(backend) => backend.send(message),
@@ -871,11 +890,17 @@ fn tidy_views(ui: &mut Ui) {
 }
 
 /// Shuts the picker list that is open while its picker cannot be used (the session is opening or
-/// has ended; for the model picker, also when there are no models to choose from), so it does not
-/// open again by itself once it can.
+/// has ended; for the model picker, also when there are no models to choose from; for the
+/// effort picker, also when the model in use takes no level, and the picker is not shown), so it
+/// does not open again by itself once it can.
 fn shut_disabled_picker(view: &mut SessionView, session: &Session) {
     let usable = !matches!(session.phase, Phase::Opening | Phase::Ended { .. });
-    if !usable || (view.open_picker == Some(Picker::Model) && session.models.is_empty()) {
+    let gone = match view.open_picker {
+        Some(Picker::Model) => session.models.is_empty(),
+        Some(Picker::Effort) => session.effort_levels().is_empty(),
+        Some(Picker::Mode) | None => false,
+    };
+    if !usable || gone {
         view.open_picker = None;
     }
 }
@@ -999,6 +1024,7 @@ mod tests {
     };
     use mr_core::{HistoryState, ItemBody, Phase, Screen, ThinkingTime, Width};
     use rune::prefs::Prefs;
+    use rune::{Key, Mods, Runtime};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1376,10 +1402,68 @@ mod tests {
             Saved {
                 sidebar_width: None,
                 sidebar_collapsed: false,
+                panel_width: None,
+                panel_open: false,
                 closed_by_app: Vec::new(),
                 ..written
             }
         );
+    }
+
+    #[test]
+    fn the_panel_is_saved_and_comes_back() {
+        let (fresh, _) = opened(Prefs::memory());
+        assert_eq!((fresh.panel.width(), fresh.panel.is_open()), (300.0, false));
+        let mut rt = testkit::window("conversation");
+        let ui = &mut rt.state;
+        ui.panel.set_width(360.0);
+        ui.panel.set_open(true);
+        let effects = ui.app.save_now();
+        run(ui, effects);
+        let written: Saved = ui.prefs.get(STATE_KEY).expect("written");
+        assert_eq!(
+            (written.panel_width, written.panel_open),
+            (Some(360.0), true)
+        );
+        let prefs = std::mem::replace(&mut ui.prefs, Prefs::memory());
+        let (back, _) = opened(prefs);
+        assert_eq!((back.panel.width(), back.panel.is_open()), (360.0, true));
+        assert_eq!(
+            (back.sidebar.width(), back.sidebar.is_open()),
+            (260.0, true),
+            "the sidebar is its own"
+        );
+
+        // Hidden, it comes back hidden, at its width.
+        let mut prefs = Prefs::memory();
+        let hidden = Saved {
+            version: SAVED_VERSION,
+            panel_width: Some(420.0),
+            panel_open: false,
+            ..Saved::default()
+        };
+        prefs.set(STATE_KEY, &hidden).unwrap();
+        let (back, _) = opened(prefs);
+        assert_eq!((back.panel.width(), back.panel.is_open()), (420.0, false));
+    }
+
+    #[test]
+    fn showing_the_panel_saves_at_once() {
+        let mut rt = testkit::window("conversation");
+        let written = |rt: &Runtime<Ui>| -> Option<(Option<f32>, bool)> {
+            let saved: Saved = rt.state.prefs.get(STATE_KEY)?;
+            Some((saved.panel_width, saved.panel_open))
+        };
+        rt.state.prefs.remove(STATE_KEY).unwrap();
+        testkit::click(&mut rt, "mr-panel-toggle");
+        assert_eq!(written(&rt), Some((Some(300.0), true)), "the button");
+        rt.state.prefs.remove(STATE_KEY).unwrap();
+        let ctrl_alt = Mods {
+            alt: true,
+            ..testkit::ctrl()
+        };
+        testkit::press_with(&mut rt, Key::Command('b'), ctrl_alt);
+        assert_eq!(written(&rt), Some((Some(300.0), false)), "the key");
     }
 
     #[test]

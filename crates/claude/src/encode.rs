@@ -82,6 +82,26 @@ pub fn get_usage() -> Value {
     json!({"subtype": "get_usage"})
 }
 
+/// Sets the effort level of the running session's next messages. The reply is a bare
+/// success also for a level that was not taken, so `get_settings` reads what is in use.
+/// Read from the program (2.1.323), never seen live.
+pub fn set_effort(level: &str) -> Value {
+    json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": level}})
+}
+
+/// Reads the settings in use; its reply's `applied.effort` is the level the next message
+/// will use. The reply also holds the user's own settings. Read from the program
+/// (2.1.323), never seen live.
+pub fn get_settings() -> Value {
+    json!({"subtype": "get_settings"})
+}
+
+/// Asks what the context is made of; its reply's `categories` and `maxTokens` are read. The
+/// reply also names memory files, tools and skills, which are not. Seen working live (V9).
+pub fn get_context_usage() -> Value {
+    json!({"subtype": "get_context_usage"})
+}
+
 pub fn rename_session(title: &str) -> Value {
     json!({"subtype": "rename_session", "title": title})
 }
@@ -226,6 +246,12 @@ mod tests {
             json!({"subtype":"rename_session","title":"New title"})
         );
         assert_eq!(get_usage(), json!({"subtype":"get_usage"}));
+        assert_eq!(
+            set_effort("high"),
+            json!({"subtype":"apply_flag_settings","settings":{"effortLevel":"high"}})
+        );
+        assert_eq!(get_settings(), json!({"subtype":"get_settings"}));
+        assert_eq!(get_context_usage(), json!({"subtype":"get_context_usage"}));
         assert_eq!(
             generate_session_title("Fix the parser"),
             json!({"subtype":"generate_session_title","description":"Fix the parser","persist":true})

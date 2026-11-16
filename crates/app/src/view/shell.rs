@@ -1,29 +1,43 @@
 //! The shell: the sidebar, with the new-session button, the list of groups and sessions and the
-//! usage footer, beside the main area.
+//! usage footer, the main area beside it, and the right panel beside that.
 
 use mr_core::{UsageLine, account_line, usage_lines};
-use rune::{El, Tx, col, el, row, text};
-use rune_kit::shell::{PaneState, Sidebar, SplitView};
+use rune::{El, KeyEvent, Tx, col, el, row, text};
+use rune_kit::shell::{PaneState, Sidebar, SplitView, Toolbar};
 use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 pub use rune_kit::shell::is_sidebar_toggle;
 
 use crate::glue::Ui;
 use crate::theme::{self, USAGE_BAR_HEIGHT};
-use crate::view::{folder, sidebar};
+use crate::view::{folder, panel, sidebar};
 
 /// The key of the sidebar's "New session".
 pub const NEW_SESSION: &str = "mr-new-session";
 
-/// The sidebar on the left, which the user can drag wider and collapse, and `main` beside it.
+/// Ctrl+Alt+B (Cmd+Alt+B on macOS): shows or hides the right panel.
+pub fn is_panel_toggle(ev: &KeyEvent) -> bool {
+    let m = ev.mods;
+    ev.is_command('b') && m.alt && !m.shift && !(cfg!(target_os = "macos") && m.ctrl)
+}
+
+/// The sidebar on the left and the right panel, each of which the user can drag wider and
+/// collapse, and `main` between them, under the band that holds the panel's button at its
+/// right end.
 pub fn shell(ui: &Ui, kit: &'static Kit, main: El) -> El {
     SplitView::new(main)
         .sidebar(&ui.sidebar, sidebar_pane, sidebar(ui, kit))
+        .inspector(&ui.panel, panel_pane, panel::panel(ui, kit))
+        .toolbar(Toolbar::new().trailing(panel::button(ui, kit)))
         .build(kit)
 }
 
 fn sidebar_pane(ui: &mut Ui) -> &mut PaneState {
     &mut ui.sidebar
+}
+
+fn panel_pane(ui: &mut Ui) -> &mut PaneState {
+    &mut ui.panel
 }
 
 /// The sidebar: "New session", which asks for the new session's folder (`folder::ask`), with
@@ -77,9 +91,11 @@ fn footer(ui: &Ui, kit: &Kit) -> El {
         .child(usage(&weekly, "mr-usage-weekly", kit))
 }
 
-/// One usage line: its text keyed `key`, a thin bar filled to the fraction used, and when the
-/// window resets. An unknown line has an empty bar and no reset wording.
-fn usage(line: &UsageLine, key: &str, kit: &Kit) -> El {
+/// One usage line: its text keyed `key`, a thin bar keyed `{key}-bar` filled to the fraction
+/// used, and when the window resets. An unknown line has an empty bar and no reset wording. The
+/// text and the bar take the colour of the line's level. The right panel draws its context line
+/// with it too.
+pub(super) fn usage(line: &UsageLine, key: &str, kit: &Kit) -> El {
     let color = theme::level_color(kit, line.level);
     let mut bar = row()
         .key(format!("{key}-bar"))

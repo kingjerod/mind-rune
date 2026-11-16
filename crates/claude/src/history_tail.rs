@@ -51,6 +51,7 @@ pub fn read_tail(
             earlier_left_out: !from_start,
             model: None,
             permission_mode,
+            effort: None,
         });
     };
     let (steps, end) = records.chain_to(leaf);
@@ -58,6 +59,7 @@ pub fn read_tail(
     let mut items = Vec::new();
     let mut tool_positions = HashMap::new();
     let mut model = None;
+    let mut effort = None;
     for step in steps.iter().rev() {
         match step {
             Step::Compaction => items.push(HistoryItem::Compacted),
@@ -67,6 +69,9 @@ pub fn read_tail(
                 };
                 if let Some(name) = answering_model(&record) {
                     model = Some(name.to_string());
+                }
+                if let Some(level) = reply_effort(&record) {
+                    effort = Some(level.to_string());
                 }
                 add_record(&record, &mut items, &mut tool_positions);
             }
@@ -86,6 +91,7 @@ pub fn read_tail(
         earlier_left_out,
         model,
         permission_mode,
+        effort,
     })
 }
 
@@ -112,6 +118,17 @@ fn answering_model(record: &Value) -> Option<&str> {
         .and_then(|message| message.get("model"))
         .and_then(Value::as_str)
         .filter(|model| !model.is_empty() && *model != SYNTHETIC_MODEL)
+}
+
+/// The effort level an `assistant` record names.
+fn reply_effort(record: &Value) -> Option<&str> {
+    if record.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    record
+        .get("effort")
+        .and_then(Value::as_str)
+        .filter(|level| !level.is_empty())
 }
 
 /// The top-level fields of a record that place it on a chain. Each is read as any JSON
@@ -511,6 +528,45 @@ mod tests {
         let history = read_all(&path);
         assert_eq!(history.model.as_deref(), Some("claude-x-2"));
         assert_eq!(history.permission_mode, Some(PermissionMode::Auto));
+    }
+
+    /// An answer by `claude-x-1` that names the effort level it was made with.
+    fn assistant_with_effort(uuid: &str, parent: Option<&str>, text: &str, effort: &str) -> String {
+        let mut record: Value = serde_json::from_str(&assistant(uuid, parent, text)).unwrap();
+        record["effort"] = json!(effort);
+        record["perTurnEffort"] = Value::Null;
+        record.to_string()
+    }
+
+    #[test]
+    fn a_stored_session_gives_the_effort_of_its_last_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            &[
+                user("u1", None, "one"),
+                assistant_with_effort("a1", Some("u1"), "one back", "low"),
+                user("u2", Some("a1"), "abandoned"),
+                assistant_with_effort("a2", Some("u2"), "abandoned back", "max"),
+                user("u3", Some("a1"), "two"),
+                assistant_with_effort("a3", Some("u3"), "two back", "high"),
+                user("u4", Some("a3"), "three"),
+            ],
+        );
+        assert_eq!(read_all(&path).effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_stored_session_without_effort_gives_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            &[
+                user("u1", None, "one"),
+                assistant("a1", Some("u1"), "one back"),
+            ],
+        );
+        assert_eq!(read_all(&path).effort, None);
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 mod app;
 mod backend;
+mod changes;
 mod conversation;
+mod git;
 mod groups;
 mod saved;
 mod session;
@@ -17,13 +19,17 @@ pub use app::{
     USAGE_RETRY_SECONDS, Width,
 };
 pub use backend::{Backend, FromBackend, ToBackend, Wake};
+pub use changes::{Changes, FileChange};
 pub use conversation::{
     Conversation, DID_NOT_FINISH, Item, ItemBody, ItemId, NoticeKind, RequestState, ThinkingTime,
     thinking_label,
 };
+pub use git::{Branch, branch};
 pub use groups::{Group, GroupId, Groups, Line, Row, Section, SidebarModel, sidebar_model};
 pub use saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile};
-pub use session::{HistoryState, Phase, Session, answer_words, mode_label, model_option_label};
+pub use session::{
+    HistoryState, Phase, Remote, Session, answer_words, mode_label, model_option_label,
+};
 pub use sessions::{Entry, EntryMut, Mark, Prompt, SessionKey, Sessions};
 pub use tiles::{
     Column, Laid, Level as TileLevel, MIN_TILE_HEIGHT, MIN_TILE_WIDTH, Part, Place, RowSize, Spot,

@@ -13,7 +13,7 @@ use mr_claude::ClaudeAgent;
 const USAGE: &str = "\
 usage:
   mindrune-probe raw --cwd DIR [--program PATH] [--resume ID] [--fork] [--model M]
-                        [--mode MODE] [--record FILE] [--full-login]
+                        [--mode MODE] [--record FILE] [--full-login] [--arg VALUE]...
   mindrune-probe events --cwd DIR [--model M]
   mindrune-probe scrub IN OUT";
 
@@ -64,6 +64,7 @@ fn parse_raw(args: &[String]) -> Result<repl::RawOptions, String> {
         mode: None,
         record: None,
         full_login: false,
+        extra_args: Vec::new(),
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -79,6 +80,8 @@ fn parse_raw(args: &[String]) -> Result<repl::RawOptions, String> {
             "--model" => options.model = Some(value("--model")?),
             "--mode" => options.mode = Some(value("--mode")?),
             "--record" => options.record = Some(PathBuf::from(value("--record")?)),
+            // Taken as it is, also when it starts with `--`.
+            "--arg" => options.extra_args.push(value("--arg")?),
             "--fork" => options.fork = true,
             "--full-login" => options.full_login = true,
             other => return Err(format!("unknown argument `{other}`")),
@@ -148,6 +151,31 @@ mod tests {
         assert_eq!(
             absolute_program("a/stub.sh".into()),
             Ok(cwd.join("a/stub.sh"))
+        );
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn every_arg_is_kept_in_its_order_even_one_that_starts_with_dashes() {
+        let options = parse_raw(&words(
+            "--arg --replay-user-messages --cwd /p --arg --effort --arg low",
+        ))
+        .unwrap();
+        assert_eq!(
+            options.extra_args,
+            words("--replay-user-messages --effort low")
+        );
+        assert_eq!(options.cwd, PathBuf::from("/p"));
+        assert_eq!(
+            parse_raw(&words("--cwd /p")).unwrap().extra_args,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_raw(&words("--cwd /p --arg")).err(),
+            Some("--arg needs a value".to_string())
         );
     }
 }

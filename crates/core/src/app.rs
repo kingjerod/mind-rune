@@ -2,7 +2,7 @@
 //! numbered opens that keep a replaced program from changing anything. Every intent returns the
 //! effects to carry out instead of doing the work, so this module stays plain data.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use mr_agent::{
@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::FromBackend;
 use crate::conversation::NoticeKind;
+use crate::git::Branch;
 use crate::groups::{GroupId, Groups, Recency, SidebarModel, sidebar_model};
 use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile, remember_folder};
 use crate::session::{HistoryState, Phase, Session};
@@ -109,6 +110,10 @@ pub enum Effect {
     Look {
         folder: PathBuf,
     },
+    /// Read the git branch of `folder`.
+    ReadBranch {
+        folder: PathBuf,
+    },
     /// Write what is kept between runs.
     SaveState(Box<Saved>),
 }
@@ -152,6 +157,8 @@ pub struct App {
     /// The folders new sessions started in, the latest first: at most [`RECENT_FOLDERS`], each
     /// once.
     pub recent_folders: Vec<PathBuf>,
+    /// New sessions start with Remote Control wanted.
+    pub remote_for_new: bool,
     launch: Launch,
     /// The number of the latest open. Each open gets the next, so a number is never reused.
     open: u64,
@@ -178,6 +185,8 @@ pub struct App {
     /// From the last run: the names kept for sessions no listing has given yet (see
     /// [`Saved::names`]).
     names: Vec<(SessionId, String)>,
+    /// The branch last read for each folder; a folder whose answer was none is not here.
+    branches: HashMap<PathBuf, Branch>,
 }
 
 /// The tiles of the last run, as [`Saved`] had them.
@@ -251,6 +260,7 @@ impl App {
             sidebar: SidebarModel::default(),
             sidebar_version: 0,
             recent_folders,
+            remote_for_new: saved.remote_for_new,
             launch,
             open: 0,
             listed_unix: None,
@@ -263,6 +273,7 @@ impl App {
             restored: None,
             closed_by_app: saved.closed_by_app,
             names: saved.names,
+            branches: HashMap::new(),
         };
         (app, vec![Effect::CheckAccount])
     }
@@ -274,6 +285,11 @@ impl App {
 
     pub fn focused_entry(&self) -> Option<&Entry> {
         self.focused().and_then(|key| self.sessions.get(key))
+    }
+
+    /// The branch last read for `key`'s folder.
+    pub fn branch_of(&self, key: SessionKey) -> Option<&Branch> {
+        self.branches.get(&self.sessions.get(key)?.session.folder)
     }
 
     /// The width of the tile row, as the window last laid it out.
@@ -346,10 +362,11 @@ impl App {
             return Vec::new();
         };
         if error == AgentError::NotInstalled {
+            let focused = self.focused();
             self.screen = Screen::NotInstalled;
             self.sessions.remove(key);
             self.remove_tile(key);
-            return Vec::new();
+            return self.branch_if_moved(focused).into_iter().collect();
         }
         let exited = SessionEvent::Exited {
             clean: false,
@@ -391,8 +408,9 @@ impl App {
 
     /// Applies `event` to the session whose current open is `open`, stamped `now`. A turn that
     /// ends in a session other than the focused one leaves it unseen, also when it is in a
-    /// tile; a program that is gone lets go of its open. A save is asked for when the name kept
-    /// for the session changed: its id became known, or its program confirmed or refused it.
+    /// tile; one that ends in the focused session asks for the branch of its folder. A program
+    /// that is gone lets go of its open. A save is asked for when the name kept for the session
+    /// changed: its id became known, or its program confirmed or refused it.
     pub fn event(&mut self, open: u64, event: SessionEvent, now: f64) -> Vec<Effect> {
         let (now_unix, focused) = (self.now_unix, self.focused());
         let Some(mut entry) = self.sessions.by_open(open) else {
@@ -439,6 +457,11 @@ impl App {
         let names_changed = kept.is_some_and(|kept| entry.session.kept_name() != kept);
         if ends_turn && focused != Some(entry.key) {
             entry.unseen = true;
+        }
+        if ends_turn && focused == Some(entry.key) {
+            effects.push(Effect::ReadBranch {
+                folder: entry.session.folder.clone(),
+            });
         }
         if entry.session.at_rest() {
             entry.open = None;
@@ -504,6 +527,13 @@ impl App {
                 self.learn_models(models);
                 Vec::new()
             }
+            FromBackend::Branch { folder, branch } => {
+                match branch {
+                    Some(branch) => self.branches.insert(folder, branch),
+                    None => self.branches.remove(&folder),
+                };
+                Vec::new()
+            }
         }
     }
 
@@ -559,8 +589,8 @@ impl App {
     /// complete listing has come, the known ones in their columns with their shares and splits;
     /// a column of two with one session not known shows the other alone. Each is marked as
     /// [`App::show`] marks a session. The focus goes to the one focused then when it is among
-    /// them, else to the first column's upper tile. Once it ran, or once anything is in a tile,
-    /// it is not tried again.
+    /// them, else to the first column's upper tile, and the branch of its folder is asked for.
+    /// Once it ran, or once anything is in a tile, it is not tried again.
     fn restore_tiles(&mut self, complete: bool) -> Vec<Effect> {
         let Some(waiting) = self.restore.take() else {
             return Vec::new();
@@ -604,11 +634,14 @@ impl App {
         let focused = waiting.shown.and_then(|id| self.sessions.by_id(&id));
         self.tiles.restore(known, focused);
         self.restored = self.focused();
-        self.tiles
+        let mut effects: Vec<Effect> = self
+            .tiles
             .keys()
             .into_iter()
             .filter_map(|key| self.mark_shown(key))
-            .collect()
+            .collect();
+        effects.extend(self.read_branch());
+        effects
     }
 
     /// The store's answer to whether `key`'s session may be open elsewhere. Changed within
@@ -646,10 +679,11 @@ impl App {
     }
 
     /// Shows a new session in `folder` at `place` and starts its program, and puts `folder`
-    /// first among the recent folders. Asks once to save, after the start, when that changed
-    /// them or [`App::show`] asked to. A session taken out of its tile leaves as `leaving`
-    /// says (see [`App::show`]). When the focused session is an empty one in that folder
-    /// already, and its program has not ended, nothing happens.
+    /// first among the recent folders. The session wants Remote Control when `remote_for_new`
+    /// says so. Asks once to save, after the start, when that changed them or [`App::show`]
+    /// asked to. A session taken out of its tile leaves as `leaving` says (see [`App::show`]).
+    /// When the focused session is an empty one in that folder already, and its program has
+    /// not ended, nothing happens.
     pub fn new_session(&mut self, folder: PathBuf, place: Place, leaving: Leaving) -> Vec<Effect> {
         if self.screen != Screen::Main {
             return Vec::new();
@@ -660,7 +694,9 @@ impl App {
             return Vec::new();
         }
         let remembered = remember_folder(&mut self.recent_folders, &folder);
-        let key = self.sessions.add(Session::opening(folder), self.now_unix);
+        let mut session = Session::opening(folder);
+        session.remote_wanted = self.remote_for_new;
+        let key = self.sessions.add(session, self.now_unix);
         let mut effects = self.show(key, place, leaving);
         let asked = drop_saves(&mut effects);
         effects.extend(self.start(key));
@@ -696,11 +732,11 @@ impl App {
 
     /// Shows `key`'s session at `place` (see [`Tiles`]): a session already in a tile only has
     /// its tile focused. The session counts as seen and is offered the models known, and a
-    /// stored history not read yet is asked for. The session taken out of its tile, if any, is
-    /// closed and forgotten when it is empty, unless `leaving` says to keep it. Asks to save
-    /// when a tile opened beside the focused one, at a place, or over or under a tile. A session
-    /// shown in the focused tile, the first tile included, is saved with the next change that
-    /// asks.
+    /// stored history not read yet is asked for, then the branch of its folder. The session
+    /// taken out of its tile, if any, is closed and forgotten when it is empty, unless `leaving`
+    /// says to keep it. Asks to save when a tile opened beside the focused one, at a place, or
+    /// over or under a tile. A session shown in the focused tile, the first tile included, is
+    /// saved with the next change that asks.
     pub fn show(&mut self, key: SessionKey, place: Place, leaving: Leaving) -> Vec<Effect> {
         if self.focused() == Some(key) || self.sessions.get(key).is_none() {
             return Vec::new();
@@ -717,23 +753,26 @@ impl App {
             _ => Vec::new(),
         };
         effects.extend(read);
+        effects.extend(self.read_branch());
         if put == Put::Added && place != Place::Focused {
             effects.push(self.save_state());
         }
         effects
     }
 
-    /// Moves the focus to `key`'s tile and counts its session as seen. Nothing happens when it
-    /// is in no tile or its tile has the focus already. Asks for no save.
+    /// Moves the focus to `key`'s tile, counts its session as seen and asks for the branch of
+    /// its folder. Nothing happens when it is in no tile or its tile has the focus already. Asks
+    /// for no save.
     pub fn focus_tile(&mut self, key: SessionKey) -> Vec<Effect> {
-        self.focus(key);
-        Vec::new()
+        self.focus(key).into_iter().collect()
     }
 
     /// Takes `key`'s tile out of the row; its session leaves as `leaving` says. When that tile
     /// had the focus, the focus goes to the other tile of its column when it has two; else to
-    /// the upper tile of the column on its right, else of the one on its left. Asks to save.
+    /// the upper tile of the column on its right, else of the one on its left, and the branch
+    /// of its session's folder is asked for. Asks to save.
     pub fn close_tile(&mut self, key: SessionKey, leaving: Leaving) -> Vec<Effect> {
+        let focused = self.focused();
         if !self.remove_tile(key) {
             return Vec::new();
         }
@@ -741,20 +780,25 @@ impl App {
             Leaving::ForgetIfEmpty => self.forget_if_empty(key),
             Leaving::Keep => Vec::new(),
         };
+        effects.extend(self.branch_if_moved(focused));
         effects.push(self.save_state());
         effects
     }
 
     /// Moves `key`'s tile to `spot` (see `Tiles::move_to`); it takes the focus and its session
-    /// counts as seen. Asks to save. Nothing, and no effect, when nothing moved.
+    /// counts as seen. Asks for the branch of its folder when the focus came to it, and to save.
+    /// Nothing, and no effect, when nothing moved.
     pub fn move_tile(&mut self, key: SessionKey, spot: Spot) -> Vec<Effect> {
+        let focused = self.focused();
         if !self.tiles.move_to(key, spot, self.row_size()) {
             return Vec::new();
         }
         if let Some(mut entry) = self.sessions.get_mut(key) {
             entry.unseen = false;
         }
-        vec![self.save_state()]
+        let mut effects: Vec<Effect> = self.branch_if_moved(focused).into_iter().collect();
+        effects.push(self.save_state());
+        effects
     }
 
     /// Makes `left`'s column `width` points wide against the column on its right (see
@@ -864,8 +908,8 @@ impl App {
         effects
     }
 
-    /// What is kept between runs, as of now. The sidebar's width and whether it is collapsed
-    /// are the window's: they are left at their defaults.
+    /// What is kept between runs, as of now. The widths of the sidebar and the right panel and
+    /// whether each shows are the window's: they are left at their defaults.
     ///
     /// Once the complete listing has been merged, a placement whose session the app does not
     /// know is left out. Every tile whose session the store has is kept, column by column, one
@@ -929,6 +973,7 @@ impl App {
                 .cloned()
                 .collect(),
             names: self.saved_names(),
+            remote_for_new: self.remote_for_new,
             ..Saved::default()
         };
         self.groups.save_into(&mut saved);
@@ -973,18 +1018,20 @@ impl App {
     }
 
     /// Starts an ended session's program again. A resting one is woken by a message instead.
-    /// This and the session intents below first focus the session's tile, when it is in one.
+    /// This and the session intents below first focus the session's tile, when it is in one
+    /// without it, and then ask for the branch of its folder.
     pub fn restart(&mut self, key: SessionKey) -> Vec<Effect> {
-        self.focus(key);
+        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         let Some(mut entry) = self.sessions.get_mut(key) else {
-            return Vec::new();
+            return effects;
         };
         if !matches!(entry.session.phase, Phase::Ended { .. }) {
-            return Vec::new();
+            return effects;
         }
         entry.session.reopening();
         drop(entry);
-        self.start(key)
+        effects.extend(self.start(key));
+        effects
     }
 
     /// Sends `text` to `key`'s session, or queues it there, and makes the session active now.
@@ -992,13 +1039,13 @@ impl App {
     /// run, the store is first asked whether another app may have it open. A session that does
     /// not take a message now (see [`App::takes_message`]) takes nothing.
     pub fn submit(&mut self, key: SessionKey, text: &str) -> Vec<Effect> {
-        self.focus(key);
+        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         if text.trim().is_empty() || !self.takes_message(key) {
-            return Vec::new();
+            return effects;
         }
         let now_unix = self.now_unix;
         let Some(mut entry) = self.sessions.get_mut(key) else {
-            return Vec::new();
+            return effects;
         };
         if entry.session.phase == Phase::Resting {
             entry.session.wake(text);
@@ -1007,16 +1054,19 @@ impl App {
                 && let Some(id) = entry.session.id.clone()
             {
                 entry.checking = true;
-                return vec![Effect::CheckActivity { key, id }];
+                effects.push(Effect::CheckActivity { key, id });
+                return effects;
             }
             entry.last_active_unix = now_unix;
             drop(entry);
-            return self.start(key);
+            effects.extend(self.start(key));
+            return effects;
         }
         entry.last_active_unix = now_unix;
         let commands = entry.session.submit(text);
         drop(entry);
-        self.send(key, commands)
+        effects.extend(self.send(key, commands));
+        effects
     }
 
     /// Whether `key`'s session takes a message now. An ended one does not, until it is
@@ -1034,39 +1084,71 @@ impl App {
     }
 
     pub fn stop(&mut self, key: SessionKey) -> Vec<Effect> {
-        self.focus(key);
+        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         let command = self
             .sessions
             .get(key)
             .and_then(|entry| entry.session.stop());
-        self.send(key, command)
+        effects.extend(self.send(key, command));
+        effects
     }
 
     pub fn answer(&mut self, key: SessionKey, id: &RequestId, answer: Answer) -> Vec<Effect> {
-        self.focus(key);
+        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         let command = self
             .sessions
             .get_mut(key)
             .and_then(|mut entry| entry.session.answer(id, answer));
-        self.send(key, command)
+        effects.extend(self.send(key, command));
+        effects
     }
 
     pub fn choose_model(&mut self, key: SessionKey, option_id: &str) -> Vec<Effect> {
-        self.focus(key);
+        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         let command = self
             .sessions
             .get_mut(key)
             .and_then(|mut entry| entry.session.choose_model(option_id));
+        effects.extend(self.send(key, command));
+        effects
+    }
+
+    /// Asks `key`'s session for the effort `level`. The focus does not move.
+    pub fn choose_effort(&mut self, key: SessionKey, level: &str) -> Vec<Effect> {
+        let command = self
+            .sessions
+            .get_mut(key)
+            .and_then(|mut entry| entry.session.choose_effort(level));
         self.send(key, command)
     }
 
+    /// Turns Remote Control on or off for `key`'s session (see [`Session::set_remote`]). The
+    /// focus does not move.
+    pub fn set_remote(&mut self, key: SessionKey, on: bool) -> Vec<Effect> {
+        let command = self
+            .sessions
+            .get_mut(key)
+            .and_then(|mut entry| entry.session.set_remote(on));
+        self.send(key, command)
+    }
+
+    /// Sets the preference and asks to save. Nothing when it is already so.
+    pub fn set_remote_for_new(&mut self, on: bool) -> Vec<Effect> {
+        if self.remote_for_new == on {
+            return Vec::new();
+        }
+        self.remote_for_new = on;
+        vec![self.save_state()]
+    }
+
     pub fn choose_mode(&mut self, key: SessionKey, mode: PermissionMode) -> Vec<Effect> {
-        self.focus(key);
+        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         let command = self
             .sessions
             .get_mut(key)
             .and_then(|mut entry| entry.session.choose_mode(mode));
-        self.send(key, command)
+        effects.extend(self.send(key, command));
+        effects
     }
 
     /// Names `key`'s session `name`, trimmed. Nothing for an empty name or the name it has.
@@ -1117,24 +1199,25 @@ impl App {
         key: SessionKey,
         choice: PromptChoice,
     ) -> (Vec<Effect>, Option<String>) {
-        self.focus(key);
+        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         let now_unix = self.now_unix;
         let Some(mut entry) = self.sessions.get_mut(key) else {
-            return (Vec::new(), None);
+            return (effects, None);
         };
         let Some(Prompt::OpenElsewhere { text }) = entry.prompt.take() else {
-            return (Vec::new(), None);
+            return (effects, None);
         };
         if entry.session.phase != Phase::Resting {
-            return (Vec::new(), None);
+            return (effects, None);
         }
         match choice {
-            PromptChoice::Cancel => (Vec::new(), Some(text)),
+            PromptChoice::Cancel => (effects, Some(text)),
             PromptChoice::ContinueHere => {
                 entry.session.wake(&text);
                 entry.last_active_unix = now_unix;
                 drop(entry);
-                (self.start(key), None)
+                effects.extend(self.start(key));
+                (effects, None)
             }
             PromptChoice::ContinueAsCopy => {
                 let group = self.groups.group_of(&entry);
@@ -1156,7 +1239,7 @@ impl App {
                 } else {
                     Place::Focused
                 };
-                let mut effects = self.show(copy, place, Leaving::Keep);
+                effects.extend(self.show(copy, place, Leaving::Keep));
                 if let Some(mut entry) = self.sessions.get_mut(copy)
                     && let Some(id) = read_from
                     && matches!(
@@ -1416,15 +1499,28 @@ impl App {
     }
 
     /// Moves the focus to `key`'s tile, when it is in one without it, and counts its session as
-    /// seen. True when the focus moved.
-    fn focus(&mut self, key: SessionKey) -> bool {
+    /// seen. Asks for the branch of its folder when the focus moved.
+    fn focus(&mut self, key: SessionKey) -> Option<Effect> {
         if !self.tiles.focus(key) {
-            return false;
+            return None;
         }
         if let Some(mut entry) = self.sessions.get_mut(key) {
             entry.unseen = false;
         }
-        true
+        self.read_branch()
+    }
+
+    /// Asks for the branch of the focused session's folder.
+    fn read_branch(&self) -> Option<Effect> {
+        let folder = self.focused_entry()?.session.folder.clone();
+        Some(Effect::ReadBranch { folder })
+    }
+
+    /// [`App::read_branch`], when the focus is no longer on `before`.
+    fn branch_if_moved(&self, before: Option<SessionKey>) -> Option<Effect> {
+        (self.focused() != before)
+            .then(|| self.read_branch())
+            .flatten()
     }
 
     /// Takes `key`'s tile out of the row and counts the session whose tile takes the focus as
@@ -1520,8 +1616,8 @@ fn empty(session: &Session) -> bool {
 #[cfg(test)]
 mod tests {
     use mr_agent::{
-        HistoryItem, LimitWindow, SessionInfo, StoredHistory, ToolDetail, TurnSummary, UserRequest,
-        UserRequestKind,
+        HistoryItem, LimitWindow, RemoteAccess, SessionInfo, StoredHistory, ToolDetail,
+        TurnSummary, UserRequest, UserRequestKind,
     };
 
     use super::*;
@@ -1809,6 +1905,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![
+                reads_branch("/p"),
                 Effect::Open {
                     open: 1,
                     spec: StartSpec::new("/p")
@@ -1933,6 +2030,7 @@ mod tests {
                     open: 1,
                     command: SessionCommand::Close
                 },
+                reads_branch("/q"),
                 Effect::Open {
                     open: 2,
                     spec: StartSpec::new("/q")
@@ -1990,7 +2088,7 @@ mod tests {
         app.submit(key, "go");
         app.event(1, exited(false), 0.0);
         let effects = app.new_session("/p".into(), Place::Focused, Leaving::ForgetIfEmpty);
-        assert_eq!(effects.len(), 1, "{effects:?}");
+        assert_eq!(effects.len(), 2, "its branch and its open: {effects:?}");
         assert_eq!(
             closes(&effects),
             Vec::<u64>::new(),
@@ -2105,6 +2203,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![
+                reads_branch("/p"),
                 Effect::Open {
                     open: 1,
                     spec: StartSpec::new("/p")
@@ -2384,7 +2483,10 @@ mod tests {
             Vec::<u64>::new()
         );
         assert!(app.sessions.get(a).is_some(), "kept");
-        assert_eq!(app.show(a, Place::Focused, Leaving::ForgetIfEmpty), vec![]);
+        assert_eq!(
+            app.show(a, Place::Focused, Leaving::ForgetIfEmpty),
+            vec![reads_branch("/a")]
+        );
         // A new session in another folder keeps it too.
         assert_eq!(
             closes(&app.new_session("/b".into(), Place::Focused, Leaving::Keep)),
@@ -2410,10 +2512,13 @@ mod tests {
         let mut app = main_screen();
         assert_eq!(
             unsaved(app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty)),
-            vec![Effect::Open {
-                open: 1,
-                spec: StartSpec::new("/a")
-            }]
+            vec![
+                reads_branch("/a"),
+                Effect::Open {
+                    open: 1,
+                    spec: StartSpec::new("/a")
+                }
+            ]
         );
         let a = app.focused();
         assert_eq!(
@@ -2428,6 +2533,7 @@ mod tests {
                     open: 1,
                     command: SessionCommand::Close
                 },
+                reads_branch("/b"),
                 Effect::Open {
                     open: 2,
                     spec: StartSpec::new("/b")
@@ -2451,10 +2557,13 @@ mod tests {
         assert!(matches!(session(&app, failed).phase, Phase::Ended { .. }));
         assert_eq!(
             app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty),
-            vec![Effect::Open {
-                open: 2,
-                spec: StartSpec::new("/a")
-            }]
+            vec![
+                reads_branch("/a"),
+                Effect::Open {
+                    open: 2,
+                    spec: StartSpec::new("/a")
+                }
+            ]
         );
         assert!(app.sessions.get(failed).is_none(), "the ended one is gone");
         let fresh = app.focused_entry().unwrap();
@@ -2506,7 +2615,7 @@ mod tests {
         let c = app.sessions.add(stored("s9"), NOW - 60);
         assert_eq!(
             app.show(c, Place::Focused, Leaving::ForgetIfEmpty),
-            vec![reads_s9(c)],
+            vec![reads_s9(c), reads_branch("/home/alex/project")],
             "no save"
         );
         assert_eq!((tile_keys(&app), app.focused()), (vec![c, b], Some(c)));
@@ -2519,7 +2628,8 @@ mod tests {
         let a = busy(&mut app, "/a");
         let c = app.sessions.add(stored("s9"), NOW - 60);
         let effects = app.show(c, Place::Side, Leaving::ForgetIfEmpty);
-        assert_eq!(effects, vec![reads_s9(c), save(&app)]);
+        let branch = reads_branch("/home/alex/project");
+        assert_eq!(effects, vec![reads_s9(c), branch, save(&app)]);
         assert_eq!((tile_keys(&app), app.focused()), (vec![a, c], Some(c)));
     }
 
@@ -2531,9 +2641,15 @@ mod tests {
         app.show(b, Place::Side, Leaving::ForgetIfEmpty);
         app.focus_tile(a);
         assert_eq!(app.focused(), Some(a));
-        assert_eq!(app.show(b, Place::Focused, Leaving::ForgetIfEmpty), vec![]);
+        assert_eq!(
+            app.show(b, Place::Focused, Leaving::ForgetIfEmpty),
+            vec![reads_branch("/home/alex/project")]
+        );
         assert_eq!((tile_keys(&app), app.focused()), (vec![a, b], Some(b)));
-        assert_eq!(app.show(a, Place::Side, Leaving::ForgetIfEmpty), vec![]);
+        assert_eq!(
+            app.show(a, Place::Side, Leaving::ForgetIfEmpty),
+            vec![reads_branch("/a")]
+        );
         assert_eq!((tile_keys(&app), app.focused()), (vec![a, b], Some(a)));
     }
 
@@ -2544,7 +2660,7 @@ mod tests {
         assert_eq!(mark(&app, a), Mark::None, "it ended in the focused tile");
         app.event(open_of(&app, b), done(), 0.0);
         assert_eq!(mark(&app, b), Mark::Finished, "though it is in a tile");
-        assert_eq!(app.focus_tile(b), vec![], "no save");
+        assert_eq!(app.focus_tile(b), vec![reads_branch("/b")], "no save");
         assert_eq!(mark(&app, b), Mark::None);
     }
 
@@ -2579,6 +2695,140 @@ mod tests {
     }
 
     #[test]
+    fn choosing_an_effort_sends_it_to_that_session_only() {
+        let (mut app, a, b) = two_tiles();
+        for key in [a, b] {
+            let mut entry = app.sessions.get_mut(key).unwrap();
+            entry.session.models[1].effort_levels = vec!["low".into(), "high".into()];
+        }
+        let before = session(&app, a).clone();
+        assert_eq!(
+            app.choose_effort(b, "high"),
+            vec![Effect::Send {
+                open: open_of(&app, b),
+                command: SessionCommand::SetEffort("high".into())
+            }]
+        );
+        assert_eq!(
+            (tile_keys(&app), app.focused()),
+            (vec![a, b], Some(a)),
+            "the focus does not move"
+        );
+        assert_eq!(session(&app, a), &before);
+        assert_eq!(app.choose_effort(b, "max"), vec![], "not a level it takes");
+        assert_eq!(app.choose_effort(SessionKey(99), "high"), vec![]);
+    }
+
+    #[test]
+    fn switching_remote_control_sends_to_that_session_only() {
+        let (mut app, a, b) = two_tiles();
+        app.settle();
+        let (before, sidebar) = (session(&app, a).clone(), app.sidebar_version);
+        assert_eq!(
+            app.set_remote(b, true),
+            vec![Effect::Send {
+                open: open_of(&app, b),
+                command: SessionCommand::SetRemoteAccess { on: true }
+            }]
+        );
+        assert!(session(&app, b).remote_wanted);
+        assert_eq!(
+            (tile_keys(&app), app.focused()),
+            (vec![a, b], Some(a)),
+            "the focus does not move"
+        );
+        assert_eq!(session(&app, a), &before);
+        let open = open_of(&app, b);
+        app.event(
+            open,
+            SessionEvent::RemoteAccess(RemoteAccess::Starting),
+            0.0,
+        );
+        app.settle();
+        assert_eq!(app.sidebar_version, sidebar, "no sidebar row shows it");
+        assert_eq!(app.set_remote(SessionKey(99), true), vec![]);
+    }
+
+    #[test]
+    fn a_new_session_wants_remote_control_when_the_preference_says_so() {
+        let mut app = main_screen();
+        assert!(!app.remote_for_new);
+        app.set_remote_for_new(true);
+        app.new_session("/p".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let key = app.focused().unwrap();
+        assert!(session(&app, key).remote_wanted);
+        let open = open_of(&app, key);
+        let effects = app.event(open, SessionEvent::Started(info()), 0.0);
+        let turn_on = Effect::Send {
+            open,
+            command: SessionCommand::SetRemoteAccess { on: true },
+        };
+        assert!(effects.contains(&turn_on), "{effects:?}");
+
+        app.set_remote_for_new(false);
+        app.new_session("/q".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let key = app.focused().unwrap();
+        assert!(!session(&app, key).remote_wanted);
+        let open = open_of(&app, key);
+        let effects = app.event(open, SessionEvent::Started(info()), 0.0);
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Send {
+                    command: SessionCommand::SetRemoteAccess { .. },
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_stored_session_and_a_copy_do_not_get_the_preference() {
+        let mut app = main_screen();
+        app.set_remote_for_new(true);
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
+        listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![a1]);
+        let key = by_id(&app, "a1");
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        assert!(!session(&app, key).remote_wanted, "a stored session");
+
+        let (mut app, key, _) = checked(5);
+        app.set_remote_for_new(true);
+        app.answer_prompt(key, PromptChoice::ContinueAsCopy);
+        let copy = app.focused().unwrap();
+        assert_ne!(copy, key);
+        assert!(!session(&app, copy).remote_wanted, "a copy");
+        let effects = app.event(1, SessionEvent::Started(info()), 0.0);
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Send {
+                    command: SessionCommand::SetRemoteAccess { .. },
+                    ..
+                }
+            )),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn the_preference_is_saved_and_read_back() {
+        let mut app = main_screen();
+        let effects = app.set_remote_for_new(true);
+        assert!(app.remote_for_new);
+        assert_eq!(effects, vec![save(&app)]);
+        assert!(app.saved().remote_for_new);
+        assert!(restored(app.saved()).remote_for_new);
+        assert_eq!(app.set_remote_for_new(true), vec![], "nothing changed");
+        let effects = app.set_remote_for_new(false);
+        assert_eq!(effects, vec![save(&app)]);
+        assert!(!app.saved().remote_for_new);
+        assert!(!restored(app.saved()).remote_for_new);
+        assert!(!restored(Saved::default()).remote_for_new);
+    }
+
+    #[test]
     fn closing_a_tile_keeps_its_session_running() {
         let (mut app, a, b) = two_tiles();
         let effects = app.close_tile(b, Leaving::ForgetIfEmpty);
@@ -2605,7 +2855,7 @@ mod tests {
         app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
         let b = app.focused().unwrap();
         let effects = app.close_tile(b, Leaving::Keep);
-        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(effects, vec![reads_branch("/a"), save(&app)]);
         assert!(app.sessions.get(b).is_some(), "text is typed in it");
         assert_eq!(tile_keys(&app), vec![a]);
     }
@@ -2616,7 +2866,10 @@ mod tests {
         let a = busy(&mut app, "/a");
         app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
         let b = app.focused().unwrap();
-        assert_eq!(app.show(a, Place::Focused, Leaving::ForgetIfEmpty), vec![]);
+        assert_eq!(
+            app.show(a, Place::Focused, Leaving::ForgetIfEmpty),
+            vec![reads_branch("/a")]
+        );
         assert!(app.sessions.get(b).is_some(), "it is still in its tile");
         app.focus_tile(b);
         let c = app.sessions.add(stored("s9"), NOW - 60);
@@ -2687,7 +2940,7 @@ mod tests {
         let b = app.sessions.add(stored("s9"), NOW - 60);
         assert_eq!(
             app.show(b, Place::Side, Leaving::ForgetIfEmpty),
-            vec![reads_s9(b)]
+            vec![reads_s9(b), reads_branch("/home/alex/project")]
         );
         assert_eq!((tile_keys(&app), app.focused()), (vec![b], Some(b)));
         assert!(app.sessions.get(a).is_some());
@@ -2709,6 +2962,136 @@ mod tests {
         app.focus_tile(b);
         app.settle();
         assert_eq!(app.sidebar_version, version + 1, "it had the focus");
+    }
+
+    fn reads_branch(folder: &str) -> Effect {
+        Effect::ReadBranch {
+            folder: folder.into(),
+        }
+    }
+
+    /// The folders whose branch `effects` ask for, in order.
+    fn branch_asks(effects: &[Effect]) -> Vec<&str> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ReadBranch { folder } => folder.to_str(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_branch_is_asked_for_when_the_focus_comes_and_when_a_turn_ends() {
+        let (mut app, a, b) = two_tiles();
+        assert_eq!(branch_asks(&app.focus_tile(b)), ["/b"]);
+        assert!(branch_asks(&app.focus_tile(b)).is_empty(), "it had it");
+        let effects = app.event(open_of(&app, b), done(), 0.0);
+        assert_eq!(branch_asks(&effects), ["/b"], "a turn ended there");
+        let effects = app.event(open_of(&app, a), done(), 0.0);
+        assert!(branch_asks(&effects).is_empty(), "in another tile");
+        app.submit(b, "again");
+        let failed = SessionEvent::TurnFailed {
+            reason: "it broke".into(),
+        };
+        let effects = app.event(open_of(&app, b), failed, 0.0);
+        assert_eq!(branch_asks(&effects), ["/b"], "a turn failed there");
+        let effects = app.event(open_of(&app, b), exited(false), 0.0);
+        assert_eq!(branch_asks(&effects), ["/b"], "its program died");
+        let effects = app.close_tile(b, Leaving::Keep);
+        assert_eq!(branch_asks(&effects), ["/a"], "the focus went to a");
+        let c = app.sessions.add(stored("s9"), NOW - 60);
+        let effects = app.show(c, Place::Side, Leaving::ForgetIfEmpty);
+        assert_eq!(branch_asks(&effects), ["/home/alex/project"]);
+        let effects = app.move_tile(a, Spot::Edge(2));
+        assert_eq!(branch_asks(&effects), ["/a"], "a moved tile takes it");
+        let effects = app.new_session("/c".into(), Place::Focused, Leaving::Keep);
+        assert_eq!(branch_asks(&effects), ["/c"], "a session made there");
+
+        // An intent on a session in another tile focuses it.
+        type Intent = fn(&mut App, SessionKey) -> Vec<Effect>;
+        let intents: [(&str, Intent); 7] = [
+            ("submit", |app, key| app.submit(key, "hi")),
+            ("restart", |app, key| app.restart(key)),
+            ("answer_prompt", |app, key| {
+                app.answer_prompt(key, PromptChoice::ContinueHere).0
+            }),
+            ("stop", |app, key| app.stop(key)),
+            ("answer", |app, key| {
+                let allow = Answer::Allow { always: false };
+                app.answer(key, &RequestId("r1".into()), allow)
+            }),
+            ("model", |app, key| app.choose_model(key, "default")),
+            ("mode", |app, key| {
+                app.choose_mode(key, PermissionMode::Plan)
+            }),
+        ];
+        for (name, intent) in intents {
+            let (mut app, _, b) = two_tiles();
+            let effects = intent(&mut app, b);
+            assert_eq!(branch_asks(&effects), ["/b"], "{name}");
+        }
+        // The focused session's tile goes when its program is not installed.
+        let (mut app, a, _) = two_tiles();
+        let effects = app.open_failed(open_of(&app, a), AgentError::NotInstalled);
+        assert_eq!(branch_asks(&effects), ["/b"], "not installed");
+    }
+
+    #[test]
+    fn the_branch_is_asked_for_the_session_focused_at_start() {
+        let saved = Saved {
+            version: SAVED_VERSION,
+            shown: Some(id("a2")),
+            ..Saved::default()
+        };
+        let mut app = restored(saved);
+        let effects = listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        assert_eq!(branch_asks(&effects), ["/home/alex/project"]);
+
+        let (mut app, _) = App::new(caps(), Width::Unlimited, launch("/p"), NOW);
+        let effects = app.account_checked(signed_in());
+        assert_eq!(branch_asks(&effects), ["/p"], "the launch folder");
+    }
+
+    #[test]
+    fn two_sessions_of_one_folder_share_the_answer() {
+        let mut app = main_screen();
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        let (a1, a2, b1) = (by_id(&app, "a1"), by_id(&app, "a2"), by_id(&app, "b1"));
+        let answer = |folder: &str, branch: &Branch| FromBackend::Branch {
+            folder: folder.into(),
+            branch: Some(branch.clone()),
+        };
+        let main = Branch::Named("main".into());
+        // None of them is focused: an answer is kept for its folder all the same.
+        let effects = app.receive(answer("/home/alex/project", &main), 0.0);
+        assert_eq!(effects, vec![]);
+        let branches = |app: &App| [a1, a2, b1].map(|key| app.branch_of(key).cloned());
+        let shared = Some(main.clone());
+        assert_eq!(branches(&app), [shared.clone(), shared, None]);
+        let detached = Branch::Detached("0123456".into());
+        app.receive(answer("/home/alex/project", &detached), 0.0);
+        app.receive(answer("/home/alex/notes", &main), 0.0);
+        assert_eq!(
+            branches(&app),
+            [Some(detached.clone()), Some(detached), Some(main)]
+        );
+    }
+
+    #[test]
+    fn an_answer_of_none_takes_the_branch_away() {
+        let (mut app, key) = ready();
+        let main = Branch::Named("main".into());
+        let answer = |folder: &str, branch: Option<Branch>| FromBackend::Branch {
+            folder: folder.into(),
+            branch,
+        };
+        app.receive(answer("/p", Some(main.clone())), 0.0);
+        assert_eq!(app.branch_of(key), Some(&main));
+        app.receive(answer("/q", None), 0.0);
+        assert_eq!(app.branch_of(key), Some(&main), "another folder's answer");
+        app.receive(answer("/p", None), 0.0);
+        assert_eq!(app.branch_of(key), None);
     }
 
     #[test]
@@ -2746,7 +3129,7 @@ mod tests {
     fn moving_a_tile_focuses_it_and_asks_for_a_save() {
         let (mut app, a, b) = two_tiles();
         let effects = app.move_tile(b, Spot::Edge(0));
-        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(effects, vec![reads_branch("/b"), save(&app)]);
         assert_eq!((tile_keys(&app), app.focused()), (vec![b, a], Some(b)));
     }
 
@@ -2822,7 +3205,8 @@ mod tests {
         assert_eq!(app.row_height(), Some(900.0));
         let c = app.sessions.add(stored("s9"), NOW - 60);
         let effects = app.show(c, Place::Below(a), Leaving::ForgetIfEmpty);
-        assert_eq!(effects, vec![reads_s9(c), save(&app)]);
+        let branch = reads_branch("/home/alex/project");
+        assert_eq!(effects, vec![reads_s9(c), branch, save(&app)]);
         assert_eq!(
             (tile_columns(&app), app.focused()),
             (vec![vec![a, c], vec![b]], Some(c))
@@ -2921,7 +3305,7 @@ mod tests {
     fn moving_a_tile_into_a_column_asks_for_a_save() {
         let (mut app, a, b) = two_tiles();
         let effects = app.move_tile(b, Spot::Below(a));
-        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(effects, vec![reads_branch("/b"), save(&app)]);
         assert_eq!(
             (tile_columns(&app), app.focused()),
             (vec![vec![a, b]], Some(b))
@@ -2950,7 +3334,7 @@ mod tests {
         app.event(open_of(&app, a), done(), 0.0);
         assert_eq!(mark(&app, a), Mark::Finished, "c has the focus");
         let effects = app.close_tile(c, Leaving::Keep);
-        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(effects, vec![reads_branch("/a"), save(&app)]);
         assert_eq!(
             (tile_columns(&app), app.focused()),
             (vec![vec![a], vec![b]], Some(a))
@@ -2997,10 +3381,13 @@ mod tests {
         assert_eq!(session(&app, a).phase, Phase::Working);
         assert_eq!(
             unsaved(app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty)),
-            vec![Effect::Open {
-                open: 2,
-                spec: StartSpec::new("/b")
-            }]
+            vec![
+                reads_branch("/b"),
+                Effect::Open {
+                    open: 2,
+                    spec: StartSpec::new("/b")
+                }
+            ]
         );
         let a = app.sessions.get(a).unwrap();
         assert_eq!((a.session.phase.clone(), a.open), (Phase::Working, Some(1)));
@@ -3196,11 +3583,14 @@ mod tests {
         let key = by_id(&app, "a1");
         assert_eq!(
             app.show(key, Place::Focused, Leaving::ForgetIfEmpty),
-            vec![Effect::ReadHistory {
-                key,
-                id: id("a1"),
-                max_items: HISTORY_ITEMS
-            }]
+            vec![
+                Effect::ReadHistory {
+                    key,
+                    id: id("a1"),
+                    max_items: HISTORY_ITEMS
+                },
+                reads_branch("/home/alex/project")
+            ]
         );
         assert_eq!(session(&app, key).history, HistoryState::Loading);
         let reads = |effects: &[Effect]| {
@@ -3502,7 +3892,8 @@ mod tests {
         assert_eq!((back, app.prompt(key)), (None, None));
         let mut spec = resume_a1();
         spec.fork = true;
-        assert_eq!(effects, vec![Effect::Open { open: 1, spec }]);
+        let branch = reads_branch("/home/alex/project");
+        assert_eq!(effects, vec![branch, Effect::Open { open: 1, spec }]);
         let copy = app.focused().unwrap();
         assert_ne!(copy, key);
         assert_eq!(app.sessions.len(), 2);
@@ -3844,10 +4235,13 @@ mod tests {
         ));
         assert_eq!(
             effects,
-            vec![Effect::Open {
-                open: 1,
-                spec: StartSpec::new("/home/alex/notes")
-            }]
+            vec![
+                reads_branch("/home/alex/notes"),
+                Effect::Open {
+                    open: 1,
+                    spec: StartSpec::new("/home/alex/notes")
+                }
+            ]
         );
         let key = app.focused().unwrap();
         app.settle();
@@ -4207,6 +4601,7 @@ mod tests {
                     id: id("a2"),
                     max_items: HISTORY_ITEMS
                 },
+                reads_branch("/home/alex/project"),
             ]
         );
         assert_eq!(session(&app, key).phase, Phase::Resting);
@@ -4363,7 +4758,12 @@ mod tests {
         assert_eq!(again.focused(), Some(a2));
         assert_eq!(
             effects,
-            vec![reads(a1, "a1"), reads(a2, "a2"), reads(b1, "b1")],
+            vec![
+                reads(a1, "a1"),
+                reads(a2, "a2"),
+                reads(b1, "b1"),
+                reads_branch("/home/alex/project")
+            ],
             "no Open"
         );
         assert!(
@@ -4384,7 +4784,11 @@ mod tests {
         assert_eq!((tile_keys(&app), app.focused()), (vec![key], Some(key)));
         assert_eq!(
             effects,
-            vec![Effect::ListSessions { since_unix: None }, reads(key, "s1")]
+            vec![
+                Effect::ListSessions { since_unix: None },
+                reads(key, "s1"),
+                reads_branch("/home/alex/notes")
+            ]
         );
         let saved = app.saved();
         assert_eq!(
@@ -4505,6 +4909,42 @@ mod tests {
         listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1]);
         let a1 = by_id(&app, "a1");
         assert_eq!((tile_keys(&app), app.focused()), (vec![a1], Some(a1)));
+    }
+
+    #[test]
+    fn a_session_driven_from_another_device_is_kept() {
+        let (mut app, a1) = shows_stored();
+        app.new_session(
+            "/home/alex/notes".into(),
+            Place::Side,
+            Leaving::ForgetIfEmpty,
+        );
+        let new = app.focused().unwrap();
+        let started = SessionInfo {
+            id: id("new"),
+            ..info()
+        };
+        let open = open_of(&app, new);
+        app.event(open, SessionEvent::Started(started), 0.0);
+        // A prompt typed on a phone: a turn runs that nothing here handed over.
+        app.event(open, SessionEvent::TurnStarted, 0.0);
+        app.event(open, done(), 0.0);
+        assert_eq!(
+            app.saved().tiles,
+            vec![tile("a1", 1.0), tile("new", 1.0)],
+            "its tile is kept"
+        );
+        // Leaving it with nothing typed neither ends its program nor forgets it.
+        assert_eq!(
+            closes(&app.show(a1, Place::Focused, Leaving::ForgetIfEmpty)),
+            Vec::<u64>::new()
+        );
+        assert!(app.sessions.get(new).is_some());
+        assert_eq!(
+            closes(&app.close_tile(new, Leaving::ForgetIfEmpty)),
+            Vec::<u64>::new()
+        );
+        assert!(app.sessions.get(new).is_some());
     }
 
     #[test]
@@ -4668,7 +5108,12 @@ mod tests {
         assert_eq!(again.focused(), Some(a2));
         assert_eq!(
             effects,
-            vec![reads(a1, "a1"), reads(a2, "a2"), reads(b1, "b1")],
+            vec![
+                reads(a1, "a1"),
+                reads(a2, "a2"),
+                reads(b1, "b1"),
+                reads_branch("/home/alex/project")
+            ],
             "no Open"
         );
         assert!(

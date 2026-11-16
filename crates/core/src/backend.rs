@@ -5,8 +5,8 @@
 //! Every open has a thread of its own, which makes that open's `Agent::open` call and every
 //! `send` for it, in order; it ends with its session. Every look has a thread of its own too.
 //! One more thread, the library thread, makes the other calls one at a time in the order they
-//! were sent: the account, the listing, a history, an activity time. So a slow call holds up
-//! only what was sent after it to the same thread.
+//! were sent: the account, the listing, a history, an activity time. It also reads the git
+//! branch of a folder. So a slow call holds up only what was sent after it to the same thread.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ use mr_agent::{
     SessionId, StartSpec, StoredHistory, StoredSession, UsageLimits,
 };
 
+use crate::git::{self, Branch};
 use crate::sessions::SessionKey;
 
 /// What the window asks of the backend. Mirrors the agent-facing `Effect`s.
@@ -50,6 +51,10 @@ pub enum ToBackend {
     },
     /// Start a session in `folder`, learn the models and the usage limits, close it.
     Look {
+        folder: PathBuf,
+    },
+    /// Read the git branch of `folder` from its repository's files.
+    ReadBranch {
         folder: PathBuf,
     },
 }
@@ -89,6 +94,11 @@ pub enum FromBackend {
         models: Vec<ModelOption>,
         model: Option<String>,
         usage: Option<UsageLimits>,
+    },
+    /// The branch read for `folder`: none outside a repository or when it could not be read.
+    Branch {
+        folder: PathBuf,
+        branch: Option<Branch>,
     },
 }
 
@@ -165,6 +175,7 @@ impl Backend {
             ToBackend::Open { open, spec } => self.open(open, spec),
             ToBackend::Send { open, command } => self.pass(open, command),
             ToBackend::Look { folder } => self.look(folder),
+            ToBackend::ReadBranch { folder } => self.ask_library(LibraryJob::Branch { folder }),
         }
     }
 
@@ -335,6 +346,9 @@ enum LibraryJob {
         key: SessionKey,
         id: SessionId,
     },
+    Branch {
+        folder: PathBuf,
+    },
     Flush(FlushToken),
 }
 
@@ -364,6 +378,10 @@ impl Library {
                 LibraryJob::Activity { key, id } => FromBackend::Activity {
                     key,
                     result: self.agent.last_active(&id),
+                },
+                LibraryJob::Branch { folder } => FromBackend::Branch {
+                    branch: git::branch(&folder),
+                    folder,
                 },
                 LibraryJob::Flush(token) => {
                     let _ = token.send(());
@@ -726,12 +744,30 @@ mod tests {
             open,
             spec: StartSpec::new("/home/alex"),
         });
-        match next(fake, backend) {
+        let id = match next(fake, backend) {
             FromBackend::Event {
                 open: got,
                 event: SessionEvent::Started(info),
             } if got == open => info.id,
             other => panic!("{other:?}"),
+        };
+        after_started(fake, backend, open);
+        id
+    }
+
+    /// Takes in what the fake says after `Started`: the effort level, then the breakdown.
+    fn after_started(fake: &FakeAgent, backend: &Backend, open: u64) {
+        let effort = FromBackend::Event {
+            open,
+            event: SessionEvent::EffortChanged(Some("medium".into())),
+        };
+        assert_eq!(next(fake, backend), effort);
+        match next(fake, backend) {
+            FromBackend::Event {
+                open: got,
+                event: SessionEvent::ContextBreakdown(_),
+            } if got == open => {}
+            other => panic!("expected the breakdown, got {other:?}"),
         }
     }
 
@@ -858,6 +894,7 @@ mod tests {
             earlier_left_out: false,
             model: Some("fake-model".into()),
             permission_mode: Some(PermissionMode::Ask),
+            effort: None,
         }
     }
 
@@ -915,6 +952,7 @@ mod tests {
         else {
             panic!()
         };
+        after_started(&fake, &backend, 7);
         backend.send(ToBackend::Open {
             open: 8,
             spec: StartSpec::new("/q"),
@@ -926,6 +964,7 @@ mod tests {
         else {
             panic!()
         };
+        after_started(&fake, &backend, 8);
         assert_ne!(first.id, second.id);
         fake.emit(&first.id, SessionEvent::TextDelta("late".into()));
         assert_eq!(
@@ -952,6 +991,7 @@ mod tests {
         else {
             panic!()
         };
+        after_started(&fake, &backend, 1);
         backend.send(ToBackend::Send {
             open: 1,
             command: SessionCommand::Stop,
@@ -1180,6 +1220,37 @@ mod tests {
             FromBackend::Activity {
                 key: SessionKey(5),
                 result: Ok(Some(1_794_000_100))
+            }
+        );
+    }
+
+    #[test]
+    fn the_library_reads_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("notes");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        std::fs::write(repository.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let (backend, _) = start(&FakeAgent::new());
+        backend.send(ToBackend::ReadBranch {
+            folder: repository.clone(),
+        });
+        backend.send(ToBackend::ReadBranch {
+            folder: plain.clone(),
+        });
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Branch {
+                folder: repository,
+                branch: Some(Branch::Named("main".into())),
+            }
+        );
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Branch {
+                folder: plain,
+                branch: None,
             }
         );
     }

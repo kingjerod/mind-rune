@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use mr_core::{App, Entry, Laid, Mark, SessionKey, Spot, TileLevel};
+use mr_core::{App, Entry, Laid, Mark, Remote, SessionKey, Spot, TileLevel};
 use rune::{
     Color, Cursor, Cx, Drag, El, Key, KeyEvent, Phase, Spring, Transition, Tx, col, el,
     row as row_el, text,
@@ -23,6 +23,7 @@ const FOLDER: &str = "mr-tile-folder";
 const TITLE: &str = "mr-tile-title";
 const STATE: &str = "mr-tile-state";
 const CLOSE: &str = "mr-tile-close";
+const REMOTE: &str = "mr-tile-remote";
 
 /// The key of the field a session's name is edited in, in its tile's header.
 const RENAME: &str = "mr-tile-rename";
@@ -46,7 +47,7 @@ const DIVIDER_WIDTH: f32 = 8.0;
 const SPLIT_HEIGHT: f32 = 8.0;
 
 /// The title of a session that has none yet.
-const NEW_SESSION: &str = "New session";
+pub(super) const NEW_SESSION: &str = "New session";
 
 /// `mr-tile-{n}`.
 pub fn tile_key(key: SessionKey) -> String {
@@ -535,8 +536,9 @@ pub fn step_focus(ui: &mut Ui, tx: &mut Tx, step: isize) -> bool {
 }
 
 /// `key`'s header, one line of a fixed height: its folder's name as a chip, its title taking
-/// the room the others leave, what its session is doing in a word, and the button that closes
-/// the tile. It reads the session's folder, title and mark, nothing of its conversation.
+/// the room the others leave, what its session is doing in a word, "Remote" while Remote
+/// Control is on ([`remote_mark`]), and the button that closes the tile. It reads the session's
+/// folder, title, mark and Remote Control, nothing of its conversation.
 ///
 /// A double press on the title edits the session's name there, in the window's one name field
 /// (`glue::start_rename`); while it does, a press in the field only edits it. The title takes
@@ -590,6 +592,7 @@ fn header(ui: &Ui, kit: &'static Kit, key: SessionKey) -> El {
         .children(entry.map(|entry| folder_chip(&entry.session.folder, kit)))
         .child(title)
         .children(state_word(mark, kit))
+        .children(entry.and_then(|entry| remote_mark(&entry.session.remote, kit)))
         .child(close_button(key, kit))
 }
 
@@ -637,6 +640,23 @@ fn state_word(mark: Mark, kit: &Kit) -> Option<El> {
     Some(text(word).key(STATE).font(kit.ty.small_medium).color(color))
 }
 
+/// "Remote" while Remote Control is not off: in the accent's text colour while it is on, muted
+/// while it connects or reconnects. It never shrinks, so it takes its room from the title, and
+/// has no press of its own: a press on it is one on the header.
+fn remote_mark(remote: &Remote, kit: &Kit) -> Option<El> {
+    let color = match remote {
+        Remote::Off => return None,
+        Remote::On { .. } => kit.c.text_accent,
+        Remote::Starting | Remote::Reconnecting => kit.c.text_muted,
+    };
+    Some(
+        text("Remote")
+            .key(REMOTE)
+            .font(kit.ty.small_medium)
+            .color(color),
+    )
+}
+
 /// The button that closes `key`'s tile. Pressed by a click only: it is no Tab stop, and a click
 /// on it leaves the focused field focused.
 fn close_button(key: SessionKey, kit: &Kit) -> El {
@@ -674,8 +694,9 @@ fn laid_out(ui: &mut Ui, rect: [f32; 4]) {
 #[cfg(test)]
 mod tests {
     use mr_agent::{
-        RequestId, SessionCommand, SessionEvent, SessionId, StoredSession, ToolCallId, ToolDetail,
-        ToolOutcome, TurnSummary, UserRequest, UserRequestKind,
+        RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId,
+        StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UserRequest,
+        UserRequestKind,
     };
     use mr_core::{
         ItemBody, ItemId, Mark, SAVED_VERSION, Saved, SavedTile, SessionKey, Spot, TileLevel, Width,
@@ -685,7 +706,7 @@ mod tests {
 
     use super::{ROW, divider_key, split_key, tile_key, unchanged};
     use crate::demo;
-    use crate::glue::{self, Picker, Renaming, Ui};
+    use crate::glue::{self, DragFrom, Picker, Renaming, Ui};
     use crate::testkit::{self, box_focused, columns, tile, tile_keys};
     use crate::theme;
     use crate::view::{conversation, items};
@@ -3715,5 +3736,130 @@ mod tests {
         drag_split(&mut rt, b, -100.0);
         assert_near(height(&rt, b), before - 100.0, "the next drag");
         assert_placed(&rt);
+    }
+
+    // The mark of Remote Control in a header: Task 10 of plan 5.
+
+    /// `key`'s session asks for Remote Control, as its switch in the panel does, then steps.
+    fn ask_remote(rt: &mut Runtime<Ui>, key: SessionKey) {
+        rt.update(|ui, _| {
+            let effects = ui.app.set_remote(key, true);
+            glue::run(ui, effects);
+        });
+        testkit::step(rt);
+    }
+
+    /// The program says `state` of Remote Control to `key`'s session.
+    fn remote_says(rt: &mut Runtime<Ui>, key: SessionKey, state: RemoteAccess) {
+        testkit::emit_to(rt, key, SessionEvent::RemoteAccess(state));
+    }
+
+    /// Remote Control on, reachable at the address tests use.
+    fn reachable() -> RemoteAccess {
+        RemoteAccess::On {
+            url: Some("https://example.org/session".into()),
+        }
+    }
+
+    /// The mark in `key`'s header and its colour, once the window has settled.
+    fn mark_in(rt: &mut Runtime<Ui>, key: SessionKey) -> Option<(String, Color)> {
+        // A text's colour comes in on a spring.
+        rt.settle_all();
+        testkit::step(rt);
+        header_part(rt, key, "mr-tile-remote")
+    }
+
+    #[test]
+    fn a_tile_says_remote_while_it_is_on() {
+        let (mut rt, a, b) = two_tiles();
+        let c = theme::kit(true).c;
+        let muted = Some(("Remote".to_owned(), c.text_muted));
+        let on = Some(("Remote".to_owned(), c.text_accent));
+        assert_eq!(mark_in(&mut rt, b), None);
+        ask_remote(&mut rt, b);
+        remote_says(&mut rt, b, RemoteAccess::Starting);
+        assert_eq!(mark_in(&mut rt, b), muted, "while it connects");
+        remote_says(&mut rt, b, reachable());
+        assert_eq!(mark_in(&mut rt, b), on);
+        assert_eq!(mark_in(&mut rt, a), None, "b's alone");
+        remote_says(&mut rt, b, RemoteAccess::Reconnecting);
+        assert_eq!(mark_in(&mut rt, b), muted, "while it reconnects");
+        remote_says(&mut rt, b, RemoteAccess::Off);
+        assert_eq!(mark_in(&mut rt, b), None, "off");
+        ask_remote(&mut rt, b);
+        remote_says(&mut rt, b, RemoteAccess::Starting);
+        let refused = RemoteAccess::Failed {
+            reason: "/login".into(),
+            why: RemoteFailure::Login,
+        };
+        remote_says(&mut rt, b, refused);
+        assert_eq!(mark_in(&mut rt, b), None, "refused");
+    }
+
+    #[test]
+    fn the_mark_takes_its_room_from_the_title() {
+        let mut rt = testkit::window_sized("empty", SIZE);
+        let key = testkit::focused(&rt).unwrap();
+        let long = "Planning the spring beds for the community garden down by the river";
+        testkit::emit(&mut rt, SessionEvent::TitleChanged(long.into()));
+        testkit::emit(&mut rt, SessionEvent::TurnStarted);
+        ask_remote(&mut rt, key);
+        remote_says(&mut rt, key, reachable());
+        let part = |rt: &Runtime<Ui>, inner: &str| {
+            testkit::rect(rt, &tile(key, inner)).unwrap_or_else(|| panic!("{inner} is drawn"))
+        };
+        rt.settle_all();
+        testkit::step(&mut rt);
+        let [_, _, wide_title, _] = part(&rt, "mr-tile-title");
+        let whole = ["mr-tile-state", "mr-tile-remote", "mr-tile-close"].map(|p| part(&rt, p)[2]);
+        // A row of 420 points: the window less the sidebar and the main card's frame.
+        rt.set_viewport((260.0 + 8.0 + 420.0, SIZE.1), 1.0);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        let [tx, _, tw, _] = tile_rect(&rt, key);
+        assert!((tw - 420.0).abs() <= 1.0, "a tile of 420 points: {tw}");
+        let [title_x, _, title_w, _] = part(&rt, "mr-tile-title");
+        let [state_x, _, state_w, _] = part(&rt, "mr-tile-state");
+        let [mark_x, _, mark_w, _] = part(&rt, "mr-tile-remote");
+        let [close_x, _, close_w, _] = part(&rt, "mr-tile-close");
+        assert_eq!([state_w, mark_w, close_w], whole, "the three are whole");
+        assert!(
+            title_w < wide_title,
+            "the title is cut: {title_w} of {wide_title}"
+        );
+        assert!(
+            title_x + title_w <= state_x,
+            "the title ends before the word"
+        );
+        assert!(state_x + state_w <= mark_x, "the word ends before the mark");
+        assert!(
+            mark_x + mark_w <= close_x,
+            "the mark ends before the button"
+        );
+        assert!(close_x + close_w <= tx + tw + 0.5, "the button is inside");
+    }
+
+    #[test]
+    fn a_press_on_the_mark_is_a_press_on_the_header() {
+        let (mut rt, a, b) = two_tiles();
+        ask_remote(&mut rt, a);
+        remote_says(&mut rt, a, reachable());
+        assert_eq!(testkit::focused(&rt), Some(b));
+        let mark = tile(a, "mr-tile-remote");
+        testkit::click(&mut rt, &mark);
+        testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(a), "the tile is focused");
+        assert!(box_focused(&rt, a), "its box has the keyboard");
+        // A drag from the mark moves the tile, as one from the header does.
+        let (x, y) = testkit::find(&rt, &mark).unwrap();
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        testkit::step(&mut rt);
+        let [rx, ry, rw, rh] = rt.presented(ROW).unwrap().0;
+        testkit::move_held(&mut rt, (rx + rw - 20.0, ry + rh / 2.0));
+        let dragged = rt.state.drag.as_ref().map(|drag| (drag.key, drag.from));
+        assert_eq!(dragged, Some((a, DragFrom::Header)));
+        testkit::release(&mut rt);
+        assert_eq!(tile_keys(&rt), vec![b, a], "moved");
     }
 }

@@ -6,17 +6,18 @@
 //! kind has its own method, so a new rule is a new arm in [`Translator::push`]
 //! plus one method.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use mr_agent::{
-    AgentError, Answer, CommandKind, LimitWindow, ModelOption, PermissionMode, Question,
-    QuestionOption, RemoteAccess, RequestId, SessionEvent, SessionId, SessionInfo, ToolCallId,
-    ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
+    AgentError, Answer, CommandKind, ContextBreakdown, ContextKind, ContextPart, LimitWindow,
+    ModelOption, PermissionMode, Question, QuestionOption, RemoteAccess, RemoteFailure, RequestId,
+    SessionEvent, SessionId, SessionInfo, ToolCallId, ToolDetail, ToolOutcome, TurnSummary,
+    UsageLimits, UserRequest, UserRequestKind,
 };
 use serde_json::{Value, json};
 
-use crate::encode::PermissionReply;
+use crate::encode::{PermissionReply, get_context_usage, get_settings};
 use crate::mode::mode_from_wire;
 use crate::time::iso8601_to_unix;
 use crate::wire::{Block, BlockKind, Incoming, StreamEvent, ToolResult};
@@ -37,6 +38,15 @@ pub enum Tracked {
     SuggestTitle,
     /// The `get_usage` request; its reply gives the usage limits.
     Usage,
+    /// The `apply_flag_settings` request that sets this effort level.
+    SetEffort(String),
+    /// The `get_settings` request; its reply gives the effort level in use.
+    /// `asked` is the level a `SetEffort` asked for, when this read follows one.
+    Settings {
+        asked: Option<String>,
+    },
+    /// The `get_context_usage` request; its reply says what the context is made of.
+    ContextUsage,
     Other,
 }
 
@@ -51,7 +61,8 @@ pub struct SessionStart {
     pub permission_mode: Option<PermissionMode>,
 }
 
-/// Translates one session's output, message by message.
+/// Translates one session's output, message by message. It never writes: a request it
+/// wants sent waits in a list, which [`Translator::take_requests`] hands over.
 #[derive(Debug, Default)]
 pub struct Translator {
     /// The session as known before any output, for `Started` at the reply to
@@ -65,6 +76,11 @@ pub struct Translator {
     mode: Option<PermissionMode>,
     /// The last title reported. `Init` does not name one.
     title: Option<String>,
+    /// The effort level last given, once it has been read: `None` until the first reading.
+    effort: Option<Option<String>>,
+    /// The level the latest `SetEffort` asked for. Only the reading that follows it reports a
+    /// level not taken.
+    effort_asked: Option<String>,
     /// The `session_url` of the most recent successful `RemoteOn` reply,
     /// forgotten when Remote Control is turned off or fails to turn on.
     remote_url: Option<String>,
@@ -80,15 +96,22 @@ pub struct Translator {
     /// is set, an `Assistant` record's text and thinking were already given
     /// as deltas.
     streaming: bool,
-    /// `usage_tokens` of the latest top-level `Assistant` record.
+    /// `usage_tokens` of the latest top-level `Assistant` record that is a reply with usage.
     last_usage_tokens: Option<u64>,
+    /// The model of that record.
+    last_usage_model: Option<String>,
     /// Requests raised and not yet answered or withdrawn, by `request_id`.
     pending: HashMap<String, PendingRequest>,
     /// Calls to the tools that are requests to the user (see [`REQUEST_TOOLS`]) whose result
     /// has not come yet, by `tool_use` id. They are not reported as tool calls, nor are their
     /// results.
     request_calls: HashSet<String>,
+    /// The requests to send next, in order. See [`Translator::take_requests`].
+    requests: Vec<(Tracked, Value)>,
 }
+
+/// The model a record names when the program made it itself rather than a model's reply.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// The tools `claude` asks the user through: it raises a request for each call, and the
 /// request is what the user sees and answers, so the call itself is not work to report.
@@ -133,7 +156,15 @@ impl Translator {
     /// Records what a control request asks for. Call it before sending the
     /// request, so its reply cannot arrive first.
     pub fn track(&mut self, request_id: &str, what: Tracked) {
+        if let Tracked::SetEffort(level) = &what {
+            self.effort_asked = Some(level.clone());
+        }
         self.tracked.insert(request_id.to_string(), what);
+    }
+
+    /// The requests the translator wants sent next, in order. Emptied by the call.
+    pub fn take_requests(&mut self) -> Vec<(Tracked, Value)> {
+        std::mem::take(&mut self.requests)
     }
 
     /// Feeds one parsed line and returns the events it gives, in order.
@@ -154,9 +185,10 @@ impl Translator {
             Incoming::Assistant {
                 parent: None,
                 blocks,
+                model,
                 usage_tokens,
                 ..
-            } => self.assistant(blocks, usage_tokens),
+            } => self.assistant(blocks, model, usage_tokens),
             Incoming::ToolResults {
                 parent: None,
                 results,
@@ -197,14 +229,14 @@ impl Translator {
                 text,
                 cost_usd,
                 duration_ms,
-                context_window,
+                context_windows,
             } => self.result(
                 is_error,
                 interrupted,
                 text,
                 cost_usd,
                 duration_ms,
-                context_window,
+                &context_windows,
             ),
             // Sub-agent records (`parent` set) and the kinds later rules cover.
             Incoming::Stream { .. }
@@ -228,6 +260,7 @@ impl Translator {
             self.started = true;
             self.model = Some(model.clone());
             self.mode = Some(mode.clone());
+            self.read_after_start_or_turn();
             return vec![SessionEvent::Started(SessionInfo {
                 id: SessionId(session_id),
                 folder: cwd.into(),
@@ -282,9 +315,19 @@ impl Translator {
         let access = match state {
             "failed" => RemoteAccess::Failed {
                 reason: detail.unwrap_or_else(|| "Remote Control failed".into()),
-                needs_login: failure_kind == Some("auth"),
+                why: match failure_kind {
+                    Some("auth") => RemoteFailure::Login,
+                    Some("ended_elsewhere") => RemoteFailure::Elsewhere,
+                    _ => RemoteFailure::Other,
+                },
+            },
+            "policy_disabled" => RemoteAccess::Failed {
+                reason: detail.unwrap_or_else(|| "Remote Control is turned off by policy".into()),
+                why: RemoteFailure::Policy,
             },
             "ready" => RemoteAccess::Starting,
+            "reconnecting" => RemoteAccess::Reconnecting,
+            // After a drop it comes back with `recovered`, at the same address.
             "connected" => RemoteAccess::On {
                 url: self.remote_url.clone(),
             },
@@ -312,6 +355,9 @@ impl Translator {
         };
         let event = match (tracked, ok) {
             (Tracked::Other, _) | (Tracked::Initialize, false) => None,
+            (Tracked::ContextUsage, true) => context_breakdown(body),
+            // Asked for in the background: the breakdown shown stays.
+            (Tracked::ContextUsage, false) => None,
             (Tracked::Initialize, true) => self.initialized(body),
             (Tracked::RemoteOn, true) => {
                 self.remote_url = body
@@ -326,7 +372,12 @@ impl Translator {
                     reason: error
                         .clone()
                         .unwrap_or_else(|| "Remote Control failed".into()),
-                    needs_login: error_code == Some("remote_control_auth"),
+                    why: match error_code {
+                        Some("remote_control_auth") => RemoteFailure::Login,
+                        Some("remote_control_policy_disabled") => RemoteFailure::Policy,
+                        Some("remote_control_ended_elsewhere") => RemoteFailure::Elsewhere,
+                        _ => RemoteFailure::Other,
+                    },
                 }))
             }
             (Tracked::RemoteOff, true) => {
@@ -338,6 +389,8 @@ impl Translator {
                     .get("model")
                     .and_then(Value::as_str)
                     .map_or(asked, str::to_string);
+                // A model can go on with another level than the last one.
+                self.read_effort(None);
                 self.model_changed_to(model)
             }
             (Tracked::SetMode(mode), true) => self.mode_changed_to(mode),
@@ -362,8 +415,73 @@ impl Translator {
                 Some(command_failed(CommandKind::SuggestTitle, reason()))
             }
             (Tracked::Usage, false) => Some(command_failed(CommandKind::RefreshUsage, reason())),
+            // The reply confirms nothing: a level not taken is a success too.
+            (Tracked::SetEffort(level), true) => {
+                self.read_effort(Some(level));
+                None
+            }
+            (Tracked::SetEffort(_), false) => {
+                Some(command_failed(CommandKind::SetEffort, reason()))
+            }
+            // A reading can give two events.
+            (Tracked::Settings { asked }, ok) => {
+                return self.effort_read(asked, ok, body, reason());
+            }
         };
         event.into_iter().collect()
+    }
+
+    /// Queues what is read once the session has started and after every turn: the effort level
+    /// in use, then what the context is made of.
+    fn read_after_start_or_turn(&mut self) {
+        self.read_effort(None);
+        self.requests
+            .push((Tracked::ContextUsage, get_context_usage()));
+    }
+
+    /// Queues a reading of the effort level in use, after a change to `asked` when there is one.
+    fn read_effort(&mut self, asked: Option<String>) {
+        self.requests
+            .push((Tracked::Settings { asked }, get_settings()));
+    }
+
+    /// The events for a reply to `get_settings`. The reply holds the user's settings; only
+    /// `applied.effort` is read from it. A reading after a change that a later one replaced
+    /// reports no failure: the later reading does.
+    fn effort_read(
+        &mut self,
+        asked: Option<String>,
+        ok: bool,
+        body: &Value,
+        reason: String,
+    ) -> Vec<SessionEvent> {
+        let asked = asked.filter(|asked| self.effort_asked.as_ref() == Some(asked));
+        if !ok {
+            return asked
+                .map(|_| command_failed(CommandKind::SetEffort, reason))
+                .into_iter()
+                .collect();
+        }
+        let level = body
+            .get("applied")
+            .and_then(|applied| applied.get("effort"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut events = Vec::new();
+        if let Some(asked) = asked
+            && level.as_deref() != Some(asked.as_str())
+        {
+            let reason = match &level {
+                Some(level) => format!("Claude Code goes on with {level}"),
+                None => "Claude Code goes on with no effort level".to_string(),
+            };
+            events.push(command_failed(CommandKind::SetEffort, reason));
+        }
+        if self.effort.as_ref() != Some(&level) {
+            self.effort = Some(level.clone());
+            events.push(SessionEvent::EffortChanged(level));
+        }
+        events
     }
 
     /// `Started` from a successful reply to `initialize`, once, and only when
@@ -390,6 +508,7 @@ impl Translator {
         self.started = true;
         self.model = Some(model.clone());
         self.mode = Some(permission_mode.clone());
+        self.read_after_start_or_turn();
         Some(SessionEvent::Started(SessionInfo {
             id: start.id,
             folder: start.folder,
@@ -455,9 +574,18 @@ impl Translator {
         vec![make(text)]
     }
 
-    fn assistant(&mut self, blocks: Vec<Block>, usage_tokens: Option<u64>) -> Vec<SessionEvent> {
+    fn assistant(
+        &mut self,
+        blocks: Vec<Block>,
+        model: Option<String>,
+        usage_tokens: Option<u64>,
+    ) -> Vec<SessionEvent> {
         let streamed = self.streaming;
-        self.last_usage_tokens = usage_tokens;
+        // Only a reply counts: not a record without usage, nor one the program made itself.
+        if usage_tokens.is_some() && model.as_deref() != Some(SYNTHETIC_MODEL) {
+            self.last_usage_tokens = usage_tokens;
+            self.last_usage_model = model;
+        }
         let mut events = Vec::new();
         for block in blocks {
             match block {
@@ -621,18 +749,28 @@ impl Translator {
         text: String,
         cost_usd: f64,
         duration_ms: u64,
-        context_window: Option<u64>,
+        context_windows: &BTreeMap<String, u64>,
     ) -> Vec<SessionEvent> {
         self.turn_open = false;
         self.streaming = false;
         self.open_block = None;
         self.block_has_text = false;
+        self.read_after_start_or_turn();
         // A stopped turn is reported as an error by `claude`, but is not a failure.
         if is_error && !interrupted {
             return vec![SessionEvent::TurnFailed { reason: text }];
         }
-        let context_used = match (self.last_usage_tokens, context_window) {
-            (Some(used), Some(window)) if window > 0 => Some((used as f64 / window as f64) as f32),
+        // The window of the last message's model, else the largest one named.
+        let window = self
+            .last_usage_model
+            .as_ref()
+            .and_then(|model| context_windows.get(model))
+            .or_else(|| context_windows.values().max())
+            .copied();
+        let context_used = match (self.last_usage_tokens, window) {
+            (Some(used), Some(window)) if window > 0 => {
+                Some(((used as f64 / window as f64) as f32).min(1.0))
+            }
             _ => None,
         };
         vec![SessionEvent::TurnFinished(TurnSummary {
@@ -667,6 +805,7 @@ fn model_options(entries: Option<&Vec<Value>>) -> Vec<ModelOption> {
                     .get("supportsAutoMode")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                effort_levels: effort_levels(entry),
             };
             Some((option, text("description")))
         })
@@ -697,6 +836,22 @@ fn model_options(entries: Option<&Vec<Value>>) -> Vec<ModelOption> {
         .collect()
 }
 
+/// The levels a `models` entry lists in `supportedEffortLevels`, in its order, when its
+/// `supportsEffort` is true; none otherwise.
+fn effort_levels(entry: &Value) -> Vec<String> {
+    if entry.get("supportsEffort").and_then(Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    entry
+        .get("supportedEffortLevels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
 fn limit_window((used, resets_at_unix): (f32, i64)) -> LimitWindow {
     LimitWindow {
         used,
@@ -721,6 +876,44 @@ fn usage_limits(body: &Value) -> SessionEvent {
         session: window("five_hour"),
         weekly: window("seven_day"),
     })
+}
+
+/// The breakdown in a reply to `get_context_usage`: its `categories` of the kinds `used`,
+/// `buffer` and `free`, in its order, each with a `name` and whole `tokens`, and its
+/// `maxTokens` as the window. Rows of the kind `deferred` are kept out of the window by the
+/// program and are left out, as are rows of a kind not known. Nothing when the window is not
+/// above nothing or no row is left. Nothing else of the reply is read: it also names memory
+/// files, tools and skills.
+fn context_breakdown(body: &Value) -> Option<SessionEvent> {
+    let window = body
+        .get("maxTokens")?
+        .as_u64()
+        .filter(|window| *window > 0)?;
+    let parts: Vec<ContextPart> = body
+        .get("categories")?
+        .as_array()?
+        .iter()
+        .filter_map(|row| {
+            let kind = match row.get("kind")?.as_str()? {
+                "used" => ContextKind::Used,
+                "buffer" => ContextKind::Buffer,
+                "free" => ContextKind::Free,
+                _ => return None,
+            };
+            Some(ContextPart {
+                name: row.get("name")?.as_str()?.to_string(),
+                tokens: row.get("tokens")?.as_u64()?,
+                kind,
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(SessionEvent::ContextBreakdown(ContextBreakdown {
+        parts,
+        window,
+    }))
 }
 
 fn command_failed(what: CommandKind, reason: String) -> SessionEvent {
@@ -915,7 +1108,7 @@ mod tests {
                 SessionEvent::BlockFinished,
                 SessionEvent::TurnFinished(TurnSummary {
                     cost_usd: 0.002,
-                    context_used: Some(0.05),
+                    context_used: Some(0.049),
                     duration_ms: 915,
                     interrupted: false
                 }),
@@ -965,7 +1158,10 @@ mod tests {
                 name: "Opus 5.5".into(),
                 resolved: "claude-opus-5-5".into(),
                 stands_for: None,
-                auto_mode: true
+                auto_mode: true,
+                effort_levels: ["low", "medium", "high", "xhigh", "max"]
+                    .map(String::from)
+                    .to_vec(),
             }
         );
         assert_eq!(info.models.len(), 3);
@@ -1089,7 +1285,8 @@ mod tests {
                 name: "X".into(),
                 resolved: "claude-x".into(),
                 stands_for: None,
-                auto_mode: false
+                auto_mode: false,
+                effort_levels: Vec::new(),
             }]
         );
         assert_eq!(
@@ -1920,7 +2117,7 @@ mod tests {
         t.track("probe_2", Tracked::RemoteOn);
         let ready =
             r#"{"type":"system","subtype":"bridge_state","state":"ready","session_id":"s1"}"#;
-        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"probe_2","response":{"session_url":"https://claude.ai/code/session_X","bridge_epoch":1}}}"#;
+        let reply = r#"{"type":"control_response","response":{"subtype":"success","request_id":"probe_2","response":{"session_url":"https://example.org/session","bridge_epoch":1}}}"#;
         let connected = r#"{"type":"system","subtype":"bridge_state","state":"connected","bridge_epoch":1,"session_id":"s1"}"#;
         let mut events = Vec::new();
         for l in [ready, reply, connected] {
@@ -1932,7 +2129,7 @@ mod tests {
                 SessionEvent::RemoteAccess(RemoteAccess::Starting),
                 SessionEvent::RemoteAccess(RemoteAccess::Starting),
                 SessionEvent::RemoteAccess(RemoteAccess::On {
-                    url: Some("https://claude.ai/code/session_X".into())
+                    url: Some("https://example.org/session".into())
                 })
             ]
         );
@@ -1950,7 +2147,7 @@ mod tests {
 
     const READY: &str = r#"{"type":"system","subtype":"bridge_state","state":"ready"}"#;
     const CONNECTED: &str = r#"{"type":"system","subtype":"bridge_state","state":"connected"}"#;
-    const URL: &str = "https://claude.ai/code/session_X";
+    const URL: &str = "https://example.org/session";
 
     /// Remote Control on with a URL, connected, then off.
     fn on_then_off() -> Translator {
@@ -2181,7 +2378,7 @@ mod tests {
             t.push(refused.clone()),
             vec![SessionEvent::RemoteAccess(RemoteAccess::Failed {
                 reason: "Claude.ai login was rejected".into(),
-                needs_login: true
+                why: RemoteFailure::Login
             })]
         );
         assert!(t.push(refused).is_empty(), "a tracked id is used once");
@@ -2194,7 +2391,7 @@ mod tests {
             feed(&[l]),
             vec![SessionEvent::RemoteAccess(RemoteAccess::Failed {
                 reason: "Claude.ai login was rejected".into(),
-                needs_login: true
+                why: RemoteFailure::Login
             })]
         );
         assert!(
@@ -2354,8 +2551,257 @@ mod tests {
                 SessionEvent::RemoteAccess(RemoteAccess::On { url: None }),
                 SessionEvent::RemoteAccess(RemoteAccess::Failed {
                     reason: "Remote Control failed".into(),
-                    needs_login: false
+                    why: RemoteFailure::Other
                 }),
+            ]
+        );
+    }
+
+    /// A `bridge_state` line with these fields after `state`, as the program writes it.
+    fn bridge(state: &str, rest: &str) -> String {
+        format!(
+            r#"{{"type":"system","subtype":"bridge_state","state":"{state}"{rest},"bridge_epoch":1,"session_id":"s1"}}"#
+        )
+    }
+
+    /// The event a refused request to turn Remote Control on gives, with these fields after
+    /// `request_id`.
+    fn remote_refused(rest: &str) -> Vec<SessionEvent> {
+        let mut t = Translator::new();
+        t.track("rc", Tracked::RemoteOn);
+        t.push(parse_line(&format!(
+            r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"rc"{rest}}}}}"#
+        )))
+    }
+
+    fn remote(access: RemoteAccess) -> Vec<SessionEvent> {
+        vec![SessionEvent::RemoteAccess(access)]
+    }
+
+    fn failed(reason: &str, why: RemoteFailure) -> Vec<SessionEvent> {
+        remote(RemoteAccess::Failed {
+            reason: reason.into(),
+            why,
+        })
+    }
+
+    #[test]
+    fn a_dropped_connection_reconnects_and_comes_back() {
+        // Never seen live: `reconnecting` and `recovered` are written from the program.
+        let mut t = Translator::new();
+        t.track("on", Tracked::RemoteOn);
+        for line in [READY, &remote_reply("on", Some(URL)), CONNECTED] {
+            t.push(parse_line(line));
+        }
+        assert_eq!(
+            t.push(parse_line(&bridge(
+                "reconnecting",
+                r#","detail":"The connection dropped""#
+            ))),
+            remote(RemoteAccess::Reconnecting)
+        );
+        assert_eq!(
+            t.push(parse_line(&bridge("connected", r#","recovered":true"#))),
+            remote(RemoteAccess::On {
+                url: Some(URL.into())
+            })
+        );
+    }
+
+    #[test]
+    fn a_policy_that_forbids_remote_control_is_a_failure_of_its_own() {
+        // Never seen live: `policy_disabled` is written from the program.
+        assert_eq!(
+            feed(&[&bridge(
+                "policy_disabled",
+                r#","detail":"Your organisation turned it off""#
+            )]),
+            failed("Your organisation turned it off", RemoteFailure::Policy)
+        );
+        assert_eq!(
+            feed(&[&bridge("policy_disabled", "")]),
+            failed(
+                "Remote Control is turned off by policy",
+                RemoteFailure::Policy
+            )
+        );
+    }
+
+    #[test]
+    fn each_kind_of_failure_says_why() {
+        // Never seen live: no failure was recorded. The lines are written from the program.
+        let state = |kind: &str| {
+            feed(&[&bridge(
+                "failed",
+                &format!(r#","detail":"It stopped"{kind}"#),
+            )])
+        };
+        assert_eq!(
+            state(r#","failure_kind":"auth""#),
+            failed("It stopped", RemoteFailure::Login)
+        );
+        assert_eq!(
+            state(r#","failure_kind":"ended_elsewhere""#),
+            failed("It stopped", RemoteFailure::Elsewhere)
+        );
+        for other in [
+            r#","failure_kind":"terminal""#,
+            r#","failure_kind":"network""#,
+            "",
+        ] {
+            assert_eq!(state(other), failed("It stopped", RemoteFailure::Other));
+        }
+        // The reason is passed on as given, even when it is not a sentence.
+        assert_eq!(
+            feed(&[&bridge(
+                "failed",
+                r#","detail":"/login","failure_kind":"auth""#
+            )]),
+            failed("/login", RemoteFailure::Login)
+        );
+
+        let code = |code: &str| remote_refused(&format!(r#","error":"Refused"{code}"#));
+        assert_eq!(
+            code(r#","error_code":"remote_control_auth""#),
+            failed("Refused", RemoteFailure::Login)
+        );
+        assert_eq!(
+            code(r#","error_code":"remote_control_policy_disabled""#),
+            failed("Refused", RemoteFailure::Policy)
+        );
+        assert_eq!(
+            code(r#","error_code":"remote_control_ended_elsewhere""#),
+            failed("Refused", RemoteFailure::Elsewhere)
+        );
+        for other in [r#","error_code":"remote_control_terminal""#, ""] {
+            assert_eq!(code(other), failed("Refused", RemoteFailure::Other));
+        }
+        assert_eq!(
+            remote_refused(r#","error":"/login","error_code":"remote_control_auth""#),
+            failed("/login", RemoteFailure::Login)
+        );
+    }
+
+    #[test]
+    fn an_unknown_state_still_says_nothing() {
+        let mut t = Translator::new();
+        t.track("on", Tracked::RemoteOn);
+        for line in [READY, &remote_reply("on", Some(URL)), CONNECTED] {
+            t.push(parse_line(line));
+        }
+        assert!(
+            t.push(parse_line(&bridge(
+                "a-state-nobody-has-seen",
+                r#","detail":"Something""#
+            )))
+            .is_empty()
+        );
+        assert_eq!(
+            t.push(parse_line(CONNECTED)),
+            remote(RemoteAccess::On {
+                url: Some(URL.into())
+            })
+        );
+    }
+
+    /// The `context_used` of every finished turn, in order.
+    fn context_used(events: &[SessionEvent]) -> Vec<Option<f32>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::TurnFinished(summary) => Some(summary.context_used),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `used` tokens over a window of `window`, as a fraction.
+    fn fraction(used: u64, window: u64) -> Option<f32> {
+        Some((used as f64 / window as f64) as f32)
+    }
+
+    #[test]
+    fn context_counts_the_input_side_only() {
+        // V1's two turns: input, cache creation and cache read of the last message, over the
+        // window of its model. Its 4 output tokens are not counted.
+        assert_eq!(
+            context_used(&replay("v1-remote.jsonl")),
+            vec![
+                fraction(2 + 14281 + 12932, 1_000_000),
+                fraction(2 + 12142 + 16420, 1_000_000)
+            ]
+        );
+    }
+
+    /// An `assistant` record of `model` whose usage puts `input` tokens and 49,000 of cache in
+    /// the context, or with no usage at all. Written by hand; a record without usage was never
+    /// seen live.
+    fn reply_of(model: &str, input: Option<u64>) -> String {
+        let usage = input.map_or(String::new(), |input| {
+            format!(
+                r#","usage":{{"input_tokens":{input},"cache_creation_input_tokens":9000,"cache_read_input_tokens":40000,"output_tokens":5000}}"#
+            )
+        });
+        format!(
+            r#"{{"type":"assistant","message":{{"id":"m","model":"{model}","content":[]{usage}}}}}"#
+        )
+    }
+
+    const HAIKU_RESULT: &str = r#"{"type":"result","is_error":false,"duration_ms":5,"total_cost_usd":0.5,"result":"ok","modelUsage":{"claude-haiku-5-5":{"contextWindow":200000}}}"#;
+
+    #[test]
+    fn a_record_without_usage_keeps_the_last_reading() {
+        let lines = [
+            reply_of("claude-haiku-5-5", Some(1000)),
+            reply_of("claude-haiku-5-5", None),
+            HAIKU_RESULT.to_string(),
+        ];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(context_used(&feed(&lines)), vec![fraction(50_000, 200_000)]);
+    }
+
+    #[test]
+    fn a_synthetic_record_does_not_count_as_context() {
+        // A record the program makes itself, as when a turn is stopped, names the model
+        // `<synthetic>` and has a usage of nothing. Written by hand: never seen live.
+        let synthetic = r#"{"type":"assistant","message":{"id":"m","model":"<synthetic>","content":[],"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}"#;
+        let lines = [
+            reply_of("claude-haiku-5-5", Some(1000)),
+            synthetic.to_string(),
+            HAIKU_RESULT.to_string(),
+        ];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(context_used(&feed(&lines)), vec![fraction(50_000, 200_000)]);
+    }
+
+    #[test]
+    fn context_is_measured_against_the_window_of_the_model_in_use() {
+        let message = |model: &str, input: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m","model":"{model}","content":[],"usage":{{"input_tokens":{input},"cache_creation_input_tokens":9000,"cache_read_input_tokens":40000,"output_tokens":5000}}}}}}"#
+            )
+        };
+        let result = r#"{"type":"result","is_error":false,"duration_ms":5,"total_cost_usd":0.5,"result":"ok","modelUsage":{"claude-sonnet-5-5":{"contextWindow":1000000},"claude-haiku-5-5":{"contextWindow":200000}}}"#;
+        let turns = [
+            message("claude-haiku-5-5", 1000),
+            result.to_string(),
+            message("claude-sonnet-5-5", 1000),
+            result.to_string(),
+            // A model the result does not name is measured against the largest window.
+            message("claude-opus-5-5", 1000),
+            result.to_string(),
+            // More than the window is all of it.
+            message("claude-haiku-5-5", 400_000),
+            result.to_string(),
+        ];
+        let lines: Vec<&str> = turns.iter().map(String::as_str).collect();
+        assert_eq!(
+            context_used(&feed(&lines)),
+            vec![
+                fraction(50_000, 200_000),
+                fraction(50_000, 1_000_000),
+                fraction(50_000, 1_000_000),
+                Some(1.0)
             ]
         );
     }
@@ -2531,5 +2977,514 @@ mod tests {
             modes[plan..].contains(&&PermissionMode::Ask),
             "and back to Ask: {modes:?}"
         );
+    }
+
+    // The replies to `apply_flag_settings` and `get_settings` below are written by hand from
+    // what the program says it sends: never seen live. Their values are made up.
+
+    /// A reply to the request `id` that succeeded with no body.
+    fn succeeded(id: &str) -> String {
+        format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}"}}}}"#
+        )
+    }
+
+    fn refused(id: &str, error: &str) -> String {
+        format!(
+            r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{id}","error":"{error}"}}}}"#
+        )
+    }
+
+    /// A reply to `get_settings` whose `applied.effort` is `effort`, among settings of the
+    /// user's that are not read.
+    fn settings(id: &str, effort: Value) -> String {
+        json!({"type": "control_response", "response": {
+        "subtype": "success", "request_id": id, "response": {
+            "effective": {"effortLevel": "low", "theme": "made-up-theme"},
+            "sources": [{"source": "userSettings",
+                         "settings": {"effortLevel": "low", "theme": "made-up-theme"}}],
+            "applied": {"model": "claude-x-1", "effort": effort},
+        }}})
+        .to_string()
+    }
+
+    /// Sends what the translator wants sent next as the adapter does, tracked under `id`.
+    /// It must be one reading of the level, after a change to `asked` when there is one.
+    fn send_read(t: &mut Translator, id: &str, asked: Option<&str>) {
+        let tracked = Tracked::Settings {
+            asked: asked.map(str::to_string),
+        };
+        assert_eq!(
+            t.take_requests(),
+            vec![(tracked.clone(), crate::encode::get_settings())]
+        );
+        t.track(id, tracked);
+    }
+
+    /// Sends what the translator wants sent after the session starts or a turn ends, as the
+    /// adapter does: a reading of the level, tracked under `id`, and a request for the
+    /// breakdown of the context, which is left untracked.
+    fn send_reads(t: &mut Translator, id: &str) {
+        let tracked = Tracked::Settings { asked: None };
+        assert_eq!(
+            t.take_requests(),
+            vec![
+                (tracked.clone(), crate::encode::get_settings()),
+                (Tracked::ContextUsage, crate::encode::get_context_usage()),
+            ]
+        );
+        t.track(id, tracked);
+    }
+
+    /// A session started from the recorded `initialize` reply, whose first reading of the
+    /// level said `level`.
+    fn started_with(level: Option<&str>) -> Translator {
+        let mut t = opening(None, None);
+        t.push(parse_line(initialize_reply()));
+        send_reads(&mut t, "read_0");
+        assert_eq!(
+            t.push(parse_line(&settings("read_0", json!(level)))),
+            vec![SessionEvent::EffortChanged(level.map(str::to_string))]
+        );
+        t
+    }
+
+    fn effort(level: Option<&str>) -> SessionEvent {
+        SessionEvent::EffortChanged(level.map(str::to_string))
+    }
+
+    fn not_taken(reason: &str) -> SessionEvent {
+        SessionEvent::CommandFailed {
+            what: CommandKind::SetEffort,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn the_model_list_says_which_levels_a_model_takes() {
+        let mut t = opening(None, None);
+        let info = started_info(&t.push(parse_line(initialize_reply())));
+        for model in &info.models {
+            assert_eq!(
+                model.effort_levels,
+                vec!["low", "medium", "high", "xhigh", "max"],
+                "{}",
+                model.id
+            );
+        }
+        let levels = |models: &str| -> Vec<Vec<String>> {
+            let mut t = opening(None, None);
+            let reply = format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"probe_1","response":{{"models":{models}}}}}}}"#
+            );
+            started_info(&t.push(parse_line(&reply)))
+                .models
+                .into_iter()
+                .map(|option| option.effort_levels)
+                .collect()
+        };
+        assert_eq!(
+            levels(
+                r#"[{"value":"a","supportsEffort":false,"supportedEffortLevels":["low","high"]},
+                    {"value":"b","supportedEffortLevels":["low","high"]},
+                    {"value":"c","supportsEffort":true},
+                    {"value":"d","supportsEffort":true,"supportedEffortLevels":["high",7,"low"]}]"#
+            ),
+            vec![
+                vec![],
+                vec![],
+                vec![],
+                vec!["high".to_string(), "low".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn the_level_is_read_after_the_session_starts() {
+        let mut t = opening(None, None);
+        assert!(t.take_requests().is_empty());
+        started_info(&t.push(parse_line(initialize_reply())));
+        send_reads(&mut t, "rc_2");
+        assert!(t.take_requests().is_empty(), "the list is emptied");
+        assert_eq!(
+            t.push(parse_line(&settings("rc_2", json!("high")))),
+            vec![effort(Some("high"))]
+        );
+        assert!(
+            !format!("{t:?}").contains("made-up-theme"),
+            "nothing else of the user's settings is kept"
+        );
+
+        let mut t = opening(None, None);
+        t.push(parse_line(initialize_reply()));
+        send_reads(&mut t, "rc_2");
+        assert_eq!(
+            t.push(parse_line(&settings("rc_2", Value::Null))),
+            vec![effort(None)]
+        );
+    }
+
+    #[test]
+    fn a_level_read_again_and_unchanged_says_nothing() {
+        for level in [Some("high"), None] {
+            let mut t = started_with(level);
+            t.push(parse_line(RESULT_OK));
+            send_reads(&mut t, "read_1");
+            assert!(
+                t.push(parse_line(&settings("read_1", json!(level))))
+                    .is_empty()
+            );
+        }
+        // A level that is not text is none.
+        let mut t = started_with(None);
+        t.push(parse_line(RESULT_OK));
+        send_reads(&mut t, "read_1");
+        assert!(t.push(parse_line(&settings("read_1", json!(3)))).is_empty());
+        // A change is said.
+        t.push(parse_line(RESULT_OK));
+        send_reads(&mut t, "read_2");
+        assert_eq!(
+            t.push(parse_line(&settings("read_2", json!("low")))),
+            vec![effort(Some("low"))]
+        );
+    }
+
+    #[test]
+    fn the_level_is_read_after_every_turn_and_after_a_change_of_model() {
+        let mut t = started_with(Some("high"));
+        for line in [
+            INIT,
+            MSG_START,
+            TEXT_START,
+            DELTA_OK,
+            ASSISTANT_OK,
+            BLOCK_STOP,
+            MSG_STOP,
+        ] {
+            t.push(parse_line(line));
+            assert!(
+                t.take_requests().is_empty(),
+                "nothing is read inside a turn"
+            );
+        }
+        t.push(parse_line(RESULT_OK));
+        send_reads(&mut t, "read_1");
+        // A turn that failed ends too.
+        let failed = r#"{"type":"result","is_error":true,"subtype":"error_during_execution","result":"it broke"}"#;
+        t.push(parse_line(failed));
+        send_reads(&mut t, "read_2");
+
+        t.track("model_1", Tracked::SetModel("opus".into()));
+        assert_eq!(
+            t.push(parse_line(&succeeded("model_1"))),
+            vec![SessionEvent::ModelChanged("opus".into())]
+        );
+        send_read(&mut t, "read_3", None);
+        // The new model goes on with another level.
+        assert_eq!(
+            t.push(parse_line(&settings("read_3", json!("medium")))),
+            vec![effort(Some("medium"))]
+        );
+        // A change of model that was refused changed nothing, so nothing is read.
+        t.track("model_2", Tracked::SetModel("haiku".into()));
+        t.push(parse_line(&refused("model_2", "no such model")));
+        assert!(t.take_requests().is_empty());
+    }
+
+    #[test]
+    fn a_change_of_effort_is_confirmed_by_reading_it() {
+        let mut t = started_with(Some("medium"));
+        t.track("effort_1", Tracked::SetEffort("high".into()));
+        assert!(t.push(parse_line(&succeeded("effort_1"))).is_empty());
+        send_read(&mut t, "read_1", Some("high"));
+        assert_eq!(
+            t.push(parse_line(&settings("read_1", json!("high")))),
+            vec![effort(Some("high"))]
+        );
+    }
+
+    #[test]
+    fn a_level_that_was_not_taken_says_so() {
+        // Asked for max, the session goes on with high, which it had before.
+        let mut t = started_with(Some("high"));
+        t.track("effort_1", Tracked::SetEffort("max".into()));
+        t.push(parse_line(&succeeded("effort_1")));
+        send_read(&mut t, "read_1", Some("max"));
+        assert_eq!(
+            t.push(parse_line(&settings("read_1", json!("high")))),
+            vec![not_taken("Claude Code goes on with high")]
+        );
+        // Asked for max, the session goes on with high, which it did not have before.
+        let mut t = started_with(Some("medium"));
+        t.track("effort_1", Tracked::SetEffort("max".into()));
+        t.push(parse_line(&succeeded("effort_1")));
+        send_read(&mut t, "read_1", Some("max"));
+        assert_eq!(
+            t.push(parse_line(&settings("read_1", json!("high")))),
+            vec![
+                not_taken("Claude Code goes on with high"),
+                effort(Some("high"))
+            ]
+        );
+        // Asked for low, the session goes on with no level at all.
+        let mut t = started_with(Some("medium"));
+        t.track("effort_1", Tracked::SetEffort("low".into()));
+        t.push(parse_line(&succeeded("effort_1")));
+        send_read(&mut t, "read_1", Some("low"));
+        assert_eq!(
+            t.push(parse_line(&settings("read_1", Value::Null))),
+            vec![
+                not_taken("Claude Code goes on with no effort level"),
+                effort(None)
+            ]
+        );
+    }
+
+    #[test]
+    fn two_choices_in_a_row_report_only_the_last() {
+        let mut t = started_with(Some("medium"));
+        t.track("effort_1", Tracked::SetEffort("high".into()));
+        t.track("effort_2", Tracked::SetEffort("low".into()));
+        assert!(t.push(parse_line(&succeeded("effort_1"))).is_empty());
+        send_read(&mut t, "read_1", Some("high"));
+        assert!(t.push(parse_line(&succeeded("effort_2"))).is_empty());
+        send_read(&mut t, "read_2", Some("low"));
+        // The program took both before the first read: that read finds the last choice.
+        assert_eq!(
+            t.push(parse_line(&settings("read_1", json!("low")))),
+            vec![effort(Some("low"))]
+        );
+        assert!(
+            t.push(parse_line(&settings("read_2", json!("low"))))
+                .is_empty()
+        );
+        // A failed read after an older choice says nothing either.
+        let mut t = started_with(Some("medium"));
+        t.track("effort_1", Tracked::SetEffort("high".into()));
+        t.track("effort_2", Tracked::SetEffort("low".into()));
+        t.push(parse_line(&succeeded("effort_1")));
+        send_read(&mut t, "read_1", Some("high"));
+        assert!(
+            t.push(parse_line(&refused("read_1", "settings are not ready")))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_refused_change_of_effort_fails() {
+        let mut t = started_with(Some("medium"));
+        t.track("effort_1", Tracked::SetEffort("high".into()));
+        assert_eq!(
+            t.push(parse_line(&refused(
+                "effort_1",
+                "settings must be an object"
+            ))),
+            vec![not_taken("settings must be an object")]
+        );
+        assert!(t.take_requests().is_empty());
+    }
+
+    #[test]
+    fn a_failed_read_after_a_change_fails_the_change() {
+        let mut t = started_with(Some("medium"));
+        t.track("effort_1", Tracked::SetEffort("high".into()));
+        t.push(parse_line(&succeeded("effort_1")));
+        send_read(&mut t, "read_1", Some("high"));
+        assert_eq!(
+            t.push(parse_line(&refused("read_1", "settings are not ready"))),
+            vec![not_taken("settings are not ready")]
+        );
+    }
+
+    #[test]
+    fn a_failed_read_nobody_asked_for_says_nothing() {
+        let mut t = opening(None, None);
+        t.push(parse_line(initialize_reply()));
+        send_reads(&mut t, "read_0");
+        assert!(
+            t.push(parse_line(&refused("read_0", "settings are not ready")))
+                .is_empty()
+        );
+        // A failed read is no reading: the next one is still the first.
+        t.push(parse_line(RESULT_OK));
+        send_reads(&mut t, "read_1");
+        assert_eq!(
+            t.push(parse_line(&settings("read_1", json!("high")))),
+            vec![effort(Some("high"))]
+        );
+    }
+
+    // The replies to `get_context_usage` below are written by hand in the shape of the one
+    // recorded live (V9), whose list was cut to three `used` rows; the other kinds were read
+    // in the program and never seen live. Their values are made up.
+
+    /// A reply to `get_context_usage` with `response` as its body.
+    fn context_reply(id: &str, response: Value) -> String {
+        json!({"type": "control_response", "response": {
+            "subtype": "success", "request_id": id, "response": response}})
+        .to_string()
+    }
+
+    /// A row of `categories`.
+    fn category(name: &str, tokens: u64, kind: &str) -> Value {
+        json!({"id": "made_up", "name": name, "tokens": tokens, "color": "inactive", "kind": kind})
+    }
+
+    fn part(name: &str, tokens: u64, kind: ContextKind) -> ContextPart {
+        ContextPart {
+            name: name.into(),
+            tokens,
+            kind,
+        }
+    }
+
+    /// A translator whose breakdown request was sent and tracked under `id`.
+    fn asked_for_breakdown(id: &str) -> Translator {
+        let mut t = opening(None, None);
+        t.push(parse_line(initialize_reply()));
+        t.take_requests();
+        t.track(id, Tracked::ContextUsage);
+        t
+    }
+
+    #[test]
+    fn a_context_breakdown_is_asked_for_after_the_start_and_after_every_turn() {
+        let breakdowns = |t: &mut Translator| {
+            t.take_requests()
+                .into_iter()
+                .filter(|(tracked, body)| {
+                    *tracked == Tracked::ContextUsage && *body == crate::encode::get_context_usage()
+                })
+                .count()
+        };
+        // Started from the reply to `initialize`, or from the first `init`.
+        let mut t = opening(None, None);
+        assert_eq!(breakdowns(&mut t), 0);
+        t.push(parse_line(initialize_reply()));
+        assert_eq!(breakdowns(&mut t), 1);
+        let mut t = Translator::new();
+        t.push(parse_line(INIT));
+        assert_eq!(breakdowns(&mut t), 1);
+        // Nothing inside a turn; once at its end, whether it ended well or not.
+        for line in [
+            INIT,
+            MSG_START,
+            TEXT_START,
+            DELTA_OK,
+            ASSISTANT_OK,
+            BLOCK_STOP,
+            MSG_STOP,
+        ] {
+            t.push(parse_line(line));
+            assert_eq!(breakdowns(&mut t), 0, "{line}");
+        }
+        t.push(parse_line(RESULT_OK));
+        assert_eq!(breakdowns(&mut t), 1);
+        let failed = r#"{"type":"result","is_error":true,"subtype":"error_during_execution","result":"it broke"}"#;
+        t.push(parse_line(failed));
+        assert_eq!(breakdowns(&mut t), 1);
+        let stopped = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming","duration_ms":5,"total_cost_usd":0.06}"#;
+        t.push(parse_line(stopped));
+        assert_eq!(breakdowns(&mut t), 1);
+        // Not after a change of model, which reads only the level.
+        t.track("model_1", Tracked::SetModel("opus".into()));
+        t.push(parse_line(&succeeded("model_1")));
+        assert_eq!(breakdowns(&mut t), 0);
+    }
+
+    #[test]
+    fn the_breakdown_keeps_used_buffer_and_free_rows_in_order() {
+        let mut t = asked_for_breakdown("ctx_1");
+        let reply = context_reply(
+            "ctx_1",
+            json!({
+                "categories": [
+                    category("System prompt", 3_237, "used"),
+                    category("System tools", 5_870, "used"),
+                    category("MCP tools", 1_200, "deferred"),
+                    category("Something new", 50, "made_up_kind"),
+                    {"id": "skills", "name": "Skills", "color": "inactive", "kind": "used"},
+                    {"id": "agents", "tokens": 40, "color": "inactive", "kind": "used"},
+                    category("Messages", 18_105, "used"),
+                    category("Autocompact buffer", 33_000, "buffer"),
+                    category("Free space", 939_788, "free"),
+                ],
+                "totalTokens": 27_212,
+                "maxTokens": 1_000_000,
+                "percentage": 3,
+                "memoryFiles": [{"path": "/home/alex/notes.md", "tokens": 68}],
+            }),
+        );
+        assert_eq!(
+            t.push(parse_line(&reply)),
+            vec![SessionEvent::ContextBreakdown(ContextBreakdown {
+                parts: vec![
+                    part("System prompt", 3_237, ContextKind::Used),
+                    part("System tools", 5_870, ContextKind::Used),
+                    part("Messages", 18_105, ContextKind::Used),
+                    part("Autocompact buffer", 33_000, ContextKind::Buffer),
+                    part("Free space", 939_788, ContextKind::Free),
+                ],
+                window: 1_000_000,
+            })]
+        );
+        assert!(t.take_requests().is_empty(), "nothing more is asked");
+        assert!(
+            !format!("{t:?}").contains("notes.md"),
+            "nothing else of the reply is kept"
+        );
+    }
+
+    #[test]
+    fn the_recorded_breakdown_gives_its_three_rows() {
+        // Line 14 of the V9 recording answers the request `p2`.
+        let recorded = include_str!("../tests/fixtures/live/v9-control.jsonl")
+            .lines()
+            .nth(13)
+            .unwrap();
+        let mut t = asked_for_breakdown("p2");
+        assert_eq!(
+            t.push(parse_line(recorded)),
+            vec![SessionEvent::ContextBreakdown(ContextBreakdown {
+                parts: vec![
+                    part("System prompt", 3_237, ContextKind::Used),
+                    part("System tools", 5_870, ContextKind::Used),
+                    part("MCP server instructions", 717, ContextKind::Used),
+                ],
+                window: 1_000_000,
+            })]
+        );
+    }
+
+    #[test]
+    fn a_refused_breakdown_says_nothing() {
+        let mut t = asked_for_breakdown("ctx_1");
+        assert!(
+            t.push(parse_line(&refused("ctx_1", "not ready")))
+                .is_empty()
+        );
+        assert!(t.take_requests().is_empty());
+    }
+
+    #[test]
+    fn a_reply_without_categories_says_nothing() {
+        let rows = json!([category("Messages", 8_000, "used")]);
+        for response in [
+            json!({"maxTokens": 200_000}),
+            json!({"categories": rows}),
+            json!({"categories": rows, "maxTokens": 0}),
+            json!({"categories": rows, "maxTokens": "lots"}),
+            json!({"categories": "none", "maxTokens": 200_000}),
+            json!({"categories": [], "maxTokens": 200_000}),
+            json!({"categories": [category("MCP tools", 1_200, "deferred")], "maxTokens": 200_000}),
+            Value::Null,
+        ] {
+            let mut t = asked_for_breakdown("ctx_1");
+            assert!(
+                t.push(parse_line(&context_reply("ctx_1", response.clone())))
+                    .is_empty(),
+                "{response}"
+            );
+        }
     }
 }

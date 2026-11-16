@@ -5,6 +5,8 @@
 //! is not understood becomes [`Incoming::Ignored`]; nothing here panics or
 //! returns an error.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 
 /// One parsed output line.
@@ -33,6 +35,9 @@ pub enum Incoming {
         parent: Option<String>,
         message_id: String,
         blocks: Vec<Block>,
+        /// The model that wrote the message.
+        model: Option<String>,
+        /// The input side of the message's usage: what it put in the context.
         usage_tokens: Option<u64>,
     },
     ToolResults {
@@ -45,7 +50,8 @@ pub enum Incoming {
         text: String,
         cost_usd: f64,
         duration_ms: u64,
-        context_window: Option<u64>,
+        /// The `contextWindow` of each model in `modelUsage` that names one.
+        context_windows: BTreeMap<String, u64>,
     },
     /// Each window is `(utilization, resetsAt)`.
     RateLimit {
@@ -255,7 +261,8 @@ fn parse_assistant(v: &Value) -> Option<Incoming> {
         parent: parent_of(v),
         message_id: string_at(message, "id").unwrap_or_default(),
         blocks: content.iter().map(parse_block).collect(),
-        usage_tokens: message.get("usage").and_then(usage_total),
+        model: string_at(message, "model"),
+        usage_tokens: message.get("usage").and_then(input_side),
     })
 }
 
@@ -275,7 +282,9 @@ fn parse_block(b: &Value) -> Block {
     parsed.unwrap_or(Block::Other)
 }
 
-fn usage_total(usage: &Value) -> Option<u64> {
+/// Input, cache read and cache creation tokens, as Claude Code's status line counts the
+/// context. The output tokens are not counted.
+fn input_side(usage: &Value) -> Option<u64> {
     usage.as_object()?;
     let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     // Saturate: a huge counter must not overflow (panic in debug, wrap in release).
@@ -284,7 +293,6 @@ fn usage_total(usage: &Value) -> Option<u64> {
             "input_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
-            "output_tokens",
         ]
         .into_iter()
         .map(n)
@@ -348,14 +356,13 @@ fn parse_result(v: &Value) -> Option<Incoming> {
             }
         }
     };
-    let context_window = v
+    let context_windows = v
         .get("modelUsage")
         .and_then(Value::as_object)
-        .and_then(|m| {
-            m.values()
-                .filter_map(|u| u.get("contextWindow")?.as_u64())
-                .max()
-        });
+        .into_iter()
+        .flatten()
+        .filter_map(|(model, u)| Some((model.clone(), u.get("contextWindow")?.as_u64()?)))
+        .collect();
     Some(Incoming::Result {
         is_error,
         interrupted,
@@ -365,7 +372,7 @@ fn parse_result(v: &Value) -> Option<Incoming> {
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
         duration_ms: v.get("duration_ms").and_then(Value::as_u64).unwrap_or(0),
-        context_window,
+        context_windows,
     })
 }
 
@@ -400,7 +407,7 @@ mod tests {
                 text: "[ede_diagnostic] result_type=user".into(),
                 cost_usd: 0.06,
                 duration_ms: 3555,
-                context_window: None
+                context_windows: BTreeMap::new()
             }
         );
         let no_text = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"duration_ms":1,"total_cost_usd":0}"#;
@@ -412,7 +419,7 @@ mod tests {
                 text: "error_max_turns".into(),
                 cost_usd: 0.0,
                 duration_ms: 1,
-                context_window: None
+                context_windows: BTreeMap::new()
             }
         );
     }
@@ -430,7 +437,7 @@ mod tests {
             text: "r".into(),
             cost_usd: 0.5,
             duration_ms: 5,
-            context_window: None,
+            context_windows: BTreeMap::new(),
         };
         assert_eq!(result(r#""subtype":"success","#), expect(false));
         assert_eq!(result(r#""subtype":"error_max_turns","#), expect(true));
@@ -454,6 +461,7 @@ mod tests {
                 parent: None,
                 message_id: String::new(),
                 blocks: vec![Block::Text("hi".into())],
+                model: None,
                 usage_tokens: None
             }
         );
@@ -612,7 +620,7 @@ mod tests {
 
     #[test]
     fn an_assistant_record_with_a_tool_call() {
-        let l = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"m1","content":[{"type":"text","text":"Running it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}}}"#;
+        let l = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"m1","model":"claude-haiku-5-5","content":[{"type":"text","text":"Running it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}],"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}}}"#;
         assert_eq!(
             parse_line(l),
             Incoming::Assistant {
@@ -626,7 +634,9 @@ mod tests {
                         input: json!({"command":"ls"})
                     }
                 ],
-                usage_tokens: Some(100)
+                model: Some("claude-haiku-5-5".into()),
+                // The output tokens are not context.
+                usage_tokens: Some(60)
             }
         );
     }
@@ -640,6 +650,7 @@ mod tests {
                 parent: None,
                 message_id: "m".into(),
                 blocks: vec![],
+                model: None,
                 usage_tokens: Some(u64::MAX)
             }
         );
@@ -670,7 +681,7 @@ mod tests {
 
     #[test]
     fn result_and_rate_limit() {
-        let r = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":915,"total_cost_usd":0.0020488399999999997,"result":"ok","modelUsage":{"claude-haiku-5-5":{"contextWindow":1000000}}}"#;
+        let r = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":915,"total_cost_usd":0.0020488399999999997,"result":"ok","modelUsage":{"claude-haiku-5-5":{"contextWindow":200000},"claude-sonnet-5-5":{"contextWindow":1000000},"claude-x":{}}}"#;
         assert_eq!(
             parse_line(r),
             Incoming::Result {
@@ -679,7 +690,10 @@ mod tests {
                 text: "ok".into(),
                 cost_usd: 0.0020488399999999997,
                 duration_ms: 915,
-                context_window: Some(1000000)
+                context_windows: BTreeMap::from([
+                    ("claude-haiku-5-5".into(), 200000),
+                    ("claude-sonnet-5-5".into(), 1000000)
+                ])
             }
         );
         let l = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1794385200,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.08,"resetsAt":1794385200,"status":"allowed"},"seven_day":{"utilization":0.06,"resetsAt":1794776400,"status":"allowed"}}}}"#;

@@ -5,8 +5,9 @@
 use std::path::PathBuf;
 
 use mr_agent::{
-    Answer, CommandKind, ModelOption, PermissionMode, RequestId, SessionCommand, SessionEvent,
-    SessionId, StartSpec, StoredHistory, StoredSession,
+    Answer, CommandKind, ContextBreakdown, ContextKind, ModelOption, PermissionMode, RemoteAccess,
+    RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec, StoredHistory,
+    StoredSession,
 };
 
 use crate::conversation::{Conversation, NoticeKind};
@@ -26,6 +27,15 @@ pub enum Phase {
         clean: bool,
         detail: String,
     },
+}
+
+/// What the program last said of Remote Control.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Remote {
+    Off,
+    Starting,
+    On { url: Option<String> },
+    Reconnecting,
 }
 
 /// How much of a stored conversation the session holds.
@@ -53,6 +63,9 @@ pub struct Session {
     /// The full id of the model in use, once known.
     pub model: Option<String>,
     pub models: Vec<ModelOption>,
+    /// The effort level in use: what the program last said, or while no program runs what the
+    /// user chose or the store gave. None while it is not known or the model takes none.
+    pub effort: Option<String>,
     pub mode: PermissionMode,
     pub conversation: Conversation,
     pub history: HistoryState,
@@ -62,17 +75,34 @@ pub struct Session {
     pub queued: Option<String>,
     pub cost_usd: Option<f64>,
     pub context_used: Option<f32>,
+    /// What the context is made of, as the program last counted it; the next reading replaces
+    /// it. A turn does not clear it.
+    pub context_parts: Option<ContextBreakdown>,
+    pub remote: Remote,
+    /// The user asked for it; true from the press on, until a refusal or a turning off.
+    pub remote_wanted: bool,
+    /// Why it last failed, in words for the user, until the next change.
+    pub remote_said: Option<String>,
+    /// What the running program was last asked of Remote Control, until its answer settles it.
+    remote_asked: Option<bool>,
+    /// The level the running program was last asked for, until its answer settles it.
+    effort_asked: Option<String>,
     /// The option id the user last picked, for naming the model they chose.
     chosen_model: Option<String>,
     /// The mode is known from the program or from the user, so a history that arrives later
     /// does not change it.
     mode_known: bool,
+    /// The effort is known from the program or from the user, so a history that arrives later
+    /// does not change it.
+    effort_known: bool,
     /// `models` came from the session's own program, not from a list it was offered.
     own_models: bool,
     /// It came from the store.
     from_store: bool,
     /// Messages handed over in this run, less those that could not be.
     handed_over: usize,
+    /// Its program ran a turn in this run, whoever sent the prompt.
+    ran_turn: bool,
     /// `user_title` waits for a program to confirm it: it is kept between runs and told to
     /// each program that starts. Not after the program confirmed or refused it.
     name_pending: bool,
@@ -88,6 +118,7 @@ impl Session {
             phase: Phase::Opening,
             model: None,
             models: Vec::new(),
+            effort: None,
             mode: PermissionMode::Ask,
             conversation: Conversation::new(),
             history: HistoryState::Loaded,
@@ -95,11 +126,19 @@ impl Session {
             queued: None,
             cost_usd: None,
             context_used: None,
+            context_parts: None,
+            remote: Remote::Off,
+            remote_wanted: false,
+            remote_said: None,
+            remote_asked: None,
+            effort_asked: None,
             chosen_model: None,
             mode_known: false,
+            effort_known: false,
             own_models: false,
             from_store: false,
             handed_over: 0,
+            ran_turn: false,
             name_pending: false,
         }
     }
@@ -116,9 +155,10 @@ impl Session {
     }
 
     /// Puts the stored history before what this run added to the conversation. The history's
-    /// model and mode are taken when neither the user nor the program has named them yet,
-    /// except Bypass or an unknown mode, which leave the mode as it is. A history that is
-    /// already loaded is not loaded again.
+    /// model, effort and mode are taken when neither the user nor the program has named them
+    /// yet, except Bypass or an unknown mode, which leave the mode as it is; a resting session
+    /// forgets an effort level its model is known not to take. A history that is already
+    /// loaded is not loaded again.
     pub fn load_history(&mut self, history: StoredHistory) {
         if self.history == HistoryState::Loaded {
             return;
@@ -131,6 +171,10 @@ impl Session {
         if self.model.is_none() {
             self.model = history.model;
         }
+        if !self.effort_known {
+            self.effort = history.effort;
+        }
+        self.fit_effort();
         // A file never turns permission checks off: Bypass, and any mode this app does not
         // know, would start the program with less asked of the user than the picker offers.
         if !self.mode_known
@@ -149,10 +193,10 @@ impl Session {
         }
     }
 
-    /// Whether the agent has anything stored for it: it came from the store, or a message
-    /// was handed over in this run.
+    /// Whether the agent has anything stored for it: it came from the store, a message was
+    /// handed over in this run, or its program ran a turn, as one sent from another device.
     pub fn is_stored(&self) -> bool {
-        self.from_store || self.handed_over > 0
+        self.from_store || self.handed_over > 0 || self.ran_turn
     }
 
     /// Resting to Opening, with `text` queued for when the program is ready. Trimmed as
@@ -174,9 +218,10 @@ impl Session {
         self.queued.take()
     }
 
-    /// How to start its program: resuming when `is_stored`, afresh otherwise; with the model
-    /// and mode it shows. The model is the option the user chose while it names the model in
-    /// use, else the model's id; the mode is passed unless it is Ask, the program's default.
+    /// How to start its program: resuming when `is_stored`, afresh otherwise; with the model,
+    /// effort and mode it shows. The model is the option the user chose while it names the
+    /// model in use, else the model's id; the effort is passed unless that model is known not
+    /// to take it; the mode is passed unless it is Ask, the program's default.
     pub fn start_spec(&self) -> StartSpec {
         let mut spec = StartSpec::new(self.folder.clone());
         if self.is_stored() {
@@ -188,6 +233,10 @@ impl Session {
         spec.model = chosen
             .map(|option| option.id.clone())
             .or_else(|| self.model.clone());
+        spec.effort = self.effort.clone().filter(|level| {
+            self.named_by()
+                .is_none_or(|option| option.effort_levels.contains(level))
+        });
         if self.mode != PermissionMode::Ask {
             spec.permission_mode = Some(self.mode.clone());
         }
@@ -248,17 +297,20 @@ impl Session {
         self.name_pending.then(|| self.user_title.clone()).flatten()
     }
 
-    /// Gives the session models to choose from when it has none of its own yet.
+    /// Gives the session models to choose from when it has none of its own yet. A resting
+    /// session then forgets an effort level its model is known not to take.
     pub fn offer_models(&mut self, models: &[ModelOption]) {
         if !self.own_models {
             self.models = models.to_vec();
+            self.fit_effort();
         }
     }
 
     /// Applies an event. Returns commands the session now wants sent: at a start, the user's
-    /// name when no program has confirmed it yet; a queued message, and the request for a title
-    /// when that message is the session's first. While the user's name holds, a title from the
-    /// program only confirms it when it is the same, and is ignored otherwise.
+    /// name when no program has confirmed it yet and Remote Control when it is wanted; a queued
+    /// message, and the request for a title when that message is the session's first. While
+    /// the user's name holds, a title from the program only confirms it when it is the same,
+    /// and is ignored otherwise.
     pub fn apply(&mut self, event: SessionEvent, now: f64) -> Vec<SessionCommand> {
         self.conversation.apply(&event, now);
         match event {
@@ -276,11 +328,16 @@ impl Session {
                         .map(SessionCommand::Rename)
                         .into_iter()
                         .collect();
+                    if self.remote_wanted {
+                        self.remote_asked = Some(true);
+                        commands.push(SessionCommand::SetRemoteAccess { on: true });
+                    }
                     commands.extend(self.send_queued());
                     return commands;
                 }
             }
             SessionEvent::TurnStarted => {
+                self.ran_turn = true;
                 if !self.at_rest() {
                     self.phase = if self.conversation.waiting() > 0 {
                         Phase::NeedsUser
@@ -317,20 +374,36 @@ impl Session {
                 None => self.title = Some(title),
             },
             SessionEvent::ModelChanged(model) => self.model = Some(model),
+            SessionEvent::EffortChanged(level) => {
+                self.effort = level;
+                self.effort_known = true;
+                self.effort_asked = None;
+            }
             SessionEvent::PermissionModeChanged(mode) => {
                 self.mode = mode;
                 self.mode_known = true;
             }
+            SessionEvent::RemoteAccess(state) => self.take_remote(state),
+            SessionEvent::ContextBreakdown(breakdown) => self.context_parts = Some(breakdown),
             SessionEvent::CommandFailed { what, reason } => {
                 if what == CommandKind::Rename {
                     // The name stays on screen for this run, and is neither kept nor told again.
                     self.name_pending = false;
+                }
+                if what == CommandKind::SetRemoteAccess {
+                    // A refused turning off: the switch shows what the program says again.
+                    self.remote_wanted = self.remote != Remote::Off;
+                    self.remote_asked = None;
+                }
+                if what == CommandKind::SetEffort {
+                    self.effort_asked = None;
                 }
                 let wording = match what {
                     CommandKind::SetModel => "Could not change the model",
                     CommandKind::SetPermissionMode => "Could not change the permission mode",
                     CommandKind::Rename => "Could not rename the session",
                     CommandKind::SetRemoteAccess => "Could not change Remote Control",
+                    CommandKind::SetEffort => "Could not change the effort level",
                     // Asked for in the background; the stand-in title simply stays.
                     CommandKind::RefreshUsage | CommandKind::SuggestTitle => return Vec::new(),
                 };
@@ -339,6 +412,9 @@ impl Session {
             }
             // A clean end leaves a stored conversation that the next message carries on.
             SessionEvent::Exited { clean, detail } => {
+                self.remote = Remote::Off;
+                self.remote_asked = None;
+                self.effort_asked = None;
                 self.phase = if clean && self.is_stored() {
                     Phase::Resting
                 } else {
@@ -351,10 +427,68 @@ impl Session {
             | SessionEvent::BlockFinished
             | SessionEvent::ToolStarted { .. }
             | SessionEvent::ToolFinished { .. }
-            | SessionEvent::UsageLimits(_)
-            | SessionEvent::RemoteAccess(_) => {}
+            | SessionEvent::UsageLimits(_) => {}
         }
         Vec::new()
+    }
+
+    /// Turns Remote Control on or off as far as the session's state allows.
+    ///
+    /// The wish is taken at once and clears what was said of the last failure. While a program
+    /// runs it is asked, unless that is what it was last asked and has not answered yet, or,
+    /// with nothing on its way, what it last said; a session that opens or rests asks when its
+    /// program has started. An ended session takes nothing.
+    pub fn set_remote(&mut self, on: bool) -> Option<SessionCommand> {
+        if matches!(self.phase, Phase::Ended { .. }) {
+            return None;
+        }
+        self.remote_wanted = on;
+        self.remote_said = None;
+        let runs = matches!(self.phase, Phase::Idle | Phase::Working | Phase::NeedsUser);
+        let is_on = self.remote_asked.unwrap_or(self.remote != Remote::Off);
+        if !runs || is_on == on {
+            return None;
+        }
+        self.remote_asked = Some(on);
+        Some(SessionCommand::SetRemoteAccess { on })
+    }
+
+    /// What the program said of Remote Control. A failure turns the wish off and is told in
+    /// the conversation, once: one that comes while it is off and not wanted was told already.
+    /// A live state clears the reason of the last failure, so it is never shown over it.
+    fn take_remote(&mut self, state: RemoteAccess) {
+        let live = |s: &mut Session, remote: Remote| {
+            s.remote = remote;
+            s.remote_said = None;
+        };
+        match state {
+            RemoteAccess::Off => {
+                self.remote = Remote::Off;
+                if self.remote_asked == Some(false) {
+                    self.remote_asked = None;
+                }
+            }
+            RemoteAccess::Starting => live(self, Remote::Starting),
+            RemoteAccess::On { url } => {
+                live(self, Remote::On { url });
+                if self.remote_asked == Some(true) {
+                    self.remote_asked = None;
+                }
+            }
+            RemoteAccess::Reconnecting => live(self, Remote::Reconnecting),
+            RemoteAccess::Failed { reason, why } => {
+                self.remote_asked = None;
+                if self.remote == Remote::Off && !self.remote_wanted {
+                    return;
+                }
+                let words = remote_failure_words(&reason, why);
+                self.remote = Remote::Off;
+                self.remote_wanted = false;
+                self.conversation
+                    .push_notice(NoticeKind::CommandFailed, &words);
+                self.remote_said = Some(words);
+            }
+        }
     }
 
     /// Sends `text`, or queues it while it cannot be sent yet. Only trailing whitespace is
@@ -406,6 +540,7 @@ impl Session {
     /// Asks for the model option `option_id`. Nothing is sent when it is already the model in
     /// use and already the option the model is named by: the picker then only closes. A
     /// resting session takes the choice at once, sending nothing: its program starts with it.
+    /// It then forgets an effort level the new model does not take.
     pub fn choose_model(&mut self, option_id: &str) -> Option<SessionCommand> {
         if matches!(self.phase, Phase::Opening | Phase::Ended { .. }) {
             return None;
@@ -418,9 +553,65 @@ impl Session {
         self.chosen_model = Some(option_id.into());
         if self.phase == Phase::Resting {
             self.model = Some(option.resolved.clone());
+            self.fit_effort();
             return None;
         }
         Some(SessionCommand::SetModel(option_id.into()))
+    }
+
+    /// The levels the model in use takes; empty when it takes none or is not known.
+    pub fn effort_levels(&self) -> &[String] {
+        self.named_by()
+            .map_or(&[], |option| option.effort_levels.as_slice())
+    }
+
+    /// Asks for `level`. Nothing while the session opens or has ended, or when it is the level
+    /// last asked for and not answered yet or, with nothing on its way, the level in use.
+    ///
+    /// While a program runs, `effort` stays as it is until the program says; nothing waits for
+    /// that answer. A resting session takes the level at once, sending nothing: its program
+    /// starts with it. A level the model in use does not list is not asked for.
+    pub fn choose_effort(&mut self, level: &str) -> Option<SessionCommand> {
+        let asked = self.effort_asked.as_ref().or(self.effort.as_ref());
+        if matches!(self.phase, Phase::Opening | Phase::Ended { .. })
+            || asked.map(String::as_str) == Some(level)
+            || !self.effort_levels().iter().any(|known| known == level)
+        {
+            return None;
+        }
+        if self.phase == Phase::Resting {
+            self.effort = Some(level.into());
+            self.effort_known = true;
+            return None;
+        }
+        self.effort_asked = Some(level.into());
+        Some(SessionCommand::SetEffort(level.into()))
+    }
+
+    /// While it rests, forgets a level the model in use is known not to take. While a program
+    /// runs or after it ended, the level is what the program last said, and only it changes it.
+    fn fit_effort(&mut self) {
+        if self.phase != Phase::Resting {
+            return;
+        }
+        let known = self.named_by().map(|option| &option.effort_levels);
+        if let (Some(levels), Some(level)) = (known, &self.effort)
+            && !levels.contains(level)
+        {
+            self.effort = None;
+        }
+    }
+
+    /// "Low", "Medium", "High", "Extra high", "Max"; any other level as it is.
+    pub fn effort_label(level: &str) -> String {
+        match level {
+            "low" => "Low".into(),
+            "medium" => "Medium".into(),
+            "high" => "High".into(),
+            "xhigh" => "Extra high".into(),
+            "max" => "Max".into(),
+            other => other.into(),
+        }
     }
 
     /// Asks for `mode`. A resting session takes it at once, sending nothing.
@@ -482,6 +673,24 @@ impl Session {
     /// it. An ended one takes none until it is restarted.
     pub fn takes_messages(&self) -> bool {
         !matches!(self.phase, Phase::Ended { .. })
+    }
+
+    /// The share of the context window in use: what the program said when it last finished a
+    /// turn here; else, with a breakdown, its used parts over its window, at most all of it;
+    /// else not known. So a stored session woken again shows a share before its first turn here
+    /// has ended.
+    pub fn context_share(&self) -> Option<f32> {
+        if self.context_used.is_some() {
+            return self.context_used;
+        }
+        let breakdown = self.context_parts.as_ref().filter(|b| b.window > 0)?;
+        let used: u64 = breakdown
+            .parts
+            .iter()
+            .filter(|part| part.kind == ContextKind::Used)
+            .map(|part| part.tokens)
+            .sum();
+        Some(((used as f64 / breakdown.window as f64) as f32).min(1.0))
     }
 
     /// No program runs for it: it rests or has ended.
@@ -551,6 +760,27 @@ fn title_stand_in(message: &str) -> String {
     format!("{}…", kept.trim_end())
 }
 
+/// Why Remote Control failed, in words for the user. The program's reason is shown only when
+/// nothing better is known, and never when it is the bare `/login`, which is not a sentence.
+fn remote_failure_words(reason: &str, why: RemoteFailure) -> String {
+    let words = match why {
+        RemoteFailure::Login => {
+            "Remote Control needs a full claude.ai sign-in. \
+             Run `claude auth login` in a terminal, then turn it on again."
+        }
+        RemoteFailure::Policy => "Remote Control is turned off by your organisation's policy.",
+        RemoteFailure::Elsewhere => {
+            "Remote Control was ended for this session from another place. \
+             Turn it on again to reconnect."
+        }
+        RemoteFailure::Other => match reason.trim() {
+            "" | "/login" => "Remote Control stopped.",
+            reason => return format!("Remote Control stopped: {reason}"),
+        },
+    };
+    words.into()
+}
+
 /// How a model choice reads in the picker: its name, then the model it stands for when the
 /// name does not say it, as in "Default (recommended) · Fable 5.2".
 pub fn model_option_label(option: &ModelOption) -> String {
@@ -614,6 +844,7 @@ pub(crate) mod testing {
                     resolved: "claude-fable-5-2".into(),
                     stands_for: None,
                     auto_mode: false,
+                    effort_levels: Vec::new(),
                 },
                 ModelOption {
                     id: "haiku".into(),
@@ -621,6 +852,7 @@ pub(crate) mod testing {
                     resolved: "claude-haiku-5-5".into(),
                     stands_for: None,
                     auto_mode: false,
+                    effort_levels: Vec::new(),
                 },
             ],
         }
@@ -634,8 +866,9 @@ mod tests {
     use crate::conversation::{DID_NOT_FINISH, ItemBody};
     use crate::tools::{ToolCall, ToolGroup};
     use mr_agent::{
-        HistoryItem, QuestionAnswer, StoredHistory, StoredSession, ToolCallId, ToolDetail,
-        ToolOutcome, TurnSummary, UserRequest, UserRequestKind,
+        HistoryItem, QuestionAnswer, RemoteAccess, RemoteFailure, SessionInfo, StoredHistory,
+        StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UserRequest,
+        UserRequestKind,
     };
 
     fn started() -> Session {
@@ -651,6 +884,86 @@ mod tests {
             duration_ms: 1,
             interrupted: false,
         })
+    }
+
+    /// A breakdown of a window of 200,000 with `used` tokens in two used parts, and the buffer
+    /// and the free space.
+    fn breakdown(used: u64) -> ContextBreakdown {
+        let part = |name: &str, tokens: u64, kind: ContextKind| mr_agent::ContextPart {
+            name: name.into(),
+            tokens,
+            kind,
+        };
+        ContextBreakdown {
+            parts: vec![
+                part("System prompt", 3_000, ContextKind::Used),
+                part("Messages", used - 3_000, ContextKind::Used),
+                part("Autocompact buffer", 33_000, ContextKind::Buffer),
+                part(
+                    "Free space",
+                    200_000u64.saturating_sub(used + 33_000),
+                    ContextKind::Free,
+                ),
+            ],
+            window: 200_000,
+        }
+    }
+
+    #[test]
+    fn a_breakdown_is_kept_and_replaced_by_the_next() {
+        let mut s = started();
+        assert_eq!(s.context_parts, None);
+        s.apply(SessionEvent::ContextBreakdown(breakdown(26_000)), 0.0);
+        assert_eq!(s.context_parts, Some(breakdown(26_000)));
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(done(), 0.0);
+        assert_eq!(s.context_parts, Some(breakdown(26_000)), "a turn keeps it");
+        s.apply(SessionEvent::ContextBreakdown(breakdown(74_000)), 0.0);
+        assert_eq!(s.context_parts, Some(breakdown(74_000)));
+        assert!(
+            s.conversation.items().is_empty(),
+            "nothing in the conversation"
+        );
+    }
+
+    #[test]
+    fn the_share_comes_from_the_breakdown_until_a_turn_has_ended() {
+        let stored = StoredSession {
+            id: SessionId("s1".into()),
+            folder: "/p".into(),
+            title: "Fix the parser".into(),
+            last_active_unix: 0,
+        };
+        let mut s = Session::resting(&stored);
+        assert_eq!(s.context_share(), None);
+        s.reopening();
+        s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(s.context_share(), None, "no breakdown yet");
+        // The used parts over the window: the buffer and the free space are not used.
+        s.apply(SessionEvent::ContextBreakdown(breakdown(74_000)), 0.0);
+        assert_eq!(s.context_share(), Some(0.37));
+        // At most the whole window.
+        let mut full = breakdown(150_000);
+        full.parts[1].tokens = 400_000;
+        s.apply(SessionEvent::ContextBreakdown(full), 0.0);
+        assert_eq!(s.context_share(), Some(1.0));
+        // A turn that says nothing of the context leaves the breakdown's share.
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(
+            SessionEvent::TurnFinished(TurnSummary {
+                cost_usd: 0.1,
+                context_used: None,
+                duration_ms: 1,
+                interrupted: false,
+            }),
+            0.0,
+        );
+        assert_eq!(s.context_share(), Some(1.0));
+        // Once a turn said it, its figure holds, whatever the breakdown says.
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(done(), 0.0);
+        s.apply(SessionEvent::ContextBreakdown(breakdown(74_000)), 0.0);
+        assert_eq!(s.context_share(), Some(0.5));
     }
 
     fn permission(id: &str) -> SessionEvent {
@@ -858,6 +1171,7 @@ mod tests {
             resolved: "claude-fable-5-2".into(),
             stands_for: None,
             auto_mode: false,
+            effort_levels: Vec::new(),
         });
         assert_eq!(
             s.choose_model("fable"),
@@ -1109,6 +1423,7 @@ mod tests {
                 resolved: "claude-opus-5-5".into(),
                 stands_for: None,
                 auto_mode: true,
+                effort_levels: Vec::new(),
             },
             ModelOption {
                 id: "m-2".into(),
@@ -1116,6 +1431,7 @@ mod tests {
                 resolved: "m-2".into(),
                 stands_for: None,
                 auto_mode: false,
+                effort_levels: Vec::new(),
             },
         ]
     }
@@ -1198,6 +1514,7 @@ mod tests {
             earlier_left_out: true,
             model: None,
             permission_mode: None,
+            effort: None,
         });
         let closed = ToolCall {
             id: ToolCallId("t1".into()),
@@ -1317,6 +1634,7 @@ mod tests {
             model: Some("m-2".into()),
             permission_mode: Some(PermissionMode::Plan),
             earlier_left_out: false,
+            effort: None,
         });
         assert_eq!(
             bodies(&s),
@@ -1386,6 +1704,7 @@ mod tests {
                 fork: false,
                 model: Some("opus".into()),
                 permission_mode: Some(PermissionMode::Auto),
+                effort: None,
             }
         );
     }
@@ -1540,6 +1859,27 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_nobody_here_sent_makes_the_session_stored() {
+        let mut s = started();
+        assert!(!s.is_stored());
+        // A prompt from another device: the turn starts with nothing handed over here.
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        assert!(s.is_stored());
+        s.apply(done(), 0.0);
+        assert_eq!(s.start_spec().resume, Some(SessionId("s1".into())));
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.start_spec().resume, Some(SessionId("s1".into())));
+        // A message that could not be handed over does not take it back.
+        let mut s = started();
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(done(), 0.0);
+        s.submit("go");
+        s.send_failed();
+        assert!(s.is_stored());
+    }
+
+    #[test]
     fn a_failed_message_returns_to_idle() {
         let mut s = started();
         s.submit("go");
@@ -1575,5 +1915,679 @@ mod tests {
         r.apply(SessionEvent::Started(info()), 0.0);
         r.offer_models(&offered());
         assert_eq!(r.models, info().models);
+    }
+
+    /// The levels the Haiku option of [`leveled_info`] takes.
+    fn levels() -> Vec<String> {
+        ["low", "medium", "high"].map(String::from).to_vec()
+    }
+
+    /// What a started session reports when its model, Haiku, takes three levels; Default
+    /// takes none.
+    fn leveled_info() -> SessionInfo {
+        let mut info = info();
+        info.models[1].effort_levels = levels();
+        info
+    }
+
+    /// A started session whose model takes the levels of [`levels`].
+    fn with_levels() -> Session {
+        let mut s = Session::opening("/p");
+        s.apply(SessionEvent::Started(leveled_info()), 0.0);
+        s
+    }
+
+    /// [`offered`], with levels: Opus takes all five, `m-2` low and high.
+    fn offered_with_levels() -> Vec<ModelOption> {
+        let mut models = offered();
+        models[0].effort_levels = ["low", "medium", "high", "xhigh", "max"]
+            .map(String::from)
+            .to_vec();
+        models[1].effort_levels = ["low", "high"].map(String::from).to_vec();
+        models
+    }
+
+    fn effort(level: &str) -> SessionEvent {
+        SessionEvent::EffortChanged(Some(level.into()))
+    }
+
+    fn set_effort(level: &str) -> Option<SessionCommand> {
+        Some(SessionCommand::SetEffort(level.into()))
+    }
+
+    /// A stored history that names `m-2` and the level `level`.
+    fn history_with_effort(level: &str) -> StoredHistory {
+        StoredHistory {
+            items: vec![said("one")],
+            model: Some("m-2".into()),
+            effort: Some(level.into()),
+            ..StoredHistory::default()
+        }
+    }
+
+    fn failed_notices(s: &Session) -> Vec<String> {
+        s.conversation
+            .items()
+            .iter()
+            .filter_map(|i| match &i.body {
+                ItemBody::Notice {
+                    kind: NoticeKind::CommandFailed,
+                    text,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_effort_in_use_is_what_the_program_says() {
+        let mut s = with_levels();
+        assert_eq!(s.effort, None, "not known until the program says");
+        assert_eq!(s.effort_levels(), levels());
+        s.apply(effort("medium"), 0.0);
+        assert_eq!(s.effort.as_deref(), Some("medium"));
+        s.apply(effort("high"), 0.0);
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        s.apply(SessionEvent::EffortChanged(None), 0.0);
+        assert_eq!(s.effort, None);
+        // A session that rests again shows the level it had.
+        s.apply(effort("low"), 0.0);
+        s.submit("go");
+        s.apply(done(), 0.0);
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.effort.as_deref(), Some("low"));
+        assert_eq!(s.start_spec().effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn choosing_an_effort_asks_for_it_and_shows_it_once_confirmed() {
+        let mut s = with_levels();
+        s.apply(effort("medium"), 0.0);
+        assert_eq!(s.choose_effort("high"), set_effort("high"));
+        assert_eq!(
+            s.effort.as_deref(),
+            Some("medium"),
+            "until the program says"
+        );
+        s.apply(effort("high"), 0.0);
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        // Also while a turn runs.
+        s.submit("go");
+        assert_eq!(s.phase, Phase::Working);
+        assert_eq!(s.choose_effort("low"), set_effort("low"));
+        assert_eq!(
+            s.choose_effort("max"),
+            None,
+            "a level the model does not list"
+        );
+        assert!(failed_notices(&s).is_empty());
+    }
+
+    #[test]
+    fn an_effort_that_was_not_taken_is_said_in_a_line_and_the_old_one_stays() {
+        let mut s = with_levels();
+        s.apply(effort("medium"), 0.0);
+        assert_eq!(s.choose_effort("high"), set_effort("high"));
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetEffort,
+                reason: "Claude Code goes on with medium".into(),
+            },
+            0.0,
+        );
+        assert_eq!(s.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            failed_notices(&s),
+            vec!["Could not change the effort level: Claude Code goes on with medium"]
+        );
+        // Nothing waits for an answer: the same level can be asked for again.
+        assert_eq!(s.choose_effort("high"), set_effort("high"));
+    }
+
+    #[test]
+    fn a_resting_session_keeps_the_effort_chosen_and_starts_with_it() {
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        assert_eq!(s.choose_model("opus"), None);
+        assert_eq!(s.effort_levels().len(), 5);
+        assert_eq!(s.choose_effort("xhigh"), None, "nothing is sent");
+        assert_eq!(s.effort.as_deref(), Some("xhigh"), "shown at once");
+        let spec = s.start_spec();
+        assert_eq!(
+            (spec.model.as_deref(), spec.effort.as_deref()),
+            (Some("opus"), Some("xhigh"))
+        );
+        assert_eq!(Session::resting(&stored()).start_spec().effort, None);
+    }
+
+    #[test]
+    fn a_stored_session_goes_on_with_its_effort() {
+        let mut s = Session::resting(&stored());
+        s.load_history(history_with_effort("high"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert_eq!(
+            s.start_spec().effort.as_deref(),
+            Some("high"),
+            "the model's levels are not known, so the level is passed"
+        );
+        s.offer_models(&offered_with_levels());
+        assert_eq!(
+            s.start_spec().effort.as_deref(),
+            Some("high"),
+            "m-2 takes it"
+        );
+        // Forgotten, and not passed, when the model it starts with is known not to take that
+        // level.
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        s.load_history(history_with_effort("max"));
+        assert_eq!(s.effort, None);
+        assert_eq!(s.start_spec().effort, None);
+        // Also when the model's levels become known after the history was read.
+        let mut s = Session::resting(&stored());
+        s.load_history(history_with_effort("max"));
+        assert_eq!(s.effort.as_deref(), Some("max"), "not known yet");
+        s.offer_models(&offered_with_levels());
+        assert_eq!(s.effort, None);
+        // Nor when it is known to take none.
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered());
+        s.load_history(history_with_effort("high"));
+        assert_eq!(s.effort, None);
+        assert_eq!(s.start_spec().effort, None);
+        // A history read while the program runs: the program's level is newer.
+        let mut s = Session::resting(&stored());
+        s.history = HistoryState::Loading;
+        s.wake("go");
+        s.apply(SessionEvent::Started(leveled_info()), 0.0);
+        s.apply(SessionEvent::EffortChanged(None), 0.0);
+        s.load_history(history_with_effort("high"));
+        assert_eq!(s.effort, None);
+        // While a program runs, only the program changes the level, even one its model does
+        // not list.
+        let mut s = Session::resting(&stored());
+        s.history = HistoryState::Loading;
+        s.wake("go");
+        s.apply(SessionEvent::Started(leveled_info()), 0.0);
+        s.apply(effort("max"), 0.0);
+        s.load_history(history_with_effort("high"));
+        s.offer_models(&offered_with_levels());
+        assert_eq!(s.effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn the_users_choice_beats_the_stored_one() {
+        // Chosen while the history was on its way.
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        s.choose_model("m-2");
+        s.history = HistoryState::Loading;
+        assert_eq!(s.choose_effort("low"), None);
+        s.load_history(history_with_effort("high"));
+        assert_eq!(s.effort.as_deref(), Some("low"));
+        assert_eq!(s.start_spec().effort.as_deref(), Some("low"));
+        // Chosen after it was read.
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        s.load_history(history_with_effort("high"));
+        assert_eq!(s.choose_effort("low"), None);
+        assert_eq!(s.start_spec().effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn a_model_without_levels_has_no_effort_to_choose() {
+        let mut s = started();
+        s.apply(SessionEvent::EffortChanged(None), 0.0);
+        assert!(s.effort_levels().is_empty());
+        assert_eq!(s.choose_effort("medium"), None);
+        assert_eq!(s.effort, None);
+        // A model no option names: its levels are not known.
+        let mut s = with_levels();
+        s.apply(effort("medium"), 0.0);
+        s.apply(SessionEvent::ModelChanged("claude-unknown".into()), 0.0);
+        assert!(s.effort_levels().is_empty());
+        assert_eq!(s.choose_effort("high"), None);
+        // A resting session whose model is not known yet.
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        assert!(s.effort_levels().is_empty());
+        assert_eq!(s.choose_effort("high"), None);
+        assert_eq!(s.effort, None);
+    }
+
+    #[test]
+    fn a_level_the_new_model_does_not_take_is_forgotten() {
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        s.choose_model("opus");
+        s.choose_effort("high");
+        s.choose_model("m-2");
+        assert_eq!(s.effort.as_deref(), Some("high"), "m-2 takes it");
+        s.choose_model("opus");
+        s.choose_effort("max");
+        s.choose_model("m-2");
+        assert_eq!(s.effort, None);
+        assert_eq!(s.start_spec().effort, None);
+        // While a program runs, the program says what a change of model did to the level.
+        let mut s = with_levels();
+        s.apply(effort("high"), 0.0);
+        assert_eq!(
+            s.choose_model("default"),
+            Some(SessionCommand::SetModel("default".into()))
+        );
+        s.apply(SessionEvent::ModelChanged("claude-fable-5-2".into()), 0.0);
+        assert_eq!(s.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn nothing_is_asked_while_opening_or_after_the_end() {
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        s.choose_model("opus");
+        s.wake("go");
+        assert_eq!(s.phase, Phase::Opening);
+        assert_eq!(s.choose_effort("low"), None);
+        assert_eq!(s.effort, None);
+        let mut s = with_levels();
+        s.apply(effort("medium"), 0.0);
+        s.apply(killed(), 0.0);
+        assert_eq!(s.choose_effort("high"), None);
+        assert_eq!(s.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn choosing_the_level_in_use_asks_nothing() {
+        let mut s = with_levels();
+        s.apply(effort("medium"), 0.0);
+        assert_eq!(s.choose_effort("medium"), None);
+        let mut s = Session::resting(&stored());
+        s.offer_models(&offered_with_levels());
+        s.choose_model("opus");
+        s.choose_effort("high");
+        assert_eq!(s.choose_effort("high"), None);
+        assert_eq!(s.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn taking_a_choice_back_while_it_is_in_flight_asks_for_the_old_level() {
+        let mut s = with_levels();
+        s.apply(effort("medium"), 0.0);
+        assert_eq!(s.choose_effort("high"), set_effort("high"));
+        assert_eq!(
+            s.choose_effort("medium"),
+            set_effort("medium"),
+            "high is still on its way"
+        );
+        assert_eq!(s.choose_effort("medium"), None, "it is on its way");
+        s.apply(effort("medium"), 0.0);
+        assert_eq!(s.choose_effort("medium"), None, "it is in use again");
+        // A refusal or an end settles what was asked too.
+        assert_eq!(s.choose_effort("low"), set_effort("low"));
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetEffort,
+                reason: "no".into(),
+            },
+            0.0,
+        );
+        assert_eq!(s.choose_effort("medium"), None);
+        s.choose_effort("high");
+        s.apply(killed(), 0.0);
+        s.reopening();
+        s.apply(SessionEvent::Started(leveled_info()), 0.0);
+        s.apply(effort("medium"), 0.0);
+        assert_eq!(s.choose_effort("medium"), None);
+    }
+
+    #[test]
+    fn a_new_session_starts_with_no_effort() {
+        assert_eq!(Session::opening("/p").start_spec().effort, None);
+    }
+
+    #[test]
+    fn the_levels_have_names() {
+        let names: Vec<String> = ["low", "medium", "high", "xhigh", "max", "turbo"]
+            .into_iter()
+            .map(Session::effort_label)
+            .collect();
+        assert_eq!(
+            names,
+            ["Low", "Medium", "High", "Extra high", "Max", "turbo"]
+        );
+    }
+
+    /// The address tests use for a session reachable by Remote Control.
+    const ADDRESS: &str = "https://example.org/session";
+
+    fn remote(state: RemoteAccess) -> SessionEvent {
+        SessionEvent::RemoteAccess(state)
+    }
+
+    fn reachable() -> SessionEvent {
+        remote(RemoteAccess::On {
+            url: Some(ADDRESS.into()),
+        })
+    }
+
+    fn refused(why: RemoteFailure, reason: &str) -> SessionEvent {
+        remote(RemoteAccess::Failed {
+            reason: reason.into(),
+            why,
+        })
+    }
+
+    fn turn(on: bool) -> SessionCommand {
+        SessionCommand::SetRemoteAccess { on }
+    }
+
+    /// The notices of refused commands, Remote Control's failures among them.
+    fn warnings(s: &Session) -> Vec<String> {
+        s.conversation
+            .items()
+            .iter()
+            .filter_map(|i| match &i.body {
+                ItemBody::Notice {
+                    kind: NoticeKind::CommandFailed,
+                    text,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turning_remote_control_on_asks_the_program_and_follows_what_it_says() {
+        let mut s = started();
+        assert_eq!((s.remote.clone(), s.remote_wanted), (Remote::Off, false));
+        s.submit("go");
+        assert_eq!(s.set_remote(true), Some(turn(true)), "also during a turn");
+        assert!(s.remote_wanted);
+        assert_eq!(s.remote, Remote::Off, "until the program says");
+        s.apply(remote(RemoteAccess::Starting), 0.0);
+        assert_eq!(s.remote, Remote::Starting);
+        assert_eq!(s.set_remote(true), None, "it is on its way already");
+        s.apply(reachable(), 0.0);
+        assert_eq!(
+            s.remote,
+            Remote::On {
+                url: Some(ADDRESS.into())
+            }
+        );
+        assert!(s.remote_wanted);
+        assert_eq!(s.remote_said, None);
+        assert_eq!(s.set_remote(true), None, "it is on already");
+        assert_eq!(warnings(&s), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_refusal_turns_it_off_and_says_why() {
+        let cases = [
+            (
+                RemoteFailure::Login,
+                "/login",
+                "Remote Control needs a full claude.ai sign-in. Run `claude auth login` in a \
+                 terminal, then turn it on again.",
+            ),
+            (
+                RemoteFailure::Policy,
+                "Remote Control is turned off by policy",
+                "Remote Control is turned off by your organisation's policy.",
+            ),
+            (
+                RemoteFailure::Elsewhere,
+                "ended",
+                "Remote Control was ended for this session from another place. Turn it on \
+                 again to reconnect.",
+            ),
+            (
+                RemoteFailure::Other,
+                "the network is down",
+                "Remote Control stopped: the network is down",
+            ),
+            (RemoteFailure::Other, "", "Remote Control stopped."),
+            (RemoteFailure::Other, "/login", "Remote Control stopped."),
+        ];
+        for (why, reason, words) in cases {
+            let mut s = started();
+            s.set_remote(true);
+            s.apply(remote(RemoteAccess::Starting), 0.0);
+            s.apply(refused(why, reason), 0.0);
+            assert_eq!(
+                (s.remote.clone(), s.remote_wanted),
+                (Remote::Off, false),
+                "{why:?}"
+            );
+            assert_eq!(s.remote_said.as_deref(), Some(words), "{why:?}");
+            assert_eq!(warnings(&s), vec![words.to_string()], "{why:?}");
+            assert!(
+                warnings(&s).iter().all(|line| !line.contains("/login")),
+                "{why:?}"
+            );
+            assert_eq!(s.set_remote(true), Some(turn(true)), "{why:?}");
+            assert_eq!(s.remote_said, None, "a press clears it: {why:?}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_told_twice_adds_one_line() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(refused(RemoteFailure::Login, "/login"), 0.0);
+        let said = s.remote_said.clone();
+        s.apply(refused(RemoteFailure::Login, "/login"), 0.0);
+        assert_eq!(warnings(&s).len(), 1);
+        assert_eq!(s.remote_said, said);
+        assert_eq!((s.remote.clone(), s.remote_wanted), (Remote::Off, false));
+    }
+
+    #[test]
+    fn a_resting_session_remembers_the_wish_and_asks_when_it_starts() {
+        let mut s = Session::resting(&stored());
+        assert_eq!(s.set_remote(true), None);
+        assert!(s.remote_wanted);
+        s.wake("carry on");
+        assert_eq!(s.set_remote(true), None, "nothing runs yet");
+        let sent = s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(sent, vec![turn(true), send("carry on")]);
+    }
+
+    #[test]
+    fn a_session_that_is_opening_asks_when_it_has_started() {
+        let mut s = Session::opening("/p");
+        assert_eq!(s.set_remote(true), None);
+        assert_eq!(
+            s.apply(SessionEvent::Started(info()), 0.0),
+            vec![turn(true)]
+        );
+        let mut s = Session::opening("/p");
+        s.set_remote(true);
+        assert_eq!(s.set_remote(false), None);
+        assert_eq!(
+            s.apply(SessionEvent::Started(info()), 0.0),
+            vec![],
+            "turned off again before it started"
+        );
+    }
+
+    #[test]
+    fn a_program_that_ends_leaves_the_wish_and_the_next_one_turns_it_on_again() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(reachable(), 0.0);
+        s.apply(killed(), 0.0);
+        assert_eq!((s.remote.clone(), s.remote_wanted), (Remote::Off, true));
+        s.reopening();
+        assert_eq!(
+            s.apply(SessionEvent::Started(info()), 0.0),
+            vec![turn(true)]
+        );
+
+        let mut s = started();
+        s.submit("go");
+        s.apply(done(), 0.0);
+        s.set_remote(true);
+        s.apply(reachable(), 0.0);
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!((s.remote.clone(), s.remote_wanted), (Remote::Off, true));
+        s.wake("more");
+        let sent = s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(sent, vec![turn(true), send("more")]);
+    }
+
+    #[test]
+    fn turning_it_off_asks_once_and_forgets_the_wish() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(reachable(), 0.0);
+        assert_eq!(s.set_remote(false), Some(turn(false)));
+        assert!(!s.remote_wanted);
+        s.apply(remote(RemoteAccess::Off), 0.0);
+        assert_eq!((s.remote.clone(), s.remote_wanted), (Remote::Off, false));
+        assert_eq!(s.set_remote(false), None, "it is off already");
+        assert_eq!(warnings(&s), Vec::<String>::new());
+    }
+
+    #[test]
+    fn turning_it_off_while_it_connects_asks_too() {
+        for state in [RemoteAccess::Starting, RemoteAccess::Reconnecting] {
+            let mut s = started();
+            s.set_remote(true);
+            s.apply(remote(state.clone()), 0.0);
+            assert_eq!(s.set_remote(false), Some(turn(false)), "{state:?}");
+            assert!(!s.remote_wanted, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn turning_it_off_before_the_program_answered_asks_too() {
+        let mut s = started();
+        assert_eq!(s.set_remote(true), Some(turn(true)));
+        assert_eq!(
+            s.set_remote(false),
+            Some(turn(false)),
+            "the on is still on its way"
+        );
+        assert!(!s.remote_wanted);
+        s.apply(remote(RemoteAccess::Starting), 0.0);
+        s.apply(reachable(), 0.0);
+        assert!(!s.remote_wanted, "a late on does not turn the wish on");
+        assert_eq!(s.set_remote(false), None, "the off is on its way");
+        s.apply(remote(RemoteAccess::Off), 0.0);
+        assert_eq!((s.remote.clone(), s.remote_wanted), (Remote::Off, false));
+        assert_eq!(s.set_remote(false), None, "it is off already");
+        assert_eq!(warnings(&s), Vec::<String>::new());
+    }
+
+    #[test]
+    fn turning_it_on_again_while_the_off_is_in_flight_asks_too() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(reachable(), 0.0);
+        assert_eq!(s.set_remote(false), Some(turn(false)));
+        assert_eq!(
+            s.set_remote(true),
+            Some(turn(true)),
+            "the off is still on its way"
+        );
+        assert!(s.remote_wanted);
+        s.apply(remote(RemoteAccess::Off), 0.0);
+        assert!(s.remote_wanted, "the off answers the earlier press");
+        assert_eq!(s.set_remote(true), None, "the on is on its way");
+        s.apply(remote(RemoteAccess::Starting), 0.0);
+        s.apply(reachable(), 0.0);
+        assert!(matches!(s.remote, Remote::On { .. }));
+        assert!(s.remote_wanted);
+        assert_eq!(s.set_remote(true), None, "it is on already");
+    }
+
+    #[test]
+    fn what_was_asked_is_forgotten_when_the_program_ends() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(killed(), 0.0);
+        s.reopening();
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(reachable(), 0.0);
+        // A failure or a refusal settles what was asked too.
+        assert_eq!(s.set_remote(false), Some(turn(false)));
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetRemoteAccess,
+                reason: "busy".into(),
+            },
+            0.0,
+        );
+        assert_eq!(s.set_remote(false), Some(turn(false)), "it is still on");
+    }
+
+    #[test]
+    fn a_dropped_connection_shows_reconnecting_then_on() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(reachable(), 0.0);
+        s.apply(remote(RemoteAccess::Reconnecting), 0.0);
+        assert_eq!(
+            (s.remote.clone(), s.remote_wanted),
+            (Remote::Reconnecting, true)
+        );
+        s.apply(reachable(), 0.0);
+        assert_eq!(
+            s.remote,
+            Remote::On {
+                url: Some(ADDRESS.into())
+            }
+        );
+        assert_eq!(warnings(&s), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_refused_turning_off_keeps_it_on() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(reachable(), 0.0);
+        s.set_remote(false);
+        s.apply(
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetRemoteAccess,
+                reason: "busy".into(),
+            },
+            0.0,
+        );
+        assert!(s.remote_wanted, "the switch shows it on again");
+        assert!(matches!(s.remote, Remote::On { .. }));
+        assert_eq!(warnings(&s), vec!["Could not change Remote Control: busy"]);
+    }
+
+    #[test]
+    fn an_ended_session_takes_no_switch() {
+        let mut s = started();
+        s.set_remote(true);
+        s.apply(refused(RemoteFailure::Policy, "no"), 0.0);
+        s.apply(killed(), 0.0);
+        let said = s.remote_said.clone();
+        assert_eq!(s.set_remote(true), None);
+        assert_eq!((s.remote_wanted, s.remote_said.clone()), (false, said));
+    }
+
+    #[test]
+    fn a_live_state_clears_the_old_reason() {
+        let live = [
+            remote(RemoteAccess::Starting),
+            reachable(),
+            remote(RemoteAccess::Reconnecting),
+        ];
+        for state in live {
+            let mut s = started();
+            s.set_remote(true);
+            s.apply(refused(RemoteFailure::Login, "/login"), 0.0);
+            assert!(s.remote_said.is_some());
+            s.apply(remote(RemoteAccess::Off), 0.0);
+            assert!(s.remote_said.is_some(), "off keeps it");
+            // Turned on another way than the switch: no press cleared it.
+            s.apply(state, 0.0);
+            assert_eq!(s.remote_said, None);
+        }
     }
 }

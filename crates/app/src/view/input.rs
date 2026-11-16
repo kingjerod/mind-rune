@@ -1,12 +1,12 @@
-//! The input box under the conversation: the queued message, the text area, the model and
-//! permission-mode pickers, and the send or stop button.
+//! The input box under the conversation: the queued message, the text area, the model,
+//! effort and permission-mode pickers, and the send or stop button.
 //!
 //! Enter in the text area submits the draft and nothing else: it never reaches a request card,
 //! whose buttons take no focus. While a turn runs a message is queued by the core, not sent.
 
 use mr_agent::PermissionMode;
 use mr_core::{Phase, Session, SessionKey, mode_label, model_option_label};
-use rune::{El, Key, KeyEvent, TextEdit, TextStyle, Tx, col, el, row, text};
+use rune::{El, Key, KeyEvent, TextEdit, TextStyle, Tx, col, row, text};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Placement, Select,
     TextArea,
@@ -25,7 +25,7 @@ const AREA_PAD_BOTTOM: f32 = 16.0;
 /// The space inside the box, and between its parts.
 const BOX_PAD: f32 = 8.0;
 
-/// The space between the pickers, the spacer and the send or stop button (this app's own).
+/// The space between the pickers and the send or stop button (this app's own).
 const CONTROLS_GAP: f32 = 4.0;
 
 /// The send or stop button's width. Copied from the kit, which does not export it: the side of
@@ -33,13 +33,17 @@ const CONTROLS_GAP: f32 = 4.0;
 /// (`crates/rune-kit/src/actions.rs` in the Rune checkout, `ControlSize::Large => (28.0, ..)`).
 const SEND_SIZE: f32 = 28.0;
 
-/// The least width the mode picker keeps beside a long model label: its chevron and the start
-/// of its label. The model picker's label is cut short only past this. Of the 48 points, 32
-/// copy the kit's inline `Select` trigger, which does not export them (`Select::field`,
-/// `SelectAppearance::Inline` in `crates/rune-kit/src/select.rs` in the Rune checkout:
-/// `.pl(8.0)`, `.pr(4.0)`, `.gap(4.0)` and the 16 point chevron icon); the other 16 are this
-/// app's choice, room for about two letters of the label.
+/// The least width the mode picker keeps beside a long model label: its chevron, and an
+/// ellipsis where its label was. The model picker's label is cut short only past this. Of the
+/// 48 points, 32 copy the kit's inline `Select` trigger, which does not export them
+/// (`Select::field`, `SelectAppearance::Inline` in `crates/rune-kit/src/select.rs` in the Rune
+/// checkout: `.pl(8.0)`, `.pr(4.0)`, `.gap(4.0)` and the 16 point chevron icon); the other 16
+/// are this app's choice, which the ellipsis fills: no letter of the label shows.
 const MODE_MIN: f32 = 48.0;
+
+/// The least the effort picker shrinks to, in points: as [`MODE_MIN`], its chevron and an
+/// ellipsis, with no letter of the level.
+const EFFORT_MIN: f32 = 48.0;
 
 /// The kit text area's padding and line height, where the ended wording sits.
 const FIELD_PAD: f32 = 8.0;
@@ -51,7 +55,7 @@ const PLACEHOLDER_ENDED: &str = "This session has ended";
 
 /// The input box of `key`'s session, keyed `mr-input-area` (the space round it) and
 /// `mr-input-box` (the rounded box): the queued message when there is one, the text area keyed
-/// `mr-input`, then the two pickers and the send or stop button; under the box, the line that
+/// `mr-input`, then the pickers and the send or stop button; under the box, the line that
 /// says the session's folder is gone, after a message could not wake it. The pickers' lists go into
 /// `layer`. The area is `width` points wide and centred, as the conversation's rows are (the
 /// whole width while the tile's width is not known yet).
@@ -72,24 +76,32 @@ pub fn input(ui: &Ui, kit: &Kit, key: SessionKey, layer: &mut Vec<El>, width: Op
         frame = frame.child(queued_strip(key, queued, kit));
     }
     let plan_mode = ui.app.capabilities.plan_mode;
-    frame = frame.child(text_area(key, view, ended, kit)).child(
-        row()
-            .key("mr-input-controls")
-            .w_full()
-            .gap(CONTROLS_GAP)
-            .center_y()
-            .child(model_picker(
-                key,
-                session,
-                view,
-                kit,
-                layer,
-                width.map(model_room),
-            ))
-            .child(mode_picker(key, session, view, plan_mode, kit, layer))
-            .child(el().key("mr-input-gap").grow(1.0))
-            .child(send_or_stop(ui, key, view, phase, kit)),
-    );
+    let effort = effort_picker(key, session, view, kit, layer);
+    let room = width.map(|width| model_room(width, effort.is_some()));
+    let mut controls = row()
+        .key("mr-input-controls")
+        .w_full()
+        .gap(CONTROLS_GAP)
+        .center_y()
+        .child(model_picker(key, session, view, kit, layer, room));
+    if let Some(effort) = effort {
+        controls = controls.child(effort);
+    }
+    // The mode picker sits at the start of the room the others leave, and is cut short in it
+    // first: the room takes what is free and gives none of it back until it is down to
+    // `MODE_MIN`, so the effort picker shrinks only after that.
+    let mode_slot = row()
+        .key("mr-mode-slot")
+        .grow(1.0)
+        .min_w(MODE_MIN)
+        .center_y()
+        .child(mode_picker(key, session, view, plan_mode, kit, layer));
+    controls = controls
+        .child(mode_slot)
+        .child(send_or_stop(ui, key, view, phase, kit));
+    frame = frame
+        .child(text_area(key, view, ended, kit))
+        .child(controls);
     let area = col().key("mr-input-area");
     let area = match width {
         Some(width) => area.w(width).self_center(),
@@ -119,14 +131,20 @@ fn folder_gone(folder: &std::path::Path, kit: &Kit) -> El {
     .px(8.0)
 }
 
-/// The most width the model picker takes in an input area `width` points wide: what the box
-/// holds beside the send or stop button, less [`MODE_MIN`] for the mode picker. `AREA_PAD_X`,
-/// `BOX_PAD` and `CONTROLS_GAP` are this app's; `SEND_SIZE` and part of `MODE_MIN` copy the
-/// kit (see each), so a change of those kit sizes makes this cap a little off. The tests
-/// `in_the_smallest_window_*` measure the result.
-fn model_room(width: f32) -> f32 {
+/// The room the model picker has in a column `width` wide, with or without an effort picker:
+/// what the box holds beside the send or stop button, less [`MODE_MIN`] for the mode picker,
+/// and with `effort` less [`EFFORT_MIN`] and a gap more. So the model's name is cut last.
+/// `AREA_PAD_X`, `BOX_PAD` and `CONTROLS_GAP` are this app's; `SEND_SIZE` and part of
+/// `MODE_MIN` copy the kit (see each), so a change of those kit sizes makes this cap a little
+/// off. The tests `in_the_smallest_window_*` measure the result.
+fn model_room(width: f32, effort: bool) -> f32 {
     let inside = width - 2.0 * AREA_PAD_X - 2.0 * BOX_PAD;
-    (inside - SEND_SIZE - 3.0 * CONTROLS_GAP - MODE_MIN).max(MODE_MIN)
+    let others = if effort {
+        EFFORT_MIN + 3.0 * CONTROLS_GAP
+    } else {
+        2.0 * CONTROLS_GAP
+    };
+    (inside - SEND_SIZE - MODE_MIN - others).max(MODE_MIN)
 }
 
 /// The permission modes the mode picker offers: Ask and Accept edits, then Plan when the agent
@@ -391,13 +409,58 @@ fn model_picker(
             chosen(ui, key);
         })
         .build(kit, layer);
-    // In a narrow window the mode picker gives up width first. A model label longer than the
-    // room left beside it is cut short inside the trigger, so the send or stop button stays
-    // inside the box.
+    // In a narrow window the mode and effort pickers give up width first. A model label
+    // longer than the room left beside them is cut short inside the trigger, so the send or
+    // stop button stays inside the box.
     match room {
         Some(room) => picker.max_w(room),
         None => picker,
     }
+}
+
+/// The effort picker, or none for a model that takes no level.
+///
+/// It shows the level in use by name, or "Effort" while none is known, and lists the levels
+/// the model in use takes, in their order. Choosing one asks for it: while a program runs the
+/// trigger changes once the program says, at rest at once. It never moves the tile focus, and as
+/// its list shuts the keyboard goes back to the box the user types in ([`effort_shut`]).
+fn effort_picker(
+    key: SessionKey,
+    session: Option<&Session>,
+    view: &SessionView,
+    kit: &Kit,
+    layer: &mut Vec<El>,
+) -> Option<El> {
+    let session = session?;
+    let levels = session.effort_levels().to_vec();
+    if levels.is_empty() {
+        return None;
+    }
+    let labels: Vec<String> = levels.iter().map(|l| Session::effort_label(l)).collect();
+    let current = session
+        .effort
+        .as_deref()
+        .map_or_else(|| "Effort".to_owned(), Session::effort_label);
+    let picker = Select::new(picker_key("mr-effort", key), &labels)
+        .label("Effort")
+        .current(Some(&current))
+        .placement(Placement::TopStart)
+        .disabled(!picker_enabled(Some(session)))
+        .open(view.open_picker == Some(Picker::Effort))
+        .on_toggle(move |ui: &mut Ui| toggle(ui, key, Picker::Effort))
+        .on_close(move |ui: &mut Ui| effort_shut(ui, key))
+        .on_choose(move |ui: &mut Ui, label: &str, _tx: &mut Tx| {
+            if let Some(level) = levels.iter().find(|l| Session::effort_label(l) == label) {
+                let effects = ui.app.choose_effort(key, level);
+                glue::run(ui, effects);
+            }
+            effort_shut(ui, key);
+        })
+        .build(kit, layer)
+        // In a narrow window it gives up width after the mode picker, its label cut short.
+        .shrink()
+        .min_w(EFFORT_MIN);
+    Some(picker)
 }
 
 /// The session's permission mode, always shown; choosing another asks the agent for it.
@@ -429,8 +492,9 @@ fn mode_picker(
             chosen(ui, key);
         })
         .build(kit, layer)
-        // In a narrow window the mode picker gives up width, its label cut short, so the
-        // model's name stays whole and the send or stop button stays inside the box.
+        // In a narrow window the mode picker gives up width first, its label cut short inside
+        // the room it sits in, so the model's name stays whole and the send or stop button
+        // stays inside the box.
         .shrink()
         .min_w(0.0)
 }
@@ -447,12 +511,15 @@ fn picker_enabled(session: Option<&Session>) -> bool {
     session.is_some_and(|s| !matches!(s.phase, Phase::Opening | Phase::Ended { .. }))
 }
 
-/// Opens `picker` of `key`'s session, closing the other one and the picker of every other
-/// session's view, and focuses its tile; or closes it when it is open.
+/// Opens `picker` of `key`'s session, closing the other ones and the picker of every other
+/// session's view, and focuses its tile (but for the effort picker, which never moves the
+/// tile focus); or closes it when it is open.
 fn toggle(ui: &mut Ui, key: SessionKey, picker: Picker) {
     let opens = glue::view_of(ui, key).open_picker != Some(picker);
     if opens {
-        glue::focus_tile(ui, key, false);
+        if picker != Picker::Effort {
+            glue::focus_tile(ui, key, false);
+        }
         for (other, view) in &mut ui.views {
             if *other != key {
                 view.open_picker = None;
@@ -474,13 +541,26 @@ fn chosen(ui: &mut Ui, key: SessionKey) {
     view.draft.focused = true;
 }
 
+/// The effort list of `key`'s session shuts, by a choice, Escape or a press outside, and the
+/// keyboard goes back to the box the user types in: the focused tile's, which a press on the
+/// effort picker leaves where it is. That is `key`'s own box when its tile is the focused one.
+///
+/// The kit would hand the keyboard to the picker's trigger (`focus_return`), but Rune lets a
+/// text field asked for in the same commit win over that hand-back, and then does not return
+/// the focus at all once it is outside the shut list.
+fn effort_shut(ui: &mut Ui, key: SessionKey) {
+    glue::view_mut(ui, key).open_picker = None;
+    let typing = ui.app.focused().unwrap_or(key);
+    glue::type_in(ui, typing);
+}
+
 #[cfg(test)]
 mod tests {
     use mr_agent::{CommandKind, PermissionMode, SessionCommand, SessionEvent, TurnSummary};
-    use mr_core::Session;
+    use mr_core::{Session, SessionKey};
     use rune::{Key, Mods, Runtime};
 
-    use super::{MODE_MIN, mode_choices, toggle};
+    use super::{EFFORT_MIN, MODE_MIN, mode_choices, toggle};
     use crate::glue::{self, Picker, Ui};
     use crate::testkit;
 
@@ -780,6 +860,383 @@ mod tests {
         assert!(!testkit::texts(&rt).iter().any(|t| t == "Auto"));
     }
 
+    /// The key of `part` of `key`'s effort picker: `mr-effort-{n}-{part}`.
+    fn effort(key: SessionKey, part: &str) -> String {
+        format!("mr-effort-{}-{part}", key.0)
+    }
+
+    /// The key of `part` of the focused session's effort picker.
+    fn effort_key(rt: &Runtime<Ui>, part: &str) -> String {
+        effort(testkit::focused(rt).expect("a session is shown"), part)
+    }
+
+    /// The text the picker whose trigger is keyed `trigger` shows, and where it is drawn.
+    fn shown(rt: &Runtime<Ui>, trigger: &str) -> Option<(String, [f32; 4])> {
+        rt.elements()
+            .into_iter()
+            .filter(|e| !e.exiting && e.path.contains(&format!("/{trigger}/")))
+            .find_map(|e| e.text.map(|text| (text, e.rect)))
+    }
+
+    /// The text `key`'s effort picker shows.
+    fn effort_shown(rt: &Runtime<Ui>, key: SessionKey) -> Option<String> {
+        shown(rt, &effort(key, "trigger")).map(|(text, _)| text)
+    }
+
+    /// The commands the fake received for `key`'s session, in order.
+    fn sent_to(rt: &Runtime<Ui>, key: SessionKey) -> Vec<SessionCommand> {
+        let id = rt.state.app.sessions.get(key).unwrap().session.id.clone();
+        let fake = rt
+            .state
+            .fake
+            .as_ref()
+            .expect("the demo window has its fake");
+        fake.sent()
+            .into_iter()
+            .filter(|(to, _)| Some(to) == id.as_ref())
+            .map(|(_, command)| command)
+            .collect()
+    }
+
+    /// Opens `key`'s effort picker with a click and chooses `label` from its list.
+    fn choose_effort(rt: &mut Runtime<Ui>, key: SessionKey, label: &str) {
+        testkit::click(rt, &effort(key, "trigger"));
+        testkit::step(rt);
+        assert_eq!(
+            glue::view_of(&rt.state, key).open_picker,
+            Some(Picker::Effort)
+        );
+        testkit::click_text(rt, label);
+        testkit::step(rt);
+    }
+
+    /// The labels of the open list keyed `content`, in order.
+    fn listed(rt: &Runtime<Ui>, content: &str) -> Vec<String> {
+        rt.elements()
+            .into_iter()
+            .filter(|e| !e.exiting && e.path.contains(content) && e.key.as_deref() == Some("label"))
+            .filter_map(|e| e.text)
+            .collect()
+    }
+
+    #[test]
+    fn the_effort_picker_shows_the_level_and_changes_it() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        assert_eq!(effort_shown(&rt, key).as_deref(), Some("Medium"));
+        choose_effort(&mut rt, key, "High");
+        assert_eq!(
+            sent_to(&rt, key).last(),
+            Some(&SessionCommand::SetEffort("high".into()))
+        );
+        assert_eq!(testkit::shown_view(&rt).open_picker, None);
+        assert_eq!(
+            effort_shown(&rt, key).as_deref(),
+            Some("Medium"),
+            "not until the program says"
+        );
+        testkit::emit(&mut rt, SessionEvent::EffortChanged(Some("high".into())));
+        assert_eq!(effort_shown(&rt, key).as_deref(), Some("High"));
+    }
+
+    #[test]
+    fn the_effort_picker_lists_the_models_levels_by_name() {
+        let mut rt = testkit::window("empty");
+        let trigger = effort_key(&rt, "trigger");
+        testkit::click(&mut rt, &trigger);
+        testkit::step(&mut rt);
+        let list = effort_key(&rt, "content");
+        assert_eq!(listed(&rt, &list), ["Low", "Medium", "High"]);
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        // A model that takes all five, in the order the model gives them.
+        let mut entry = rt.state.focused_entry_mut().unwrap();
+        entry.session.models[0].effort_levels = ["max", "low", "medium", "high", "xhigh"]
+            .map(String::from)
+            .to_vec();
+        drop(entry);
+        rt.invalidate();
+        testkit::step(&mut rt);
+        let trigger = effort_key(&rt, "trigger");
+        testkit::click(&mut rt, &trigger);
+        testkit::step(&mut rt);
+        assert_eq!(
+            listed(&rt, &list),
+            ["Max", "Low", "Medium", "High", "Extra high"]
+        );
+    }
+
+    #[test]
+    fn a_model_without_levels_shows_no_effort_picker() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        testkit::click(&mut rt, &effort(key, "trigger"));
+        testkit::step(&mut rt);
+        assert_eq!(testkit::shown_view(&rt).open_picker, Some(Picker::Effort));
+        testkit::emit(
+            &mut rt,
+            SessionEvent::ModelChanged("fake-model-fast".into()),
+        );
+        assert_eq!(testkit::shown_view(&rt).open_picker, None, "its list shut");
+        assert!(!testkit::drawn(&rt, &effort(key, "trigger")));
+        assert!(testkit::drawn(&rt, &testkit::model_key(&rt, "trigger")));
+        assert!(testkit::drawn(&rt, &testkit::mode_key(&rt, "trigger")));
+        // Back on a model that takes levels, the picker is back and its list stays shut.
+        testkit::emit(&mut rt, SessionEvent::ModelChanged("fake-model".into()));
+        assert!(testkit::drawn(&rt, &effort(key, "trigger")));
+        assert_eq!(testkit::shown_view(&rt).open_picker, None);
+        assert!(!testkit::drawn(&rt, &effort(key, "content")));
+    }
+
+    #[test]
+    fn an_effort_not_known_yet_reads_effort() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        rt.state.focused_entry_mut().unwrap().session.effort = None;
+        rt.invalidate();
+        testkit::step(&mut rt);
+        assert_eq!(effort_shown(&rt, key).as_deref(), Some("Effort"));
+    }
+
+    #[test]
+    fn a_resting_sessions_effort_is_chosen_without_a_program() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        testkit::type_text(&mut rt, "go");
+        testkit::press(&mut rt, Key::Enter);
+        testkit::step(&mut rt);
+        testkit::emit(
+            &mut rt,
+            SessionEvent::Exited {
+                clean: true,
+                detail: String::new(),
+            },
+        );
+        assert_eq!(
+            rt.state.focused_session().unwrap().phase,
+            mr_core::Phase::Resting
+        );
+        let before = testkit::sent(&rt).len();
+        choose_effort(&mut rt, key, "Low");
+        assert_eq!(testkit::sent(&rt).len(), before, "nothing is sent");
+        assert_eq!(effort_shown(&rt, key).as_deref(), Some("Low"), "at once");
+        assert_eq!(
+            rt.state.focused_session().unwrap().phase,
+            mr_core::Phase::Resting,
+            "no program was started"
+        );
+    }
+
+    #[test]
+    fn an_effort_that_was_not_taken_leaves_the_trigger_and_adds_a_line() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        choose_effort(&mut rt, key, "High");
+        testkit::emit(
+            &mut rt,
+            SessionEvent::CommandFailed {
+                what: CommandKind::SetEffort,
+                reason: "the level is set in the environment".into(),
+            },
+        );
+        assert!(testkit::has_text(
+            &rt,
+            "Could not change the effort level: the level is set in the environment"
+        ));
+        assert_eq!(effort_shown(&rt, key).as_deref(), Some("Medium"));
+    }
+
+    #[test]
+    fn choosing_an_effort_keeps_the_keyboard_in_the_box_and_the_tile_focused() {
+        let mut rt = testkit::window_sized("empty", (1800.0, 900.0));
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        let b = testkit::add_session(&mut rt, "/home/alex/b");
+        testkit::show(&mut rt, a);
+        testkit::show_side(&mut rt, b);
+        assert_eq!(testkit::tile_keys(&rt), [a, b]);
+        assert!(testkit::box_focused(&rt, b));
+        // In the focused tile.
+        choose_effort(&mut rt, b, "High");
+        testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        assert!(testkit::box_focused(&rt, b), "the keyboard is in b's box");
+        // In the other tile: the focus stays on b, and the keyboard goes back to b's box.
+        choose_effort(&mut rt, a, "Low");
+        testkit::step(&mut rt);
+        assert_eq!(
+            sent_to(&rt, a).last(),
+            Some(&SessionCommand::SetEffort("low".into()))
+        );
+        assert_eq!(
+            testkit::focused(&rt),
+            Some(b),
+            "the tile focus did not move"
+        );
+        assert!(
+            testkit::box_focused(&rt, b),
+            "the keyboard is back in b's box"
+        );
+        assert!(!testkit::box_focused(&rt, a));
+        testkit::type_text(&mut rt, "typed");
+        assert_eq!(glue::view_of(&rt.state, b).draft.text, "typed");
+    }
+
+    #[test]
+    fn two_tiles_each_choose_their_own_effort() {
+        let mut rt = testkit::window_sized("empty", (1800.0, 900.0));
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        let b = testkit::add_session(&mut rt, "/home/alex/b");
+        testkit::show(&mut rt, a);
+        testkit::show_side(&mut rt, b);
+        // Opening a's effort list shuts b's model list.
+        testkit::click(&mut rt, &format!("mr-model-{}-trigger", b.0));
+        testkit::step(&mut rt);
+        assert_eq!(glue::view_of(&rt.state, b).open_picker, Some(Picker::Model));
+        toggle(&mut rt.state, a, Picker::Effort);
+        rt.invalidate();
+        testkit::step(&mut rt);
+        assert_eq!(glue::view_of(&rt.state, b).open_picker, None);
+        assert_eq!(
+            glue::view_of(&rt.state, a).open_picker,
+            Some(Picker::Effort)
+        );
+        toggle(&mut rt.state, a, Picker::Effort);
+        rt.invalidate();
+        for _ in 0..20 {
+            testkit::step(&mut rt);
+        }
+        choose_effort(&mut rt, a, "High");
+        assert_eq!(
+            sent_to(&rt, a).last(),
+            Some(&SessionCommand::SetEffort("high".into()))
+        );
+        assert!(
+            !sent_to(&rt, b)
+                .iter()
+                .any(|c| matches!(c, SessionCommand::SetEffort(_)))
+        );
+        testkit::emit_to(&mut rt, a, SessionEvent::EffortChanged(Some("high".into())));
+        choose_effort(&mut rt, b, "Low");
+        assert_eq!(
+            sent_to(&rt, b).last(),
+            Some(&SessionCommand::SetEffort("low".into()))
+        );
+        testkit::emit_to(&mut rt, b, SessionEvent::EffortChanged(Some("low".into())));
+        assert_eq!(effort_shown(&rt, a).as_deref(), Some("High"));
+        assert_eq!(effort_shown(&rt, b).as_deref(), Some("Low"));
+    }
+
+    #[test]
+    fn in_a_tile_of_420_points_the_model_and_the_effort_are_whole() {
+        let rt = testkit::window_sized("empty", (688.0, 800.0));
+        let key = testkit::focused(&rt).unwrap();
+        let tile = rt.presented(&crate::view::tile_key(key)).unwrap().0;
+        assert_eq!(tile[2], 420.0, "the tile is 420 points wide");
+        let roomy = testkit::window("empty");
+        let whole = |trigger: &str| shown(&roomy, trigger).expect("a label").1[2];
+        let model_trigger = testkit::model_key(&rt, "trigger");
+        let (model, at) = shown(&rt, &model_trigger).expect("the model's label");
+        assert_eq!(model, DEFAULT_LABEL);
+        assert_eq!(at[2], whole(&model_trigger), "the model's name is not cut");
+        let effort_trigger = effort(key, "trigger");
+        let (level, at) = shown(&rt, &effort_trigger).expect("the effort's label");
+        assert_eq!(level, "Medium");
+        assert_eq!(at[2], whole(&effort_trigger), "the level is not cut");
+        let mode = rect(&rt, &testkit::mode_key(&rt, "trigger"));
+        assert!(mode[2] >= MODE_MIN - 0.5, "the mode keeps its least width");
+    }
+
+    /// Whether the keyboard focus is on `key`'s effort trigger.
+    fn effort_trigger_focused(rt: &Runtime<Ui>, key: SessionKey) -> bool {
+        let trigger = effort(key, "trigger");
+        rt.elements()
+            .into_iter()
+            .any(|e| !e.exiting && e.focused && e.key.as_deref() == Some(trigger.as_str()))
+    }
+
+    /// After a's effort list shut with b's tile focused: in the frame it shut, and after more
+    /// frames (so the kit's hand-back to the trigger never comes late), b's box has the
+    /// keyboard, a's trigger has not, b is still the focused tile, and typing lands in b.
+    fn keyboard_back_in_b(rt: &mut Runtime<Ui>, a: SessionKey, b: SessionKey) {
+        for frame in 0..3 {
+            assert_eq!(glue::view_of(&rt.state, a).open_picker, None);
+            assert!(testkit::box_focused(rt, b), "b's box, frame {frame}");
+            assert!(
+                !effort_trigger_focused(rt, a),
+                "not a's trigger, frame {frame}"
+            );
+            assert_eq!(testkit::focused(rt), Some(b));
+            testkit::step(rt);
+        }
+        testkit::type_text(rt, "typed");
+        assert_eq!(glue::view_of(&rt.state, b).draft.text, "typed");
+        assert_eq!(glue::view_of(&rt.state, a).draft.text, "");
+    }
+
+    /// Two tiles side by side, b focused with the keyboard in its box, and a's effort list
+    /// opened with a click.
+    fn effort_open_in_the_other_tile() -> (Runtime<Ui>, SessionKey, SessionKey) {
+        let mut rt = testkit::window_sized("empty", (1800.0, 900.0));
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        let b = testkit::add_session(&mut rt, "/home/alex/b");
+        testkit::show(&mut rt, a);
+        testkit::show_side(&mut rt, b);
+        assert!(testkit::box_focused(&rt, b));
+        testkit::click(&mut rt, &effort(a, "trigger"));
+        testkit::step(&mut rt);
+        assert_eq!(
+            glue::view_of(&rt.state, a).open_picker,
+            Some(Picker::Effort)
+        );
+        assert!(
+            !testkit::box_focused(&rt, b),
+            "the open list holds the keyboard"
+        );
+        (rt, a, b)
+    }
+
+    #[test]
+    fn escape_in_the_effort_list_gives_the_keyboard_back_to_the_box() {
+        let (mut rt, a, b) = effort_open_in_the_other_tile();
+        testkit::press(&mut rt, Key::Escape);
+        keyboard_back_in_b(&mut rt, a, b);
+    }
+
+    #[test]
+    fn a_press_outside_the_effort_list_gives_the_keyboard_back_to_the_box() {
+        let (mut rt, a, b) = effort_open_in_the_other_tile();
+        // On the empty middle of a's own conversation, under the list's scrim: were the press
+        // to reach the tile, it would focus a.
+        let [x, y, w, h] = rt.presented(&crate::view::tile_key(a)).unwrap().0;
+        let (x, y) = (x + w / 2.0, y + h / 3.0);
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.016);
+        keyboard_back_in_b(&mut rt, a, b);
+    }
+
+    #[test]
+    fn escape_in_the_effort_list_closes_it_and_the_turn_runs_on() {
+        let mut rt = testkit::window("working");
+        let trigger = effort_key(&rt, "trigger");
+        testkit::click(&mut rt, &trigger);
+        testkit::step(&mut rt);
+        assert_eq!(testkit::shown_view(&rt).open_picker, Some(Picker::Effort));
+        // The window's keys wait while it is open.
+        testkit::press_with(&mut rt, Key::Command('n'), testkit::ctrl_shift());
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.folder_menu, None);
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+        assert_eq!(testkit::shown_view(&rt).open_picker, None);
+        assert!(!testkit::sent(&rt).contains(&SessionCommand::Stop));
+        assert_eq!(
+            rt.state.focused_session().unwrap().phase,
+            mr_core::Phase::Working
+        );
+    }
+
     #[test]
     fn an_ended_session_cannot_be_typed_into() {
         let mut rt = testkit::window("ended");
@@ -989,6 +1446,33 @@ mod tests {
         assert_eq!(testkit::shown_view(&rt).open_picker, Some(Picker::Mode));
     }
 
+    /// The model, effort and mode triggers of the focused session and its input box, as drawn,
+    /// after checking that the three and the stop button lie inside the box in that order and
+    /// do not overlap.
+    fn bottom_row(rt: &Runtime<Ui>) -> [[f32; 4]; 4] {
+        let frame = rect(rt, "mr-input-box");
+        let model = rect(rt, &testkit::model_key(rt, "trigger"));
+        let effort = rect(rt, &effort_key(rt, "trigger"));
+        let mode = rect(rt, &testkit::mode_key(rt, "trigger"));
+        let stop = rect(rt, "mr-stop");
+        let parts = [model, effort, mode, stop];
+        for part in parts {
+            assert!(
+                part[0] >= frame[0] - 0.5 && part[0] + part[2] <= frame[0] + frame[2] + 0.5,
+                "{part:?} inside {frame:?}"
+            );
+        }
+        for pair in parts.windows(2) {
+            assert!(
+                pair[0][0] + pair[0][2] <= pair[1][0] + 0.5,
+                "{:?} left of {:?}, not over it",
+                pair[0],
+                pair[1]
+            );
+        }
+        [model, effort, mode, frame]
+    }
+
     #[test]
     fn in_the_smallest_window_a_long_model_label_is_cut_inside_its_trigger() {
         let mut rt = testkit::window_sized("working", (560.0, 400.0));
@@ -1002,36 +1486,21 @@ mod tests {
         drop(entry);
         rt.invalidate();
         testkit::step(&mut rt);
-        let frame = rect(&rt, "mr-input-box");
-        let inside = |part: [f32; 4]| {
-            part[0] >= frame[0] - 0.5 && part[0] + part[2] <= frame[0] + frame[2] + 0.5
-        };
-        let stop = rect(&rt, "mr-stop");
-        assert!(inside(stop), "{stop:?} inside {frame:?}");
-        let model = rect(&rt, &testkit::model_key(&rt, "trigger"));
-        assert!(inside(model), "{model:?} inside {frame:?}");
-        let mode = rect(&rt, &testkit::mode_key(&rt, "trigger"));
+        let [model, effort, mode, _] = bottom_row(&rt);
         assert!(
-            model[0] + model[2] <= mode[0] + 0.5,
-            "the pickers do not overlap"
+            (mode[2] - MODE_MIN).abs() <= 0.5,
+            "the mode picker is at its least width: {mode:?}"
         );
         assert!(
-            mode[2] >= MODE_MIN - 0.5,
-            "the mode picker keeps its least width"
+            (effort[2] - EFFORT_MIN).abs() <= 0.5,
+            "the effort picker is at its least width: {effort:?}"
         );
-        let value = rt
-            .elements()
-            .into_iter()
-            .find(|e| {
-                e.path
-                    .contains(&format!("/{}/", testkit::model_key(&rt, "trigger")))
-                    && e.text.as_deref() == Some(&label)
-            })
-            .expect("the model picker shows the label");
+        let (shown_label, value) =
+            shown(&rt, &testkit::model_key(&rt, "trigger")).expect("the model's label");
+        assert_eq!(shown_label, label);
         assert!(
-            value.rect[0] + value.rect[2] <= model[0] + model[2] + 0.5,
-            "the label is cut inside its trigger: {:?} in {model:?}",
-            value.rect
+            value[0] + value[2] <= model[0] + model[2] + 0.5,
+            "the label is cut inside its trigger: {value:?} in {model:?}"
         );
         let mut roomy = testkit::window("working");
         let mut entry = roomy.state.focused_entry_mut().unwrap();
@@ -1041,23 +1510,13 @@ mod tests {
         drop(entry);
         roomy.invalidate();
         testkit::step(&mut roomy);
-        let whole = roomy
-            .elements()
-            .into_iter()
-            .find(|e| {
-                e.path
-                    .contains(&format!("/{}/", testkit::model_key(&roomy, "trigger")))
-                    && e.text.as_deref() == Some(&label)
-            })
-            .expect("the model picker shows the label");
-        assert!(
-            value.rect[2] < whole.rect[2],
-            "cut short at the smallest size only"
-        );
+        let (_, whole) =
+            shown(&roomy, &testkit::model_key(&roomy, "trigger")).expect("the model's label");
+        assert!(value[2] < whole[2], "cut short at the smallest size only");
     }
 
     #[test]
-    fn in_the_smallest_window_the_model_and_the_button_stay_whole_in_the_box() {
+    fn in_the_smallest_window_the_pickers_and_the_button_stay_in_the_box() {
         let mut rt = testkit::window_sized("working", (560.0, 400.0));
         testkit::type_text(
             &mut rt,
@@ -1065,37 +1524,33 @@ mod tests {
         );
         testkit::press(&mut rt, Key::Enter);
         testkit::step(&mut rt);
-        let frame = rect(&rt, "mr-input-box");
-        let stop = rect(&rt, "mr-stop");
+        let [model, effort, mode, _] = bottom_row(&rt);
         assert!(
-            stop[0] + stop[2] <= frame[0] + frame[2],
-            "{stop:?} inside {frame:?}"
+            (mode[2] - MODE_MIN).abs() <= 0.5,
+            "the mode picker is at its least width: {mode:?}"
         );
-        assert!(testkit::texts(&rt).iter().any(|t| t == DEFAULT_LABEL));
-        let value = rt
-            .elements()
-            .into_iter()
-            .find(|e| {
-                e.path
-                    .contains(&format!("/{}/", testkit::model_key(&rt, "trigger")))
-                    && e.text.is_some()
-            })
-            .expect("the model picker shows a name");
-        let model = rect(&rt, &testkit::model_key(&rt, "trigger"));
         assert!(
-            value.rect[0] + value.rect[2] <= model[0] + model[2],
-            "the name is inside its trigger"
+            (effort[2] - EFFORT_MIN).abs() <= 0.5,
+            "the effort picker is at its least width: {effort:?}"
         );
         let roomy = testkit::window("working");
-        let whole = roomy
-            .elements()
-            .into_iter()
-            .find(|e| {
-                e.path
-                    .contains(&format!("/{}/", testkit::model_key(&roomy, "trigger")))
-                    && e.text.is_some()
-            })
-            .expect("the model picker shows a name");
-        assert_eq!(value.rect[2], whole.rect[2], "the name is not cut");
+        let whole = |trigger: &str| shown(&roomy, trigger).expect("a label").1;
+        let model_trigger = testkit::model_key(&rt, "trigger");
+        let (name, value) = shown(&rt, &model_trigger).expect("the model's name");
+        assert_eq!(name, DEFAULT_LABEL);
+        assert!(
+            value[0] + value[2] <= model[0] + model[2] + 0.5,
+            "the name is cut inside its trigger: {value:?} in {model:?}"
+        );
+        assert!(
+            value[2] < whole(&model_trigger)[2],
+            "the model's name is the one cut, last"
+        );
+        let (level, value) = shown(&rt, &effort_key(&rt, "trigger")).expect("the level");
+        assert_eq!(level, "Medium");
+        assert!(
+            value[0] + value[2] <= effort[0] + effort[2] + 0.5,
+            "the level is cut inside its trigger: {value:?} in {effort:?}"
+        );
     }
 }

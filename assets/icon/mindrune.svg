@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>MindRune</title>
+  <rect width="512" height="512" rx="122" fill="#2c3140"/>
+  <g transform="translate(256 256) scale(3.2)">
+    <g fill="#f3922e">
+      <rect x="-3.5" y="-62" width="7" height="16" rx="3.5"/>
+      <rect x="-3.5" y="-62" width="7" height="16" rx="3.5" transform="rotate(60)"/>
+      <rect x="-3.5" y="-62" width="7" height="16" rx="3.5" transform="rotate(120)"/>
+      <rect x="-3.5" y="-62" width="7" height="16" rx="3.5" transform="rotate(180)"/>
+      <rect x="-3.5" y="-62" width="7" height="16" rx="3.5" transform="rotate(240)"/>
+      <rect x="-3.5" y="-62" width="7" height="16" rx="3.5" transform="rotate(300)"/>
+    </g>
+    <path d="M0 -30 L26 -15 L26 15 L0 30 L-26 15 L-26 -15 Z" fill="#246b43" stroke="#246b43" stroke-width="8" stroke-linejoin="round"/>
+  </g>
+</svg>

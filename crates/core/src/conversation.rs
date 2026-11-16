@@ -10,6 +10,7 @@ use mr_agent::{
     HistoryItem, RequestId, SessionEvent, StoredHistory, ToolCallId, ToolOutcome, UserRequest,
 };
 
+use crate::changes::{self, Changes};
 use crate::tools::{ToolCall, ToolGroup};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -119,6 +120,8 @@ pub struct Conversation {
     /// Positions of the tool groups a call was started in this turn, so that ending the turn
     /// closes the calls left running without scanning the whole conversation.
     calls: Vec<usize>,
+    /// The files the edits changed, counted as each call finishes.
+    changes: Changes,
 }
 
 impl Conversation {
@@ -151,6 +154,7 @@ impl Conversation {
         }
         let later = std::mem::replace(&mut self.items, earlier.items);
         self.items.extend(later);
+        self.changes = earlier.changes.then(std::mem::take(&mut self.changes));
         self.revision += 1;
         for item in &mut self.items {
             item.id = ItemId(self.next_id);
@@ -169,6 +173,11 @@ impl Conversation {
 
     pub fn items(&self) -> &[Item] {
         &self.items
+    }
+
+    /// The files this conversation's edits changed.
+    pub fn changes(&self) -> &Changes {
+        &self.changes
     }
 
     /// Grows by at least one whenever anything a view shows has changed.
@@ -251,7 +260,9 @@ impl Conversation {
             | SessionEvent::RemoteAccess(_)
             | SessionEvent::TitleChanged(_)
             | SessionEvent::ModelChanged(_)
+            | SessionEvent::EffortChanged(_)
             | SessionEvent::PermissionModeChanged(_)
+            | SessionEvent::ContextBreakdown(_)
             | SessionEvent::CommandFailed { .. } => {}
         }
     }
@@ -386,6 +397,8 @@ impl Conversation {
     }
 
     fn tool_started(&mut self, call: ToolCall) {
+        // A stored call comes with its outcome, which may already count.
+        self.changes.add(&call);
         let call = match self.items.last_mut() {
             Some(Item {
                 body: ItemBody::Tools(group),
@@ -447,7 +460,13 @@ impl Conversation {
         if let Some((call, changed)) = found
             && call.outcome.as_ref() != Some(outcome)
         {
+            let counted = changes::counts(call);
             call.outcome = Some(outcome.clone());
+            match (counted, changes::counts(call)) {
+                (false, true) => self.changes.add(call),
+                (true, false) => self.changes.take_back(call),
+                _ => {}
+            }
             self.revision += 1;
             *changed = self.revision;
         }
@@ -510,6 +529,9 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::changes::FileChange;
+    use crate::session::{HistoryState, Session};
+    use crate::tools::line_counts;
     use mr_agent::{
         HistoryItem, RequestId, SessionEvent, StoredHistory, ToolCallId, ToolDetail, ToolOutcome,
         TurnSummary, UserRequest, UserRequestKind,
@@ -1194,6 +1216,230 @@ mod tests {
                     streaming: true
                 },
             ]
+        );
+    }
+
+    const MAIN: &str = "/home/alex/app/src/main.rs";
+    const LIB: &str = "/home/alex/app/src/lib.rs";
+    const NOTES: &str = "/home/alex/app/NOTES.md";
+
+    fn edit(id: &str, path: &str, old_text: &str, new_text: &str) -> SessionEvent {
+        SessionEvent::ToolStarted {
+            id: ToolCallId(id.into()),
+            name: "Edit".into(),
+            detail: ToolDetail::FileEdit {
+                path: path.into(),
+                old_text: old_text.into(),
+                new_text: new_text.into(),
+            },
+        }
+    }
+    fn write(id: &str, path: &str, content: &str) -> SessionEvent {
+        SessionEvent::ToolStarted {
+            id: ToolCallId(id.into()),
+            name: "Write".into(),
+            detail: ToolDetail::FileWrite {
+                path: path.into(),
+                content: content.into(),
+            },
+        }
+    }
+    fn finished(id: &str, outcome: ToolOutcome) -> SessionEvent {
+        SessionEvent::ToolFinished {
+            id: ToolCallId(id.into()),
+            outcome,
+        }
+    }
+    fn ok() -> ToolOutcome {
+        ToolOutcome::Ok {
+            output: "done".into(),
+        }
+    }
+    fn failed(output: &str) -> ToolOutcome {
+        ToolOutcome::Failed {
+            output: output.into(),
+        }
+    }
+    fn change(path: &str, added: usize, removed: usize) -> FileChange {
+        FileChange {
+            path: path.into(),
+            added,
+            removed,
+        }
+    }
+
+    #[test]
+    fn an_edit_that_succeeded_counts_its_lines() {
+        let (old, new) = ("fn main() {}\n", "fn main() {\n    run();\n}\n");
+        let mut c = Conversation::new();
+        play(&mut c, &[edit("e1", MAIN, old, new)]);
+        assert!(c.changes().files().is_empty(), "not finished yet");
+        play(&mut c, &[finished("e1", ok())]);
+        // The numbers the call's own row shows.
+        assert_eq!(line_counts(old, new), (3, 1));
+        assert_eq!(c.changes().files(), [change(MAIN, 3, 1)]);
+    }
+
+    #[test]
+    fn a_written_file_counts_its_lines_as_added() {
+        let mut c = Conversation::new();
+        play(
+            &mut c,
+            &[
+                write("w1", LIB, "pub mod a;\npub mod b;\npub mod c;"),
+                finished("w1", ok()),
+            ],
+        );
+        assert_eq!(c.changes().files(), [change(LIB, 3, 0)]);
+    }
+
+    #[test]
+    fn a_failed_a_denied_and_an_unfinished_edit_do_not_count() {
+        let mut c = Conversation::new();
+        play(
+            &mut c,
+            &[
+                edit("e1", MAIN, "a\n", "b\n"),
+                finished("e1", failed("The text to replace was not found.")),
+                write("w1", LIB, "one\n"),
+                finished("w1", failed("Denied by the user")),
+                edit("e2", NOTES, "a\n", "b\n"),
+                SessionEvent::TurnFinished(summary(false)),
+            ],
+        );
+        assert_eq!(c.changes(), &Changes::default());
+    }
+
+    #[test]
+    fn a_late_result_counts_and_a_result_that_turns_to_failed_is_taken_back() {
+        let mut c = Conversation::new();
+        play(
+            &mut c,
+            &[
+                edit("e1", MAIN, "a\n", "b\n"),
+                edit("e2", LIB, "a\n", "b\nc\n"),
+                finished("e2", ok()),
+                SessionEvent::TurnFinished(summary(false)),
+            ],
+        );
+        assert_eq!(c.changes().files(), [change(LIB, 2, 1)]);
+        // The call the turn closed as "Did not finish" still takes its real outcome.
+        play(&mut c, &[finished("e1", ok())]);
+        assert_eq!(c.changes().files(), [change(LIB, 2, 1), change(MAIN, 1, 1)]);
+        // Another output for a call that succeeded counts nothing again.
+        play(
+            &mut c,
+            &[finished(
+                "e1",
+                ToolOutcome::Ok {
+                    output: "again".into(),
+                },
+            )],
+        );
+        assert_eq!(c.changes().files(), [change(LIB, 2, 1), change(MAIN, 1, 1)]);
+        play(&mut c, &[finished("e2", failed("gone"))]);
+        assert_eq!(c.changes().files(), [change(MAIN, 1, 1)]);
+    }
+
+    #[test]
+    fn other_tools_change_nothing() {
+        let mut c = Conversation::new();
+        let started = |id: &str, name: &str, detail: ToolDetail| SessionEvent::ToolStarted {
+            id: ToolCallId(id.into()),
+            name: name.into(),
+            detail,
+        };
+        play(
+            &mut c,
+            &[
+                read("r1"),
+                finished("r1", ok()),
+                started(
+                    "c1",
+                    "Bash",
+                    ToolDetail::Command {
+                        command: "rm /home/alex/app/old.txt".into(),
+                    },
+                ),
+                finished("c1", ok()),
+                started(
+                    "s1",
+                    "Grep",
+                    ToolDetail::Search {
+                        query: "fn main".into(),
+                    },
+                ),
+                finished("s1", ok()),
+                started(
+                    "o1",
+                    "NotebookEdit",
+                    ToolDetail::Other {
+                        input_json: r#"{"notebook_path":"/home/alex/app/a.ipynb"}"#.into(),
+                    },
+                ),
+                finished("o1", ok()),
+            ],
+        );
+        assert_eq!(c.changes(), &Changes::default());
+    }
+
+    #[test]
+    fn a_stored_sessions_edits_are_counted_once_and_come_first() {
+        let stored_edit = |id: &str, path: &str, outcome: Option<ToolOutcome>| HistoryItem::Tool {
+            id: ToolCallId(id.into()),
+            name: "Edit".into(),
+            detail: ToolDetail::FileEdit {
+                path: path.into(),
+                old_text: "a\n".into(),
+                new_text: "b\nc\n".into(),
+            },
+            outcome,
+        };
+        let stored = StoredHistory {
+            earlier_left_out: true,
+            ..history(vec![
+                HistoryItem::User {
+                    text: "tidy up".into(),
+                    image_count: 0,
+                },
+                stored_edit("h1", MAIN, Some(ok())),
+                HistoryItem::Tool {
+                    id: ToolCallId("h2".into()),
+                    name: "Write".into(),
+                    detail: ToolDetail::FileWrite {
+                        path: LIB.into(),
+                        content: "one\ntwo\n".into(),
+                    },
+                    outcome: Some(ok()),
+                },
+                stored_edit("h3", NOTES, Some(failed("Denied by the user"))),
+                // Its result is not in the store; the program may still send it.
+                stored_edit("h4", NOTES, None),
+            ])
+        };
+        let mut s = Session::opening("/home/alex/app");
+        s.conversation.push_user("and the docs");
+        play(
+            &mut s.conversation,
+            &[edit("e1", LIB, "two\n", "2\n"), finished("e1", ok())],
+        );
+        s.history = HistoryState::Loading;
+        s.load_history(stored.clone());
+        s.load_history(stored.clone());
+        let expected = [change(MAIN, 2, 1), change(LIB, 3, 1)];
+        assert_eq!(s.conversation.changes().files(), expected);
+        // The history alone, read as often as asked, counts the same.
+        let alone = [change(MAIN, 2, 1), change(LIB, 2, 0)];
+        assert_eq!(Conversation::from_history(&stored).changes().files(), alone);
+        assert_eq!(Conversation::from_history(&stored).changes().files(), alone);
+        // A stored call's result sent again counts nothing again.
+        play(&mut s.conversation, &[finished("h1", ok())]);
+        assert_eq!(s.conversation.changes().files(), expected);
+        // The result of a stored call that had none counts once it comes.
+        play(&mut s.conversation, &[finished("h4", ok())]);
+        assert_eq!(
+            s.conversation.changes().files(),
+            [change(MAIN, 2, 1), change(LIB, 3, 1), change(NOTES, 2, 1)]
         );
     }
 }

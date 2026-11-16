@@ -3,9 +3,10 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use mr_agent::{
-    Account, Agent, AgentError, Answer, LimitWindow, ModelOption, PermissionMode, RemoteAccess,
-    RequestId, SessionCommand, SessionEvent, SessionHandle, SessionId, SessionInfo, StartSpec,
-    ToolDetail, UsageLimits, UserRequestKind,
+    Account, Agent, AgentError, Answer, ContextBreakdown, ContextKind, ContextPart, LimitWindow,
+    ModelOption, PermissionMode, RemoteAccess, RemoteFailure, RequestId, SessionCommand,
+    SessionEvent, SessionHandle, SessionId, SessionInfo, StartSpec, ToolDetail, UsageLimits,
+    UserRequestKind,
 };
 use mr_claude::ClaudeAgent;
 
@@ -60,16 +61,41 @@ fn open_with(
     (Box::new(handle), rx)
 }
 
-/// Opens a stub session and waits for its `Started`.
+/// Opens a stub session and waits for its `Started`, the effort level read after it, which is
+/// the stub's `medium`, and the breakdown of its context.
 fn open_started_with(
     edit: impl FnOnce(&mut StartSpec),
     extra_env: &[(&str, &str)],
 ) -> (Box<dyn SessionHandle>, Receiver<SessionEvent>, SessionInfo) {
     let (handle, rx) = open_with(edit, extra_env);
-    match next(&rx) {
-        SessionEvent::Started(info) => (handle, rx, info),
+    let info = match next(&rx) {
+        SessionEvent::Started(info) => info,
         other => panic!("expected Started first, got {other:?}"),
-    }
+    };
+    assert_eq!(
+        next(&rx),
+        SessionEvent::EffortChanged(Some("medium".into()))
+    );
+    assert_eq!(next(&rx), stub_breakdown());
+    (handle, rx, info)
+}
+
+/// What the stub says its context is made of: its deferred row is left out.
+fn stub_breakdown() -> SessionEvent {
+    let part = |name: &str, tokens: u64, kind: ContextKind| ContextPart {
+        name: name.into(),
+        tokens,
+        kind,
+    };
+    SessionEvent::ContextBreakdown(ContextBreakdown {
+        parts: vec![
+            part("System prompt", 3_000, ContextKind::Used),
+            part("Messages", 46_000, ContextKind::Used),
+            part("Autocompact buffer", 33_000, ContextKind::Buffer),
+            part("Free space", 918_000, ContextKind::Free),
+        ],
+        window: 1_000_000,
+    })
 }
 
 fn open_stub() -> (Box<dyn SessionHandle>, Receiver<SessionEvent>) {
@@ -104,7 +130,8 @@ fn a_session_starts_before_any_turn_with_the_id_it_was_given() {
             name: "Sonnet".into(),
             resolved: "claude-sonnet-5-5".into(),
             stands_for: None,
-            auto_mode: false
+            auto_mode: false,
+            effort_levels: Vec::new(),
         }
     );
     assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
@@ -137,7 +164,10 @@ fn a_turn_arrives_as_agent_events() {
     assert!(
         matches!(next(&rx), SessionEvent::UsageLimits(u) if u.session.as_ref().unwrap().percent() == 8)
     );
-    assert!(matches!(next(&rx), SessionEvent::TurnFinished(s) if s.context_used == Some(0.05)));
+    // 49000 of 1000000: the 1000 output tokens are not context.
+    assert!(matches!(next(&rx), SessionEvent::TurnFinished(s) if s.context_used == Some(0.049)));
+    // The level read after the turn is unchanged and says nothing; the breakdown is given again.
+    assert_eq!(next(&rx), stub_breakdown());
     // The stub holds the turn's result back until the hook request is refused,
     // so TurnFinished above proves the unsupported reply reached it.
 }
@@ -152,7 +182,7 @@ fn a_refused_remote_control_request_comes_back_as_a_failure() {
         next(&rx),
         SessionEvent::RemoteAccess(RemoteAccess::Failed {
             reason: "Claude.ai login was rejected".into(),
-            needs_login: true
+            why: RemoteFailure::Login
         })
     );
 }
@@ -318,6 +348,16 @@ fn the_usage_limits_are_asked_for_and_reported() {
             }),
         })
     );
+}
+
+#[test]
+fn a_change_of_effort_goes_out_and_comes_back() {
+    let (handle, rx) = open_stub();
+    handle
+        .send(SessionCommand::SetEffort("low".into()))
+        .unwrap();
+    assert_eq!(next(&rx), SessionEvent::EffortChanged(Some("low".into())));
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
 }
 
 /// Whether a process with this id still exists.

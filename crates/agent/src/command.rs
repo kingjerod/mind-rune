@@ -32,6 +32,11 @@ pub enum SessionCommand {
     },
     /// Ask for the usage limits now. The answer is a `UsageLimits` event.
     RefreshUsage,
+    /// Sets the effort level of the next messages. An `EffortChanged` event comes when the
+    /// level the agent reads afterwards differs from the last one it gave. When the change was
+    /// refused or not taken, a `CommandFailed { what: CommandKind::SetEffort, .. }` says so,
+    /// with no `EffortChanged` when the level in use did not change.
+    SetEffort(String),
     Close,
 }
 

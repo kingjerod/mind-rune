@@ -1,6 +1,7 @@
 //! What is kept between runs: the groups, where sessions were placed, the folders new sessions
-//! started in, the tiles on screen, the sidebar's width and the names given to sessions. It is one value, read once at
-//! start and written whole.
+//! started in, the tiles on screen, the sidebar's width, the names given to sessions, whether
+//! new sessions start with Remote Control, and the right panel's width and whether it shows. It
+//! is one value, read once at start and written whole.
 
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,15 @@ pub struct Saved {
     /// read.
     #[serde(deserialize_with = "names_that_read")]
     pub names: Vec<(SessionId, String)>,
+    /// New sessions start with Remote Control wanted. Anything but `true` reads as false.
+    #[serde(deserialize_with = "true_or_false")]
+    pub remote_for_new: bool,
+    /// The right panel's width in points; the window's own when none or not a number.
+    #[serde(deserialize_with = "number_or_none")]
+    pub panel_width: Option<f32>,
+    /// The right panel shows. Anything that is not `true` reads as false.
+    #[serde(deserialize_with = "true_or_false")]
+    pub panel_open: bool,
 }
 
 /// One column of tiles as kept between runs: its tile, or the upper of its two, and the lower.
@@ -85,8 +95,15 @@ fn split_or_half<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f3
     number_or(deserializer, half())
 }
 
-/// A number, or `or` for anything else: JSON has no NaN, and serde_json writes one as `null`.
+/// A number, or `or` for anything else.
 fn number_or<'de, D: serde::Deserializer<'de>>(deserializer: D, or: f32) -> Result<f32, D::Error> {
+    Ok(number_or_none(deserializer)?.unwrap_or(or))
+}
+
+/// A number, or none for anything else: JSON has no NaN, and serde_json writes one as `null`.
+fn number_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f32>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Number {
@@ -94,8 +111,8 @@ fn number_or<'de, D: serde::Deserializer<'de>>(deserializer: D, or: f32) -> Resu
         Other(serde::de::IgnoredAny),
     }
     Ok(match Number::deserialize(deserializer)? {
-        Number::Number(number) => number,
-        Number::Other(_) => or,
+        Number::Number(number) => Some(number),
+        Number::Other(_) => None,
     })
 }
 
@@ -113,6 +130,17 @@ fn below_that_reads<'de, D: serde::Deserializer<'de>>(
         Below::Below(below) => Some(below),
         Below::Other(_) => None,
     })
+}
+
+/// True for `true`, false for anything else.
+fn true_or_false<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Flag {
+        Bool(bool),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(matches!(Flag::deserialize(deserializer)?, Flag::Bool(true)))
 }
 
 /// The entries that are a pair of an id and a name; none when `names` is not a list.
@@ -171,8 +199,9 @@ mod tests {
     use super::*;
 
     /// A saved state with a folder group, a custom group, a placement, two recent folders, two
-    /// columns, the first of two tiles, its upper one focused, and a name kept for the second
-    /// column's tile.
+    /// columns, the first of two tiles, its upper one focused, a name kept for the second
+    /// column's tile, Remote Control wanted for new sessions, and the right panel open at 360
+    /// points.
     fn sample() -> Saved {
         Saved {
             version: SAVED_VERSION,
@@ -213,11 +242,14 @@ mod tests {
             sidebar_collapsed: false,
             closed_by_app: vec![(SessionId("a1".into()), 1_800_000_000)],
             names: vec![(SessionId("b1".into()), "Garden".into())],
+            remote_for_new: true,
+            panel_width: Some(360.0),
+            panel_open: true,
         }
     }
 
     /// How [`sample`] is written, as the window keeps it under its settings key.
-    const SAMPLE_JSON: &str = r#"{"version":1,"groups":[{"id":{"Custom":2},"name":"Side projects","collapsed":false,"hidden":false},{"id":{"Folder":"/home/alex/project"},"name":"Parser","collapsed":true,"hidden":false}],"placed":[["a1",{"Custom":2}]],"next_custom":3,"recent_folders":["/home/alex/project","/home/alex/notes"],"shown":"a1","tiles":[{"id":"a1","share":1.5,"below":{"id":"a2","split":0.25}},{"id":"b1","share":0.5,"below":null}],"sidebar_width":300.0,"sidebar_collapsed":false,"closed_by_app":[["a1",1800000000]],"names":[["b1","Garden"]]}"#;
+    const SAMPLE_JSON: &str = r#"{"version":1,"groups":[{"id":{"Custom":2},"name":"Side projects","collapsed":false,"hidden":false},{"id":{"Folder":"/home/alex/project"},"name":"Parser","collapsed":true,"hidden":false}],"placed":[["a1",{"Custom":2}]],"next_custom":3,"recent_folders":["/home/alex/project","/home/alex/notes"],"shown":"a1","tiles":[{"id":"a1","share":1.5,"below":{"id":"a2","split":0.25}},{"id":"b1","share":0.5,"below":null}],"sidebar_width":300.0,"sidebar_collapsed":false,"closed_by_app":[["a1",1800000000]],"names":[["b1","Garden"]],"remote_for_new":true,"panel_width":360.0,"panel_open":true}"#;
 
     #[test]
     fn a_saved_state_survives_a_round_trip() {
@@ -369,6 +401,39 @@ mod tests {
             assert!(read.names.is_empty(), "{names}");
             assert_eq!(read.next_custom, 3, "{names}");
         }
+    }
+
+    #[test]
+    fn a_preference_that_cannot_be_read_is_off_and_the_rest_is_read() {
+        for value in ["false", "null", "1", r#""true""#, "[true]", "{}"] {
+            let json = format!(r#"{{"version":1,"next_custom":3,"remote_for_new":{value}}}"#);
+            let read: Saved =
+                serde_json::from_str(&json).unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert!(!read.remote_for_new, "{value}");
+            assert_eq!(read.next_custom, 3, "{value}");
+        }
+        let read: Saved =
+            serde_json::from_str(r#"{"version":1,"next_custom":3,"remote_for_new":true}"#).unwrap();
+        assert!(read.remote_for_new);
+        assert_eq!(read.next_custom, 3);
+    }
+
+    #[test]
+    fn a_panel_width_that_is_not_a_number_reads_as_none_and_the_rest_is_read() {
+        for value in ["null", r#""x""#, "true", "[300]", "{}"] {
+            let json = format!(
+                r#"{{"version":1,"next_custom":3,"panel_width":{value},"panel_open":true}}"#
+            );
+            let read: Saved =
+                serde_json::from_str(&json).unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(read.panel_width, None, "{value}");
+            assert!(read.panel_open, "{value}");
+            assert_eq!(read.next_custom, 3, "{value}");
+        }
+        let read: Saved =
+            serde_json::from_str(r#"{"version":1,"panel_width":320.5,"panel_open":1}"#).unwrap();
+        assert_eq!(read.panel_width, Some(320.5));
+        assert!(!read.panel_open, "anything but true is false");
     }
 
     #[test]

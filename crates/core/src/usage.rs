@@ -9,6 +9,17 @@ pub enum Level {
     Alarm,
 }
 
+impl Level {
+    /// The level of a bar `percent` full: a warning from 75, an alarm from 90.
+    pub fn of(percent: u8) -> Level {
+        match percent {
+            90.. => Level::Alarm,
+            75.. => Level::Warning,
+            _ => Level::Normal,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageLine {
     pub text: String,
@@ -39,11 +50,7 @@ fn line(window: Option<&LimitWindow>, name: &str, now_unix: i64) -> UsageLine {
     UsageLine {
         text: format!("{percent}% of {name} used"),
         fraction: Some(window.used.clamp(0.0, 1.0)),
-        level: match percent {
-            90.. => Level::Alarm,
-            75.. => Level::Warning,
-            _ => Level::Normal,
-        },
+        level: Level::of(percent),
         resets: Some(resets_in(window.resets_at_unix, now_unix)),
     }
 }

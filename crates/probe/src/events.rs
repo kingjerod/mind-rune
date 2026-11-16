@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use mr_agent::{Agent, SessionCommand, SessionEvent, StartSpec};
+use mr_agent::{Agent, RemoteAccess, SessionCommand, SessionEvent, StartSpec};
 
 use crate::repl::{Cmd, parse_command};
 
@@ -30,7 +30,7 @@ pub fn run(agent: &dyn Agent, cwd: PathBuf, model: Option<String>) -> Result<(),
         .open(
             spec,
             Box::new(move |event| {
-                println!("{event:?}");
+                println!("{}", shown(&event));
                 if matches!(event, SessionEvent::Exited { .. }) {
                     let _ = sink_tx.send(Message::SessionExited);
                 }
@@ -82,6 +82,16 @@ pub fn run(agent: &dyn Agent, cwd: PathBuf, model: Option<String>) -> Result<(),
     Ok(())
 }
 
+/// The event as it is printed: its debug form, with a Remote Control address hidden.
+fn shown(event: &SessionEvent) -> String {
+    match event {
+        SessionEvent::RemoteAccess(RemoteAccess::On { url: Some(_) }) => {
+            "RemoteAccess(On { url: <hidden> })".to_string()
+        }
+        event => format!("{event:?}"),
+    }
+}
+
 fn read_typed_lines(messages: mpsc::Sender<Message>) {
     let mut stdin = io::stdin().lock();
     let mut line = String::new();
@@ -97,4 +107,24 @@ fn read_typed_lines(messages: mpsc::Sender<Message>) {
         }
     }
     let _ = messages.send(Message::InputEnded);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_remote_control_address_is_hidden_and_the_state_still_shown() {
+        let on = SessionEvent::RemoteAccess(RemoteAccess::On {
+            url: Some("https://example.org/session".into()),
+        });
+        assert_eq!(shown(&on), "RemoteAccess(On { url: <hidden> })");
+        let on_without = SessionEvent::RemoteAccess(RemoteAccess::On { url: None });
+        assert_eq!(shown(&on_without), "RemoteAccess(On { url: None })");
+        assert_eq!(
+            shown(&SessionEvent::RemoteAccess(RemoteAccess::Starting)),
+            "RemoteAccess(Starting)"
+        );
+        assert_eq!(shown(&SessionEvent::TurnStarted), "TurnStarted");
+    }
 }

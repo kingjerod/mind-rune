@@ -40,6 +40,10 @@ pub fn build_args(spec: &StartSpec, new_id: Option<&SessionId>) -> Vec<String> {
         args.push("--model".into());
         args.push(model.clone());
     }
+    if let Some(effort) = &spec.effort {
+        args.push("--effort".into());
+        args.push(effort.clone());
+    }
     if let Some(mode) = &spec.permission_mode
         && *mode != PermissionMode::Ask
     {
@@ -121,5 +125,22 @@ mod tests {
             build_args(&spec, None),
             with(&["--model", "opus", "--permission-mode", "auto"])
         );
+    }
+
+    #[test]
+    fn an_effort_is_passed_at_start() {
+        let mut spec = StartSpec::new("/p");
+        spec.model = Some("opus".into());
+        spec.effort = Some("high".into());
+        assert_eq!(
+            build_args(&spec, None),
+            with(&["--model", "opus", "--effort", "high"])
+        );
+    }
+
+    #[test]
+    fn no_effort_no_flag() {
+        let spec = StartSpec::new("/p");
+        assert!(!build_args(&spec, None).iter().any(|arg| arg == "--effort"));
     }
 }
