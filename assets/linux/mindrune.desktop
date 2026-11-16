@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MindRune
+Comment=A desktop window for Claude Code
+Exec=mindrune
+Icon=mindrune
+Terminal=false
+Categories=Development;
+StartupWMClass=mindrune

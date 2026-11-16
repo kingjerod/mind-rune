@@ -27,6 +27,15 @@ struct Launch {
 
 static LAUNCH: OnceLock<Launch> = OnceLock::new();
 
+/// The id the window reports to a Linux desktop, which finds the window's icon through the
+/// entry of that name: `assets/linux/mindrune.desktop`, put in place by
+/// `scripts/install-desktop-entry.sh`.
+const APP_ID: &str = "mindrune";
+
+/// The app's icon where the program sets it itself: the Dock on macOS, the windows and the
+/// taskbar on Windows.
+const ICON: &[u8] = include_bytes!("../../../assets/icon/mindrune-512.png");
+
 fn main() {
     // Rune's own flags (`--scene`, `--snap`, ...) are not in `extra_args`.
     let launch = parse(rune::extra_args()).unwrap_or_else(|message| {
@@ -34,6 +43,10 @@ fn main() {
         std::process::exit(2);
     });
     let _ = LAUNCH.set(launch);
+    rune::set_app_id(APP_ID);
+    if let Err(message) = rune::set_app_icon(ICON) {
+        eprintln!("mindrune: {message}");
+    }
     // As `rune::run`, with a hook that ends the session when the window closes.
     rune::App::new(AppSpec {
         min_size: Some((560.0, 400.0)),
@@ -218,6 +231,32 @@ mod tests {
         assert_eq!(opened.as_deref(), Some(dir.path()));
         let shown = app.focused_entry().expect("its session is shown");
         assert_eq!(shown.session.folder, dir.path());
+    }
+
+    /// The value of `key` in a desktop entry.
+    fn entry_value<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
+        entry
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    #[test]
+    fn the_desktop_entry_names_the_id_the_window_reports() {
+        // A Linux desktop matches a window to its entry, and so to its icon, by this id.
+        let entry = include_str!("../../../assets/linux/mindrune.desktop");
+        assert_eq!(APP_ID, "mindrune");
+        assert_eq!(entry_value(entry, "StartupWMClass"), Some("mindrune"));
+        assert_eq!(entry_value(entry, "Icon"), Some("mindrune"));
+    }
+
+    #[test]
+    fn the_app_icon_is_a_square_png_of_256_pixels_or_more() {
+        // What `rune::set_app_icon` asks for on Windows.
+        assert_eq!(&ICON[..8], b"\x89PNG\r\n\x1a\n");
+        let side = |at: usize| u32::from_be_bytes(ICON[at..at + 4].try_into().unwrap());
+        let (width, height) = (side(16), side(20));
+        assert_eq!(width, height);
+        assert!(width >= 256, "{width}");
     }
 
     #[test]
