@@ -194,7 +194,7 @@ mod tests {
         FakeAgent, FakeStep, HistoryItem, PermissionMode, SessionCommand, SessionEvent, SessionId,
         StoredHistory, StoredSession,
     };
-    use mr_core::{HistoryState, Phase, Place, Session, SessionKey};
+    use mr_core::{HistoryState, ItemBody, ItemId, Phase, Place, Session, SessionKey};
     use rune::{Key, Runtime};
 
     use crate::demo::{
@@ -421,15 +421,37 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_message_says_how_many_images_it_had() {
+    fn a_stored_message_keeps_a_slot_for_each_image() {
         let mut rt = testkit::window("resting");
         assert!(testkit::has_text(&rt, "This is what it prints now."));
-        assert!(testkit::texts(&rt).iter().any(|t| t == "1 image"));
+        assert!(!testkit::texts(&rt).iter().any(|t| t == "1 image"));
+        let user_pictures = |rt: &Runtime<Ui>, key: SessionKey| -> Vec<(ItemId, Vec<u64>)> {
+            session(rt, key)
+                .conversation
+                .items()
+                .iter()
+                .filter_map(|item| match &item.body {
+                    ItemBody::User { pictures, .. } => Some((item.id, pictures.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The parser's screenshot: the store gave no bytes for it, so its slot waits for good.
+        let parser = parser(&rt);
+        let (_, shot) = user_pictures(&rt, parser)
+            .into_iter()
+            .find(|(_, pictures)| !pictures.is_empty())
+            .expect("the message with a screenshot");
+        assert_eq!(shot.len(), 1);
+        let wait = format!("mr-user-picture-wait-{}", shot[0]);
+        assert!(testkit::element(&rt, &testkit::tile(parser, &wait)).is_some());
         let history = StoredHistory {
             items: vec![
                 HistoryItem::User {
                     text: String::new(),
                     image_count: 3,
+                    files: Vec::new(),
+                    images: vec![None; 3],
                 },
                 HistoryItem::AssistantText("Three screenshots of the same error.".into()),
             ],
@@ -438,13 +460,18 @@ mod tests {
         let key = stored(&mut rt, "stored-notes", history);
         testkit::show(&mut rt, key);
         assert!(testkit::has_text(&rt, "Three screenshots"));
-        let images = text_element(&rt, "3 images");
-        let kit = theme::kit(true);
-        assert_eq!(images.text_color, Some(kit.c.text_muted));
-        let first = session(&rt, key).conversation.items()[0].id;
+        let [(first, pictures)] = &user_pictures(&rt, key)[..] else {
+            panic!("one message of the user's");
+        };
+        assert_eq!(pictures.len(), 3);
+        for picture in pictures {
+            let wait = format!("mr-user-picture-wait-{picture}");
+            assert!(testkit::element(&rt, &testkit::tile(key, &wait)).is_some());
+        }
+        assert!(!testkit::has_text(&rt, "3 images"));
         assert!(
             rt.find(&format!("mr-user-{}", first.0)).is_none(),
-            "a message with no text shows only how many images it had"
+            "a message with no text shows only its pictures"
         );
     }
 
@@ -870,6 +897,8 @@ mod tests {
                     HistoryItem::User {
                         text: format!("Question {n}"),
                         image_count: 0,
+                        files: Vec::new(),
+                        images: Vec::new(),
                     },
                     HistoryItem::AssistantText(format!("Answer {n}")),
                 ]

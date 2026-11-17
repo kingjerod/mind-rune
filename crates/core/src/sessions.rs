@@ -27,7 +27,8 @@ pub enum Mark {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prompt {
     /// The session's stored history changed very recently, so another app may have it open.
-    /// `text` is the message the user sent it, held until they choose.
+    /// `text` is the message the user sent it, held until they choose; its chips are back on the
+    /// session meanwhile.
     OpenElsewhere { text: String },
 }
 

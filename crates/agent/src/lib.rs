@@ -12,7 +12,7 @@ pub use agent::{
     Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, SessionHandle, StartSpec,
     StoredHistory, StoredSession,
 };
-pub use command::{Answer, Attachment, QuestionAnswer, SessionCommand};
+pub use command::{Answer, Attachment, ImageData, QuestionAnswer, SessionCommand};
 pub use event::{
     CommandKind, ContextBreakdown, ContextKind, ContextPart, LimitWindow, ModelOption,
     PermissionMode, Question, QuestionOption, RemoteAccess, RemoteFailure, SessionEvent,

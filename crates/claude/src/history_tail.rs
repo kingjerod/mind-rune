@@ -1,7 +1,7 @@
 //! The end of a stored conversation, read from the end of its file along the chain of
 //! replies, so that a very large session opens as fast as a small one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
@@ -11,7 +11,7 @@ use mr_agent::{AgentError, HistoryItem, StoredHistory};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::history::{add_record, contains, parse_record};
+use crate::history::{add_record, contains, parse_record, stored_images};
 use crate::mode::mode_from_wire;
 
 /// How much of the end of a session file is read for its history.
@@ -60,6 +60,9 @@ pub fn read_tail(
     let mut tool_positions = HashMap::new();
     let mut model = None;
     let mut effort = None;
+    // The user's messages that have images, by their place in `items`, with their records:
+    // the images are decoded once the end is known, for the messages kept only.
+    let mut with_images: VecDeque<(usize, Value)> = VecDeque::new();
     for step in steps.iter().rev() {
         match step {
             Step::Compaction => items.push(HistoryItem::Compacted),
@@ -73,13 +76,35 @@ pub fn read_tail(
                 if let Some(level) = reply_effort(&record) {
                     effort = Some(level.to_string());
                 }
+                let before = items.len();
                 add_record(&record, &mut items, &mut tool_positions);
+                if items.len() > before
+                    && let Some(HistoryItem::User { image_count, .. }) = items.last()
+                    && *image_count > 0
+                {
+                    with_images.push_back((before, record));
+                }
+                // Items are only ever added: one this far from the end is cut.
+                while with_images
+                    .front()
+                    .is_some_and(|(at, _)| items.len() - at > max_items)
+                {
+                    with_images.pop_front();
+                }
             }
         }
     }
 
     let cut = items.len().saturating_sub(max_items);
     items.drain(..cut);
+    for (at, record) in with_images {
+        if let Some(HistoryItem::User { images, .. }) = items.get_mut(at - cut) {
+            let read = stored_images(&record);
+            // `UserContent::of` counted the slots by the same rule `stored_images` reads by.
+            debug_assert_eq!(read.len(), images.len(), "one entry per image counted");
+            *images = read;
+        }
+    }
     let earlier_left_out = cut > 0
         || match end {
             ChainEnd::Outside => true,
@@ -312,6 +337,8 @@ mod tests {
         HistoryItem::User {
             text: text.into(),
             image_count: 0,
+            files: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -670,9 +697,171 @@ mod tests {
             read_all(&path).items,
             vec![HistoryItem::User {
                 text: "see".into(),
-                image_count: 1
+                image_count: 1,
+                files: Vec::new(),
+                images: vec![None],
             }]
         );
+    }
+
+    /// A user record of `blocks`, the first on its chain. Written by hand, field names and
+    /// shapes only: never seen live beyond one image block per image sent.
+    fn user_of(blocks: serde_json::Value) -> String {
+        json!({
+            "type": "user", "uuid": "u1", "parentUuid": null, "sessionId": "s1",
+            "message": {"role": "user", "content": blocks},
+        })
+        .to_string()
+    }
+
+    /// An image block holding `bytes` as base64, as the Messages format writes one.
+    fn image_block(bytes: &[u8]) -> serde_json::Value {
+        use base64::Engine;
+        json!({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }})
+    }
+
+    /// Made-up bytes that begin as a PNG does: the reader does not decode images.
+    fn png_like(fill: u8, length: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(length, fill);
+        bytes
+    }
+
+    /// Whether `image` was read, and holds `bytes`.
+    fn holds(image: &Option<mr_agent::ImageData>, bytes: &[u8]) -> bool {
+        image
+            .as_ref()
+            .is_some_and(|image| image.as_bytes() == bytes)
+    }
+
+    /// The images of the only item of the history at `path`, and its image count.
+    fn images_of(path: &Path) -> (usize, Vec<Option<mr_agent::ImageData>>) {
+        match read_all(path).items.as_slice() {
+            [
+                HistoryItem::User {
+                    image_count,
+                    images,
+                    ..
+                },
+            ] => (*image_count, images.clone()),
+            other => panic!("not one message of the user's: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stored_image_gives_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = png_like(7, 1000);
+        let record = user_of(json!([{"type": "text", "text": "see"}, image_block(&bytes)]));
+        let path = write(dir.path(), &[record]);
+        let (count, images) = images_of(&path);
+        assert_eq!(count, 1);
+        assert_eq!(images.len(), 1);
+        assert!(holds(&images[0], &bytes), "the bytes changed");
+        // Every length of the last group of base64 decodes whole.
+        for length in 9..13 {
+            let bytes = png_like(3, length);
+            let path = write(dir.path(), &[user_of(json!([image_block(&bytes)]))]);
+            let (_, images) = images_of(&path);
+            assert!(
+                images.len() == 1 && holds(&images[0], &bytes),
+                "{length} bytes did not come through"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_with_another_source_is_counted_and_gives_no_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let by_address = json!({"type": "image", "source": {
+            "type": "url", "url": "https://example.org/shot.png",
+        }});
+        let path = write(dir.path(), &[user_of(json!([by_address]))]);
+        let (count, images) = images_of(&path);
+        assert_eq!(count, 1);
+        assert_eq!(images, vec![None]);
+    }
+
+    #[test]
+    fn bad_base64_is_counted_and_gives_no_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for data in ["not base64 at all!", "QUJD=", "", "QU"] {
+            let block = json!({"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": data,
+            }});
+            let path = write(dir.path(), &[user_of(json!([block]))]);
+            let (count, images) = images_of(&path);
+            assert_eq!(count, 1, "{data:?}");
+            assert_eq!(images, vec![None], "{data:?}");
+        }
+    }
+
+    #[test]
+    fn images_files_and_text_keep_their_counts_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (png_like(1, 40), png_like(2, 50));
+        let by_address = json!({"type": "image", "source": {
+            "type": "url", "url": "https://example.org/shot.png",
+        }});
+        let record = user_of(json!([
+            {"type": "text", "text": "look\n\nAttached files:\n- /home/alex/proj/notes.txt"},
+            image_block(&first),
+            by_address,
+            image_block(&second),
+        ]));
+        let path = write(dir.path(), &[record]);
+        let history = read_all(&path);
+        let [
+            HistoryItem::User {
+                text,
+                image_count,
+                files,
+                images,
+            },
+        ] = history.items.as_slice()
+        else {
+            panic!("not one message of the user's");
+        };
+        assert_eq!(text, "look");
+        assert_eq!(files, &[PathBuf::from("/home/alex/proj/notes.txt")]);
+        assert_eq!(*image_count, 3);
+        assert_eq!(images.len(), 3);
+        assert!(holds(&images[0], &first), "the first changed");
+        // The one held another way keeps its place: the third does not move up.
+        assert_eq!(images[1], None);
+        assert!(holds(&images[2], &second), "the third changed");
+    }
+
+    #[test]
+    fn the_images_of_a_message_kept_come_through_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let (early, late) = (png_like(1, 30), png_like(2, 30));
+        let first = json!({
+            "type": "user", "uuid": "u1", "parentUuid": null,
+            "message": {"content": [{"type": "text", "text": "one"}, image_block(&early)]},
+        });
+        let second = json!({
+            "type": "user", "uuid": "u2", "parentUuid": "a1",
+            "message": {"content": [{"type": "text", "text": "two"}, image_block(&late)]},
+        });
+        let path = write(
+            dir.path(),
+            &[
+                first.to_string(),
+                assistant("a1", Some("u1"), "Done."),
+                second.to_string(),
+            ],
+        );
+        let history = read_tail(&path, 1, TAIL_BYTES).unwrap();
+        let [HistoryItem::User { text, images, .. }] = history.items.as_slice() else {
+            panic!("not the last message alone: {:?}", history.items);
+        };
+        assert_eq!(text, "two");
+        assert_eq!(images.len(), 1);
+        assert!(holds(&images[0], &late), "the image changed");
     }
 
     #[test]

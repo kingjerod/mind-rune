@@ -6,11 +6,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use mr_agent::{AgentError, HistoryItem, SessionId, StoredSession, ToolCallId, ToolOutcome};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use mr_agent::{
+    AgentError, HistoryItem, ImageData, SessionId, StoredSession, ToolCallId, ToolOutcome,
+};
 use serde_json::Value;
 
+use crate::encode::split_attached;
 use crate::translate::tool_detail;
 
 /// How much of each end of a file `describe` looks at.
@@ -363,7 +369,8 @@ pub fn find_session(projects_dir: &Path, id: &SessionId) -> Option<PathBuf> {
 
 /// Adds what one record of a conversation shows to `items`. Side chains, meta
 /// records and compaction summaries show nothing. A tool result fills in the
-/// outcome of the tool at its position in `tool_positions`.
+/// outcome of the tool at its position in `tool_positions`. A user's message comes without
+/// its images' bytes, `None` in each image's place: [`stored_images`] gives them.
 pub(crate) fn add_record(
     record: &Value,
     items: &mut Vec<HistoryItem>,
@@ -392,12 +399,15 @@ fn add_user(record: &Value, items: &mut Vec<HistoryItem>, tool_positions: &HashM
             *slot = Some(outcome);
         }
     }
-    if is_command_wrapper(&content.text) || (content.text.is_empty() && content.image_count == 0) {
+    let empty = content.text.is_empty() && content.image_count == 0 && content.files.is_empty();
+    if is_command_wrapper(&content.text) || empty {
         return;
     }
     items.push(HistoryItem::User {
         text: content.text,
         image_count: content.image_count,
+        files: content.files,
+        images: vec![None; content.image_count],
     });
 }
 
@@ -454,10 +464,48 @@ fn add_assistant(
     }
 }
 
+/// The bytes of each image a `user` record holds, one entry per image in their order (the
+/// blocks `UserContent::of` counts): `None`
+/// for an image held any other way than as base64, or whose base64 does not decode. Slow for
+/// large images: for the messages a history keeps only.
+pub(crate) fn stored_images(record: &Value) -> Vec<Option<ImageData>> {
+    let Some(Value::Array(blocks)) = record.get("message").and_then(|m| m.get("content")) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .map(image_bytes)
+        .collect()
+}
+
+/// The bytes of an image block of the form
+/// `{"type":"image","source":{"type":"base64","media_type":"…","data":"…"}}`, decoded
+/// straight into the buffer they are kept in.
+fn image_bytes(block: &Value) -> Option<ImageData> {
+    let source = block.get("source")?;
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return None;
+    }
+    let data = source.get("data").and_then(Value::as_str)?;
+    // Every four characters are three bytes, and a last group of two or three is one or two.
+    let length = data.trim_end_matches('=').len() * 3 / 4;
+    if length == 0 {
+        return None;
+    }
+    let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, length).collect();
+    let written = STANDARD
+        .decode_slice(data, Arc::get_mut(&mut bytes)?)
+        .ok()?;
+    (written == length).then(|| ImageData::new(bytes))
+}
+
 /// What a `user` record carries: the typed text (text blocks joined by a
-/// newline), how many images, and the tool results it answers.
+/// newline, without the block that names its files), the files, how many images,
+/// and the tool results it answers.
 struct UserContent {
     text: String,
+    files: Vec<PathBuf>,
     image_count: usize,
     tool_results: Vec<(String, ToolOutcome)>,
 }
@@ -466,11 +514,13 @@ impl UserContent {
     fn of(record: &Value) -> Self {
         let mut content = UserContent {
             text: String::new(),
+            files: Vec::new(),
             image_count: 0,
             tool_results: Vec::new(),
         };
+        let mut text = String::new();
         match record.get("message").and_then(|m| m.get("content")) {
-            Some(Value::String(text)) => content.text = text.clone(),
+            Some(Value::String(whole)) => text = whole.clone(),
             Some(Value::Array(blocks)) => {
                 let mut texts: Vec<&str> = Vec::new();
                 for block in blocks {
@@ -487,10 +537,13 @@ impl UserContent {
                         _ => {}
                     }
                 }
-                content.text = texts.join("\n");
+                text = texts.join("\n");
             }
             _ => {}
         }
+        let (typed, files) = split_attached(&text);
+        content.text = typed.to_string();
+        content.files = files;
         content
     }
 }
@@ -902,5 +955,64 @@ mod tests {
         let meta = describe(&path);
         assert_eq!(meta.folder, Some("/home/u/proj".into()));
         assert_eq!(meta.title.as_deref(), Some("Fix flaky reconnect"));
+    }
+
+    /// The items `add_record` makes of one record.
+    fn read_one(record: &str) -> Vec<HistoryItem> {
+        let mut items = Vec::new();
+        add_record(
+            &serde_json::from_str(record).unwrap(),
+            &mut items,
+            &mut HashMap::new(),
+        );
+        items
+    }
+
+    #[test]
+    fn a_stored_message_names_its_files() {
+        // Written by hand, field names and shapes only: never seen live.
+        let stored = r#"{"type":"user","uuid":"u1","parentUuid":null,"message":{"role":"user","content":[{"type":"text","text":"read these\n\nAttached files:\n- /home/alex/proj/notes.txt\n- /home/alex/proj/plan.md"},{"type":"image","source":{}}]}}"#;
+        assert_eq!(
+            read_one(stored),
+            vec![HistoryItem::User {
+                text: "read these".into(),
+                image_count: 1,
+                files: vec![
+                    PathBuf::from("/home/alex/proj/notes.txt"),
+                    PathBuf::from("/home/alex/proj/plan.md"),
+                ],
+                images: vec![None],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_stored_message_of_files_alone_is_kept() {
+        // Written by hand, field names and shapes only: never seen live.
+        let stored = r#"{"type":"user","uuid":"u1","parentUuid":null,"message":{"role":"user","content":[{"type":"text","text":"Attached files:\n- /home/alex/proj/notes.txt"}]}}"#;
+        assert_eq!(
+            read_one(stored),
+            vec![HistoryItem::User {
+                text: String::new(),
+                image_count: 0,
+                files: vec![PathBuf::from("/home/alex/proj/notes.txt")],
+                images: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_listing_does_not_take_its_title_from_the_files_block() {
+        let dir = tempfile::tempdir().unwrap();
+        // Written by hand, field names and shapes only: never seen live.
+        let files_alone = r#"{"type":"user","cwd":"/home/alex/proj","message":{"role":"user","content":[{"type":"text","text":"Attached files:\n- /home/alex/proj/notes.txt"}]}}"#;
+        let with_text = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the parser\n\nAttached files:\n- /home/alex/proj/log.txt"}]}}"#;
+        let path = write(
+            dir.path(),
+            "-home-alex-proj",
+            "s1",
+            &[files_alone, with_text],
+        );
+        assert_eq!(describe(&path).title.as_deref(), Some("Fix the parser"));
     }
 }

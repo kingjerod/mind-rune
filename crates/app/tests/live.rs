@@ -6,10 +6,11 @@
 //! ```
 //!
 //! It needs Claude Code installed and signed in. It runs the app twice, as the window would be
-//! opened, closed and opened again, and starts the real program four times in all: the session
+//! opened, closed and opened again, and starts the real program five times in all: the session
 //! of the first run, the look the first run takes, a second session opened to the side in the
-//! first run, and the first session resumed in the second run. The account is checked once;
-//! the second run is handed what the first found.
+//! first run, the first session resumed in the second run, and a session for attachments opened
+//! to the side in the second run. The account is checked once; the second run is handed what the
+//! first found.
 //!
 //! The first run opens with no folder, so it lists the stored sessions and looks, as the window
 //! does; the test then starts a new session in a fresh temporary folder, asks for a one-word
@@ -39,10 +40,19 @@
 //! also says that this app closed the session, so the second run is not expected to ask
 //! whether another app has it open; it prints whether it did.
 //!
-//! Every way out of the test, a failed assertion included, closes both sessions, so no `claude`
+//! Then, in the second run, a session of its own opens to the side and is sent a message with a
+//! red image made by the test and a file the test writes into its folder, each attached as the
+//! window attaches it and read on the preparing thread. It prints whether the answer names the
+//! colour and the file's first word, what the stored history gives back for that message, and
+//! whether a second message, with an image of noise a little under the largest sent as it is,
+//! was answered. None of that fails the test, nor does anything that session's program does.
+//!
+//! Every way out of the test, a failed assertion included, closes its sessions, so no `claude`
 //! is left running, and every wait has a deadline that says what it waited for. Of the user's
 //! other stored sessions it prints only counts and times: never a title, a folder, a message
-//! or an id. It writes nothing; only `claude` itself stores the test's two sessions.
+//! or an id. It writes one file, into its own temporary folder; only `claude` itself stores the
+//! test's three sessions. What it prints of the session sent attachments holds no path, no
+//! id and no image's bytes.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,14 +60,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mr_agent::{
-    Account, Agent, CommandKind, ContextBreakdown, ContextKind, PermissionMode, RemoteAccess,
-    RemoteFailure, SessionCommand, SessionEvent, SessionId,
+    Account, Agent, Attachment, CommandKind, ContextBreakdown, ContextKind, HistoryItem, ImageData,
+    PermissionMode, RemoteAccess, RemoteFailure, SessionCommand, SessionEvent, SessionId,
 };
 use mr_claude::ClaudeAgent;
 use mr_core::{
-    App, Backend, DEFAULT_WIDTH, Effect, FromBackend, HistoryState, ItemBody, Launch, Leaving,
-    Phase, Place, Prompt, PromptChoice, Saved, Screen, Session, SessionKey, ToBackend, Width,
-    mode_label,
+    App, Backend, ChipState, DEFAULT_WIDTH, Effect, FromBackend, HISTORY_ITEMS, HistoryState,
+    ItemBody, Launch, Leaving, MAX_BYTES, MAX_SIDE, Phase, Place, Prompt, PromptChoice, Saved,
+    Screen, Session, SessionKey, Source, ToBackend, Width, mode_label,
 };
 
 /// The whole run, from the account check to the reply; also a resumed session's reply.
@@ -124,6 +134,28 @@ const REMOTE_LIMIT: Duration = Duration::from_secs(30);
 /// of it, which may give another kind of failure.
 const REFUSAL_LISTEN: Duration = Duration::from_secs(2);
 
+/// The message sent with an image and a file, in a session of its own.
+const ATTACHED_MESSAGE: &str = "What colour is the image, and what is the first word of the file?";
+
+/// The image sent with it: this many pixels a side, all red.
+const RED_SIDE: u32 = 16;
+
+/// The file sent with it, written into the test's folder: one made-up sentence, and its first
+/// word as the answer would name it.
+const NOTE_NAME: &str = "note.txt";
+const NOTE: &str = "Pelican boats drift past the old harbour at dawn.\n";
+const NOTE_WORD: &str = "pelican";
+
+/// The message sent with the image of noise.
+const NOISE_MESSAGE: &str = "Reply with the single word: noise";
+
+/// The sides of the image of noise: three bytes of noise a pixel make a PNG of about 3.9 MB, a
+/// little under `MAX_BYTES`, so it is sent byte for byte, as a line of about 5.2 MB.
+const NOISE_SIZE: (u32, u32) = (1120, 1160);
+
+/// How long the chips of a message may take to be read.
+const PREPARE_LIMIT: Duration = Duration::from_secs(30);
+
 #[test]
 #[ignore = "starts the real claude; run with MINDRUNE_LIVE=1 and --ignored"]
 fn a_real_turn_the_store_the_look_and_the_session_resumed() {
@@ -173,6 +205,7 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     again.read_back(&id);
     again.restored(&id, &side_id);
     again.resume(&id);
+    again.attachments();
     again.close_app();
 }
 
@@ -240,6 +273,20 @@ struct Live {
     /// Every breakdown of the context the test's session was given, in order, each with whether
     /// a turn had ended before it came.
     breakdowns: Vec<(bool, ContextBreakdown)>,
+    /// The session that is sent attachments, once there is one. Unlike the others, nothing its
+    /// program does fails the test.
+    attached: Option<SessionKey>,
+    /// How each turn of that session ended, in order: true when it finished, false when it
+    /// failed.
+    attached_ends: Vec<bool>,
+    /// That session's stored history was asked for, and its answer is for the test alone.
+    stored_asked: bool,
+    /// What the read of that history gave: its items, or `None` when it failed.
+    stored: Option<Option<Vec<HistoryItem>>>,
+    /// The picture ids of that history's first message of the user's.
+    stored_pictures: Vec<u64>,
+    /// How many of them a picture answer came for: the reader gave their bytes.
+    stored_read: usize,
 }
 
 /// What a program said of Remote Control, without the address it may carry.
@@ -320,6 +367,12 @@ impl Live {
             remotes: Vec::new(),
             turn_ended: false,
             breakdowns: Vec::new(),
+            attached: None,
+            attached_ends: Vec::new(),
+            stored_asked: false,
+            stored: None,
+            stored_pictures: Vec::new(),
+            stored_read: 0,
         };
         if let Some(account) = account {
             effects.retain(|effect| *effect != Effect::CheckAccount);
@@ -1107,6 +1160,351 @@ impl Live {
         eprintln!("live: resumed with effort {passed}, the program says {says}");
     }
 
+    /// Opens a session of its own to the side, in the test's folder, as "Open to the side"
+    /// does, and sends it [`ATTACHED_MESSAGE`] with a red image made here, pasted, and
+    /// [`NOTE_NAME`], written into the test's folder and attached by its path, as the window
+    /// attaches them: read on the preparing thread, then sent through the backend's writer.
+    /// Prints what the message went out with, whether the answer names the colour and the
+    /// file's word, then what that session's stored history gives back for the message, then
+    /// sends [`NOISE_MESSAGE`] with an image of noise a little under the largest sent as it is
+    /// and prints whether that turn was answered. Then the session is closed. Fails on nothing
+    /// its program does, nor on a note it cannot write or a session that is not made: it says so
+    /// and leaves the attachments out.
+    fn attachments(&mut self) {
+        let note = self.folder.join(NOTE_NAME);
+        if let Err(error) = std::fs::write(&note, NOTE) {
+            eprintln!(
+                "live: the note could not be written ({:?}); attachments are not tried",
+                error.kind()
+            );
+            return;
+        }
+        let known: Vec<SessionKey> = self.app.sessions.iter().map(|entry| entry.key).collect();
+        let effects =
+            self.app
+                .new_session(self.folder.clone(), Place::Side, Leaving::ForgetIfEmpty);
+        let made = self
+            .app
+            .sessions
+            .iter()
+            .map(|entry| entry.key)
+            .find(|key| !known.contains(key));
+        self.attached = made;
+        self.carry_out(effects);
+        let Some(key) = made else {
+            eprintln!("live: no new session was made for attachments; they are not tried");
+            return;
+        };
+        let ready = self.wait_for(TURN_LIMIT, |live| {
+            matches!(live.phase_of(key), Some(Phase::Idle | Phase::Ended { .. }))
+        });
+        if !ready || self.phase_of(key) != Some(Phase::Idle) {
+            eprintln!(
+                "live: the session for attachments was not ready within {} s",
+                TURN_LIMIT.as_secs()
+            );
+            self.close_attached(key);
+            return;
+        }
+
+        let sources = vec![Source::Path(note.clone()), Source::Pasted(red_png())];
+        if let Some((before, attachments)) = self.send_with(key, ATTACHED_MESSAGE, sources, None) {
+            let images = attachments
+                .iter()
+                .filter(|attachment| matches!(attachment, Attachment::Image { .. }))
+                .count();
+            let files: Vec<&Path> = attachments
+                .iter()
+                .filter_map(|attachment| match attachment {
+                    Attachment::File { path } => Some(path.as_path()),
+                    Attachment::Image { .. } => None,
+                })
+                .collect();
+            if images == 1 && files == [note.as_path()] {
+                eprintln!("live: image and file sent");
+            } else {
+                eprintln!(
+                    "live: the message went out with {images} image(s) and {} file(s), not the \
+                     image and the file attached",
+                    files.len()
+                );
+            }
+            let finished = self.wait_for_end(key, before);
+            let answer = self.answer_after(key, ATTACHED_MESSAGE).to_lowercase();
+            let names = |word: &str| {
+                finished
+                    && answer
+                        .split(|c: char| !c.is_alphanumeric())
+                        .any(|part| part == word)
+            };
+            eprintln!("live: the answer names the colour: {}", yes(names("red")));
+            eprintln!(
+                "live: the answer names the file's word: {}",
+                yes(names(NOTE_WORD))
+            );
+            self.report_stored(key);
+        }
+
+        let noise = noise_png();
+        let bytes = noise.len();
+        let sources = vec![Source::Pasted(noise)];
+        if let Some((before, attachments)) =
+            self.send_with(key, NOISE_MESSAGE, sources, Some(bytes))
+        {
+            let kept = attachments.iter().any(|attachment| {
+                matches!(attachment, Attachment::Image { data, .. } if data.len() == bytes)
+            });
+            let finished = self.wait_for_end(key, before);
+            if kept {
+                eprintln!("live: a 3 MB line went through: {}", yes(finished));
+            } else {
+                eprintln!("live: the noise image was made smaller, so no 3 MB line was sent");
+            }
+        }
+        self.close_attached(key);
+    }
+
+    /// Attaches `sources` to `key`'s session, waits until every chip is read, and sends `text`
+    /// with them. Returns how many turns of the session had ended before and the attachments the
+    /// `Send` carried, once the message was sent; prints why and returns `None` when it was not.
+    /// With `bytes`, prints a line when the one image was not kept at that many bytes. Fails on
+    /// nothing.
+    fn send_with(
+        &mut self,
+        key: SessionKey,
+        text: &str,
+        sources: Vec<Source>,
+        bytes: Option<usize>,
+    ) -> Option<(usize, Vec<Attachment>)> {
+        let lead = if bytes.is_some() {
+            "the noise image"
+        } else {
+            "the image and the file"
+        };
+        let effects = self.app.attach(key, sources);
+        self.carry_out(effects);
+        let chips = |live: &Live| {
+            live.app
+                .sessions
+                .get(key)
+                .map(|entry| entry.session.chips.clone())
+                .unwrap_or_default()
+        };
+        let read = self.wait_for(PREPARE_LIMIT, |live| {
+            chips(live)
+                .iter()
+                .all(|chip| chip.state != ChipState::Reading)
+        });
+        if !read {
+            eprintln!(
+                "live: {lead}: not read within {} s; nothing was sent",
+                PREPARE_LIMIT.as_secs()
+            );
+            return None;
+        }
+        let held = chips(self);
+        if let Some(problem) = held.iter().find_map(|chip| match chip.state {
+            ChipState::Problem(problem) => Some(problem),
+            _ => None,
+        }) {
+            eprintln!(
+                "live: {lead}: a chip says {:?}; nothing was sent",
+                problem.words()
+            );
+            return None;
+        }
+        if let Some(bytes) = bytes {
+            let kept = held.iter().any(|chip| {
+                matches!(
+                    &chip.state,
+                    ChipState::Ready(prepared) if matches!(
+                        &prepared.attachment,
+                        Attachment::Image { data, .. } if data.len() == bytes
+                    )
+                )
+            });
+            if !kept {
+                eprintln!("live: the noise image was made smaller; the line is shorter than meant");
+            }
+        }
+        let before = self.attached_ends.len();
+        let effects = self.app.submit(key, text);
+        let sent = effects.iter().find_map(|effect| match effect {
+            Effect::Send {
+                command: SessionCommand::Send { attachments, .. },
+                ..
+            } => Some(attachments.clone()),
+            _ => None,
+        });
+        self.carry_out(effects);
+        let Some(attachments) = sent else {
+            eprintln!("live: {lead}: the app sent no message");
+            return None;
+        };
+        Some((before, attachments))
+    }
+
+    /// Waits for the turn of `key`'s session after the `before`th to end, and says whether it
+    /// finished. A turn that asks the user for something is stopped, and one whose program ends
+    /// does not finish; each prints a line. Fails on nothing.
+    fn wait_for_end(&mut self, key: SessionKey, before: usize) -> bool {
+        let settled = |live: &Live| {
+            live.attached_ends.len() > before
+                || matches!(
+                    live.phase_of(key),
+                    Some(Phase::NeedsUser | Phase::Ended { .. })
+                )
+        };
+        let ended = self.wait_for(TURN_LIMIT, settled);
+        match self.phase_of(key) {
+            Some(Phase::NeedsUser) => {
+                eprintln!("live: the turn asked the user for something; it is stopped");
+                let effects = self.app.stop(key);
+                self.carry_out(effects);
+                self.wait_for(TURN_LIMIT, |live| live.attached_ends.len() > before);
+                return false;
+            }
+            Some(Phase::Ended { clean, .. }) => {
+                eprintln!("live: the session's program ended in the turn (clean: {clean})");
+                return false;
+            }
+            _ => {}
+        }
+        if !ended {
+            eprintln!(
+                "live: the turn did not end within {} s",
+                TURN_LIMIT.as_secs()
+            );
+            return false;
+        }
+        let finished = self.attached_ends[before];
+        if !finished {
+            eprintln!("live: the turn failed");
+        }
+        finished
+    }
+
+    /// The finished replies in `key`'s session after the user's message that starts with
+    /// `message`, joined.
+    fn answer_after(&self, key: SessionKey, message: &str) -> String {
+        let items = self.items_of(key);
+        let asked = items.iter().rposition(
+            |body| matches!(body, ItemBody::User { text, .. } if text.starts_with(message)),
+        );
+        let after = asked.map_or(&items[..0], |at| &items[at..]);
+        finished_replies(after)
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Reads `key`'s session's stored history through the backend, as a stored session's is
+    /// read, and prints what it gives for the first message of the user's: how many images and
+    /// files, and whether its text is the message as typed. Fails on nothing.
+    fn report_stored(&mut self, key: SessionKey) {
+        let Some(id) = self
+            .app
+            .sessions
+            .get(key)
+            .and_then(|entry| entry.session.id.clone())
+        else {
+            eprintln!("live: the session for attachments has no id; its history is not read");
+            return;
+        };
+        self.stored = None;
+        self.stored_asked = true;
+        self.backend.send(ToBackend::ReadHistory {
+            key,
+            id,
+            max_items: HISTORY_ITEMS,
+        });
+        self.wait_for(HISTORY_LIMIT, |live| live.stored.is_some());
+        self.stored_asked = false;
+        let items = match self.stored.take() {
+            Some(Some(items)) => items,
+            Some(None) => {
+                eprintln!("live: the stored history could not be read");
+                return;
+            }
+            None => {
+                eprintln!(
+                    "live: the stored history gave no answer within {} s",
+                    HISTORY_LIMIT.as_secs()
+                );
+                return;
+            }
+        };
+        let users: Vec<(&String, usize, usize)> = items
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::User {
+                    text,
+                    image_count,
+                    files,
+                    ..
+                } => Some((text, *image_count, files.len())),
+                _ => None,
+            })
+            .collect();
+        eprintln!(
+            "live: the stored history holds {} message(s) of the user's",
+            users.len()
+        );
+        match users.first() {
+            Some((text, images, files)) => {
+                eprintln!(
+                    "live: the stored message shows {images} image(s) and {files} file(s), text \
+                     kept whole: {}",
+                    yes(text.as_str() == ATTACHED_MESSAGE)
+                );
+                // Each image read comes back as a picture; one not read never does.
+                let images = *images;
+                self.wait_for(HISTORY_LIMIT, |live| live.stored_read >= images);
+                eprintln!(
+                    "live: the stored message's images with bytes the app could read: {} of \
+                     {images}",
+                    self.stored_read
+                );
+            }
+            None => eprintln!("live: the stored history holds no message of the user's"),
+        }
+    }
+
+    /// Closes the program of `key`'s session, the one sent attachments, and waits for it to
+    /// rest. Prints a line when it does not. Fails on nothing.
+    fn close_attached(&mut self, key: SessionKey) {
+        if let Some(open) = self.attached_open() {
+            self.backend.send(ToBackend::Send {
+                open,
+                command: SessionCommand::Close,
+            });
+        }
+        let rested = self.wait_for(CLOSE_LIMIT, |live| {
+            matches!(
+                live.phase_of(key),
+                Some(Phase::Resting | Phase::Ended { .. }) | None
+            )
+        });
+        match self.phase_of(key) {
+            Some(Phase::Ended { clean, .. }) => {
+                eprintln!("live: the session for attachments ended (clean: {clean})");
+            }
+            _ if !rested => eprintln!(
+                "live: the session for attachments had not ended {} s after Close",
+                CLOSE_LIMIT.as_secs()
+            ),
+            _ => {}
+        }
+    }
+
+    /// The number of the current open of the session sent attachments, while its program runs.
+    fn attached_open(&self) -> Option<u64> {
+        self.attached
+            .and_then(|key| self.app.sessions.get(key))
+            .and_then(|entry| entry.open)
+    }
+
     /// The test's session in this run.
     fn session(&self) -> Option<&Session> {
         self.key
@@ -1134,6 +1532,27 @@ impl Live {
     /// does, and carries out what comes back. Notes what the test reports on as it passes.
     fn take_in(&mut self) {
         while let Some(message) = self.backend.try_recv() {
+            // The App would load it over the session's live conversation.
+            if let FromBackend::History {
+                key,
+                result,
+                pictures,
+            } = &message
+                && self.stored_asked
+                && Some(*key) == self.attached
+            {
+                self.stored_asked = false;
+                self.stored = Some(result.as_ref().ok().map(|history| history.items.clone()));
+                self.stored_pictures = pictures.first().cloned().unwrap_or_default();
+                self.stored_read = 0;
+                continue;
+            }
+            // Only an image whose bytes the reader gave is answered with a picture.
+            if let FromBackend::Picture { id, .. } = &message
+                && self.stored_pictures.contains(id)
+            {
+                self.stored_read += 1;
+            }
             self.note(&message);
             let now = self.now();
             let effects = self.app.receive(message, now);
@@ -1208,7 +1627,7 @@ impl Live {
                     self.looked = Some((asked.elapsed(), models.len(), usage.is_some()));
                 }
             }
-            FromBackend::History { key, result } => {
+            FromBackend::History { key, result, .. } => {
                 if let Some(asked) = self.reading.get(key) {
                     self.read.insert(
                         *key,
@@ -1221,6 +1640,13 @@ impl Live {
             }
             FromBackend::Activity { key, result } if Some(*key) == self.key => {
                 self.activity = Some(result.as_ref().ok().copied().flatten());
+            }
+            FromBackend::Event { open, event } if Some(*open) == self.attached_open() => {
+                match event {
+                    SessionEvent::TurnFinished(_) => self.attached_ends.push(true),
+                    SessionEvent::TurnFailed { .. } => self.attached_ends.push(false),
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -1381,6 +1807,7 @@ impl Live {
                 }
                 Effect::CheckActivity { key, id } => ToBackend::CheckActivity { key, id },
                 Effect::ReadBranch { folder } => ToBackend::ReadBranch { folder },
+                Effect::Prepare { chip, source } => ToBackend::Prepare { chip, source },
                 Effect::Look { folder } => {
                     if folder != self.folder {
                         eprintln!(
@@ -1452,14 +1879,14 @@ impl Live {
         }
     }
 
-    /// Sends `Close` to each of the test's sessions, once, unless its program has ended
-    /// already.
+    /// Sends `Close` to each of the test's sessions, the one sent attachments included, once,
+    /// unless its program has ended already.
     fn send_close(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
-        for key in self.ours() {
+        for key in self.ours().into_iter().chain(self.attached) {
             if let Some(open) = self.app.sessions.get(key).and_then(|entry| entry.open) {
                 self.backend.send(ToBackend::Send {
                     open,
@@ -1524,7 +1951,7 @@ impl Drop for Live {
                 let now = self.now();
                 let _ = self.app.receive(message, now);
             }
-            let ended = self.ours().into_iter().all(|key| {
+            let ended = self.ours().into_iter().chain(self.attached).all(|key| {
                 matches!(
                     self.phase_of(key),
                     Some(Phase::Resting | Phase::Ended { .. }) | None
@@ -1554,6 +1981,52 @@ fn finished_replies(items: &[ItemBody]) -> Vec<&String> {
             _ => None,
         })
         .collect()
+}
+
+/// "yes" or "no".
+fn yes(said: bool) -> &'static str {
+    if said { "yes" } else { "no" }
+}
+
+/// A PNG of [`RED_SIDE`] pixels a side, all red.
+fn red_png() -> ImageData {
+    let image = image::RgbImage::from_pixel(RED_SIDE, RED_SIDE, image::Rgb([255, 0, 0]));
+    ImageData::new(png(&image))
+}
+
+/// A PNG of noise from a fixed seed, [`NOISE_SIZE`] pixels: a little under [`MAX_BYTES`] and
+/// within [`MAX_SIDE`], so the app sends it byte for byte.
+fn noise_png() -> ImageData {
+    let (width, height) = NOISE_SIZE;
+    debug_assert!(width <= MAX_SIDE && height <= MAX_SIDE);
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let bytes: Vec<u8> = (0..width * height * 3)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    let image = image::RgbImage::from_raw(width, height, bytes).expect("as many bytes as pixels");
+    let png = png(&image);
+    if png.len() > MAX_BYTES {
+        eprintln!(
+            "live: the noise image came out {} bytes, over the limit of {MAX_BYTES}: it will be made \
+             smaller",
+            png.len()
+        );
+    }
+    ImageData::new(png)
+}
+
+/// `image` encoded as a PNG.
+fn png(image: &image::RgbImage) -> Vec<u8> {
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("an image made here encodes");
+    png
 }
 
 /// Whether `effects` send a Remote Control command.

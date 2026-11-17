@@ -2,14 +2,16 @@
 //! row of tiles that each hold one session's conversation area.
 
 use mr_core::{Screen, SessionKey};
-use rune::{Cx, El, KeyEvent, Tx, col, el};
+use rune::{ClipboardContent, Cx, El, KeyEvent, Tx, col, el};
 use rune_kit::Kit;
 
 use crate::glue::{self, Ui};
 use crate::theme;
 
+mod chips;
 mod conversation;
 mod drag;
+mod field;
 mod folder;
 mod input;
 mod items;
@@ -22,6 +24,7 @@ mod signin;
 mod tiles;
 mod width;
 
+pub(crate) use chips::chip_key;
 pub(crate) use conversation::conversation_key;
 pub(crate) use items::row_key;
 #[cfg(test)]
@@ -51,21 +54,50 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
     };
     // The app's own root, under the kit's: what a screenshot's tree is checked for.
     let base = el().key("mr-root").child(base.w_full().h_full());
-    rune_kit::root(base, layer)
+    rune_kit::root(base, layer).on_paste_content(paste)
+}
+
+/// A paste no text field took, heard when none has the keyboard: on the main screen files, else
+/// an image also beside text, go to the focused tile's session as chips
+/// ([`input::pasted_outside`]). Text does nothing.
+fn paste(ui: &mut Ui, content: &ClipboardContent, tx: &mut Tx) {
+    if ui.app.screen != Screen::Main {
+        return;
+    }
+    if let Some(key) = ui.app.focused() {
+        input::pasted_outside(ui, tx, key, content);
+    }
 }
 
 /// The conversation area for one session: its conversation, and below it its input box, whose
 /// pickers put their lists in `layer`, both in the column whose width the user drags. While the
 /// app asks before joining this session where another app may have it open, the card that asks
 /// sits between the two.
+///
+/// Nothing of the area is drawn outside it: not over the tile's header, not over a tile below.
+/// In a tile too short for all of it, the conversation gives up its height first, then:
+/// - Without the card, the box keeps to the bottom of the tile and what does not fit is cut off
+///   at the top of the area: the box's top padding, then the queued message, then the chips,
+///   and its text and bottom row last. The text grows only as far as the tile allows
+///   (`input::lines_for`), so they stay whole, but for a line under the box that wraps: it is
+///   counted as one line, and a long one can push the cut into the text.
+/// - With the card, the session takes no message, so the box is of no use and the card is what
+///   the user needs: the area keeps to its top, right under the header, and what does not fit
+///   is cut off at the bottom, which is the box, from its lines under it upwards. In a tile
+///   narrower than about 420 points the card's buttons wrap, and in a short one they can be cut
+///   too.
 fn pane(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, key: SessionKey, layer: &mut Vec<El>) -> El {
     let width = width::current(ui, cx, key);
-    let content = col()
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
+    let card = resting::elsewhere(ui, key, kit, width);
+    let content = col().w_full().grow(1.0).min_h(0.0).clip_soft(0.0);
+    let content = if card.is_some() {
+        content
+    } else {
+        content.justify_end()
+    };
+    let content = content
         .child(conversation::conversation(ui, kit, key, width))
-        .children(resting::elsewhere(ui, key, kit, width))
+        .children(card)
         .child(input::input(ui, kit, key, layer, width));
     width::column(ui, cx, kit, key, content)
 }

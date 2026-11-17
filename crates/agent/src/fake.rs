@@ -632,6 +632,33 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_history_carries_its_images_shared() {
+        let fake = FakeAgent::new();
+        let id = SessionId("s1".into());
+        let image = crate::command::ImageData::new(vec![1u8, 2, 3]);
+        fake.set_history(
+            &id,
+            StoredHistory {
+                items: vec![HistoryItem::User {
+                    text: "see".into(),
+                    image_count: 1,
+                    files: Vec::new(),
+                    images: vec![Some(image.clone())],
+                }],
+                ..StoredHistory::default()
+            },
+        );
+        let read = fake.read_session(&id, 10).unwrap();
+        let [HistoryItem::User { images, .. }] = read.items.as_slice() else {
+            panic!("not one message of the user's: {:?}", read.items);
+        };
+        let [Some(read)] = images.as_slice() else {
+            panic!("not one image read: {images:?}");
+        };
+        assert_eq!(read.as_bytes().as_ptr(), image.as_bytes().as_ptr());
+    }
+
+    #[test]
     fn a_history_that_cannot_be_read_is_an_error() {
         let fake = FakeAgent::new();
         let id = SessionId("s1".into());

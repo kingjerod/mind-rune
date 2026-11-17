@@ -12,12 +12,12 @@ use mr_agent::{Agent, FakeAgent, RequestId};
 use mr_core::EntryMut;
 use mr_core::{
     App, Backend, DEFAULT_WIDTH, Effect, FromBackend, GroupId, ItemBody, ItemId, Launch, Leaving,
-    Line, Phase, Place, RequestState, SAVED_VERSION, Saved, Screen, Session, SessionKey, Spot,
-    ToBackend, Width,
+    Line, Phase, Place, Prepared, RequestState, SAVED_VERSION, Saved, Screen, Session, SessionKey,
+    Source, Spot, ToBackend, Width,
 };
 use rune::prefs::Prefs;
 use rune::runtime::Waker;
-use rune::{PointerPress, TextEdit, Tx};
+use rune::{Image, ImageCache, PointerPress, TextEdit, Tx};
 use rune_kit::shell::PaneState;
 
 use crate::demo;
@@ -154,6 +154,9 @@ pub struct SessionView {
     /// The folder a message could not wake the session in, because it is no longer there:
     /// said under the input box until the next try.
     pub folder_gone: Option<PathBuf>,
+    /// Why the file picker of the attach button could not be used: said under the input box
+    /// until the picker's next answer.
+    pub attach_error: Option<String>,
 }
 
 impl SessionView {
@@ -169,6 +172,7 @@ impl SessionView {
             first_seen: None,
             generation,
             folder_gone: None,
+            attach_error: None,
         }
     }
 
@@ -246,6 +250,9 @@ pub struct Ui {
     pub side_menu: Option<SideMenu>,
     /// The sidebar row or the tile header being dragged (`view::drag`).
     pub drag: Option<RowDrag>,
+    /// The tile files dragged from another app are held over, which shows its drop veil
+    /// (`view::tiles`). Forgotten when its tile goes or its session takes no message ([`run`]).
+    pub file_drop: Option<SessionKey>,
     /// The row's press that may follow a drag's release is not a click (`view::drag::row`).
     ///
     /// Set at the release of every row's drag that went past the slop, whatever is under the
@@ -277,6 +284,24 @@ pub struct Ui {
     /// Why the folder picker could not be used, or that a folder chosen is gone: shown under the
     /// button until the next try.
     pub folder_error: Option<String>,
+    /// Where the chips' thumbnails and the messages' pictures are made: set by [`setup`], with
+    /// the window's waker. Until then, and in a view test that does not set one, none is made.
+    pub images: Option<ImageCache>,
+    /// The drawn picture of each picture id that has one: a chip's thumbnail by the chip's id,
+    /// which a message sent with the chip keeps, and a stored message's picture by its own id.
+    /// Made as the chip's answer or the picture is taken in ([`take_in`]), dropped once no
+    /// session needs the id ([`tidy_views`]).
+    pub thumbs: HashMap<u64, Image>,
+    /// The ids in `thumbs` whose handle may not have been made when it was put there. A
+    /// picture's width comes from its handle's size, so the poll after one is made draws again
+    /// ([`handles_made`]).
+    pub unready: Vec<u64>,
+    /// The attach button's file picker is open: set at the press that opened it, cleared by its
+    /// answer. A press while it is open does nothing.
+    pub file_picker_open: bool,
+    /// Chips whose answer said they cannot be sent, to be scrolled into view in their row by
+    /// the next [`poll`].
+    pub reveal_chips: Vec<u64>,
 }
 
 impl Ui {
@@ -342,6 +367,7 @@ impl Ui {
             split_press: None,
             side_menu: None,
             drag: None,
+            file_drop: None,
             swallow_row_press: false,
             passed_row: None,
             renaming: None,
@@ -350,6 +376,11 @@ impl Ui {
             folder_side: false,
             folder_offers: Vec::new(),
             folder_error: None,
+            images: None,
+            thumbs: HashMap::new(),
+            unready: Vec::new(),
+            file_picker_open: false,
+            reveal_chips: Vec::new(),
         };
         run(&mut ui, effects);
         (ui, warning)
@@ -394,9 +425,9 @@ pub fn view_mut(ui: &mut Ui, key: SessionKey) -> &mut SessionView {
 }
 
 /// What becomes of the session `place` would take out of its tile: kept while text is typed
-/// in its input box, else forgotten when it is empty. `Side`, `At`, `Above` and `Below` take
-/// none out, but `Side` swaps the focused tile's session when there is no room, so it is read
-/// as `Focused`.
+/// in its input box or it has chips, else forgotten when it is empty. `Side`, `At`, `Above` and
+/// `Below` take none out, but `Side` swaps the focused tile's session when there is no room, so
+/// it is read as `Focused`.
 pub fn leaving(ui: &Ui, place: Place) -> Leaving {
     let out = match place {
         Place::Focused | Place::Side => ui.app.focused(),
@@ -404,11 +435,17 @@ pub fn leaving(ui: &Ui, place: Place) -> Leaving {
         Place::At(_) | Place::Above(_) | Place::Below(_) => None,
     };
     let typed = out.is_some_and(|left| {
-        view_of(ui, left)
-            .draft
-            .text
-            .chars()
-            .any(|c| !c.is_whitespace())
+        let chips = ui
+            .app
+            .sessions
+            .get(left)
+            .is_some_and(|entry| !entry.session.chips.is_empty());
+        chips
+            || view_of(ui, left)
+                .draft
+                .text
+                .chars()
+                .any(|c| !c.is_whitespace())
     });
     if typed {
         Leaving::Keep
@@ -460,6 +497,20 @@ pub fn focus_tile(ui: &mut Ui, key: SessionKey, typing: bool) {
         take_keyboard(ui, key);
     }
     let effects = ui.app.focus_tile(key);
+    run(ui, effects);
+}
+
+/// Attaches `sources` to `key`'s session and runs what that asks for. The last chip added is
+/// scrolled into view in its row, which never wraps.
+pub fn attach(ui: &mut Ui, tx: &mut Tx, key: SessionKey, sources: Vec<Source>) {
+    let effects = ui.app.attach(key, sources);
+    let added = effects.iter().rev().find_map(|effect| match effect {
+        Effect::Prepare { chip, .. } => Some(*chip),
+        _ => None,
+    });
+    if let Some(chip) = added {
+        tx.scroll_into_view(view::chip_key(chip));
+    }
     run(ui, effects);
 }
 
@@ -643,9 +694,12 @@ fn system_unix() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// `AppSpec::setup`: starts the backend with the window's waker and carries out what was waiting.
-/// A second call does nothing, so a scene that started its own backend keeps it.
+/// `AppSpec::setup`: makes the thumbnails' cache and starts the backend with the window's waker,
+/// and carries out what was waiting. A second call makes the cache anew, with the waker it is
+/// given, and leaves the backend alone, so a scene that started its own backend keeps it and
+/// the window's waker still hears the thumbnails made after.
 pub fn setup(ui: &mut Ui, waker: Waker) {
+    ui.images = Some(ImageCache::new(waker.clone()));
     if ui.backend.is_some() {
         return;
     }
@@ -684,6 +738,10 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
         now
     };
     changed |= take_in(ui, stamp);
+    changed |= handles_made(ui);
+    for chip in ui.reveal_chips.drain(..) {
+        tx.scroll_into_view(view::chip_key(chip));
+    }
     if ui.was_tiled != tiled {
         tx.instant();
         changed = true;
@@ -741,6 +799,7 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
             Effect::Look { folder } => ToBackend::Look { folder },
             Effect::ReadBranch { .. } if !ui.reads_branches => continue,
             Effect::ReadBranch { folder } => ToBackend::ReadBranch { folder },
+            Effect::Prepare { chip, source } => ToBackend::Prepare { chip, source },
         };
         match &ui.backend {
             Some(backend) => backend.send(message),
@@ -751,6 +810,12 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
     tidy_views(ui);
     tidy_sidebar(ui);
     tidy_handles(ui);
+    if ui
+        .file_drop
+        .is_some_and(|key| !ui.app.tiles.contains(key) || !ui.app.takes_message(key))
+    {
+        ui.file_drop = None;
+    }
     if let Some(typing) = typing_in(ui)
         && ui.app.focused() != Some(typing)
     {
@@ -841,14 +906,26 @@ fn tidy_sidebar(ui: &mut Ui) {
 ///   disabled, with no field for the draft.
 /// - The drafts of a request no longer waiting in its own session are dropped.
 /// - A picker list open while its picker cannot be used is shut.
+/// - The drawn picture of an id that no session needs any more (`Session::picture_ids`: its
+///   chips', its queued message's, its conversation's) is dropped, and so is one for an id no
+///   session ever held.
 fn tidy_views(ui: &mut Ui) {
     let Ui {
         app,
         views,
         was_tiled,
+        thumbs,
         ..
     } = ui;
     views.retain(|key, _| app.sessions.get(*key).is_some());
+    if !thumbs.is_empty() {
+        let held: HashSet<u64> = app
+            .sessions
+            .iter()
+            .flat_map(|entry| entry.session.picture_ids())
+            .collect();
+        thumbs.retain(|id, _| held.contains(id));
+    }
     let tiled: Vec<SessionKey> = app.tiles.keys();
     if tiled != *was_tiled {
         for left in was_tiled.iter().filter(|key| !tiled.contains(key)) {
@@ -1007,10 +1084,66 @@ pub(crate) fn take_in(ui: &mut Ui, now: f64) -> bool {
     let messages: Vec<FromBackend> = std::iter::from_fn(|| backend.try_recv()).collect();
     let took = !messages.is_empty();
     for message in messages {
-        let effects = ui.app.receive(message, now);
-        run(ui, effects);
+        take(ui, message, now);
     }
     took
+}
+
+/// Takes one message from the backend in, stamped with `now`, and carries out its effects.
+fn take(ui: &mut Ui, message: FromBackend, now: f64) {
+    thumb(ui, &message);
+    if let FromBackend::Prepared {
+        chip,
+        result: Err(_),
+    } = &message
+    {
+        ui.reveal_chips.push(*chip);
+    }
+    let effects = ui.app.receive(message, now);
+    run(ui, effects);
+}
+
+/// Whether a handle in `thumbs` was made since the last call: the rows that draw it are built
+/// again (`view::items::version` reads its size). The ids whose handle is gone are forgotten.
+fn handles_made(ui: &mut Ui) -> bool {
+    let Ui {
+        unready, thumbs, ..
+    } = ui;
+    let mut made = false;
+    unready.retain(|id| match thumbs.get(id) {
+        Some(image) if image.is_ready() => {
+            made = true;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    });
+    made
+}
+
+/// Makes the drawn picture that `message` brings, when it brings one and there is a cache to
+/// make it in: a chip's thumbnail, kept by the chip's id, or a stored message's picture, kept
+/// by its own. A view cannot make one: it only reads `Ui`. One for an id no session holds goes
+/// in the same [`run`] ([`tidy_views`]).
+fn thumb(ui: &mut Ui, message: &FromBackend) {
+    let (id, thumb) = match message {
+        FromBackend::Prepared {
+            chip,
+            result: Ok(Prepared {
+                thumb: Some(thumb), ..
+            }),
+        } => (*chip, thumb),
+        FromBackend::Picture {
+            id,
+            thumb: Some(thumb),
+        } => (*id, thumb),
+        _ => return,
+    };
+    if let Some(images) = &ui.images {
+        let image = images.rgba(thumb.width, thumb.height, thumb.rgba.clone());
+        ui.thumbs.insert(id, image);
+        ui.unready.push(id);
+    }
 }
 
 #[cfg(test)]
@@ -1022,7 +1155,7 @@ mod tests {
         SessionCommand, SessionEvent, SessionHandle, SessionId, SessionInfo, StartSpec,
         StoredHistory, StoredSession, ToolCallId, ToolDetail, ToolOutcome,
     };
-    use mr_core::{HistoryState, ItemBody, Phase, Screen, ThinkingTime, Width};
+    use mr_core::{HistoryState, ItemBody, Phase, Screen, ThinkingTime, Thumb, Width};
     use rune::prefs::Prefs;
     use rune::{Key, Mods, Runtime};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1521,6 +1654,8 @@ mod tests {
             items: vec![HistoryItem::User {
                 text: "Earlier".into(),
                 image_count: 0,
+                files: Vec::new(),
+                images: Vec::new(),
             }],
             ..StoredHistory::default()
         };
@@ -1528,6 +1663,7 @@ mod tests {
             FromBackend::History {
                 key: a,
                 result: Ok(history),
+                pictures: Vec::new(),
             },
             0.0,
         );
@@ -1591,6 +1727,205 @@ mod tests {
         assert_eq!(
             Prefs::at(&path).get::<Width>("conversation_width"),
             Some(Width::Unlimited)
+        );
+    }
+
+    /// A stored session whose history is `items`, listed and not shown.
+    fn stored_with(rt: &mut Runtime<Ui>, id: &str, items: Vec<HistoryItem>) -> SessionKey {
+        let id = SessionId(id.into());
+        let history = StoredHistory {
+            items,
+            ..StoredHistory::default()
+        };
+        rt.state.fake.as_ref().unwrap().set_history(&id, history);
+        let stored = StoredSession {
+            id,
+            folder: "/home/alex/notes".into(),
+            title: "Notes".into(),
+            last_active_unix: demo::NOW_UNIX - demo::DAY,
+        };
+        let key = rt
+            .state
+            .app
+            .sessions
+            .add(mr_core::Session::resting(&stored), stored.last_active_unix);
+        run(&mut rt.state, Vec::new());
+        key
+    }
+
+    /// A message of the user's with one stored image of `width` by `height` pixels, and
+    /// Claude's answer.
+    fn with_image(text: &str, width: u32, height: u32) -> Vec<HistoryItem> {
+        let png = mr_agent::ImageData::new(testkit::png(width, height));
+        vec![
+            HistoryItem::User {
+                text: text.into(),
+                image_count: 1,
+                files: Vec::new(),
+                images: vec![Some(png)],
+            },
+            HistoryItem::AssistantText("Seen.".into()),
+        ]
+    }
+
+    /// The picture ids of `key`'s conversation.
+    fn pictures(rt: &Runtime<Ui>, key: SessionKey) -> Vec<u64> {
+        let session = &rt.state.app.sessions.get(key).unwrap().session;
+        session.conversation.pictures().collect()
+    }
+
+    /// Waits for the backend's threads, so the frames after take in every answer they gave.
+    fn settle_backend(rt: &mut Runtime<Ui>) {
+        rt.state.backend.as_ref().expect("the backend").flush();
+        testkit::step(rt);
+    }
+
+    /// Waits for every picture of `key`'s conversation to come and its handle to be made, and
+    /// runs frames.
+    fn pictures_come(rt: &mut Runtime<Ui>, key: SessionKey) {
+        settle_backend(rt);
+        for id in pictures(rt, key) {
+            let handle = rt.state.thumbs.get(&id).expect("its handle").clone();
+            handle.wait().expect("a picture made in the test is made");
+        }
+        testkit::step(rt);
+    }
+
+    fn cache() -> Option<ImageCache> {
+        Some(ImageCache::new(Arc::new(|| {})))
+    }
+
+    #[test]
+    fn a_stored_pictures_answer_makes_its_handle() {
+        let mut rt = testkit::window("resting");
+        rt.state.images = cache();
+        let key = stored_with(&mut rt, "stored-wide", with_image("Look", 6, 3));
+        testkit::show(&mut rt, key);
+        let ids = pictures(&rt, key);
+        assert_eq!(ids.len(), 1);
+        assert_ne!(ids[0] & 1 << 63, 0, "a stored picture's id");
+        pictures_come(&mut rt, key);
+        assert_eq!(rt.state.thumbs[&ids[0]].size(), Some([6, 3]));
+        let shown = format!("mr-user-picture-{}", ids[0]);
+        let shown = testkit::element(&rt, &testkit::tile(key, &shown)).expect("drawn");
+        assert_eq!(&shown.rect[2..], &[240.0, 120.0]);
+    }
+
+    #[test]
+    fn a_handle_made_after_it_came_draws_once_more() {
+        let mut rt = testkit::window("resting");
+        rt.state.images = cache();
+        let key = stored_with(&mut rt, "stored-late", with_image("Look", 6, 3));
+        testkit::show(&mut rt, key);
+        pictures_come(&mut rt, key);
+        let id = pictures(&rt, key)[0];
+        // The same picture's answer again: its new handle is made on the cache's threads.
+        let thumb = Thumb {
+            width: 2,
+            height: 1,
+            rgba: vec![90u8; 8].into(),
+        };
+        let mut redraw = true;
+        rt.update(|ui, tx| redraw = poll(ui, 1.0, tx));
+        assert!(!redraw, "nothing new");
+        take(
+            &mut rt.state,
+            FromBackend::Picture {
+                id,
+                thumb: Some(thumb),
+            },
+            0.0,
+        );
+        rt.state.thumbs[&id].wait().expect("made");
+        rt.update(|ui, tx| redraw = poll(ui, 1.0, tx));
+        assert!(redraw, "a handle made since the last poll draws again");
+        rt.update(|ui, tx| redraw = poll(ui, 1.0, tx));
+        assert!(!redraw, "once");
+    }
+
+    #[test]
+    fn a_picture_for_nobody_is_not_kept() {
+        let mut rt = testkit::window("empty");
+        rt.state.images = cache();
+        let thumb = Thumb {
+            width: 2,
+            height: 1,
+            rgba: vec![255u8; 8].into(),
+        };
+        let nobody = 1 << 63 | 4_242;
+        take(
+            &mut rt.state,
+            FromBackend::Picture {
+                id: nobody,
+                thumb: Some(thumb),
+            },
+            0.0,
+        );
+        assert!(rt.state.thumbs.is_empty());
+        let never = FromBackend::Picture {
+            id: nobody + 1,
+            thumb: None,
+        };
+        take(&mut rt.state, never, 0.0);
+        assert!(rt.state.thumbs.is_empty());
+    }
+
+    #[test]
+    fn a_sent_images_handle_outlives_its_chip() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        rt.state.images = cache();
+        testkit::paste_image(&mut rt, testkit::tiny_png());
+        let chips = |rt: &Runtime<Ui>| {
+            rt.state
+                .app
+                .sessions
+                .get(key)
+                .unwrap()
+                .session
+                .chips
+                .clone()
+        };
+        settle_backend(&mut rt);
+        assert!(chips(&rt)[0].state != mr_core::ChipState::Reading);
+        let chip = chips(&rt)[0].id;
+        assert!(rt.state.thumbs.contains_key(&chip));
+        testkit::type_text(&mut rt, "Look");
+        testkit::press(&mut rt, Key::Enter);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        assert!(chips(&rt).is_empty(), "the chip went with the message");
+        assert_eq!(pictures(&rt, key), [chip]);
+        let handle = rt
+            .state
+            .thumbs
+            .get(&chip)
+            .expect("held: the conversation holds its id")
+            .clone();
+        handle.wait().expect("made");
+        testkit::step(&mut rt);
+        let shown = format!("mr-user-picture-{chip}");
+        assert!(testkit::element(&rt, &testkit::tile(key, &shown)).is_some());
+    }
+
+    #[test]
+    fn pictures_go_with_their_session() {
+        let mut rt = testkit::window("resting");
+        rt.state.images = cache();
+        let one = stored_with(&mut rt, "stored-one", with_image("One", 4, 3));
+        testkit::show(&mut rt, one);
+        pictures_come(&mut rt, one);
+        let two = stored_with(&mut rt, "stored-two", with_image("Two", 3, 4));
+        testkit::show(&mut rt, two);
+        pictures_come(&mut rt, two);
+        let (a, b) = (pictures(&rt, one)[0], pictures(&rt, two)[0]);
+        assert!(rt.state.thumbs.contains_key(&a) && rt.state.thumbs.contains_key(&b));
+        rt.state.app.sessions.remove(two);
+        run(&mut rt.state, Vec::new());
+        assert!(!rt.state.thumbs.contains_key(&b), "gone with its session");
+        assert!(
+            rt.state.thumbs.contains_key(&a),
+            "the other session's stays"
         );
     }
 }

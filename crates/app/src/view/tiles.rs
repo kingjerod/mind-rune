@@ -2,9 +2,9 @@
 //! in columns side by side, each column as wide as its share of the row and holding one tile or
 //! two, one above the other. Each tile holds a header over that session's pane.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use mr_core::{App, Entry, Laid, Mark, Remote, SessionKey, Spot, TileLevel};
+use mr_core::{App, Entry, Laid, Mark, Remote, SessionKey, Source, Spot, TileLevel};
 use rune::{
     Color, Cursor, Cx, Drag, El, Key, KeyEvent, Phase, Spring, Transition, Tx, col, el,
     row as row_el, text,
@@ -31,11 +31,16 @@ const RENAME: &str = "mr-tile-rename";
 /// The key of the outline drawn over a tile while it has one.
 const OUTLINE: &str = "mr-tile-outline";
 
+/// The keys of the veil over a tile's pane while files dragged from another app are held over
+/// the tile, and of its words.
+const DROP_VEIL: &str = "mr-drop-files";
+const DROP_VEIL_TEXT: &str = "mr-drop-files-text";
+
 /// How thick a tile's outline is.
 const OUTLINE_WIDTH: f32 = 2.0;
 
 /// The height of a tile's header.
-const HEADER_HEIGHT: f32 = 36.0;
+pub(super) const HEADER_HEIGHT: f32 = 36.0;
 
 /// The widest the folder's chip grows before its name is cut.
 const CHIP_MAX_WIDTH: f32 = 160.0;
@@ -137,6 +142,11 @@ pub fn row(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, layer: &mut Vec<El>) -> 
 /// The tile `laid` places, without its place in the row: its header over its session's pane,
 /// under its outline when it has one, and its lines (see [`row`]), `last` being the index of
 /// the row's last column.
+///
+/// While its session takes a message, the tile takes files dropped from another app
+/// ([`drop_files`]), and shows its veil while they are held over it ([`veil`]). Otherwise the
+/// drag passes it by. Whether it takes them is read as the view is built: Rune asks during the
+/// drag, with no state to read.
 fn tile(
     ui: &Ui,
     cx: &mut Cx<Ui>,
@@ -152,6 +162,7 @@ fn tile(
     } else {
         0.0
     };
+    let takes = ui.app.takes_message(key);
     col()
         .key(tile_key(key))
         .min_w(0.0)
@@ -162,9 +173,54 @@ fn tile(
         // After the press handler, which would make it a button.
         .role("group")
         .focusable(false)
+        .on_drop_files(drop_files(key))
+        .accepts_files(move |_| takes)
+        .on_drop_hover(move |ui: &mut Ui, over: bool, _: &mut Tx| {
+            if over {
+                ui.file_drop = Some(key);
+            } else if ui.file_drop == Some(key) {
+                ui.file_drop = None;
+            }
+        })
         .child(header(ui, kit, key))
         .child(super::pane(ui, cx, kit, key, layer))
+        .children((takes && ui.file_drop == Some(key)).then(|| veil(kit)))
         .children(outline(ui, key, kit).map(ring))
+}
+
+/// What files dropped on `key`'s tile from another app do: each becomes a chip of its session,
+/// and the tile takes the focus, with the keyboard in its input box. A session that stopped
+/// taking messages since its tile was drawn takes nothing, and the focus stays where it is.
+fn drop_files(key: SessionKey) -> impl Fn(&mut Ui, &[PathBuf], &mut Tx) + 'static {
+    move |ui: &mut Ui, paths: &[PathBuf], tx: &mut Tx| {
+        if !ui.app.takes_message(key) {
+            return;
+        }
+        tx.instant();
+        let sources = paths.iter().cloned().map(Source::Path).collect();
+        glue::attach(ui, tx, key, sources);
+        glue::focus_tile(ui, key, true);
+    }
+}
+
+/// The veil over a tile's pane under its header while files are held over the tile: the accent
+/// faintly, with "Drop to attach" in its middle. It takes no room and no input, and comes and
+/// goes at once.
+fn veil(kit: &Kit) -> El {
+    col()
+        .key(DROP_VEIL)
+        .pin(Some(0.0), Some(HEADER_HEIGHT), Some(0.0), Some(0.0))
+        .center()
+        .fill(kit.c.bg_accent.alpha(0.12))
+        .transition(Transition::none())
+        .motion(Spring::NONE)
+        .inert()
+        .child(
+            text("Drop to attach")
+                .key(DROP_VEIL_TEXT)
+                .font(kit.ty.ui_medium)
+                .color(kit.c.text_base),
+        )
 }
 
 /// What a press on a tile's plain content or its header does: the tile takes the focus, and its
@@ -328,7 +384,7 @@ fn tile_width(ui: &Ui, key: SessionKey) -> Option<f32> {
 }
 
 /// `key`'s tile's height in the row as last laid out.
-fn tile_height(ui: &Ui, key: SessionKey) -> Option<f32> {
+pub(super) fn tile_height(ui: &Ui, key: SessionKey) -> Option<f32> {
     let size = [ui.app.row_width()?, ui.app.row_height()?];
     let laid = ui.app.tiles.rects(size);
     laid.iter()
@@ -693,13 +749,16 @@ fn laid_out(ui: &mut Ui, rect: [f32; 4]) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use mr_agent::{
         RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId,
         StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UserRequest,
         UserRequestKind,
     };
     use mr_core::{
-        ItemBody, ItemId, Mark, SAVED_VERSION, Saved, SavedTile, SessionKey, Spot, TileLevel, Width,
+        ItemBody, ItemId, Mark, SAVED_VERSION, Saved, SavedTile, SessionKey, Source, Spot,
+        TileLevel, Width,
     };
     use rune::prefs::Prefs;
     use rune::{Color, Key, KeyEvent, Mods, Runtime};
@@ -3861,5 +3920,235 @@ mod tests {
         assert_eq!(dragged, Some((a, DragFrom::Header)));
         testkit::release(&mut rt);
         assert_eq!(tile_keys(&rt), vec![b, a], "moved");
+    }
+
+    /// How many chips `key`'s session holds.
+    fn chips(rt: &Runtime<Ui>, key: SessionKey) -> usize {
+        rt.state.app.sessions.get(key).unwrap().session.chips.len()
+    }
+
+    /// The centre of `key`'s tile, which is in its conversation.
+    fn tile_middle(rt: &Runtime<Ui>, key: SessionKey) -> (f32, f32) {
+        let [x, y, w, h] = tile_rect(rt, key);
+        (x + w / 2.0, y + h / 2.0)
+    }
+
+    /// The drop veil drawn in `key`'s tile, if any.
+    fn veil(rt: &Runtime<Ui>, key: SessionKey) -> Option<rune::ElementInfo> {
+        testkit::element(rt, &tile(key, "mr-drop-files"))
+    }
+
+    /// No mark of a dragged row or header is drawn.
+    fn no_drag_marks(rt: &Runtime<Ui>) {
+        for mark in ["mr-drag-chip", "mr-drop-edge", "mr-drop-half"] {
+            assert!(!testkit::drawn(rt, mark), "{mark} is not drawn");
+        }
+    }
+
+    #[test]
+    fn files_held_over_a_tile_show_the_veil_and_leaving_takes_it_away() {
+        let (mut rt, a, b) = two_tiles();
+        let outlines = (outlined(&rt, a), outlined(&rt, b));
+        let paths = vec![PathBuf::from("/home/alex/a/notes.md")];
+        let at = tile_middle(&rt, a);
+        rt.drag_files(paths, Some(at));
+        testkit::step(&mut rt);
+        assert_eq!(rt.drop_hovered(), Some(tile_key(a)), "a is the target");
+        assert_eq!(rt.state.file_drop, Some(a));
+        let shown = veil(&rt, a).expect("a shows the veil");
+        assert!(veil(&rt, b).is_none(), "b shows none");
+        let [x, y, w, h] = tile_rect(&rt, a);
+        assert_eq!(
+            shown.rect,
+            [x, y + super::HEADER_HEIGHT, w, h - super::HEADER_HEIGHT],
+            "over the pane under the header"
+        );
+        assert!(shown.inert, "it takes no presses");
+        let accent = theme::kit(true).c.bg_accent;
+        assert_eq!(shown.fill, accent.alpha(0.12));
+        let words = testkit::element(&rt, &tile(a, "mr-drop-files/mr-drop-files-text"))
+            .expect("the veil has its words");
+        assert_eq!(words.text.as_deref(), Some("Drop to attach"));
+        let [wx, wy, ww, wh] = words.rect;
+        let middle = (wx + ww / 2.0, wy + wh / 2.0);
+        let centre = (
+            x + w / 2.0,
+            y + super::HEADER_HEIGHT + (h - super::HEADER_HEIGHT) / 2.0,
+        );
+        assert!(
+            (middle.0 - centre.0).abs() < 1.0 && (middle.1 - centre.1).abs() < 1.0,
+            "in the middle: {middle:?}, {centre:?}"
+        );
+        assert_eq!(
+            (outlined(&rt, a), outlined(&rt, b)),
+            outlines,
+            "no outline changes"
+        );
+        no_drag_marks(&rt);
+        // Over b, the veil moves to b.
+        let over_b = tile_middle(&rt, b);
+        rt.drag_files_to(Some(over_b));
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.file_drop, Some(b));
+        assert!(veil(&rt, a).is_none() && veil(&rt, b).is_some());
+        // Leaving the window takes it away.
+        rt.drag_files_leave();
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.file_drop, None);
+        assert!(veil(&rt, a).is_none() && veil(&rt, b).is_none());
+        assert_eq!(chips(&rt, a) + chips(&rt, b), 0, "nothing was dropped");
+    }
+
+    #[test]
+    fn a_tile_that_goes_takes_its_veil() {
+        let (mut rt, a, b) = two_tiles();
+        let at = tile_middle(&rt, a);
+        rt.drag_files(vec![PathBuf::from("/home/alex/a/notes.md")], Some(at));
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.file_drop, Some(a));
+        rt.update(|ui, tx| glue::close_tile(ui, tx, a));
+        testkit::step(&mut rt);
+        assert_eq!(tile_keys(&rt), vec![b]);
+        assert_eq!(rt.state.file_drop, None);
+        assert!(
+            veil(&rt, b).is_none(),
+            "the tile that took its room shows none"
+        );
+    }
+
+    #[test]
+    fn dropped_files_become_chips_of_the_tile_under_the_pointer() {
+        let (mut rt, a, b) = two_tiles();
+        assert_eq!(testkit::focused(&rt), Some(b));
+        let folder = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = ["notes.md", "plan.txt"]
+            .iter()
+            .map(|name| folder.path().join(name))
+            .collect();
+        for path in &paths {
+            std::fs::write(path, "made by the test").unwrap();
+        }
+        let at = tile_middle(&rt, a);
+        rt.drag_files(paths.clone(), Some(at));
+        testkit::step(&mut rt);
+        assert!(veil(&rt, a).is_some());
+        rt.drop_files(paths.clone(), Some(at));
+        testkit::step(&mut rt);
+        assert_eq!(chips(&rt, a), 2, "a has the chips");
+        assert_eq!(chips(&rt, b), 0, "b has none");
+        let session = &rt.state.app.sessions.get(a).unwrap().session;
+        let sources: Vec<Source> = session.chips.iter().map(|c| c.source.clone()).collect();
+        assert_eq!(
+            sources,
+            paths.iter().cloned().map(Source::Path).collect::<Vec<_>>()
+        );
+        assert_eq!(testkit::focused(&rt), Some(a), "a has the focus");
+        assert!(box_focused(&rt, a), "and its box the keyboard");
+        assert_eq!(rt.state.file_drop, None);
+        assert!(veil(&rt, a).is_none(), "the veil goes with the drop");
+        // A drop on the sidebar does nothing.
+        let (x, y) = testkit::find(&rt, &testkit::row_key(b)).unwrap();
+        let elsewhere = vec![PathBuf::from("/home/alex/b/elsewhere.md")];
+        rt.drop_files(elsewhere, Some((x, y)));
+        testkit::step(&mut rt);
+        assert_eq!((chips(&rt, a), chips(&rt, b)), (2, 0));
+        assert_eq!(testkit::focused(&rt), Some(a));
+    }
+
+    #[test]
+    fn a_drop_on_a_session_that_stopped_taking_messages_moves_no_focus() {
+        let (mut rt, a, b) = two_tiles();
+        assert_eq!(testkit::focused(&rt), Some(b));
+        let paths = vec![PathBuf::from("/home/alex/a/notes.md")];
+        let at = tile_middle(&rt, a);
+        rt.drag_files(paths.clone(), Some(at));
+        testkit::step(&mut rt);
+        assert!(veil(&rt, a).is_some(), "a took the drag");
+        // Between the frame that drew a's tile and the drop, a stops taking messages: its check
+        // in the store begins. The tile drawn still accepts the files.
+        rt.state.app.sessions.get_mut(a).unwrap().checking = true;
+        rt.drop_files(paths, Some(at));
+        testkit::step(&mut rt);
+        assert_eq!(chips(&rt, a), 0);
+        assert_eq!(testkit::focused(&rt), Some(b), "the focus stays");
+        assert!(box_focused(&rt, b), "and the keyboard with it");
+        assert_eq!(rt.state.file_drop, None);
+        assert!(veil(&rt, a).is_none(), "the veil goes with the drop");
+    }
+
+    #[test]
+    fn an_ended_sessions_tile_takes_no_files() {
+        let (mut rt, a, b) = two_tiles();
+        let ended = SessionEvent::Exited {
+            clean: false,
+            detail: "The program stopped".into(),
+        };
+        testkit::emit_to(&mut rt, a, ended);
+        let paths = vec![PathBuf::from("/home/alex/a/notes.md")];
+        let at = tile_middle(&rt, a);
+        rt.drag_files(paths.clone(), Some(at));
+        testkit::step(&mut rt);
+        assert_eq!(rt.drop_hovered(), None, "the drag passes it by");
+        assert_eq!(rt.state.file_drop, None);
+        assert!(veil(&rt, a).is_none());
+        rt.drop_files(paths, Some(at));
+        testkit::step(&mut rt);
+        assert_eq!((chips(&rt, a), chips(&rt, b)), (0, 0));
+        assert_eq!(testkit::focused(&rt), Some(b), "the focus stays");
+    }
+
+    #[test]
+    fn a_dragged_row_shows_no_veil() {
+        let (mut rt, a, b) = two_tiles();
+        let over_b = tile_middle(&rt, b);
+        testkit::hold_row(&mut rt, a, over_b);
+        assert!(rt.state.drag.is_some(), "a row is dragged");
+        assert_eq!(rt.state.file_drop, None);
+        assert!(veil(&rt, a).is_none() && veil(&rt, b).is_none());
+        testkit::press(&mut rt, Key::Escape);
+        testkit::release(&mut rt);
+        // Nor does a dragged header.
+        let (x, y) = testkit::find(&rt, &tile(a, "mr-tile-title")).unwrap();
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        testkit::step(&mut rt);
+        testkit::move_held(&mut rt, over_b);
+        let dragged = rt.state.drag.as_ref().map(|drag| (drag.key, drag.from));
+        assert_eq!(dragged, Some((a, DragFrom::Header)));
+        assert_eq!(rt.state.file_drop, None);
+        assert!(veil(&rt, a).is_none() && veil(&rt, b).is_none());
+        testkit::press(&mut rt, Key::Escape);
+        testkit::release(&mut rt);
+        assert_eq!(tile_keys(&rt), vec![a, b], "nothing moved");
+    }
+
+    #[test]
+    fn a_paste_with_no_box_focused_goes_to_the_focused_tile() {
+        let (mut rt, a, b) = two_tiles();
+        rt.update(|ui, _| {
+            for key in [a, b] {
+                glue::view_mut(ui, key).draft.focused = false;
+            }
+        });
+        rt.invalidate();
+        testkit::step(&mut rt);
+        assert!(
+            !box_focused(&rt, a) && !box_focused(&rt, b),
+            "no box has the keyboard"
+        );
+        assert_eq!(testkit::focused(&rt), Some(b));
+        testkit::paste_image(&mut rt, testkit::tiny_png());
+        testkit::step(&mut rt);
+        assert_eq!((chips(&rt, a), chips(&rt, b)), (0, 1), "the image is b's");
+        testkit::paste_files(&mut rt, &[PathBuf::from("/home/alex/b/notes.md")]);
+        testkit::step(&mut rt);
+        assert_eq!((chips(&rt, a), chips(&rt, b)), (0, 2), "the file is b's");
+        // Text pasted with no box focused does nothing.
+        rt.paste("some words");
+        testkit::step(&mut rt);
+        assert_eq!((chips(&rt, a), chips(&rt, b)), (0, 2));
+        for key in [a, b] {
+            assert_eq!(glue::view_of(&rt.state, key).draft.text, "");
+        }
     }
 }

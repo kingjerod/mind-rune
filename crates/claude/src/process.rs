@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -33,7 +34,8 @@ pub struct ExitInfo {
 
 /// A running child. Dropping it kills the child.
 pub struct ClaudeProcess {
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Lines for the thread that writes the child's input; `None` once the input was closed.
+    input: Mutex<Option<Sender<Vec<u8>>>>,
     child: Arc<Mutex<Child>>,
     closed: Arc<AtomicBool>,
 }
@@ -64,6 +66,9 @@ impl ClaudeProcess {
         let child = Arc::new(Mutex::new(child));
         let closed = Arc::new(AtomicBool::new(false));
 
+        let (input, queued) = channel();
+        thread::spawn(move || write_lines(stdin, queued));
+
         let stderr_thread = thread::spawn(move || read_tail(stderr));
         let watcher_child = Arc::clone(&child);
         let watcher_closed = Arc::clone(&closed);
@@ -79,35 +84,32 @@ impl ClaudeProcess {
         });
 
         Ok(ClaudeProcess {
-            stdin: Mutex::new(Some(stdin)),
+            input: Mutex::new(Some(input)),
             child,
             closed,
         })
     }
 
-    /// Writes `line` and a newline to the child's stdin and flushes. Returns
-    /// [`AgentError::Closed`] once the child has exited or input was closed.
+    /// Queues `line` and a newline for the child's stdin and returns without waiting for the
+    /// write. Lines are written in the order they were queued. Returns [`AgentError::Closed`]
+    /// once the child has exited, the input was closed or a write failed.
     pub fn write_line(&self, line: &str) -> Result<(), AgentError> {
-        let mut guard = lock(&self.stdin);
         if self.closed.load(Ordering::SeqCst) {
             return Err(AgentError::Closed);
         }
-        let stdin = guard.as_mut().ok_or(AgentError::Closed)?;
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
         bytes.push(b'\n');
-        stdin
-            .write_all(&bytes)
-            .and_then(|()| stdin.flush())
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::BrokenPipe => AgentError::Closed,
-                _ => AgentError::Io(e.to_string()),
-            })
+        let input = lock(&self.input);
+        let input = input.as_ref().ok_or(AgentError::Closed)?;
+        // The writer drops its end when a write fails, so this fails from then on.
+        input.send(bytes).map_err(|_| AgentError::Closed)
     }
 
-    /// Closes the child's stdin, which ends a child waiting for input.
+    /// Closes the child's stdin once the lines queued before are written, which ends a child
+    /// waiting for input.
     pub fn close_input(&self) {
-        lock(&self.stdin).take();
+        lock(&self.input).take();
     }
 
     /// Kills the child. The exit is still reported through `on_exit`.
@@ -143,6 +145,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Writes and flushes each queued line in turn. It stops when the input was closed and every
+/// line queued before is written, or when a write fails (the child is gone, or killed);
+/// returning drops the child's stdin.
+fn write_lines(mut stdin: ChildStdin, lines: Receiver<Vec<u8>>) {
+    for line in lines {
+        if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
+            return;
+        }
+    }
 }
 
 /// Delivers each newline-terminated line, and a final unterminated one.

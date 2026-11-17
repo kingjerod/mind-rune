@@ -239,7 +239,8 @@ impl Reader {
         self.send(requests);
     }
 
-    /// Sends the requests the translator asked for, as the session handle sends its own.
+    /// Queues the requests the translator asked for, as the session handle queues its own. The
+    /// reader never waits for a write.
     fn send(&self, requests: Vec<(Tracked, Value)>) {
         if requests.is_empty() {
             return;
@@ -248,7 +249,7 @@ impl Reader {
             return;
         };
         for (tracked, body) in requests {
-            // A request that cannot be written is dropped: the session is ending.
+            // A request that cannot be queued is dropped: the session is ending.
             let _ = request(
                 &self.translator,
                 &self.next_request,
@@ -272,7 +273,7 @@ impl Reader {
         let Some(process) = self.process.get().and_then(Weak::upgrade) else {
             return;
         };
-        // A failed write means the child is going away, which the exit reports.
+        // A refused line means the child is going away, which the exit reports.
         let _ = process.write_line(&unsupported_reply(request_id));
     }
 }
@@ -312,7 +313,7 @@ struct ClaudeSession {
     closing: AtomicBool,
 }
 
-/// Sends a control request under the next id, `rc_1`, `rc_2`, …. What it asks
+/// Queues a control request under the next id, `rc_1`, `rc_2`, …. What it asks
 /// for is tracked first, so the reply cannot arrive before it is expected.
 fn request(
     translator: &Mutex<Translator>,
@@ -369,6 +370,7 @@ impl SessionHandle for ClaudeSession {
     fn send(&self, command: SessionCommand) -> Result<(), AgentError> {
         match command {
             SessionCommand::Send { text, attachments } => {
+                // Only queued: a write that fails later is heard as the session's end.
                 self.process.write_line(&user_message(&text, &attachments))
             }
             SessionCommand::Answer { id, answer } => {

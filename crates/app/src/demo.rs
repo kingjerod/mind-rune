@@ -13,18 +13,19 @@
 use std::sync::Arc;
 
 use mr_agent::{
-    Account, ContextBreakdown, ContextKind, ContextPart, FakeAgent, FakeStep, HistoryItem,
-    LimitWindow, ModelOption, PermissionMode, Question, QuestionOption, RemoteAccess,
-    RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StoredHistory,
+    Account, Attachment, ContextBreakdown, ContextKind, ContextPart, FakeAgent, FakeStep,
+    HistoryItem, ImageData, LimitWindow, ModelOption, PermissionMode, Question, QuestionOption,
+    RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StoredHistory,
     StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest,
     UserRequestKind,
 };
 use mr_core::{
-    Branch, Effect, FromBackend, GroupId, HistoryState, ItemBody, Launch, Leaving, Mark, Phase,
-    Place, Remote, Screen, SessionKey, Spot, ThinkingTime,
+    AttachKind, Branch, Chip, ChipState, Effect, FromBackend, GroupId, HistoryState, ItemBody,
+    Launch, Leaving, Mark, Phase, Place, Prepared, Problem, Remote, Screen, SessionKey, Source,
+    Spot, THUMB_SIDE, ThinkingTime, Thumb,
 };
-use rune::PointerPress;
 use rune::prefs::Prefs;
+use rune::{PointerPress, TextEdit};
 
 use crate::glue::{
     self, DragFrom, DropTarget, MenuTarget, Picker, Renaming, RowDrag, SideMenu, Ui,
@@ -141,6 +142,8 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("panel", panel),
     ("panel-remote", panel_remote),
     ("panel-refused", panel_refused),
+    ("chips", chips),
+    ("chips-problem", chips_problem),
 ];
 
 /// Replaces the state with a fresh demo state.
@@ -840,6 +843,8 @@ fn sessions(ui: &mut Ui) {
                 HistoryItem::User {
                     text: "Which beds get the most sun in spring?".into(),
                     image_count: 0,
+                    files: Vec::new(),
+                    images: Vec::new(),
                 },
                 HistoryItem::AssistantText(
                     "The two beds by the south fence get sun from morning to late afternoon. \
@@ -1002,6 +1007,8 @@ pub(crate) fn parser_history() -> StoredHistory {
             HistoryItem::User {
                 text: PARSER_QUESTION.into(),
                 image_count: 0,
+                files: Vec::new(),
+                images: Vec::new(),
             },
             HistoryItem::Thinking(
                 "It returns as soon as one statement fails, so nothing after it is looked at."
@@ -1025,6 +1032,8 @@ pub(crate) fn parser_history() -> StoredHistory {
             HistoryItem::User {
                 text: "This is what it prints now.".into(),
                 image_count: 1,
+                files: Vec::new(),
+                images: vec![None; 1],
             },
             HistoryItem::AssistantText(
                 "Three errors, each with its line: the parser goes on after each one now.".into(),
@@ -1558,4 +1567,269 @@ fn key_of(ui: &Ui, id: &str) -> SessionKey {
         .find(|entry| entry.session.id.as_ref().is_some_and(|i| i.0 == id))
         .map(|entry| entry.key)
         .unwrap_or_else(|| panic!("no session {id}"))
+}
+
+/// The ids of the chips the scenes put in place: far above those `App::attach` gives, which
+/// count from 1, so a chip attached in the demo window never takes one of theirs.
+const SCENE_CHIPS: u64 = 9_000;
+
+/// The draft of the `chips` scene, two lines.
+const CHIPS_DRAFT: &str =
+    "Does the login form in the screenshot match the notes?\nThe folder has the form's code.";
+
+/// A focused tile in the demo's folder with a draft of two lines and four chips: a screenshot
+/// ready to send, its thumbnail made in code; a file; a folder; and a pasted image still being
+/// read, so the send button is off.
+fn chips(ui: &mut Ui) {
+    empty(ui);
+    let key = ui.app.focused().expect("a session is shown");
+    let pasted = SCENE_CHIPS + 4;
+    put_chips(
+        ui,
+        key,
+        vec![
+            image_chip(
+                SCENE_CHIPS + 1,
+                "/home/alex/project/screenshots/login-form.png",
+            ),
+            path_chip(
+                SCENE_CHIPS + 2,
+                "/home/alex/project/notes/login.md",
+                AttachKind::File,
+            ),
+            path_chip(
+                SCENE_CHIPS + 3,
+                "/home/alex/project/src/login",
+                AttachKind::Folder,
+            ),
+            Chip {
+                id: pasted,
+                name: mr_core::name_of(&pasted_source()),
+                source: pasted_source(),
+                state: ChipState::Reading,
+            },
+        ],
+    );
+    glue::view_mut(ui, key).draft = TextEdit::new(CHIPS_DRAFT);
+    focus_tile(ui, key);
+}
+
+/// The message the right tile of the `chips-problem` scene was sent with its three chips,
+/// Claude's reply, and the title Claude gives the session.
+const SKETCH_MESSAGE: &str = "Does the sketch follow the plan?";
+const SKETCH_REPLY: &str = "Mostly. The whiteboard draws the three shapes the plan lists, but not the spiral that shapes.txt adds.";
+const SKETCH_TITLE: &str = "Checking the sketch against the plan";
+
+/// The draft beside the chip that cannot be sent in the `chips-problem` scene.
+const PANORAMA_DRAFT: &str = "Which path in this photo is the shortest?";
+
+/// Two tiles. The left one, focused, has a draft and one chip, a photo too large to send, so the
+/// send button is off. The right one's last message went with an image and two files, and
+/// Claude has answered it: the message shows the image, its chip's thumbnail made in code, and
+/// names the two files.
+fn chips_problem(ui: &mut Ui) {
+    empty(ui);
+    let asks = ui.app.focused().expect("a session is shown");
+    let effects = ui
+        .app
+        .new_session(SKETCHES.into(), Place::Side, Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    pump_until(ui, "the new session started", |ui| {
+        ui.focused_session().is_some_and(|s| s.phase == Phase::Idle)
+    });
+    let sent = ui.app.focused().expect("the new tile is focused");
+    put_chips(
+        ui,
+        sent,
+        vec![
+            image_chip(SCENE_CHIPS + 1, "/home/alex/sketches/whiteboard.png"),
+            path_chip(
+                SCENE_CHIPS + 2,
+                "/home/alex/sketches/plan.md",
+                AttachKind::File,
+            ),
+            path_chip(
+                SCENE_CHIPS + 3,
+                "/home/alex/sketches/shapes.txt",
+                AttachKind::File,
+            ),
+        ],
+    );
+    fake(ui).reply(vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(0.0, SessionEvent::TextDelta(SKETCH_REPLY.into())),
+        FakeStep::at(0.0, SessionEvent::BlockFinished),
+        FakeStep::at(0.0, finished()),
+    ]);
+    say(ui, SKETCH_MESSAGE, SKETCH_TITLE);
+    pump_until(ui, "the reply to the message with chips", |ui| {
+        ui.app.sessions.get(sent).is_some_and(|entry| {
+            entry.session.phase == Phase::Idle && entry.session.conversation.items().len() == 2
+        })
+    });
+    let panorama = "/home/alex/project/photos/harbour-panorama.jpg";
+    put_chips(
+        ui,
+        asks,
+        vec![Chip {
+            id: SCENE_CHIPS + 4,
+            name: mr_core::name_of(&Source::Path(panorama.into())),
+            source: Source::Path(panorama.into()),
+            state: ChipState::Problem(Problem::TooLarge),
+        }],
+    );
+    glue::view_mut(ui, asks).draft = TextEdit::new(PANORAMA_DRAFT);
+    focus_tile(ui, asks);
+}
+
+/// Puts `chips` on `key`'s session, as their answers from the preparing thread would have left
+/// them, and makes the thumbnail of each ready image as `glue` makes one for a real answer. A
+/// scene waits for each: a thumbnail still being made paints nothing in a snapshot. The cache
+/// is the one `start` made; the window's own setup makes another after the scene, and a handle
+/// made here stays drawn.
+fn put_chips(ui: &mut Ui, key: SessionKey, chips: Vec<Chip>) {
+    for chip in &chips {
+        let ChipState::Ready(Prepared {
+            thumb: Some(thumb), ..
+        }) = &chip.state
+        else {
+            continue;
+        };
+        let images = ui
+            .images
+            .as_ref()
+            .expect("the scene has started the backend");
+        let image = images.rgba(thumb.width, thumb.height, thumb.rgba.clone());
+        image.wait().expect("a thumbnail made in code is made");
+        ui.thumbs.insert(chip.id, image);
+    }
+    let mut entry = ui.app.sessions.get_mut(key).expect("the session is there");
+    entry.session.chips.extend(chips);
+}
+
+/// A chip of `path`, ready to go by its path as a file or a folder.
+fn path_chip(id: u64, path: &str, kind: AttachKind) -> Chip {
+    let source = Source::Path(path.into());
+    Chip {
+        id,
+        name: mr_core::name_of(&source),
+        source,
+        state: ChipState::Ready(Prepared {
+            kind,
+            attachment: Attachment::File { path: path.into() },
+            thumb: None,
+        }),
+    }
+}
+
+/// A chip of the PNG image at `path`, ready to send, with a thumbnail made in code. Its bytes
+/// are a stand-in: nothing in the demo decodes them, and nothing is read from the disk.
+fn image_chip(id: u64, path: &str) -> Chip {
+    let source = Source::Path(path.into());
+    Chip {
+        id,
+        name: mr_core::name_of(&source),
+        source,
+        state: ChipState::Ready(Prepared {
+            kind: AttachKind::Image,
+            attachment: Attachment::Image {
+                media_type: "image/png".into(),
+                data: ImageData::new(&b"\x89PNG\r\n\x1a\n"[..]),
+            },
+            thumb: Some(window_thumb()),
+        }),
+    }
+}
+
+/// A pasted image: a stand-in for the PNG bytes a clipboard gives.
+fn pasted_source() -> Source {
+    Source::Pasted(ImageData::new(&b"\x89PNG\r\n\x1a\n"[..]))
+}
+
+/// A thumbnail made in code, as wide as a chip's thumbnail may be and two thirds as high: a
+/// window over a sky that darkens downwards, with two lines of text in it.
+fn window_thumb() -> Thumb {
+    let (width, height) = (THUMB_SIDE, THUMB_SIDE * 2 / 3);
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let in_window = (20..76).contains(&x) && (14..50).contains(&y);
+            let in_line = (28..68).contains(&x) && ((24..28).contains(&y) || (34..38).contains(&y));
+            let pixel = if in_line {
+                [96, 108, 128]
+            } else if in_window {
+                [240, 243, 248]
+            } else {
+                let down = y as f32 / height as f32;
+                [
+                    (120.0 - 70.0 * down) as u8,
+                    (180.0 - 80.0 * down) as u8,
+                    (235.0 - 60.0 * down) as u8,
+                ]
+            };
+            rgba.extend_from_slice(&pixel);
+            rgba.push(255);
+        }
+    }
+    Thumb {
+        width,
+        height,
+        rgba: rgba.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit;
+
+    #[test]
+    fn the_chips_scene_shows_four_chips_and_one_thumbnail() {
+        let rt = testkit::window("chips");
+        let key = testkit::focused(&rt).expect("a tile is focused");
+        let chips = &rt.state.app.sessions.get(key).unwrap().session.chips;
+        assert_eq!(chips.len(), 4);
+        let shown = |inner: String| testkit::element(&rt, &testkit::tile(key, &inner)).is_some();
+        let [image, file, folder, reading] = [0, 1, 2, 3].map(|n| chips[n].id);
+        assert!(shown(format!("mr-chip-thumb-{image}")));
+        assert!(rt.state.thumbs[&image].is_ready());
+        assert!(shown(format!("mr-chip-file-{file}")));
+        assert!(shown(format!("mr-chip-folder-{folder}")));
+        assert!(shown(format!("mr-chip-photo-{reading}")));
+        assert!(shown(format!("mr-chip-reading-{reading}")));
+        assert_eq!(chips[3].state, ChipState::Reading);
+        let draft = &glue::view_of(&rt.state, key).draft.text;
+        assert_eq!(draft.lines().count(), 2);
+        assert!(testkit::box_focused(&rt, key));
+        assert!(
+            !rt.state.app.can_send(key, draft),
+            "an image is still being read"
+        );
+    }
+
+    #[test]
+    fn the_chips_problem_scene_cannot_send_and_its_neighbour_names_its_files() {
+        let rt = testkit::window("chips-problem");
+        let tiles = testkit::tile_keys(&rt);
+        assert_eq!(tiles.len(), 2);
+        let key = testkit::focused(&rt).expect("a tile is focused");
+        assert_eq!(key, tiles[0]);
+        let chips = &rt.state.app.sessions.get(key).unwrap().session.chips;
+        assert_eq!(chips.len(), 1);
+        assert!(testkit::tile_has_text(&rt, key, "Too large to send"));
+        let draft = &glue::view_of(&rt.state, key).draft.text;
+        assert!(!draft.is_empty());
+        assert!(!rt.state.app.can_send(key, draft));
+        let sent = tiles[1];
+        let picture = SCENE_CHIPS + 1;
+        let shown = testkit::element(
+            &rt,
+            &testkit::tile(sent, &format!("mr-user-picture-{picture}")),
+        )
+        .expect("the sent message shows its picture");
+        assert_eq!(shown.rect[3], 120.0);
+        assert!(rt.state.thumbs[&picture].is_ready());
+        assert!(!testkit::tile_has_text(&rt, sent, "1 image"));
+        assert!(testkit::tile_has_text(&rt, sent, "plan.md, shapes.txt"));
+    }
 }

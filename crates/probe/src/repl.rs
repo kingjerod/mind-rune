@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
-use mr_agent::{Attachment, SessionId, StartSpec};
+use mr_agent::{Attachment, ImageData, SessionId, StartSpec};
 use mr_claude::{
     ClaudeProcess, ExitInfo, PermissionReply, SpawnConfig, build_args, child_env, control_request,
     initialize, interrupt, mode_from_wire, permission_reply, remote_control, rename_session,
@@ -370,7 +370,10 @@ impl Session {
                 let media_type = image_media_type(&path)?;
                 let data = std::fs::read(&path)
                     .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-                let image = Attachment::Image { media_type, data };
+                let image = Attachment::Image {
+                    media_type,
+                    data: ImageData::new(data),
+                };
                 self.send_line(&user_message(&text, &[image]))
             }
             Cmd::Raw(line) => self.send_line(&line),

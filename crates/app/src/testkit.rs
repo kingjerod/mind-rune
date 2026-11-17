@@ -4,11 +4,12 @@
 #![allow(dead_code, reason = "helpers for the view tests of Tasks 11 to 17")]
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 
 use mr_agent::{FakeStep, SessionCommand, SessionEvent, SessionId, StoredSession, TurnSummary};
 use mr_core::{FromBackend, GroupId, Leaving, Phase, Place, SessionKey};
 use rune::clipboard::MemoryClipboard;
-use rune::{ElementInfo, Env, Key, KeyEvent, Mods, Runtime};
+use rune::{ClipboardContent, ClipboardImage, ElementInfo, Env, Key, KeyEvent, Mods, Runtime};
 
 use crate::glue::{self, SessionView, Ui};
 use crate::{demo, view};
@@ -313,6 +314,48 @@ pub fn click_text(rt: &mut Runtime<Ui>, text: &str) {
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
     rt.frame(FRAME);
+}
+
+/// Pastes the image `png` into whatever has focus, as a paste from another app arrives, and
+/// runs a frame.
+pub fn paste_image(rt: &mut Runtime<Ui>, png: Vec<u8>) {
+    let image = ClipboardImage::from_png(png).expect("a PNG");
+    rt.paste_content(ClipboardContent::new("").with_image(image));
+    rt.frame(FRAME);
+}
+
+/// Pastes copied files at `paths` into whatever has focus, as a paste from a file manager
+/// arrives, and runs a frame.
+pub fn paste_files(rt: &mut Runtime<Ui>, paths: &[PathBuf]) {
+    rt.paste_content(ClipboardContent::new("").with_files(paths.iter().cloned()));
+    rt.frame(FRAME);
+}
+
+/// Presses the attach button of the focused tile, answers its file picker with `path`, and
+/// runs a few frames.
+pub fn attach_file(rt: &mut Runtime<Ui>, path: &std::path::Path) {
+    let key = focused(rt).expect("a tile is focused");
+    click(rt, &tile(key, "mr-attach"));
+    rt.resolve_file_dialog(Some(path.to_path_buf()))
+        .expect("the file picker is open");
+    step(rt);
+}
+
+/// A PNG of four by three pixels in a few colours, made here.
+pub fn tiny_png() -> Vec<u8> {
+    png(4, 3)
+}
+
+/// A PNG of `width` by `height` pixels in a few colours, made here.
+pub fn png(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_fn(width, height, |x, y| {
+        image::Rgba([(x * 60 % 256) as u8, (y * 80 % 256) as u8, 200, 255])
+    });
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("a PNG in memory");
+    png
 }
 
 /// Types `text` into whatever has focus, one key per character, and runs a frame.

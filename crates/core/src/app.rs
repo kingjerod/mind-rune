@@ -6,11 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use mr_agent::{
-    Account, AgentError, Answer, Capabilities, CommandKind, ModelOption, PermissionMode, RequestId,
-    SessionCommand, SessionEvent, SessionId, StartSpec, StoredSession, UsageLimits,
+    Account, AgentError, Answer, Capabilities, CommandKind, ImageData, ModelOption, PermissionMode,
+    RequestId, SessionCommand, SessionEvent, SessionId, StartSpec, StoredSession, UsageLimits,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::attach::{Chip, ChipState, Prepared, Problem, Source, name_of};
 use crate::backend::FromBackend;
 use crate::conversation::NoticeKind;
 use crate::git::Branch;
@@ -114,6 +115,11 @@ pub enum Effect {
     ReadBranch {
         folder: PathBuf,
     },
+    /// Read and check what chip `chip` holds.
+    Prepare {
+        chip: u64,
+        source: Source,
+    },
     /// Write what is kept between runs.
     SaveState(Box<Saved>),
 }
@@ -187,6 +193,8 @@ pub struct App {
     names: Vec<(SessionId, String)>,
     /// The branch last read for each folder; a folder whose answer was none is not here.
     branches: HashMap<PathBuf, Branch>,
+    /// The id of the latest chip. Each chip gets the next, so an id is never reused.
+    chip: u64,
 }
 
 /// The tiles of the last run, as [`Saved`] had them.
@@ -274,6 +282,7 @@ impl App {
             closed_by_app: saved.closed_by_app,
             names: saved.names,
             branches: HashMap::new(),
+            chip: 0,
         };
         (app, vec![Effect::CheckAccount])
     }
@@ -510,10 +519,14 @@ impl App {
                 error,
             } => self.send_failed(open, &command, error),
             FromBackend::Sessions { since_unix, result } => self.listed(since_unix, result),
-            FromBackend::History { key, result } => {
+            FromBackend::History {
+                key,
+                result,
+                pictures,
+            } => {
                 if let Some(mut entry) = self.sessions.get_mut(key) {
                     match result {
-                        Ok(history) => entry.session.load_history(history),
+                        Ok(history) => entry.session.load_history(history, &pictures),
                         Err(error) => entry.session.history_failed(&error.to_string()),
                     }
                 }
@@ -534,6 +547,12 @@ impl App {
                 };
                 Vec::new()
             }
+            FromBackend::Prepared { chip, result } => {
+                self.prepared(chip, result);
+                Vec::new()
+            }
+            // The window keeps the drawn picture; a picture nobody holds any more is dropped.
+            FromBackend::Picture { .. } => Vec::new(),
         }
     }
 
@@ -1036,11 +1055,11 @@ impl App {
 
     /// Sends `text` to `key`'s session, or queues it there, and makes the session active now.
     /// A resting session wakes with it queued: when this app has not run its program in this
-    /// run, the store is first asked whether another app may have it open. A session that does
-    /// not take a message now (see [`App::takes_message`]) takes nothing.
+    /// run, the store is first asked whether another app may have it open. The session's chips
+    /// go with the text. Nothing is taken unless [`App::can_send`] holds.
     pub fn submit(&mut self, key: SessionKey, text: &str) -> Vec<Effect> {
         let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
-        if text.trim().is_empty() || !self.takes_message(key) {
+        if !self.can_send(key, text) {
             return effects;
         }
         let now_unix = self.now_unix;
@@ -1076,6 +1095,86 @@ impl App {
         self.sessions.get(key).is_some_and(|entry| {
             entry.session.takes_messages() && entry.prompt.is_none() && !entry.checking
         })
+    }
+
+    /// Adds a chip for each source to `key`'s session and asks for each to be read. A session
+    /// that does not take a message now takes no chip, and a path it already has a chip for, in
+    /// its input box or in its queued message, is left out.
+    pub fn attach(&mut self, key: SessionKey, sources: Vec<Source>) -> Vec<Effect> {
+        if !self.takes_message(key) {
+            return Vec::new();
+        }
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        for source in sources {
+            let session = &entry.session;
+            let attached = matches!(source, Source::Path(_))
+                && session
+                    .chips
+                    .iter()
+                    .chain(session.queued.iter().flat_map(|queued| &queued.chips))
+                    .any(|chip| chip.source == source);
+            if attached {
+                continue;
+            }
+            self.chip += 1;
+            entry.session.chips.push(Chip {
+                id: self.chip,
+                name: name_of(&source),
+                source: source.clone(),
+                state: ChipState::Reading,
+            });
+            effects.push(Effect::Prepare {
+                chip: self.chip,
+                source,
+            });
+        }
+        effects
+    }
+
+    /// Takes chip `chip` off `key`'s session.
+    pub fn detach(&mut self, key: SessionKey, chip: u64) {
+        if let Some(mut entry) = self.sessions.get_mut(key) {
+            entry.session.chips.retain(|held| held.id != chip);
+        }
+    }
+
+    /// Whether Enter would send `text` with `key`'s chips now: the session takes a message and
+    /// [`Session::can_send`] holds.
+    pub fn can_send(&self, key: SessionKey, text: &str) -> bool {
+        self.takes_message(key)
+            && self
+                .sessions
+                .get(key)
+                .is_some_and(|entry| entry.session.can_send(text))
+    }
+
+    /// Fills the chip with id `chip`, in whatever session it is, with what reading it gave. A
+    /// chip taken off is gone: its answer is dropped. A pasted chip lets go of the clipboard's
+    /// bytes: what is sent is the prepared image's.
+    fn prepared(&mut self, chip: u64, result: Result<Prepared, Problem>) {
+        let Some(key) = self
+            .sessions
+            .iter()
+            .find(|entry| entry.session.chips.iter().any(|held| held.id == chip))
+            .map(|entry| entry.key)
+        else {
+            return;
+        };
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if let Some(held) = entry.session.chips.iter_mut().find(|held| held.id == chip) {
+            if let Source::Pasted(data) = &mut held.source {
+                *data = ImageData::new(Vec::new());
+            }
+            held.state = match result {
+                Ok(prepared) => ChipState::Ready(prepared),
+                Err(problem) => ChipState::Problem(problem),
+            };
+        }
     }
 
     /// The question waiting for the user about `key`'s session.
@@ -1192,8 +1291,10 @@ impl App {
     /// the session with the message and opens its program; `ContinueAsCopy` puts a copy of it
     /// beside it, shows the copy in the original's tile (in the focused one when the original
     /// is in no tile) and opens a program that forks the stored conversation, the message
-    /// queued in it, leaving the original resting. The text that goes back into that session's
-    /// input box, when the choice was Cancel.
+    /// queued in it, leaving the original resting. The message's chips are on the session while
+    /// the question waits: they go with the message, to the copy when it is one, and stay on
+    /// the session on Cancel. The text that goes back into that session's input box, when the
+    /// choice was Cancel or the text and chips left make no message to send.
     pub fn answer_prompt(
         &mut self,
         key: SessionKey,
@@ -1210,6 +1311,10 @@ impl App {
         if entry.session.phase != Phase::Resting {
             return (effects, None);
         }
+        // Its chips may have been taken off meanwhile, leaving nothing to send.
+        if !entry.session.can_send(&text) {
+            return (effects, Some(text));
+        }
         match choice {
             PromptChoice::Cancel => (effects, Some(text)),
             PromptChoice::ContinueHere => {
@@ -1223,7 +1328,10 @@ impl App {
                 let group = self.groups.group_of(&entry);
                 let mut spec = entry.session.start_spec();
                 spec.fork = true;
+                // The chips go with the message: none is on two sessions.
+                let chips = std::mem::take(&mut entry.session.chips);
                 let mut copy = entry.session.clone();
+                copy.chips = chips;
                 drop(entry);
                 // Its own id comes from its program; until then the stored one is only read.
                 let read_from = copy.id.take();
@@ -1607,20 +1715,21 @@ fn read_history(entry: &mut Entry) -> Option<Effect> {
     })
 }
 
-/// Nothing was handed over in it and nothing waits to be: the agent stores nothing for it, so
-/// leaving it forgets it.
+/// Nothing was handed over in it, nothing waits to be and nothing is attached: the agent stores
+/// nothing for it, so leaving it forgets it.
 fn empty(session: &Session) -> bool {
-    !session.is_stored() && session.queued.is_none()
+    !session.is_stored() && session.queued.is_none() && session.chips.is_empty()
 }
 
 #[cfg(test)]
 mod tests {
     use mr_agent::{
-        HistoryItem, LimitWindow, RemoteAccess, SessionInfo, StoredHistory, ToolDetail,
-        TurnSummary, UserRequest, UserRequestKind,
+        Attachment, HistoryItem, ImageData, LimitWindow, RemoteAccess, SessionInfo, StoredHistory,
+        ToolDetail, TurnSummary, UserRequest, UserRequestKind,
     };
 
     use super::*;
+    use crate::attach::Kind as AttachKind;
     use crate::conversation::ItemBody;
     use crate::groups::Group;
     use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, SavedBelow, SavedTile};
@@ -1717,6 +1826,8 @@ mod tests {
                 HistoryItem::User {
                     text: "read the parser".into(),
                     image_count: 0,
+                    files: Vec::new(),
+                    images: Vec::new(),
                 },
                 HistoryItem::AssistantText("It reads tokens.".into()),
             ],
@@ -1726,6 +1837,7 @@ mod tests {
             FromBackend::History {
                 key,
                 result: Ok(history),
+                pictures: Vec::new(),
             },
             0.0,
         );
@@ -3609,12 +3721,15 @@ mod tests {
             items: vec![HistoryItem::User {
                 text: "read the parser".into(),
                 image_count: 0,
+                files: Vec::new(),
+                images: Vec::new(),
             }],
             ..StoredHistory::default()
         };
         let answer = |key| FromBackend::History {
             key,
             result: Ok(history.clone()),
+            pictures: Vec::new(),
         };
         assert_eq!(app.receive(answer(key), 0.0), vec![]);
         assert_eq!(session(&app, key).history, HistoryState::Loaded);
@@ -3630,6 +3745,25 @@ mod tests {
     }
 
     #[test]
+    fn a_picture_for_nobody_is_dropped() {
+        let (mut app, key) = shows_stored();
+        let before = session(&app, key).clone();
+        let thumb = crate::attach::Thumb {
+            width: 1,
+            height: 1,
+            rgba: vec![0u8; 4].into(),
+        };
+        for thumb in [None, Some(thumb)] {
+            let picture = FromBackend::Picture {
+                id: 1 << 63 | 41,
+                thumb,
+            };
+            assert_eq!(app.receive(picture, 0.0), vec![]);
+        }
+        assert_eq!(session(&app, key), &before);
+    }
+
+    #[test]
     fn a_history_that_fails_is_shown_as_failed() {
         let mut app = main_screen();
         let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 60);
@@ -3640,6 +3774,7 @@ mod tests {
             FromBackend::History {
                 key,
                 result: Err(AgentError::Io("gone".into())),
+                pictures: Vec::new(),
             },
             0.0,
         );
@@ -3661,7 +3796,7 @@ mod tests {
         );
         let entry = app.sessions.get(key).unwrap();
         assert_eq!(entry.session.phase, Phase::Opening);
-        assert_eq!(entry.session.queued.as_deref(), Some("carry on"));
+        assert_eq!(queued_text(&entry.session), Some("carry on"));
         assert_eq!(entry.last_active_unix, NOW);
         let effects = app.event(1, SessionEvent::Started(info()), 0.0);
         assert!(sends_text(&effects, 1, "carry on"), "{effects:?}");
@@ -3717,7 +3852,7 @@ mod tests {
                 id: id("a2")
             }]
         );
-        assert_eq!(session(&app, other).queued.as_deref(), Some("hello"));
+        assert_eq!(queued_text(session(&app, other)), Some("hello"));
         assert!(app.prompt(key).is_some(), "the first question still waits");
     }
 
@@ -3860,7 +3995,7 @@ mod tests {
             }]
         );
         assert_eq!((back, app.prompt(key)), (None, None));
-        assert_eq!(session(&app, key).queued.as_deref(), Some("carry on"));
+        assert_eq!(queued_text(session(&app, key)), Some("carry on"));
         let effects = app.event(1, SessionEvent::Started(info()), 0.0);
         assert!(sends_text(&effects, 1, "carry on"), "{effects:?}");
     }
@@ -3903,7 +4038,7 @@ mod tests {
         assert_eq!(forked.conversation.items(), original.conversation.items());
         assert_eq!(forked.conversation.items().len(), 2);
         assert_eq!(forked.phase, Phase::Opening);
-        assert_eq!(forked.queued.as_deref(), Some("carry on"));
+        assert_eq!(queued_text(forked), Some("carry on"));
         assert_eq!(original.phase, Phase::Resting);
         assert_eq!(original.queued, None);
         assert_eq!(app.sessions.get(key).unwrap().open, None);
@@ -3928,7 +4063,7 @@ mod tests {
             vec![Effect::Open { open: 2, spec }]
         );
         let entry = app.sessions.get(key).unwrap();
-        assert_eq!(entry.session.queued.as_deref(), Some("more"));
+        assert_eq!(queued_text(&entry.session), Some("more"));
         assert_eq!(entry.last_active_unix, NOW + 30);
     }
 
@@ -5600,5 +5735,473 @@ mod tests {
         app.restart(key);
         let effects = app.event(2, SessionEvent::Started(info()), 0.0);
         assert!(renames(&effects).is_empty());
+    }
+
+    /// The file or folder at `text`, as attached.
+    fn at(text: &str) -> Source {
+        Source::Path(text.into())
+    }
+
+    /// An image pasted: a few bytes stand for it.
+    fn pasted() -> Source {
+        Source::Pasted(ImageData::new(vec![1u8, 2, 3]))
+    }
+
+    /// The file at `text`, read and ready to send.
+    fn file_ready(text: &str) -> Prepared {
+        Prepared {
+            kind: AttachKind::File,
+            attachment: Attachment::File { path: text.into() },
+            thumb: None,
+        }
+    }
+
+    /// The backend's answer for chip `chip`.
+    fn answer(app: &mut App, chip: u64, result: Result<Prepared, Problem>) -> Vec<Effect> {
+        app.receive(FromBackend::Prepared { chip, result }, 0.0)
+    }
+
+    /// Each chip of `key`'s session: its id and its state.
+    fn chips_of(app: &App, key: SessionKey) -> Vec<(u64, ChipState)> {
+        session(app, key)
+            .chips
+            .iter()
+            .map(|chip| (chip.id, chip.state.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn attaching_adds_reading_chips_and_asks_for_each() {
+        let (mut app, key) = ready();
+        let effects = app.attach(key, vec![at("/home/alex/notes.txt"), pasted()]);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Prepare {
+                    chip: 1,
+                    source: at("/home/alex/notes.txt")
+                },
+                Effect::Prepare {
+                    chip: 2,
+                    source: pasted()
+                },
+            ]
+        );
+        assert_eq!(
+            session(&app, key).chips,
+            vec![
+                Chip {
+                    id: 1,
+                    name: "notes.txt".into(),
+                    source: at("/home/alex/notes.txt"),
+                    state: ChipState::Reading,
+                },
+                Chip {
+                    id: 2,
+                    name: "Pasted image".into(),
+                    source: pasted(),
+                    state: ChipState::Reading,
+                },
+            ]
+        );
+        // An id taken off is not given again.
+        app.detach(key, 2);
+        assert_eq!(
+            app.attach(key, vec![pasted()]),
+            vec![Effect::Prepare {
+                chip: 3,
+                source: pasted()
+            }]
+        );
+        assert_eq!(
+            chips_of(&app, key),
+            vec![(1, ChipState::Reading), (3, ChipState::Reading)]
+        );
+    }
+
+    #[test]
+    fn the_same_path_is_attached_once() {
+        let (mut app, key) = ready();
+        app.attach(key, vec![at("/home/alex/a.txt")]);
+        let effects = app.attach(
+            key,
+            vec![
+                at("/home/alex/a.txt"),
+                at("/home/alex/b.txt"),
+                at("/home/alex/b.txt"),
+            ],
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Prepare {
+                chip: 2,
+                source: at("/home/alex/b.txt")
+            }]
+        );
+        assert_eq!(
+            app.attach(key, vec![pasted(), pasted()]).len(),
+            2,
+            "a pasted image twice is two chips"
+        );
+        assert_eq!(session(&app, key).chips.len(), 4);
+        // Taken off, a path can be attached again.
+        app.detach(key, 1);
+        assert_eq!(
+            app.attach(key, vec![at("/home/alex/a.txt")]),
+            vec![Effect::Prepare {
+                chip: 5,
+                source: at("/home/alex/a.txt")
+            }]
+        );
+    }
+
+    #[test]
+    fn a_path_queued_with_a_message_is_not_attached_again() {
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.attach(key, vec![at("/home/alex/a.txt")]);
+        answer(&mut app, 1, Ok(file_ready("/home/alex/a.txt")));
+        app.submit(key, "and read this");
+        assert_eq!(queued_text(session(&app, key)), Some("and read this"));
+        assert_eq!(chips_of(&app, key), vec![], "the chip waits with the text");
+        assert_eq!(
+            app.attach(key, vec![at("/home/alex/a.txt"), at("/home/alex/b.txt")]),
+            vec![Effect::Prepare {
+                chip: 2,
+                source: at("/home/alex/b.txt")
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pasted_chip_lets_go_of_the_clipboards_bytes_once_read() {
+        let (mut app, key) = ready();
+        app.attach(key, vec![pasted(), pasted()]);
+        let held = |app: &App| -> Vec<usize> {
+            session(app, key)
+                .chips
+                .iter()
+                .map(|chip| match &chip.source {
+                    Source::Pasted(data) => data.len(),
+                    Source::Path(_) => usize::MAX,
+                })
+                .collect()
+        };
+        assert_eq!(held(&app), vec![3, 3], "held while it is read");
+        answer(&mut app, 1, Ok(image_ready()));
+        answer(&mut app, 2, Err(Problem::Unreadable));
+        assert_eq!(held(&app), vec![0, 0]);
+        // What is sent is the prepared image's.
+        assert_eq!(
+            chips_of(&app, key),
+            vec![
+                (1, ChipState::Ready(image_ready())),
+                (2, ChipState::Problem(Problem::Unreadable)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_answer_fills_its_chip() {
+        let (mut app, key) = ready();
+        app.attach(key, vec![at("/home/alex/a.txt"), at("/home/alex/huge.png")]);
+        assert_eq!(
+            answer(&mut app, 1, Ok(file_ready("/home/alex/a.txt"))),
+            vec![]
+        );
+        assert_eq!(answer(&mut app, 2, Err(Problem::TooLarge)), vec![]);
+        assert_eq!(
+            chips_of(&app, key),
+            vec![
+                (1, ChipState::Ready(file_ready("/home/alex/a.txt"))),
+                (2, ChipState::Problem(Problem::TooLarge)),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_answer_for_a_removed_chip_is_dropped() {
+        let (mut app, key) = ready();
+        app.attach(key, vec![at("/home/alex/a.txt"), at("/home/alex/b.txt")]);
+        app.detach(key, 1);
+        assert_eq!(
+            answer(&mut app, 1, Ok(file_ready("/home/alex/a.txt"))),
+            vec![]
+        );
+        assert_eq!(
+            answer(&mut app, 9, Ok(file_ready("/home/alex/c.txt"))),
+            vec![],
+            "nor is one for a chip never given"
+        );
+        assert_eq!(chips_of(&app, key), vec![(2, ChipState::Reading)]);
+    }
+
+    #[test]
+    fn a_chip_belongs_to_its_session() {
+        let (mut app, a, b) = two_tiles();
+        app.attach(a, vec![at("/home/alex/a.txt")]);
+        // The same path in another session is a chip of its own.
+        app.attach(b, vec![at("/home/alex/a.txt")]);
+        answer(&mut app, 2, Err(Problem::Unreadable));
+        answer(&mut app, 1, Ok(file_ready("/home/alex/a.txt")));
+        assert_eq!(
+            chips_of(&app, a),
+            vec![(1, ChipState::Ready(file_ready("/home/alex/a.txt")))]
+        );
+        assert_eq!(
+            chips_of(&app, b),
+            vec![(2, ChipState::Problem(Problem::Unreadable))]
+        );
+    }
+
+    #[test]
+    fn an_ended_session_takes_no_chips() {
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.attach(key, vec![at("/home/alex/a.txt")]);
+        app.event(1, done(), 0.0);
+        assert_eq!(
+            chips_of(&app, key),
+            vec![(1, ChipState::Reading)],
+            "a turn ending keeps them"
+        );
+        app.event(1, exited(false), 0.0);
+        assert_eq!(app.attach(key, vec![at("/home/alex/b.txt")]), vec![]);
+        // It keeps the chips it had, and an answer still fills them.
+        answer(&mut app, 1, Ok(file_ready("/home/alex/a.txt")));
+        assert_eq!(
+            chips_of(&app, key),
+            vec![(1, ChipState::Ready(file_ready("/home/alex/a.txt")))]
+        );
+        // Restarted, it keeps them and takes chips again.
+        app.restart(key);
+        assert_eq!(session(&app, key).chips.len(), 1);
+        assert_eq!(
+            app.attach(key, vec![at("/home/alex/b.txt")]),
+            vec![Effect::Prepare {
+                chip: 2,
+                source: at("/home/alex/b.txt")
+            }]
+        );
+    }
+
+    #[test]
+    fn nothing_can_be_sent_while_a_chip_is_read_or_has_a_problem() {
+        let (mut app, key) = ready();
+        assert!(app.can_send(key, "hi"));
+        app.attach(key, vec![at("/home/alex/a.txt")]);
+        assert!(!app.can_send(key, "hi"), "it is read");
+        answer(&mut app, 1, Err(Problem::Unreadable));
+        assert!(!app.can_send(key, "hi"), "it has a problem");
+        app.detach(key, 1);
+        assert!(app.can_send(key, "hi"));
+        app.attach(key, vec![at("/home/alex/b.txt")]);
+        answer(&mut app, 2, Ok(file_ready("/home/alex/b.txt")));
+        assert!(app.can_send(key, "hi"));
+        app.event(1, exited(false), 0.0);
+        assert!(
+            !app.can_send(key, "hi"),
+            "an ended session takes no message"
+        );
+        assert!(
+            session(&app, key).can_send("hi"),
+            "though its text and its chips are ready"
+        );
+    }
+
+    #[test]
+    fn chips_alone_can_be_sent() {
+        let (mut app, key) = ready();
+        assert!(!app.can_send(key, ""));
+        assert!(!app.can_send(key, " \n\t"));
+        app.attach(key, vec![at("/home/alex/a.txt")]);
+        answer(&mut app, 1, Ok(file_ready("/home/alex/a.txt")));
+        assert!(app.can_send(key, ""));
+        assert!(app.can_send(key, " \n"));
+    }
+
+    #[test]
+    fn a_session_with_chips_is_not_empty() {
+        let mut app = main_screen();
+        let other = app.sessions.add(stored("s9"), NOW - 60);
+        app.new_session("/a".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let a = app.focused().unwrap();
+        app.attach(a, vec![at("/home/alex/a.txt")]);
+        assert_eq!(
+            closes(&app.show(other, Place::Focused, Leaving::ForgetIfEmpty)),
+            Vec::<u64>::new()
+        );
+        assert!(app.sessions.get(a).is_some(), "kept for its chip");
+        // Without its chip, it goes when left.
+        app.show(a, Place::Focused, Leaving::ForgetIfEmpty);
+        app.detach(a, 1);
+        assert_eq!(
+            closes(&app.show(other, Place::Focused, Leaving::ForgetIfEmpty)),
+            vec![1]
+        );
+        assert!(app.sessions.get(a).is_none());
+    }
+
+    /// The text of `session`'s queued message.
+    fn queued_text(session: &Session) -> Option<&str> {
+        session.queued.as_ref().map(|queued| queued.text.as_str())
+    }
+
+    /// The image `pasted()` gives, read and ready to send.
+    fn image_ready() -> Prepared {
+        Prepared {
+            kind: AttachKind::Image,
+            attachment: pasted_image(),
+            thumb: None,
+        }
+    }
+
+    fn pasted_image() -> Attachment {
+        Attachment::Image {
+            media_type: "image/png".into(),
+            data: ImageData::new(vec![1u8, 2, 3]),
+        }
+    }
+
+    /// `shows_stored`, with a file and an image ready in its input box and `text` sent: the
+    /// store says another app had the session open, so the question waits.
+    fn asked_with_chips(text: &str) -> (App, SessionKey) {
+        let (mut app, key) = shows_stored();
+        app.attach(key, vec![at("/home/alex/a.txt"), pasted()]);
+        answer(&mut app, 1, Ok(file_ready("/home/alex/a.txt")));
+        answer(&mut app, 2, Ok(image_ready()));
+        assert_eq!(
+            app.submit(key, text),
+            vec![Effect::CheckActivity { key, id: id("a1") }]
+        );
+        assert_eq!(chips_of(&app, key), vec![], "they went with the message");
+        app.receive(
+            FromBackend::Activity {
+                key,
+                result: Ok(Some(NOW - 5)),
+            },
+            0.0,
+        );
+        assert_eq!(
+            app.prompt(key),
+            Some(&Prompt::OpenElsewhere { text: text.into() })
+        );
+        (app, key)
+    }
+
+    #[test]
+    fn cancel_on_open_elsewhere_brings_the_chips_back() {
+        for text in ["carry on", ""] {
+            let (mut app, key) = asked_with_chips(text);
+            let (effects, back) = app.answer_prompt(key, PromptChoice::Cancel);
+            assert_eq!((effects, back.as_deref()), (vec![], Some(text)));
+            assert_eq!(session(&app, key).queued, None);
+            assert_eq!(
+                chips_of(&app, key),
+                vec![
+                    (1, ChipState::Ready(file_ready("/home/alex/a.txt"))),
+                    (2, ChipState::Ready(image_ready())),
+                ],
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_left_with_nothing_to_send_is_given_back() {
+        for choice in [PromptChoice::ContinueHere, PromptChoice::ContinueAsCopy] {
+            let (mut app, key) = asked_with_chips("");
+            app.detach(key, 1);
+            app.detach(key, 2);
+            let (effects, back) = app.answer_prompt(key, choice);
+            assert_eq!((effects, back.as_deref()), (vec![], Some("")), "{choice:?}");
+            assert_eq!(app.prompt(key), None);
+            assert_eq!(app.sessions.len(), 1, "no copy");
+            let entry = app.sessions.get(key).unwrap();
+            assert_eq!((&entry.session.phase, entry.open), (&Phase::Resting, None));
+        }
+    }
+
+    #[test]
+    fn continue_here_sends_the_chips() {
+        let (mut app, key) = asked_with_chips("carry on");
+        let (effects, back) = app.answer_prompt(key, PromptChoice::ContinueHere);
+        assert_eq!(
+            effects,
+            vec![Effect::Open {
+                open: 1,
+                spec: resume_a1()
+            }]
+        );
+        assert_eq!((back, app.prompt(key)), (None, None));
+        let effects = app.event(1, SessionEvent::Started(info()), 0.0);
+        assert!(
+            effects.contains(&Effect::Send {
+                open: 1,
+                command: SessionCommand::Send {
+                    text: "carry on".into(),
+                    attachments: vec![
+                        Attachment::File {
+                            path: "/home/alex/a.txt".into()
+                        },
+                        pasted_image(),
+                    ],
+                },
+            }),
+            "{effects:?}"
+        );
+        let session = session(&app, key);
+        assert_eq!((&session.chips, &session.queued), (&vec![], &None));
+    }
+
+    #[test]
+    fn continue_as_a_copy_takes_the_chips_along() {
+        let (mut app, key) = asked_with_chips("carry on");
+        app.answer_prompt(key, PromptChoice::ContinueAsCopy);
+        let copy = app.focused().unwrap();
+        assert_ne!(copy, key);
+        let (original, forked) = (session(&app, key), session(&app, copy));
+        assert_eq!((&original.chips, &original.queued), (&vec![], &None));
+        assert_eq!(queued_text(forked), Some("carry on"));
+        let queued: Vec<u64> = forked
+            .queued
+            .iter()
+            .flat_map(|q| &q.chips)
+            .map(|chip| chip.id)
+            .collect();
+        assert_eq!(queued, vec![1, 2]);
+        // No chip is on two sessions.
+        let mut held: Vec<u64> = app
+            .sessions
+            .iter()
+            .flat_map(|entry| {
+                let session = &entry.session;
+                session
+                    .chips
+                    .iter()
+                    .chain(session.queued.iter().flat_map(|q| &q.chips))
+                    .map(|chip| chip.id)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        held.sort();
+        assert_eq!(held, vec![1, 2]);
+        let effects = app.event(1, SessionEvent::Started(info()), 0.0);
+        assert!(
+            effects.contains(&Effect::Send {
+                open: 1,
+                command: SessionCommand::Send {
+                    text: "carry on".into(),
+                    attachments: vec![
+                        Attachment::File {
+                            path: "/home/alex/a.txt".into()
+                        },
+                        pasted_image(),
+                    ],
+                },
+            }),
+            "{effects:?}"
+        );
+        assert_eq!(session(&app, copy).chips, vec![]);
     }
 }

@@ -1,6 +1,6 @@
 # Protocol notes
 
-What the real `claude` program did when driven through `mindrune-probe` on 2026-11-10. Tasks 10 to 16 of plan 1 and plans 2 to 5 treat this file as the source of truth. Where it disagrees with an earlier assumption, this file wins. Two sections were added later: "Stored sessions", by plan 3, from the store on disk rather than from the probe, and the last, "Read in the program for plan 5", from the program's own text. Nothing in that last section was seen live, and it marks each point as seen, read in the program or guessed.
+What the real `claude` program did when driven through `mindrune-probe` on 2026-11-10. Tasks 10 to 16 of plan 1 and plans 2 to 5 treat this file as the source of truth. Where it disagrees with an earlier assumption, this file wins. Two sections were added later: "Stored sessions", by plan 3, from the store on disk rather than from the probe, and the last, "Read in the program for plan 5", from the program's own text. Nothing in that last section was seen live, and it marks each point as seen, read in the program or guessed. "The context breakdown" followed plan 5, and plan 6 added "Attachments, as sent", the shapes the adapter writes for a message with images and files, marked the same way.
 
 Lines without a prefix below are what `claude` sent. They come from the scrubbed fixtures in `crates/claude/tests/fixtures/live/`, with some fields left out for brevity and long strings cut with `…`; the fixtures hold the full records. Lines starting with `> ` are what the probe sent. Those come from the raw recordings and are in no fixture, because the scrubber keeps only what `claude` sent. In the fixtures, UUIDs are replaced with numbered placeholders, the e-mail and home path are replaced, lists longer than six entries are cut to three, the MCP server and plugin lists are cut to one, thinking signatures are replaced, the `get_usage` reply keeps only its `five_hour` and `seven_day` windows and drops its `behaviors` block, and one file path that the stream had split across two lines was fixed by hand.
 
@@ -371,7 +371,7 @@ Added by plan 5 (the effort level, the right panel and Remote Control) on 2026-1
 - **Read in the program**: read in its text, never seen working.
 - **Guess**: inferred, not read.
 
-Lines below that start with `> ` are what the adapter sends; the others are what the program would send. All of them are written by hand from the program's text, with made-up values and some keys left out: none is a recording. Plan 5's live test prints a line for most points, and each point says which line settles it. Until Jerod has run the live test, every point marked "read in the program" is open.
+Lines below that start with `> ` are what the adapter sends; the others are what the program would send. All of them are written by hand from the program's text, with made-up values and some keys left out: none is a recording. Plan 5's live test prints a line for most points, and each point says which line settles it. Until Jerod has run the live test, every point marked "read in the program" is open. Jerod ran it on 2026-11-16: `get_settings`, `apply_flag_settings` with `effortLevel` (both ways), `get_context_usage` at a session's start and after a turn, Remote Control on and off after a turn and before a first turn, and `--effort` on resume were all seen working. The refusal kinds and the states `reconnecting` and `policy_disabled` were not met and stay as read.
 
 ### Effort level
 
@@ -454,3 +454,36 @@ Added on 2026-11-16, after plan 5, for the rows under "Context" in the panel. Ma
 - **Seen.** Rows of the kind `used`. **Read in the program:** `kind` is also `free` (one row, "Free space", the rest of the window), `buffer` (the room kept for compacting, "Autocompact buffer" or "Compact buffer") or `deferred` (tool descriptions kept out of the window, listed for awareness and left out of the program's sums). The rows come in this order of ids: `system_prompt`, `system_tools`, `mcp_tools`, `mcp_instructions`, `mcp_tools_deferred`, `system_tools_deferred`, `custom_agents`, `memory_files`, `skills`, `messages`, then the buffer, then `free_space`; a used row with no tokens is left out by the program.
 - **What the adapter does.** It asks after the session starts and after every `result`, whether the turn ended well or not, in the same list as the reading of the effort level and after it. From a success reply with `categories` and a `maxTokens` above nothing it gives the `used`, `buffer` and `free` rows in the program's order; a `deferred` row, a row of a kind it does not know and a row without a `name` or whole `tokens` are dropped. A refusal, a reply without the two keys, or one with no row left gives nothing, and nothing in the conversation. The panel shows each row with tokens; before a session's first turn here, its share over the bar is the used rows over the window.
 - **Not known.** Whether the program answers before the first turn, when nothing has been sent yet: V9 asked mid-session. Settled by the live test's two lines, `live: context breakdown at start: …` and `live: context breakdown after a turn: …`, each a count of parts and their kinds, or `none`. Whether `free` and `buffer` rows come as read is settled by the kinds they print.
+
+## Attachments, as sent
+
+Added by plan 6 (attachments) on 2026-11-16. No agent ran `claude` for it. The lines below are what the adapter writes (`crates/claude/src/encode.rs`, `user_message`), written by hand with made-up values: none is a recording. The base64 is cut with `…`; the adapter writes it whole, on the one line. The keys are shown in a readable order; the adapter writes them sorted by name. Each point is marked as in "Read in the program for plan 5", and says which line of the live test settles it. Until Jerod has run the live test, every point not marked "seen" is open. Jerod ran it on 2026-11-16: a PNG image block sent through the app's own path was answered, a path under `Attached files:` made Claude read the file, the stored message read back as 1 image and 1 file with the text kept whole, and a line of about 5.2 MB went through. JPEG, GIF and WebP blocks stay unseen.
+
+A message with text, one image and two files is one `user` line. Its content is one text block, then one `image` block per image with a base64 source. Files are not blocks: the text names them by path after a blank line and `Attached files:`, one `- PATH` line each.
+
+```json
+> {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Does the sketch follow the plan?\n\nAttached files:\n- /home/alex/sketches/plan.md\n- /home/alex/sketches/shapes.txt"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAABAAAAAQ…"}}]}}
+```
+
+A message of an image alone has no text block at all, not an empty one:
+
+```json
+> {"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo…"}}]}}
+```
+
+A message of files alone is a text block that starts with the heading:
+
+```json
+> {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Attached files:\n- /home/alex/project/notes/login.md"}]}}
+```
+
+The `media_type` is `image/png`, `image/jpeg`, `image/gif` or `image/webp`, from the image's first bytes, not its name. An image made smaller by the app is sent as PNG when a pixel of it is not opaque, or when it is opaque and its PNG fits the limit; else as JPEG. A JPEG whose orientation tag says it is not upright is always turned and sent as a new JPEG. A path is written as it is, never quoted; a path that is not UTF-8 or holds a line break is never sent (its chip says "Its name cannot be sent").
+
+What each shape rests on:
+
+- **Seen** (V4). A text block followed by a PNG `image` block with a base64 source is answered, and the answer was about the image. The live test's `live: the answer names the colour: yes` sees it again through the app's own path: the chip read on the library thread, the line queued to the writer thread.
+- **Read in the Messages format, never seen.** JPEG, GIF and WebP image blocks. Nothing in the live test sends one; Jerod's look does, by attaching one.
+- **Never seen.** That a path under `Attached files:` makes Claude read the file with its own tools. Settled by `live: the answer names the file's word: yes|no`: the file the test writes starts with a word the answer can only name if the file was read. A `no` beside a `yes` for the colour means the path alone does not make Claude read it.
+- **Never seen.** How the program stores such a message. The history reader (`crates/claude/src/history.rs`) counts the `image` blocks of a stored `user` record and takes the `Attached files:` block off the end of its text, giving the files back; it assumes the program stores the text block first and unchanged. Settled by `live: the stored message shows N image(s) and N file(s), text kept whole: yes|no`, read from the session's stored history through the backend: `1 image(s) and 1 file(s), text kept whole: yes` means the reader holds. Fewer images, no file, or `no` means the stored form differs, and the reader is corrected from what the test prints before plan 6 is merged. The line before it, `live: the stored history holds N message(s) of the user's`, says whether the program split the message into more than one record.
+- **Read in the program, never seen.** The program's own limits for an image: 2,000 pixels a side and 5,242,880 bytes of base64. The app keeps under them by itself: an image is sent as it is only while it is within 2,000 pixels a side and 3,932,160 bytes, else made smaller. Nothing is sent past them.
+- **Never seen.** A line of several megabytes on the program's input. Settled by `live: a 3 MB line went through: yes|no`: a PNG of noise of about 3.9 MB, a little under the app's limit, sent byte for byte as a line of about 5.2 MB of base64. `yes` means the turn it was sent in was answered. `no` means the turn failed, the program ended, or nothing came within 120 seconds, and the lines before it say which.

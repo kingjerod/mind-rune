@@ -1,6 +1,7 @@
 //! Everything the window knows, as plain data: no UI code and no adapter code.
 
 mod app;
+mod attach;
 mod backend;
 mod changes;
 mod conversation;
@@ -18,6 +19,10 @@ pub use app::{
     MIN_WIDTH, OWN_EXIT_SLACK_SECONDS, PromptChoice, RECENT_DAYS, RELIST_SECONDS, Screen,
     USAGE_RETRY_SECONDS, Width,
 };
+pub use attach::{
+    Chip, ChipState, Kind as AttachKind, MAX_BYTES, MAX_PIXELS, MAX_SIDE, Prepared, Problem,
+    READ_LIMIT, Source, THUMB_SIDE, Thumb, name_of, prepare,
+};
 pub use backend::{Backend, FromBackend, ToBackend, Wake};
 pub use changes::{Changes, FileChange};
 pub use conversation::{
@@ -28,7 +33,7 @@ pub use git::{Branch, branch};
 pub use groups::{Group, GroupId, Groups, Line, Row, Section, SidebarModel, sidebar_model};
 pub use saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile};
 pub use session::{
-    HistoryState, Phase, Remote, Session, answer_words, mode_label, model_option_label,
+    HistoryState, Outgoing, Phase, Remote, Session, answer_words, mode_label, model_option_label,
 };
 pub use sessions::{Entry, EntryMut, Mark, Prompt, SessionKey, Sessions};
 pub use tiles::{

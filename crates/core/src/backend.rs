@@ -6,10 +6,13 @@
 //! `send` for it, in order; it ends with its session. Every look has a thread of its own too.
 //! One more thread, the library thread, makes the other calls one at a time in the order they
 //! were sent: the account, the listing, a history, an activity time. It also reads the git
-//! branch of a folder. So a slow call holds up only what was sent after it to the same thread.
+//! branch of a folder. The preparing thread reads and checks each attachment, in the order
+//! they were attached, and then makes the picture of each image a history holds. So a slow
+//! call holds up only what was sent after it to the same thread.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -18,10 +21,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mr_agent::{
-    Account, Agent, AgentError, ModelOption, SessionCommand, SessionEvent, SessionHandle,
-    SessionId, StartSpec, StoredHistory, StoredSession, UsageLimits,
+    Account, Agent, AgentError, HistoryItem, ImageData, ModelOption, SessionCommand, SessionEvent,
+    SessionHandle, SessionId, StartSpec, StoredHistory, StoredSession, UsageLimits,
 };
 
+use crate::attach::{self, Prepared, Problem, Source, Thumb};
 use crate::git::{self, Branch};
 use crate::sessions::SessionKey;
 
@@ -57,6 +61,11 @@ pub enum ToBackend {
     ReadBranch {
         folder: PathBuf,
     },
+    /// Read and check what chip `chip` holds.
+    Prepare {
+        chip: u64,
+        source: Source,
+    },
 }
 
 /// What the backend queues for the window. Everything that belongs to an open carries its
@@ -81,9 +90,13 @@ pub enum FromBackend {
         since_unix: Option<i64>,
         result: Result<Vec<StoredSession>, AgentError>,
     },
+    /// A history, without its images' bytes: each stored image has an id in `pictures`
+    /// instead, which holds the ids of each of its user messages in turn, one per image, and
+    /// whose picture comes by itself in a `Picture`.
     History {
         key: SessionKey,
         result: Result<StoredHistory, AgentError>,
+        pictures: Vec<Vec<u64>>,
     },
     Activity {
         key: SessionKey,
@@ -100,11 +113,31 @@ pub enum FromBackend {
         folder: PathBuf,
         branch: Option<Branch>,
     },
+    /// What reading chip `chip`'s attachment gave.
+    Prepared {
+        chip: u64,
+        result: Result<Prepared, Problem>,
+    },
+    /// The picture of the stored image `id`: none when it cannot be read. The pictures of a
+    /// history come after it, in no set order.
+    Picture {
+        id: u64,
+        thumb: Option<Thumb>,
+    },
 }
 
 /// Called after every message is queued for the window, on whichever thread
 /// queued it. It must be cheap and must not block.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// What reads and checks an attachment: `attach::prepare`, or a stand-in in a test.
+type Preparer = Arc<dyn Fn(&Source) -> Result<Prepared, Problem> + Send + Sync>;
+
+/// What makes the picture of a stored image: `attach::picture_of`, or a stand-in in a test.
+type Picturer = Arc<dyn Fn(&ImageData) -> Option<Thumb> + Send + Sync>;
+
+/// The top bit of every stored picture's id, which no chip's id has.
+const STORED_PICTURE: u64 = 1 << 63;
 
 /// The window's end of the backend. Neither `send` nor `try_recv` blocks: the first only
 /// pushes onto channels (or starts a thread) and the second polls one.
@@ -120,6 +153,7 @@ pub struct Backend {
     /// Set when the `Backend` is dropped: every thread skips what is still queued.
     stopping: Arc<AtomicBool>,
     library: Sender<LibraryJob>,
+    preparing: Sender<PrepareJob>,
     lanes: RefCell<HashMap<u64, Arc<Lane>>>,
     looks: RefCell<Vec<LookThread>>,
     /// How many opens' threads are running.
@@ -130,28 +164,58 @@ impl Backend {
     pub const LOOK_START_LIMIT: Duration = Duration::from_secs(20);
     pub const LOOK_USAGE_LIMIT: Duration = Duration::from_secs(10);
 
-    /// Starts the library thread. `wake` is called after every message is queued for the
-    /// window.
+    /// Starts the library thread and the preparing thread. `wake` is called after every message
+    /// is queued for the window.
     pub fn start(agent: Arc<dyn Agent>, wake: Wake) -> Backend {
+        Backend::start_with(
+            agent,
+            wake,
+            Arc::new(attach::prepare),
+            Arc::new(attach::picture_of),
+        )
+    }
+
+    /// `start`, with `prepare` reading each attachment and `picture` making each stored
+    /// image's picture.
+    fn start_with(
+        agent: Arc<dyn Agent>,
+        wake: Wake,
+        prepare: Preparer,
+        picture: Picturer,
+    ) -> Backend {
         let (sender, inbox) = mpsc::channel();
         let outbox = Outbox { sender, wake };
         let stopping = Arc::new(AtomicBool::new(false));
+        let (preparing, prepare_jobs) = mpsc::channel();
         let (library, jobs) = mpsc::channel();
         let thread = Library {
             agent: agent.clone(),
             outbox: outbox.clone(),
             stopping: stopping.clone(),
+            preparing: preparing.clone(),
+            next_picture: 0,
         };
         thread::Builder::new()
             .name("mindrune-library".into())
             .spawn(move || thread.run(jobs))
             .expect("the backend's library thread starts");
+        let thread = Preparing {
+            outbox: outbox.clone(),
+            stopping: stopping.clone(),
+            prepare,
+            picture,
+        };
+        thread::Builder::new()
+            .name("mindrune-prepare".into())
+            .spawn(move || thread.run(prepare_jobs))
+            .expect("the backend's preparing thread starts");
         Backend {
             agent,
             outbox,
             inbox,
             stopping,
             library,
+            preparing,
             lanes: RefCell::new(HashMap::new()),
             looks: RefCell::new(Vec::new()),
             open_threads: Arc::new(AtomicUsize::new(0)),
@@ -176,6 +240,10 @@ impl Backend {
             ToBackend::Send { open, command } => self.pass(open, command),
             ToBackend::Look { folder } => self.look(folder),
             ToBackend::ReadBranch { folder } => self.ask_library(LibraryJob::Branch { folder }),
+            ToBackend::Prepare { chip, source } => {
+                // A send fails only once the preparing thread has ended; there is nobody to ask.
+                let _ = self.preparing.send(PrepareJob::Prepare { chip, source });
+            }
         }
     }
 
@@ -193,13 +261,16 @@ impl Backend {
     /// Waits until every thread has handled every message sent so far, looks included. For
     /// tests and the scripted demo only: with a real agent this can block for seconds.
     pub fn flush(&self) {
-        // Every open's thread and the library thread answer their copy of `token` when they
-        // reach it, or drop it unanswered when they end first: either way everything sent to
-        // them before it was handled. `recv` fails once the last copy is gone.
+        // Every open's thread, the library thread and the preparing thread answer their copy of
+        // `token` when they reach it, or drop it unanswered when they end first: either way
+        // everything sent to them before it was handled. The library passes its copy on to the
+        // preparing thread, behind the pictures it asked for. `recv` fails once the last copy
+        // is gone.
         let (token, handled) = mpsc::channel();
         for lane in self.lanes.borrow().values() {
             let _ = lane.offer(OpenJob::Flush(token.clone()));
         }
+        let _ = self.preparing.send(PrepareJob::Flush(token.clone()));
         let _ = self.library.send(LibraryJob::Flush(token));
         while handled.recv().is_ok() {}
         // A look's thread handles one message; it is handled when the thread has ended.
@@ -309,7 +380,8 @@ impl Drop for Backend {
         for look in self.looks.get_mut().iter() {
             let _ = look.signals.send(LookSignal::Stop);
         }
-        // The library thread ends when `library` is dropped with this.
+        // The library thread ends when `library` is dropped with this, and the preparing thread
+        // once `preparing` and the library thread's sender are gone.
     }
 }
 
@@ -356,11 +428,15 @@ struct Library {
     agent: Arc<dyn Agent>,
     outbox: Outbox,
     stopping: Arc<AtomicBool>,
+    /// Where the pictures of a history's images are made.
+    preparing: Sender<PrepareJob>,
+    /// The number of the next stored picture's id.
+    next_picture: u64,
 }
 
 impl Library {
     /// Ends when the `Backend`, which holds the only sending end of `jobs`, is dropped.
-    fn run(self, jobs: Receiver<LibraryJob>) {
+    fn run(mut self, jobs: Receiver<LibraryJob>) {
         while let Ok(job) = jobs.recv() {
             if self.stopping.load(Ordering::SeqCst) {
                 break;
@@ -371,10 +447,11 @@ impl Library {
                     since_unix,
                     result: self.agent.list_sessions(since_unix),
                 },
-                LibraryJob::History { key, id, max_items } => FromBackend::History {
-                    key,
-                    result: self.agent.read_session(&id, max_items),
-                },
+                LibraryJob::History { key, id, max_items } => {
+                    let result = self.agent.read_session(&id, max_items);
+                    self.answer_history(key, result);
+                    continue;
+                }
                 LibraryJob::Activity { key, id } => FromBackend::Activity {
                     key,
                     result: self.agent.last_active(&id),
@@ -384,11 +461,131 @@ impl Library {
                     folder,
                 },
                 LibraryJob::Flush(token) => {
-                    let _ = token.send(());
+                    // Answered behind the pictures asked for so far, or dropped once the
+                    // preparing thread is gone.
+                    let _ = self.preparing.send(PrepareJob::Flush(token));
                     continue;
                 }
             };
             self.outbox.queue(answer);
+        }
+    }
+
+    /// Answers a history at once, with an id for each stored image and none of their bytes,
+    /// then asks the preparing thread for each picture. An image whose bytes the store could
+    /// not give has an id and no picture, and nothing is answered for it.
+    fn answer_history(&mut self, key: SessionKey, result: Result<StoredHistory, AgentError>) {
+        let mut pictures = Vec::new();
+        let mut images = Vec::new();
+        let result = result.map(|mut history| {
+            for item in &mut history.items {
+                if let HistoryItem::User {
+                    image_count,
+                    images: stored,
+                    ..
+                } = item
+                {
+                    let ids: Vec<u64> = (0..*image_count).map(|_| self.picture_id()).collect();
+                    // Each image keeps its place; the history keeps `None` in every entry, even
+                    // one past the count, so no bytes reach the window.
+                    for (at, image) in stored.iter_mut().enumerate() {
+                        if let Some(image) = image.take()
+                            && let Some(&id) = ids.get(at)
+                        {
+                            images.push((id, image));
+                        }
+                    }
+                    pictures.push(ids);
+                }
+            }
+            history
+        });
+        self.outbox.queue(FromBackend::History {
+            key,
+            result,
+            pictures,
+        });
+        for (id, image) in images {
+            let _ = self.preparing.send(PrepareJob::Picture { id, image });
+        }
+    }
+
+    /// A new id for a stored picture. Its top bit keeps it apart from every chip's.
+    fn picture_id(&mut self) -> u64 {
+        let id = STORED_PICTURE | self.next_picture;
+        self.next_picture += 1;
+        id
+    }
+}
+
+enum PrepareJob {
+    Prepare { chip: u64, source: Source },
+    Picture { id: u64, image: ImageData },
+    Flush(FlushToken),
+}
+
+/// Reads attachments and makes the pictures of stored images, apart from the library: a file
+/// on a slow disk, or a large image, holds up only what was asked after it, and a chip waits
+/// for no stored picture but the one under way.
+struct Preparing {
+    outbox: Outbox,
+    stopping: Arc<AtomicBool>,
+    prepare: Preparer,
+    picture: Picturer,
+}
+
+impl Preparing {
+    /// Ends once the `Backend` and the library thread, which hold the sending ends of `jobs`,
+    /// are gone and nothing is left to do, or as soon as the `Backend` is dropped.
+    ///
+    /// What the user waits to send goes first: every job waiting is taken in before the next
+    /// one starts, and a chip's goes before the pictures asked for earlier. A picture under way
+    /// is finished first. A flush waits behind the pictures, so it is still answered after
+    /// everything sent before it.
+    fn run(self, jobs: Receiver<PrepareJob>) {
+        let mut chips = VecDeque::new();
+        let mut later = VecDeque::new();
+        loop {
+            while let Ok(job) = jobs.try_recv() {
+                match job {
+                    PrepareJob::Prepare { .. } => chips.push_back(job),
+                    PrepareJob::Picture { .. } | PrepareJob::Flush(_) => later.push_back(job),
+                }
+            }
+            let job = match chips.pop_front().or_else(|| later.pop_front()) {
+                Some(job) => job,
+                None => match jobs.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                },
+            };
+            if self.stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            self.handle(job);
+        }
+    }
+
+    /// Does one job: a chip's, a picture's or a flush.
+    fn handle(&self, job: PrepareJob) {
+        match job {
+            PrepareJob::Prepare { chip, source } => {
+                // The decoders read files from anywhere: one that panics costs its own chip
+                // and not the thread.
+                let result = panic::catch_unwind(AssertUnwindSafe(|| (self.prepare)(&source)))
+                    .unwrap_or(Err(Problem::Unreadable));
+                self.outbox.queue(FromBackend::Prepared { chip, result });
+            }
+            PrepareJob::Picture { id, image } => {
+                // A stored image is read as a file is: a decoder that panics costs its own
+                // picture.
+                let thumb = panic::catch_unwind(AssertUnwindSafe(|| (self.picture)(&image)))
+                    .unwrap_or(None);
+                self.outbox.queue(FromBackend::Picture { id, thumb });
+            }
+            PrepareJob::Flush(token) => {
+                let _ = token.send(());
+            }
         }
     }
 }
@@ -888,6 +1085,8 @@ mod tests {
                 HistoryItem::User {
                     text: "Tidy the notes".into(),
                     image_count: 0,
+                    files: Vec::new(),
+                    images: Vec::new(),
                 },
                 HistoryItem::AssistantText("Done, alex.".into()),
             ],
@@ -1150,7 +1349,8 @@ mod tests {
             wait(&backend),
             FromBackend::History {
                 key: SessionKey(2),
-                result: Ok(stored_history())
+                result: Ok(stored_history()),
+                pictures: vec![Vec::new()],
             }
         );
         assert!(agent.holding(), "the look is still blocked");
@@ -1208,7 +1408,8 @@ mod tests {
             wait(&backend),
             FromBackend::History {
                 key: SessionKey(4),
-                result: Ok(stored_history())
+                result: Ok(stored_history()),
+                pictures: vec![Vec::new()],
             }
         );
         backend.send(ToBackend::CheckActivity {
@@ -1253,6 +1454,450 @@ mod tests {
                 branch: None,
             }
         );
+    }
+
+    #[test]
+    fn an_attachment_is_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dot.png");
+        let pixels = image::RgbaImage::from_pixel(4, 3, image::Rgba([200, 40, 40, 255]));
+        pixels.save(&path).unwrap();
+        let (backend, _) = start(&FakeAgent::new());
+        backend.send(ToBackend::Prepare {
+            chip: 7,
+            source: Source::Path(path),
+        });
+        let FromBackend::Prepared { chip, result } = wait(&backend) else {
+            panic!("the answer is not a prepared chip");
+        };
+        let prepared = result.expect("the image is read");
+        assert_eq!(chip, 7);
+        assert_eq!(prepared.kind, crate::attach::Kind::Image);
+        let thumb = prepared.thumb.expect("an image has a thumb");
+        assert_eq!((thumb.width, thumb.height), (4, 3));
+    }
+
+    /// A folder holding a repository on the branch `main`.
+    fn repository(dir: &tempfile::TempDir) -> PathBuf {
+        let repository = dir.path().join("notes");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        std::fs::write(repository.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        repository
+    }
+
+    #[test]
+    fn preparing_does_not_hold_up_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = repository(&dir);
+        // Each attachment waits until the test lets it go, and says when it starts to wait.
+        let (entered, began) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let prepare: Preparer = Arc::new(move |_: &Source| {
+            let _ = entered.send(());
+            let _ = gate.lock().unwrap().recv();
+            Err(Problem::Unreadable)
+        });
+        let backend = Backend::start_with(
+            Arc::new(FakeAgent::new()),
+            Arc::new(|| {}),
+            prepare,
+            Arc::new(attach::picture_of),
+        );
+        for chip in 1..=3 {
+            backend.send(ToBackend::Prepare {
+                chip,
+                source: Source::Path(format!("/home/alex/photo-{chip}.png").into()),
+            });
+        }
+        began
+            .recv_timeout(LIMIT)
+            .expect("the first attachment is read");
+        backend.send(ToBackend::ReadBranch {
+            folder: repository.clone(),
+        });
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Branch {
+                folder: repository,
+                branch: Some(Branch::Named("main".into())),
+            }
+        );
+        drop(release);
+        for chip in 1..=3 {
+            assert_eq!(
+                wait(&backend),
+                FromBackend::Prepared {
+                    chip,
+                    result: Err(Problem::Unreadable)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_panic_while_preparing_costs_one_chip() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "a line\n").unwrap();
+        // Stands for a decoder that breaks on one file.
+        let prepare: Preparer = Arc::new(|source: &Source| match source {
+            Source::Path(path) if path.ends_with("broken.png") => panic!("a decoder broke"),
+            other => attach::prepare(other),
+        });
+        let backend = Backend::start_with(
+            Arc::new(FakeAgent::new()),
+            Arc::new(|| {}),
+            prepare,
+            Arc::new(attach::picture_of),
+        );
+        backend.send(ToBackend::Prepare {
+            chip: 1,
+            source: Source::Path(dir.path().join("broken.png")),
+        });
+        backend.send(ToBackend::Prepare {
+            chip: 2,
+            source: Source::Path(notes.clone()),
+        });
+        let FromBackend::Prepared { chip, result } = wait(&backend) else {
+            panic!("the answer is not a prepared chip");
+        };
+        assert_eq!(chip, 1);
+        assert_eq!(result.map_err(Problem::words), Err("Cannot be read"));
+        let FromBackend::Prepared { chip, result } = wait(&backend) else {
+            panic!("the answer is not a prepared chip");
+        };
+        assert_eq!(chip, 2);
+        assert_eq!(
+            result.map(|prepared| prepared.attachment),
+            Ok(mr_agent::Attachment::File { path: notes })
+        );
+    }
+
+    /// A PNG of `width` by `height`, made here.
+    fn png(width: u32, height: u32) -> ImageData {
+        let pixels = image::RgbaImage::from_pixel(width, height, image::Rgba([40, 90, 200, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        ImageData::new(bytes.into_inner())
+    }
+
+    /// A stored history of one message of the user's with `images`, `None` for one not read,
+    /// and a reply.
+    fn history_with_images(images: Vec<Option<ImageData>>) -> StoredHistory {
+        StoredHistory {
+            items: vec![
+                HistoryItem::User {
+                    text: "look at these".into(),
+                    image_count: images.len(),
+                    files: Vec::new(),
+                    images,
+                },
+                HistoryItem::AssistantText("Seen, alex.".into()),
+            ],
+            ..StoredHistory::default()
+        }
+    }
+
+    /// The history `backend` answers for `key`: its items, without any image's bytes, and the
+    /// ids of its stored pictures.
+    fn read_history(
+        backend: &Backend,
+        key: SessionKey,
+        id: &SessionId,
+    ) -> (StoredHistory, Vec<Vec<u64>>) {
+        backend.send(ToBackend::ReadHistory {
+            key,
+            id: id.clone(),
+            max_items: 10,
+        });
+        match wait(backend) {
+            FromBackend::History {
+                key: answered,
+                result: Ok(history),
+                pictures,
+            } if answered == key => (history, pictures),
+            other => panic!("not the history: {other:?}"),
+        }
+    }
+
+    /// Picture answers until `count` came, by id.
+    fn pictures(backend: &Backend, count: usize) -> HashMap<u64, Option<Thumb>> {
+        let mut answers = HashMap::new();
+        while answers.len() < count {
+            match wait(backend) {
+                FromBackend::Picture { id, thumb } => {
+                    assert!(answers.insert(id, thumb).is_none(), "{id} answered twice");
+                }
+                other => panic!("not a picture: {other:?}"),
+            }
+        }
+        answers
+    }
+
+    #[test]
+    fn a_history_is_answered_before_its_pictures() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.set_history(
+            &id,
+            history_with_images(vec![Some(png(60, 30)), Some(png(5, 8))]),
+        );
+        // Each picture waits until the test lets it go, so the history cannot wait for them.
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let picture: Picturer = Arc::new(move |image: &ImageData| {
+            let _ = gate.lock().unwrap().recv();
+            attach::picture_of(image)
+        });
+        let backend = Backend::start_with(
+            Arc::new(fake.clone()),
+            Arc::new(|| {}),
+            Arc::new(attach::prepare),
+            picture,
+        );
+        let (history, ids) = read_history(&backend, SessionKey(3), &id);
+        let [
+            HistoryItem::User {
+                image_count,
+                images,
+                ..
+            },
+            HistoryItem::AssistantText(_),
+        ] = history.items.as_slice()
+        else {
+            panic!("not the stored items: {:?}", history.items);
+        };
+        assert_eq!(*image_count, 2);
+        assert_eq!(images, &[None, None], "the bytes came with the history");
+        let [ids] = ids.as_slice() else {
+            panic!("not one list of ids: {ids:?}");
+        };
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids.iter().all(|id| id & 1 << 63 != 0), "{ids:?}");
+        assert!(
+            backend.try_recv().is_none(),
+            "a picture came before it was let go"
+        );
+        drop(release);
+        let answers = pictures(&backend, 2);
+        let size = |id: u64| {
+            let thumb = answers[&id].as_ref().expect("a picture");
+            (thumb.width, thumb.height)
+        };
+        assert_eq!(size(ids[0]), (60, 30));
+        assert_eq!(size(ids[1]), (5, 8));
+        // Read again, the same session gives new ids.
+        let (_, again) = read_history(&backend, SessionKey(3), &id);
+        assert_eq!(again[0].len(), 2);
+        assert!(again[0].iter().all(|id| !ids.contains(id)), "{again:?}");
+        assert_eq!(pictures(&backend, 2).len(), 2);
+    }
+
+    #[test]
+    fn an_unreadable_stored_image_answers_with_no_picture() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        // Three counted: one read and no image, one an image, one not read at all.
+        let not_an_image = ImageData::new(b"alex was here".to_vec());
+        fake.set_history(
+            &id,
+            history_with_images(vec![Some(not_an_image), Some(png(4, 4)), None]),
+        );
+        let (backend, _) = start(&fake);
+        let (_, ids) = read_history(&backend, SessionKey(1), &id);
+        assert_eq!(ids[0].len(), 3, "an image not read still has an id");
+        backend.flush();
+        let answers = pictures(&backend, 2);
+        assert_eq!(answers[&ids[0][0]], None);
+        assert!(answers[&ids[0][1]].is_some());
+        assert!(!answers.contains_key(&ids[0][2]));
+        assert!(backend.try_recv().is_none());
+    }
+
+    #[test]
+    fn an_unreadable_image_in_the_middle_keeps_the_others_in_place() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        // The second was held another way than as base64: the reader could not read it.
+        fake.set_history(
+            &id,
+            history_with_images(vec![Some(png(6, 3)), None, Some(png(2, 5))]),
+        );
+        let (backend, _) = start(&fake);
+        let (_, ids) = read_history(&backend, SessionKey(1), &id);
+        let [ids] = ids.as_slice() else {
+            panic!("not one list of ids: {ids:?}");
+        };
+        assert_eq!(ids.len(), 3);
+        backend.flush();
+        let answers = pictures(&backend, 2);
+        let size = |id: u64| {
+            let thumb = answers[&id].as_ref().expect("a picture");
+            (thumb.width, thumb.height)
+        };
+        assert_eq!(size(ids[0]), (6, 3));
+        assert_eq!(size(ids[2]), (2, 5));
+        assert!(!answers.contains_key(&ids[1]));
+        assert_eq!(
+            backend.try_recv(),
+            None,
+            "nothing comes for the one not read"
+        );
+    }
+
+    #[test]
+    fn a_chip_is_prepared_before_waiting_pictures() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        let images = (1..=4).map(|width| Some(png(width, 1))).collect();
+        fake.set_history(&id, history_with_images(images));
+        // Each picture says when it starts and waits until the test lets it go.
+        let (entered, began) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let picture: Picturer = Arc::new(move |image: &ImageData| {
+            let _ = entered.send(());
+            let _ = gate.lock().unwrap().recv();
+            attach::picture_of(image)
+        });
+        let backend = Backend::start_with(
+            Arc::new(fake.clone()),
+            Arc::new(|| {}),
+            Arc::new(attach::prepare),
+            picture,
+        );
+        let (_, ids) = read_history(&backend, SessionKey(1), &id);
+        let ids = &ids[0];
+        began
+            .recv_timeout(LIMIT)
+            .expect("the first picture is under way");
+        // The library asked for every picture before it answers what was sent after the history.
+        let plain = dir.path().to_path_buf();
+        backend.send(ToBackend::ReadBranch {
+            folder: plain.clone(),
+        });
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Branch {
+                folder: plain,
+                branch: None,
+            }
+        );
+        backend.send(ToBackend::Prepare {
+            chip: 7,
+            source: Source::Pasted(png(3, 2)),
+        });
+        drop(release);
+        let answers: Vec<FromBackend> = (0..5).map(|_| wait(&backend)).collect();
+        // The picture under way is finished first, then the chip, then the pictures that waited.
+        assert!(
+            matches!(&answers[0], FromBackend::Picture { id, .. } if *id == ids[0]),
+            "{:?}",
+            answers[0]
+        );
+        assert!(
+            matches!(
+                &answers[1],
+                FromBackend::Prepared {
+                    chip: 7,
+                    result: Ok(_)
+                }
+            ),
+            "{:?}",
+            answers[1]
+        );
+        let mut rest: Vec<u64> = answers[2..]
+            .iter()
+            .map(|answer| match answer {
+                FromBackend::Picture { id, .. } => *id,
+                other => panic!("not a picture: {other:?}"),
+            })
+            .collect();
+        rest.sort_unstable();
+        assert_eq!(rest, ids[1..]);
+    }
+
+    #[test]
+    fn a_history_answered_holds_no_bytes_whatever_the_agent_sends() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        // An agent that counts one image and gives two.
+        let mut history = history_with_images(vec![Some(png(3, 3)), Some(png(4, 4))]);
+        if let HistoryItem::User { image_count, .. } = &mut history.items[0] {
+            *image_count = 1;
+        }
+        fake.set_history(&id, history);
+        let (backend, _) = start(&fake);
+        let (answered, ids) = read_history(&backend, SessionKey(1), &id);
+        let HistoryItem::User { images, .. } = &answered.items[0] else {
+            panic!("not the user's message: {:?}", answered.items);
+        };
+        assert!(images.iter().all(Option::is_none), "{images:?}");
+        assert_eq!(ids, vec![vec![ids[0][0]]]);
+        backend.flush();
+        let answers = pictures(&backend, 1);
+        assert!(answers[&ids[0][0]].is_some());
+        assert_eq!(
+            backend.try_recv(),
+            None,
+            "nothing comes for the image not counted"
+        );
+    }
+
+    #[test]
+    fn a_panic_while_making_a_picture_costs_one_picture() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.set_history(
+            &id,
+            history_with_images(vec![Some(png(3, 3)), Some(png(4, 4))]),
+        );
+        // Stands for a decoder that breaks on one image.
+        let picture: Picturer = Arc::new(|image: &ImageData| {
+            let thumb = attach::picture_of(image).expect("a picture");
+            assert!(thumb.width != 3, "a decoder broke");
+            Some(thumb)
+        });
+        let backend = Backend::start_with(
+            Arc::new(fake.clone()),
+            Arc::new(|| {}),
+            Arc::new(attach::prepare),
+            picture,
+        );
+        let (_, ids) = read_history(&backend, SessionKey(1), &id);
+        let answers = pictures(&backend, 2);
+        assert_eq!(answers[&ids[0][0]], None);
+        assert!(answers[&ids[0][1]].is_some());
+    }
+
+    #[test]
+    fn a_history_without_images_asks_nothing_of_the_prepare_thread() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.set_history(&id, stored_history());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        let picture: Picturer = Arc::new(move |_: &ImageData| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let backend = Backend::start_with(
+            Arc::new(fake.clone()),
+            Arc::new(|| {}),
+            Arc::new(attach::prepare),
+            picture,
+        );
+        let (history, ids) = read_history(&backend, SessionKey(1), &id);
+        assert_eq!(history, stored_history());
+        assert_eq!(ids, vec![Vec::<u64>::new()]);
+        backend.flush();
+        assert_eq!(backend.try_recv(), None);
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
     }
 
     #[test]

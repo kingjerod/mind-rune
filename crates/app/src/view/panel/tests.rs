@@ -1551,7 +1551,7 @@ fn files_are_not_known_until_the_history_is_read() {
     history_is(&mut rt, key, HistoryState::Loading);
     {
         let mut entry = rt.state.app.sessions.get_mut(key).unwrap();
-        entry.session.load_history(StoredHistory::default());
+        entry.session.load_history(StoredHistory::default(), &[]);
     }
     rt.invalidate();
     settle(&mut rt);
@@ -1597,6 +1597,8 @@ fn a_history_with_an_earlier_part_says_what_is_not_listed() {
         items: vec![HistoryItem::User {
             text: "Plant the bulbs".into(),
             image_count: 0,
+            files: Vec::new(),
+            images: Vec::new(),
         }],
         earlier_left_out: true,
         ..StoredHistory::default()
@@ -1604,7 +1606,7 @@ fn a_history_with_an_earlier_part_says_what_is_not_listed() {
     {
         let mut entry = rt.state.app.sessions.get_mut(key).unwrap();
         entry.session.history = HistoryState::NotLoaded;
-        entry.session.load_history(history);
+        entry.session.load_history(history, &[]);
     }
     rt.invalidate();
     settle(&mut rt);

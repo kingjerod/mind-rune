@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::command::SessionCommand;
+use crate::command::{ImageData, SessionCommand};
 use crate::event::{PermissionMode, SessionEvent, ToolDetail, ToolOutcome};
 use crate::ids::{SessionId, ToolCallId};
 
@@ -122,6 +122,11 @@ pub enum HistoryItem {
     User {
         text: String,
         image_count: usize,
+        /// The files the message was sent with.
+        files: Vec<PathBuf>,
+        /// The bytes of each image, in the message's order: one entry per image counted,
+        /// `None` for one whose bytes the store could not give.
+        images: Vec<Option<ImageData>>,
     },
     AssistantText(String),
     Thinking(String),

@@ -4,7 +4,9 @@
 //! row's toggle, "Show all", a copy button) focuses its tile itself; the core's intents do so
 //! for the others.
 
+use std::collections::HashMap;
 use std::hash::Hash;
+use std::path::PathBuf;
 
 use mr_agent::{ToolDetail, ToolOutcome};
 use mr_core::{
@@ -12,12 +14,12 @@ use mr_core::{
     SessionKey, ThinkingTime, ToolFamily, ToolGroup, clip, fenced, file_name, line_counts,
     thinking_label, unified_diff,
 };
-use rune::{Align, Color, Cursor, El, Icon, Span, col, el, icon, rich, text};
+use rune::{Align, Color, Cursor, El, Icon, Image, Span, SurfaceFit, col, el, icon, rich, text};
 use rune_kit::{
     Button, ButtonVariant, CodeFrame, IconButton, IconButtonVariant, Kit, Markdown, Spinner,
 };
 use rune_theme_opencode::icons::{
-    BRAIN, CUBE, FILE_DOCUMENT, MAGNIFYING_GLASS, PENCIL_LINE, TERMINAL, WARNING,
+    BRAIN, CUBE, FILE_DOCUMENT, MAGNIFYING_GLASS, PENCIL_LINE, PHOTO, TERMINAL, WARNING,
 };
 
 use crate::glue::{self, QuestionDraft, SessionView, Ui};
@@ -35,6 +37,23 @@ const ROW_PAD_X: f32 = 24.0;
 
 /// The widest a user's message box grows before its text wraps.
 const USER_MAX_WIDTH: f32 = 560.0;
+
+/// The height of the row of a message's pictures, and of each picture in it, whether it has
+/// come or not: a picture that comes never moves the conversation.
+const PICTURE_HEIGHT: f32 = 120.0;
+
+/// The narrowest and the widest a picture is drawn; a shape outside them shows bands.
+const PICTURE_MIN_WIDTH: f32 = 60.0;
+const PICTURE_MAX_WIDTH: f32 = 240.0;
+
+/// The space between two pictures.
+const PICTURE_GAP: f32 = 6.0;
+
+/// The corners of a picture, and of the slot that waits for one.
+const PICTURE_RADIUS: f32 = 6.0;
+
+/// The size of the icon in a slot that waits for its picture.
+const PICTURE_ICON: f32 = 24.0;
 
 /// The height of a thinking or tool line.
 const LINE_HEIGHT: f32 = 28.0;
@@ -81,10 +100,20 @@ pub fn row(ui: &Ui, key: SessionKey, item: &Item, kit: &'static Kit) -> El {
     let view = glue::view_of(ui, key);
     let folds = matches!(item.body, ItemBody::Thinking { .. } | ItemBody::Tools(_));
     let (content, pad_bottom) = match &item.body {
-        ItemBody::User { text, image_count } => {
+        ItemBody::User {
+            text,
+            files,
+            pictures,
+            ..
+        } => {
             let whole = view.whole.contains(&id);
+            let sent = Sent {
+                text,
+                pictures,
+                files,
+            };
             (
-                Some(user_message(key, id, text, *image_count, whole, kit)),
+                Some(user_message(&ui.thumbs, key, id, sent, whole, kit)),
                 ROW_PAD_BOTTOM,
             )
         }
@@ -150,6 +179,9 @@ struct RowVersion {
     /// A waiting request's drafts in its session's view: the options chosen and the
     /// "Something else" text with its caret and focus. `None` for every other item.
     draft: Option<Vec<QuestionDraft>>,
+    /// The size of each picture of a user's message whose handle is made, in order: a
+    /// picture's width follows it. Empty for every other item.
+    pictures: Vec<Option<[u32; 2]>>,
 }
 
 /// The version of the row of `item`, of `key`'s session. A kind of row that reads anything else
@@ -168,6 +200,13 @@ pub fn version(ui: &Ui, key: SessionKey, item: &Item) -> impl Hash + use<> {
         whole: view.whole.contains(&item.id),
         restart: offers_restart(ui, key, item),
         draft: waiting_draft(view, item),
+        pictures: match &item.body {
+            ItemBody::User { pictures, .. } => pictures
+                .iter()
+                .map(|picture| ui.thumbs.get(picture).and_then(Image::size))
+                .collect(),
+            _ => Vec::new(),
+        },
     }
 }
 
@@ -182,19 +221,31 @@ fn waiting_draft(view: &SessionView, item: &Item) -> Option<Vec<QuestionDraft>> 
     }
 }
 
+/// What a message of the user's was sent with.
+struct Sent<'a> {
+    text: &'a str,
+    pictures: &'a [u64],
+    files: &'a [PathBuf],
+}
+
 /// The user's message as typed, never read as Markdown: plain selectable text in a filled,
 /// rounded box at the right of the column. A long message is cut as long tool output is, unless
-/// `whole`, with [`show_all`] under it. A stored message that had images says how many at the
-/// bottom, in muted text (keyed `mr-user-images-{id}`); one with images and no text shows only
-/// that. The images themselves are not drawn.
+/// `whole`, with [`show_all`] under it. A message that had images shows them over its text
+/// ([`pictures`]), and one sent with files names them under it ([`files_line`]); one with no
+/// text shows only those.
 fn user_message(
+    thumbs: &HashMap<u64, Image>,
     key: SessionKey,
     id: ItemId,
-    message: &str,
-    image_count: usize,
+    sent: Sent<'_>,
     whole: bool,
     kit: &Kit,
 ) -> El {
+    let Sent {
+        text: message,
+        pictures: shown_pictures,
+        files,
+    } = sent;
     let mut cut = None;
     let shown = clipped(message, whole, &mut cut);
     let words = text(shown.to_owned())
@@ -204,22 +255,16 @@ fn user_message(
         .wrap()
         .selectable(true);
     let more = cut.map(|lines| show_all(key, id, lines, kit));
-    let bubble = if image_count == 0 && more.is_none() {
+    let bubble = if shown_pictures.is_empty() && files.is_empty() && more.is_none() {
         words.max_w(USER_MAX_WIDTH)
     } else {
-        let images = (image_count > 0).then(|| {
-            text(images_line(image_count))
-                .key(format!("mr-user-images-{}", id.0))
-                .font(kit.ty.ui)
-                .color(kit.c.text_muted)
-                .wrap()
-        });
         col()
             .max_w(USER_MAX_WIDTH)
             .gap(4.0)
+            .children(pictures(thumbs, key, id, shown_pictures, kit))
             .children((!message.is_empty()).then_some(words))
             .children(more)
-            .children(images)
+            .children(files_line(id, files, kit))
     };
     let bubble = bubble
         .px(14.0)
@@ -229,13 +274,98 @@ fn user_message(
     rune::row().w_full().justify_end().child(bubble)
 }
 
-/// How many images a stored message had: "1 image", "3 images".
-fn images_line(count: usize) -> String {
-    if count == 1 {
-        "1 image".to_owned()
-    } else {
-        format!("{count} images")
+/// The pictures of the user's message `id`, one per picture id, in a row keyed
+/// `mr-user-pictures-{id}` that is [`PICTURE_HEIGHT`] high whatever has come, scrolls sideways
+/// and never wraps. A picture whose handle is made is drawn whole in a box its shape asks for
+/// (`mr-user-picture-{picture}`); until then, and for good when it never comes, a slot of the
+/// bubble's own colour, outlined, with the image icon stands in its place
+/// (`mr-user-picture-wait-{picture}`). A press on the row focuses `key`'s tile and leaves the
+/// keyboard where it was. None for a message with no image.
+fn pictures(
+    thumbs: &HashMap<u64, Image>,
+    key: SessionKey,
+    id: ItemId,
+    pictures: &[u64],
+    kit: &Kit,
+) -> Option<El> {
+    if pictures.is_empty() {
+        return None;
     }
+    let count = pictures.len();
+    let slots = pictures.iter().enumerate().map(|(n, &picture)| {
+        let label = format!("Image {} of {count}", n + 1);
+        let made = thumbs
+            .get(&picture)
+            .and_then(|image| Some((image, image.size()?)));
+        match made {
+            Some((image, [width, height])) => el()
+                .key(format!("mr-user-picture-{picture}"))
+                .size(picture_width(width, height), PICTURE_HEIGHT)
+                .radius(PICTURE_RADIUS)
+                .pixels_fit(image.pixels(), SurfaceFit::Fit)
+                .role("img")
+                .label(label),
+            None => rune::row()
+                .key(format!("mr-user-picture-wait-{picture}"))
+                .size(PICTURE_HEIGHT, PICTURE_HEIGHT)
+                .center()
+                .radius(PICTURE_RADIUS)
+                .border(1.0, kit.c.border_weak)
+                .role("img")
+                .label(format!("{label}, not loaded"))
+                .child(icon(&PHOTO, PICTURE_ICON).color(kit.c.icon_muted)),
+        }
+    });
+    let row = col()
+        .key(format!("mr-user-pictures-{}", id.0))
+        .w_full()
+        .h(PICTURE_HEIGHT)
+        .scroll_x()
+        // A press focuses the tile, as on the rest of the message, and leaves the keyboard
+        // where it is.
+        .on_press(move |ui: &mut Ui| glue::focus_tile(ui, key, false))
+        .child(
+            rune::row()
+                .h(PICTURE_HEIGHT)
+                .gap(PICTURE_GAP)
+                .children(slots),
+        );
+    // To a screen reader the row is nothing, and its pictures belong to the message: a group
+    // with a press handler would be announced as a button.
+    Some(requests::unfocusable(row).role("none"))
+}
+
+/// The width of a picture of `width` by `height` pixels drawn [`PICTURE_HEIGHT`] high, kept
+/// between [`PICTURE_MIN_WIDTH`] and [`PICTURE_MAX_WIDTH`].
+fn picture_width(width: u32, height: u32) -> f32 {
+    (PICTURE_HEIGHT * width as f32 / height.max(1) as f32)
+        .clamp(PICTURE_MIN_WIDTH, PICTURE_MAX_WIDTH)
+}
+
+/// The names of the files a message was sent with, the last part of each path, ", " between
+/// them: one muted line keyed `mr-user-files-{id}`, whose tooltip has the whole paths, one a
+/// line. None for a message sent with no file.
+fn files_line(id: ItemId, files: &[PathBuf], kit: &Kit) -> Option<El> {
+    let (first, rest) = files.split_first()?;
+    let names: Vec<String> = files
+        .iter()
+        .map(|path| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let line = text(names.join(", "))
+        .key(format!("mr-user-files-{}", id.0))
+        .font(kit.ty.ui)
+        .color(kit.c.text_muted)
+        .wrap()
+        .help(first.display().to_string());
+    Some(
+        rest.iter()
+            .fold(line, |line, path| line.help_row(path.display().to_string())),
+    )
 }
 
 /// Claude's reply: Markdown over the whole text so far, each finished code block with a copy
@@ -752,12 +882,17 @@ mod tests {
         HistoryItem, SessionEvent, SessionId, StoredHistory, StoredSession, ToolCallId, ToolDetail,
         ToolOutcome,
     };
-    use mr_core::{ItemBody, ItemId, Phase, Session, SessionKey};
-    use rune::Runtime;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use mr_agent::ImageData;
+    use mr_core::{ChipState, ItemBody, ItemId, Phase, Session, SessionKey, Source};
+    use rune::{ElementInfo, ImageCache, Runtime};
 
     use crate::demo::{DAY, NOW_UNIX};
     use crate::glue::{self, Ui};
     use crate::testkit;
+    use crate::theme;
 
     /// The `mr-toggle-` key of the line that reads `summary`.
     fn toggle_key(rt: &Runtime<Ui>, summary: &str) -> String {
@@ -1188,6 +1323,8 @@ mod tests {
                 HistoryItem::User {
                     text: numbered_lines(500),
                     image_count: 2,
+                    files: Vec::new(),
+                    images: vec![None; 2],
                 },
                 HistoryItem::AssistantText("Read them all.".into()),
             ],
@@ -1217,10 +1354,505 @@ mod tests {
         assert!(!testkit::has_text(&rt, "line 21"));
         let below = |inner: &str| testkit::rect(&rt, &testkit::tile(key, inner)).unwrap()[1];
         let button = below(&format!("mr-show-all-{}", id.0));
-        let images = below(&format!("mr-user-images-{}", id.0));
+        let pictures = below(&format!("mr-user-pictures-{}", id.0));
         assert!(
-            below(&format!("mr-user-{}", id.0)) < button && button < images,
-            "the text, the button, then how many images it had"
+            pictures < below(&format!("mr-user-{}", id.0))
+                && below(&format!("mr-user-{}", id.0)) < button,
+            "the pictures, the text, then the button"
+        );
+    }
+
+    /// Attaches `sources` to the focused session, sends them with `message` once they are
+    /// read, and lets the message's row land; returns the session and the message's item.
+    fn say_with(rt: &mut Runtime<Ui>, message: &str, sources: Vec<Source>) -> (SessionKey, ItemId) {
+        let key = testkit::focused(rt).expect("a session is shown");
+        rt.update(|ui, tx| glue::attach(ui, tx, key, sources));
+        for _ in 0..20 {
+            let chips = &rt.state.app.sessions.get(key).unwrap().session.chips;
+            if chips.iter().all(|chip| chip.state != ChipState::Reading) {
+                break;
+            }
+            testkit::step(rt);
+        }
+        say(rt, message)
+    }
+
+    #[test]
+    fn a_sent_message_names_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = ["notes.md", "plan.txt"]
+            .into_iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, "a line\n").unwrap();
+                path
+            })
+            .collect();
+        let mut rt = testkit::window("empty");
+        let sources = paths.iter().cloned().map(Source::Path).collect();
+        let (key, id) = say_with(&mut rt, "Read these", sources);
+        let files = testkit::element(&rt, &testkit::tile(key, &format!("mr-user-files-{}", id.0)))
+            .expect("the files line");
+        assert_eq!(files.text.as_deref(), Some("notes.md, plan.txt"));
+        let tooltip = format!("{}\n{}", paths[0].display(), paths[1].display());
+        assert_eq!(files.help.as_deref(), Some(tooltip.as_str()));
+        assert_eq!(files.text_color, Some(theme::kit(true).c.text_muted));
+        assert_eq!(shown_message(&rt, key, id), "Read these");
+        let text = testkit::rect(&rt, &testkit::tile(key, &format!("mr-user-{}", id.0))).unwrap();
+        assert!(text[1] < files.rect[1], "under the text");
+        assert!(!testkit::drawn(&rt, &format!("mr-user-pictures-{}", id.0)));
+    }
+
+    /// Pastes an image of each of `shapes` (width by height) into the focused session, with a
+    /// cache to make their handles in, sends them with `message`, and waits for the handles to
+    /// be made; returns the session and the message's item.
+    fn say_pictures(
+        rt: &mut Runtime<Ui>,
+        message: &str,
+        shapes: &[(u32, u32)],
+    ) -> (SessionKey, ItemId) {
+        rt.state.images = Some(ImageCache::new(Arc::new(|| {})));
+        let sources = shapes
+            .iter()
+            .map(|&(width, height)| Source::Pasted(ImageData::new(testkit::png(width, height))))
+            .collect();
+        let (key, id) = say_with(rt, message, sources);
+        for picture in pictures_of(rt, id) {
+            let handle = rt.state.thumbs.get(&picture).expect("a handle").clone();
+            handle.wait().expect("a picture made in the test is made");
+        }
+        testkit::step(rt);
+        (key, id)
+    }
+
+    /// The picture ids of the user's message `id` in the focused session.
+    fn pictures_of(rt: &Runtime<Ui>, id: ItemId) -> Vec<u64> {
+        testkit::shown_session_items(rt)
+            .iter()
+            .find_map(|item| match &item.body {
+                ItemBody::User { pictures, .. } if item.id == id => Some(pictures.clone()),
+                _ => None,
+            })
+            .expect("the user's message")
+    }
+
+    /// Whether `inner` lies within `outer`, both `[x, y, w, h]`.
+    fn within(inner: [f32; 4], outer: [f32; 4]) -> bool {
+        inner[0] >= outer[0]
+            && inner[1] >= outer[1]
+            && inner[0] + inner[2] <= outer[0] + outer[2]
+            && inner[1] + inner[3] <= outer[1] + outer[3]
+    }
+
+    /// The element whose child `child` is.
+    fn parent_of(rt: &Runtime<Ui>, child: &ElementInfo) -> ElementInfo {
+        let index = child.parent.expect("a parent");
+        rt.elements().swap_remove(index)
+    }
+
+    /// The row of the conversation that holds `inner`.
+    fn row_of(rt: &Runtime<Ui>, inner: &ElementInfo) -> ElementInfo {
+        rt.elements()
+            .into_iter()
+            .filter(|e| !e.exiting)
+            .filter(|e| e.key.as_deref().is_some_and(|k| k.starts_with("mr-item-")))
+            .find(|e| inner.path.starts_with(&format!("{}/", e.path)))
+            .expect("in a row")
+    }
+
+    #[test]
+    fn a_sent_message_shows_its_pictures() {
+        let mut rt = testkit::window("empty");
+        let (key, id) = say_pictures(&mut rt, "Which one?", &[(4, 3), (1, 8), (8, 1)]);
+        let ids = pictures_of(&rt, id);
+        assert_eq!(ids.len(), 3);
+        let row = line(&rt, key, format!("mr-user-pictures-{}", id.0)).expect("the row");
+        assert_eq!(row.rect[3], 120.0);
+        let mut widths = Vec::new();
+        for (n, picture) in ids.iter().enumerate() {
+            let shown = line(&rt, key, format!("mr-user-picture-{picture}")).expect("drawn");
+            assert_eq!(shown.rect[3], 120.0);
+            assert!(
+                within(shown.rect, row.rect),
+                "{:?} in {:?}",
+                shown.rect,
+                row.rect
+            );
+            assert_eq!(shown.label, Some(format!("Image {} of 3", n + 1)));
+            assert_eq!(shown.radius, 6.0);
+            assert_eq!(shown.fill.a, 0.0, "the bands are the bubble's own colour");
+            assert!(!shown.focusable);
+            widths.push(shown.rect[2]);
+        }
+        assert_eq!(widths, [160.0, 60.0, 240.0], "the shape, within 60 and 240");
+        let text = line(&rt, key, format!("mr-user-{}", id.0)).expect("the text");
+        assert!(
+            row.rect[1] + row.rect[3] <= text.rect[1],
+            "the pictures over the text"
+        );
+        let bubble = parent_of(&rt, &row);
+        assert!(within(row.rect, bubble.rect) && within(text.rect, bubble.rect));
+        assert!(!testkit::has_text(&rt, "3 images"));
+    }
+
+    /// Every node of the accessibility tree under `node`, each with the role and key of its
+    /// ancestors ("role key"), outermost first.
+    fn a11y_nodes<'a>(
+        node: &'a serde_json::Value,
+        above: &mut Vec<String>,
+        out: &mut Vec<(&'a serde_json::Value, Vec<String>)>,
+    ) {
+        out.push((node, above.clone()));
+        let role = node["role"].as_str().unwrap_or_default();
+        above.push(format!(
+            "{role} {}",
+            node["key"].as_str().unwrap_or_default()
+        ));
+        for child in node["children"].as_array().into_iter().flatten() {
+            a11y_nodes(child, above, out);
+        }
+        above.pop();
+    }
+
+    #[test]
+    fn a_screen_reader_hears_the_pictures_and_no_button() {
+        let mut rt = testkit::window("empty");
+        let (_, id) = say_pictures(&mut rt, "Which one?", &[(4, 3), (3, 4)]);
+        let ids = pictures_of(&rt, id);
+        // The second has not come.
+        rt.state.thumbs.remove(&ids[1]);
+        rt.invalidate();
+        testkit::step(&mut rt);
+        let tree = rt.accessibility_json();
+        let mut nodes = Vec::new();
+        a11y_nodes(&tree, &mut Vec::new(), &mut nodes);
+        let keyed = |key: &str| {
+            nodes
+                .iter()
+                .find(|(node, _)| node["key"].as_str() == Some(key))
+                .unwrap_or_else(|| panic!("no node keyed {key:?} in {tree:#}"))
+        };
+        let (drawn, above_drawn) = keyed(&format!("mr-user-picture-{}", ids[0]));
+        let (waiting, above_waiting) = keyed(&format!("mr-user-picture-wait-{}", ids[1]));
+        assert_eq!(drawn["role"], "image");
+        assert_eq!(drawn["name"], "Image 1 of 2");
+        assert_eq!(waiting["role"], "image");
+        assert_eq!(waiting["name"], "Image 2 of 2, not loaded");
+        // Within its row of the conversation: the tile around it is not this task's.
+        for above in [above_drawn, above_waiting] {
+            let row = above
+                .iter()
+                .rposition(|node| node.contains(" mr-item-"))
+                .expect("in a row");
+            assert!(
+                !above[row..].iter().any(|node| node.starts_with("button")),
+                "a picture is inside {above:?}"
+            );
+        }
+        let row = format!("mr-user-pictures-{}", id.0);
+        assert!(
+            nodes
+                .iter()
+                .filter(|(node, _)| node["key"].as_str() == Some(row.as_str()))
+                .all(|(node, _)| !node["role"].as_str().unwrap_or_default().contains("button")),
+            "the row is no button"
+        );
+        let images = nodes
+            .iter()
+            .filter(|(node, _)| {
+                node["key"]
+                    .as_str()
+                    .is_some_and(|key| key.starts_with("mr-user-picture-"))
+            })
+            .count();
+        assert_eq!(images, 2, "two pictures, two nodes");
+    }
+
+    #[test]
+    fn a_picture_that_has_not_come_shows_a_waiting_slot() {
+        let mut rt = testkit::window("empty");
+        rt.state.images = None;
+        let png = Source::Pasted(ImageData::new(testkit::tiny_png()));
+        let (key, id) = say_with(&mut rt, "Look", vec![png]);
+        let [picture] = pictures_of(&rt, id)[..] else {
+            panic!("one picture");
+        };
+        assert!(rt.state.thumbs.is_empty(), "no cache, no handle");
+        let slot = line(&rt, key, format!("mr-user-picture-wait-{picture}")).expect("the slot");
+        assert_eq!(&slot.rect[2..], &[120.0, 120.0]);
+        assert_eq!(slot.fill.a, 0.0, "the bubble's own colour");
+        assert_eq!(slot.radius, 6.0);
+        assert!(line(&rt, key, format!("mr-user-picture-{picture}")).is_none());
+        let elements = rt.elements();
+        let index = elements
+            .iter()
+            .position(|e| e.path == slot.path)
+            .expect("the slot is drawn");
+        let inside: Vec<&ElementInfo> = elements
+            .iter()
+            .filter(|e| e.parent == Some(index))
+            .collect();
+        assert_eq!(inside.len(), 1, "the icon alone");
+        let glyph = inside[0];
+        assert_eq!(glyph.role, "icon");
+        assert!(glyph.text.is_none(), "no words");
+        let middle = |r: [f32; 4]| (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        assert_eq!(middle(glyph.rect), middle(slot.rect), "in its middle");
+        assert!(!testkit::has_text(&rt, "1 image"));
+    }
+
+    #[test]
+    fn the_row_is_as_high_before_and_after_a_picture_comes() {
+        let mut rt = testkit::window("empty");
+        rt.state.images = None;
+        let png = Source::Pasted(ImageData::new(testkit::tiny_png()));
+        let (key, id) = say_with(&mut rt, "Look", vec![png]);
+        let [picture] = pictures_of(&rt, id)[..] else {
+            panic!("one picture");
+        };
+        let text = |rt: &Runtime<Ui>| line(rt, key, format!("mr-user-{}", id.0)).expect("text");
+        let before = text(&rt);
+        let row_before = row_of(&rt, &before).rect;
+        assert!(line(&rt, key, format!("mr-user-picture-wait-{picture}")).is_some());
+        // The picture comes.
+        let images = ImageCache::new(Arc::new(|| {}));
+        let handle = images.rgba(4, 3, vec![200u8; 4 * 3 * 4]);
+        handle.wait().expect("made");
+        rt.state.images = Some(images);
+        rt.state.thumbs.insert(picture, handle);
+        glue::run(&mut rt.state, Vec::new());
+        rt.invalidate();
+        testkit::step(&mut rt);
+        assert!(
+            rt.state.thumbs.contains_key(&picture),
+            "kept: the message holds it"
+        );
+        let shown = line(&rt, key, format!("mr-user-picture-{picture}")).expect("drawn");
+        assert_eq!(&shown.rect[2..], &[160.0, 120.0]);
+        let after = text(&rt);
+        assert_eq!(after.rect[1], before.rect[1], "the text did not move");
+        assert_eq!(after.rect[3], before.rect[3]);
+        let row_after = row_of(&rt, &after).rect;
+        assert_eq!(row_after[1], row_before[1]);
+        assert_eq!(row_after[3], row_before[3], "the row is as high");
+    }
+
+    #[test]
+    fn many_pictures_scroll_and_do_not_wrap() {
+        let mut rt = testkit::window("empty");
+        let (key, long) = say(&mut rt, &"alex ".repeat(200));
+        let widest = line(&rt, key, format!("mr-user-{}", long.0)).expect("the long message");
+        let (key, id) = say_pictures(&mut rt, "Eight", &[(4, 3); 8]);
+        let row = line(&rt, key, format!("mr-user-pictures-{}", id.0)).expect("the row");
+        assert_eq!(row.rect[3], 120.0);
+        let bubble = parent_of(&rt, &row);
+        assert!(
+            bubble.rect[2] <= widest.rect[2],
+            "{} is no wider than {}",
+            bubble.rect[2],
+            widest.rect[2]
+        );
+        let shown: Vec<ElementInfo> = pictures_of(&rt, id)
+            .iter()
+            .map(|picture| line(&rt, key, format!("mr-user-picture-{picture}")).expect("drawn"))
+            .collect();
+        assert_eq!(shown.len(), 8);
+        assert!(shown.iter().all(|e| e.rect[1] == row.rect[1]), "one line");
+        for pair in shown.windows(2) {
+            assert_eq!(pair[1].rect[0], pair[0].rect[0] + pair[0].rect[2] + 6.0);
+        }
+        let last = shown.last().unwrap().rect;
+        assert!(
+            last[0] + last[2] > row.rect[0] + row.rect[2],
+            "the rest is scrolled to"
+        );
+    }
+
+    #[test]
+    fn a_message_of_images_alone_shows_the_row_and_no_text() {
+        let mut rt = testkit::window("empty");
+        let (key, id) = say_pictures(&mut rt, "", &[(4, 3)]);
+        let [picture] = pictures_of(&rt, id)[..] else {
+            panic!("one picture");
+        };
+        assert!(line(&rt, key, format!("mr-user-pictures-{}", id.0)).is_some());
+        assert!(line(&rt, key, format!("mr-user-picture-{picture}")).is_some());
+        assert!(
+            line(&rt, key, format!("mr-user-{}", id.0)).is_none(),
+            "no text"
+        );
+        assert!(!testkit::drawn(&rt, &format!("mr-user-files-{}", id.0)));
+        assert!(!testkit::has_text(&rt, "1 image"));
+    }
+
+    #[test]
+    fn a_press_on_a_picture_leaves_the_keyboard_where_it_was() {
+        let mut rt = testkit::window("empty");
+        let (key, id) = say_pictures(&mut rt, "Look", &[(4, 3)]);
+        let [picture] = pictures_of(&rt, id)[..] else {
+            panic!("one picture");
+        };
+        testkit::type_text(&mut rt, "and then");
+        testkit::press(&mut rt, rune::Key::Left);
+        testkit::press(&mut rt, rune::Key::Left);
+        assert!(testkit::box_focused(&rt, key));
+        let caret = glue::view_of(&rt.state, key).draft.focus;
+        assert_eq!(caret, "and th".len());
+        let effects_before = testkit::sent(&rt).len();
+        let (x, y) = testkit::find(
+            &rt,
+            &testkit::tile(key, &format!("mr-user-picture-{picture}")),
+        )
+        .expect("the picture is drawn");
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(
+            testkit::box_focused(&rt, key),
+            "the box keeps the keyboard while held"
+        );
+        rt.pointer_up(x, y);
+        testkit::step(&mut rt);
+        assert!(testkit::box_focused(&rt, key), "the box keeps the keyboard");
+        let draft = &glue::view_of(&rt.state, key).draft;
+        assert_eq!(draft.text, "and then");
+        assert_eq!(
+            (draft.anchor, draft.focus),
+            (caret, caret),
+            "the caret where it was"
+        );
+        assert_eq!(testkit::sent(&rt).len(), effects_before, "nothing is sent");
+        let row = line(&rt, key, format!("mr-user-pictures-{}", id.0)).expect("the row");
+        assert!(!row.focusable, "no Tab stop");
+    }
+
+    #[test]
+    fn a_press_on_a_picture_focuses_its_tile() {
+        let mut rt = testkit::window("chips-problem");
+        let [asks, sent] = testkit::tile_keys(&rt)[..] else {
+            panic!("two tiles");
+        };
+        let session = &rt.state.app.sessions.get(sent).unwrap().session;
+        let picture = session.conversation.pictures().next().expect("a picture");
+        let shown = testkit::tile(sent, &format!("mr-user-picture-{picture}"));
+        assert_eq!(testkit::focused(&rt), Some(asks));
+        // While the other tile's box has the keyboard, it keeps it, and its tile the focus.
+        let draft = glue::view_of(&rt.state, asks).draft.clone();
+        testkit::click(&mut rt, &shown);
+        testkit::step(&mut rt);
+        assert!(testkit::box_focused(&rt, asks));
+        assert_eq!(testkit::focused(&rt), Some(asks));
+        let after = &glue::view_of(&rt.state, asks).draft;
+        assert_eq!((&after.text, after.focus), (&draft.text, draft.focus));
+        // With no field holding the keyboard, the picture's tile takes the focus.
+        rt.update(|_, tx| tx.blur());
+        testkit::step(&mut rt);
+        assert_eq!(glue::typing_in(&rt.state), None);
+        testkit::click(&mut rt, &shown);
+        testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(sent));
+        assert!(
+            !testkit::box_focused(&rt, sent),
+            "the keyboard stays where it was"
+        );
+    }
+
+    /// A file named `name` in `dir`, with a line in it.
+    fn file(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "a line\n").unwrap();
+        path
+    }
+
+    /// The element keyed `inner` in `key`'s tile.
+    fn line(rt: &Runtime<Ui>, key: SessionKey, inner: String) -> Option<ElementInfo> {
+        testkit::element(rt, &testkit::tile(key, &inner))
+    }
+
+    #[test]
+    fn the_pictures_go_over_the_text_and_the_files_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = file(dir.path(), "notes.md");
+        let mut rt = testkit::window("empty");
+        let png = testkit::tiny_png();
+        let sources = vec![
+            Source::Pasted(ImageData::new(png.as_slice())),
+            Source::Path(notes),
+        ];
+        let (key, id) = say_with(&mut rt, "Look", sources);
+        let pictures = line(&rt, key, format!("mr-user-pictures-{}", id.0)).expect("the row");
+        let text = line(&rt, key, format!("mr-user-{}", id.0)).expect("the text");
+        let files = line(&rt, key, format!("mr-user-files-{}", id.0)).expect("the files line");
+        assert_eq!(files.text.as_deref(), Some("notes.md"));
+        assert!(
+            pictures.rect[1] + pictures.rect[3] <= text.rect[1],
+            "the pictures over the text"
+        );
+        assert!(
+            text.rect[1] + text.rect[3] <= files.rect[1],
+            "the files under the text"
+        );
+        assert!(!testkit::has_text(&rt, "1 image"));
+    }
+
+    #[test]
+    fn a_message_of_files_alone_shows_only_their_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = file(dir.path(), "notes.md");
+        let mut rt = testkit::window("empty");
+        let (key, id) = say_with(&mut rt, "", vec![Source::Path(notes)]);
+        let files = line(&rt, key, format!("mr-user-files-{}", id.0)).and_then(|e| e.text);
+        assert_eq!(files.as_deref(), Some("notes.md"));
+        assert!(
+            line(&rt, key, format!("mr-user-{}", id.0)).is_none(),
+            "no text"
+        );
+        assert!(line(&rt, key, format!("mr-user-pictures-{}", id.0)).is_none());
+    }
+
+    #[test]
+    fn a_stored_message_names_its_files() {
+        let mut rt = testkit::window("resting");
+        let id = SessionId("stored-with-files".into());
+        let history = StoredHistory {
+            items: vec![
+                HistoryItem::User {
+                    text: "Read these".into(),
+                    image_count: 0,
+                    files: vec![
+                        "/home/alex/notes/plan.md".into(),
+                        "/home/alex/notes/todo.txt".into(),
+                    ],
+                    images: Vec::new(),
+                },
+                HistoryItem::AssistantText("Read them.".into()),
+            ],
+            ..StoredHistory::default()
+        };
+        rt.state
+            .fake
+            .as_ref()
+            .expect("the demo window has its fake")
+            .set_history(&id, history);
+        let stored = StoredSession {
+            id,
+            folder: "/home/alex/notes".into(),
+            title: "Notes".into(),
+            last_active_unix: NOW_UNIX - DAY,
+        };
+        let key = rt
+            .state
+            .app
+            .sessions
+            .add(Session::resting(&stored), stored.last_active_unix);
+        glue::run(&mut rt.state, Vec::new());
+        testkit::show(&mut rt, key);
+        let id = last_message(&rt);
+        let files = line(&rt, key, format!("mr-user-files-{}", id.0)).expect("the files line");
+        assert_eq!(files.text.as_deref(), Some("plan.md, todo.txt"));
+        assert_eq!(
+            files.help.as_deref(),
+            Some("/home/alex/notes/plan.md\n/home/alex/notes/todo.txt")
         );
     }
 }

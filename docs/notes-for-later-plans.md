@@ -1,8 +1,212 @@
 # Notes for later plans
 
-Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column) and plan 5 (the effort level, the right panel and Remote Control). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column), plan 5 (the effort level, the right panel and Remote Control) and plan 6 (attachments). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
 
-Plan 5's section comes first, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+Plan 6's section comes first, then plan 5's, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## Jerod's look at plan 6
+
+Plan 6 (`docs/superpowers/plans/2026-11-16-attachments.md`) lets a message carry images and files. An image pasted from the clipboard, a file picked with the plus button, files copied in the file manager and pasted, and files dropped on a tile each become a chip over the text in that tile's input box; the message goes with them. Images go to Claude as images, other files by their path. The input box no longer grows out of a short tile, and the program's input has one writer thread, so a line of several megabytes cannot lock against the reader. It is built on the branch `plan-6-attachments`, cut from `main` at `3744b76`: Tasks 1 to 10 in thirteen commits, from `b491e94` to `7bfbf55`, two of them fixes after a review (`7de43a0`, `051a942`) and one a rewrap of comments (`7bfbf55`), then Task 11's three commits (the scenes, the live test's new lines, and these notes), a fix after Task 10's review (`56fa93b`), the fix wave after the whole-branch review (`2a62c0a` to `d7aaacc`, six commits) and a small correction after its re-review (`0044fdb`, `a55510b`). After Jerod's first look came one addition they asked for, sent pictures shown in the conversation (`905d62c` to `b7fffac`, ten commits; see "What Jerod reported on 2026-11-16"). Every task's review passed. On 2026-11-16 Jerod had it merged into `main` (the merge commit `9e6d91d`; see the end of "What Jerod reported on 2026-11-16"); the branch is gone and nothing is pushed. At the branch's head `cargo test --workspace` gives 1215 passed, 0 failed, 2 ignored (the live tests), and formatting and lints are clean.
+
+The whole-branch review found nothing critical and asked for fixes, which one wave made (see "The whole-branch review of plan 6", at the end of this section).
+
+Like plan 5's, this look needs the live test, and it comes first: how the program stores a message with an image, and whether a path in the text makes Claude read the file, were never seen. Jerod runs, in their own terminal, on `main` (on the branch `plan-6-attachments` before the merge):
+
+```bash
+MINDRUNE_LIVE=1 cargo test -p mindrune --test live -- --ignored --nocapture
+```
+
+```bash
+cargo run --release -p mindrune
+```
+
+The window starts as before. Nothing a chip holds is kept when it closes.
+
+`cargo test --workspace` writes the screenshots of the two new scenes (`chips` and `chips-problem`, dark and light) to `target/snap/final`. Neither they nor the folder are in git.
+
+### The live test
+
+It needs Claude Code installed and signed in, as before. It now starts the real `claude` five times: plan 5's four, and, in the second run after the resume, a session of its own opened to the side in the test's temporary folder. So a third test session is stored by Claude Code, under the test's temporary folder, as the other two are. The test writes one file, `note.txt`, into that folder; the folder goes when the test ends. It turns nothing else on.
+
+What it now prints, after plan 5's `live: resumed with effort …`, on stderr, one per line. None of them fails the test, and nothing that session's program does fails it, a turn that fails or a program that ends included. No line holds a path, a session's id or an image's bytes.
+
+- `live: image and file sent`, printed only when the message that went out carried exactly the image and the file (else `live: the message went out with N image(s) and N file(s), not the …`): the message "What colour is the image, and what is the first word of the file?" went out with a 16 by 16 red PNG made in the test, pasted, and `note.txt`, attached by its path, both read on the library thread as the window reads them. In its place, when nothing was sent: `live: the image and the file: not read within 30 s; nothing was sent`, `… a chip says "…"; nothing was sent` or `… the app sent no message`.
+- `live: the answer names the colour: yes|no` and `live: the answer names the file's word: yes|no`, from the replies after the message, looking for the whole words "red" and "pelican" (the file's made-up sentence starts with "Pelican"). Both say `no` when the turn did not finish, and a line before them says why: `live: the turn failed`, `live: the turn did not end within 120 s`, `live: the session's program ended in the turn (clean: true|false)`, or `live: the turn asked the user for something; it is stopped`.
+- `live: the stored history holds N message(s) of the user's`, then `live: the stored message shows N image(s) and N file(s), text kept whole: yes|no`, read from that session's stored history through the backend, as a stored session's is read, while its program still runs. "Text kept whole" means the text read back is the message exactly, the `Attached files:` block taken off. In their place: `live: the stored history could not be read`, `… gave no answer within 30 s`, `… holds no message of the user's`, or `live: the session for attachments has no id; its history is not read`.
+- `live: a 3 MB line went through: yes|no`, for a second message, "Reply with the single word: noise", with a PNG of noise from a fixed seed, 1,120 by 1,160 pixels and 3,899,123 bytes, a little under the 3,932,160 sent as they are, so it goes byte for byte as about 5.2 MB of base64 on one line. `yes` when the turn it went in finished; `no` when it failed or nothing came within 120 seconds, with one of the lines above before it. Should the app ever make that image smaller, the line is not printed and others say so instead: `live: the noise image came out N bytes, over the limit of 3932160: it will be made smaller`, `live: the noise image was made smaller; the line is shorter than meant` and `live: the noise image was made smaller, so no 3 MB line was sent`. When the noise message is not sent at all, the lines of the first message's kind say why (`not read within 30 s`, `a chip says`, `the app sent no message`).
+- At the end, only when something is wrong: `live: the session for attachments ended (clean: …)` or `… had not ended 20 s after Close`. A session that was never ready prints `live: the session for attachments was not ready within 120 s` and nothing more of this part.
+
+What each line settles:
+
+- `the answer names the colour: yes`: a PNG image block goes through the app's own path (chip, library thread, writer thread) and is answered about. V4 saw it from the probe; `no` here, with the turn finished, points at the app's path.
+- `the answer names the file's word: yes`: a path under `Attached files:` makes Claude read the file. Never seen before. `no` beside a `yes` for the colour means the path alone does not make Claude read it, and files need another way in, which is a decision for Jerod. The file lies in the session's own folder, so reading it should ask no permission; `asked the user for something` says otherwise.
+- `the stored message shows 1 image(s) and 1 file(s), text kept whole: yes`, with one message of the user's: the program stores the message as the history reader expects (Task 3), so a stored session shows "1 image" and the file's name under the text after a restart. Any other count, or `no`, means the stored form differs, and Task 3's reader is corrected from what the test prints before the merge (the plan says so). More than one message of the user's means the program split it into records.
+- `a 3 MB line went through: yes`: a line of several megabytes reaches the program whole and is answered. `no` with `the session's program ended` means the program cannot take such a line; with `the turn failed`, that the program or the service refused the image.
+
+What still stays unseen after it: JPEG, GIF and WebP image blocks (the live test sends PNG only; item 5 below sends a photo); the program's own limits, which the app keeps under by itself; and pasting and the file dialog in a GNOME Wayland session, which only the window shows.
+
+What fails the test is what failed plan 5's; this plan adds no way to fail on what the program does. Setup it does not control (the note that cannot be written, no new session made) prints a line and skips the part.
+
+The test prints counts, not shapes. If `the stored message shows` anything but 1 image and 1 file with the text kept whole, the stored record of that one test session has to be looked at by hand to correct the reader.
+
+### What Jerod's run of the live test printed on 2026-11-16
+
+Jerod ran it on the branch and pasted its output: the test passed in 24 seconds. Its lines for this plan, as printed:
+
+```
+live: image and file sent
+live: the answer names the colour: yes
+live: the answer names the file's word: yes
+live: the stored history holds 1 message(s) of the user's
+live: the stored message shows 1 image(s) and 1 file(s), text kept whole: yes
+live: a 3 MB line went through: yes
+```
+
+So four things that were never seen are now seen, with Claude Code 2.1.323 or whatever version Jerod's machine runs (the test does not print it):
+
+- A PNG image goes through the app's own path (chip, the prepare thread, the encoder, the writer thread) and is answered about.
+- A path under `Attached files:` makes Claude read the file. Files by path work as the spec meant.
+- The program stores the message as one record with the text block first and unchanged, so the history reader of Task 3 is right as built: a stored session shows "1 image" and the file's name after a restart. Nothing of Task 3 is reopened.
+- A line of about 5.2 MB reaches the program whole and is answered.
+
+Still unseen, as before: JPEG, GIF and WebP image blocks; pasting and the file dialog in a GNOME Wayland session; a file drop on a real desktop. Those are the window's, items 1 to 5 and 8 below.
+
+The same run printed plan 5's lines for the first time; they are recorded in "Jerod's look at plan 5", under "What Jerod's run of the live test printed on 2026-11-16".
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- **Dropping a file onto the window does nothing in a Wayland session**, which is what Jerod's desktop runs. The toolkit hears no file drops there (winit 0.30 reports none). The drop is built and tested, and works under X11. Until the toolkit hears drops on Wayland the ways in are: paste an image, copy files in the file manager and paste them, or the attach button.
+- **The attach button picks one file at a time.** The toolkit's dialog has no way to pick several. Press it again for the next.
+- **The button shows a plus sign, not a paperclip.** The theme has no paperclip.
+- A sent image is shown small in its message, since the addition of 2026-11-16. A press on it does nothing yet: it cannot be seen large.
+- Chips are lost when the app closes, as a draft's text is.
+- An image larger than 2,000 pixels a side, or heavier than about 3.9 MB, is made smaller before it is sent. The file on disk is never changed.
+- A file that is not a PNG, JPEG, GIF or WebP image goes by its path, also a PDF, an SVG or a HEIC photo. Claude reads it from disk with its own tools.
+- The demo window (`cargo run -p mindrune -- --demo`, its scenes and the screenshots) reads nothing from the disk for its chips: the `chips` and `chips-problem` scenes put chips in place themselves, and the thumbnail is drawn in code. A chip attached in the demo window is read from the disk as in the real one.
+
+### What to try in the window
+
+1. Copy an image (a screenshot, an image in a browser) and paste it into a tile's box: a chip with a thumbnail. Seen: works (Jerod, 2026-11-16), on their Wayland desktop; Claude described the picture.
+2. Copy two files in the file manager and paste them: two chips. Seen: not yet recorded.
+3. The plus button attaches a file; a second press, a second file. Seen: not yet recorded.
+4. Send text with an image and a file: Claude answers about both, and the message names the files. Seen: not yet recorded.
+5. Attach a very large photo: it is sent, made smaller. Attach something that cannot be read: the chip says so and nothing is sent until it is removed. Seen: not yet recorded.
+6. Remove a chip; queue a message with chips while a turn runs, then "Edit" it back. Seen: not yet recorded.
+7. In a short stacked tile, type many lines: the box stays inside the tile. Seen: not yet recorded.
+8. Drag a file from the file manager onto a tile: on Wayland nothing happens (known). Does that matter enough to do something about it? Seen: not yet recorded.
+9. (Added with the sent pictures.) Send a message with an image: the picture shows in the message, above the text. Close the app, open it and open that session again: the picture comes back, after a moment as an outlined box. Seen: not yet recorded.
+
+### What Jerod reported on 2026-11-16
+
+After the live test Jerod ran the window on the branch, pasted an image into a tile's box and asked "What is this a picture of?". Their words: "The image pasted and was seen by the agent OK, but the actual image is not shown in the chat." Their screenshot shows the sent message with "1 image" under its text and Claude's answer about the picture.
+
+So the first thing to try is seen, and with it one point that was never seen before: a pasted image arrives in a GNOME Wayland session. The other seven things are not reported yet.
+
+That the sent image was not drawn in the conversation was the plan's own limit ("Not in this plan, on purpose"). Jerod met it and named it. Asked whether to build it (a small preview in the message, for images sent now and for sessions opened again, no click to enlarge), they said: "Yes, build it".
+
+**What was built for it**, on the same branch, in two parts, each reviewed, with one or two fix rounds each:
+
+- A user's message keeps a picture id for each of its images. For a message sent in this run that is its chip's id, and the picture is the chip's own thumbnail, now 320 pixels on its longer side.
+- For a stored session opened again, the history reader gives each stored image's bytes (it only counted them before). The history is answered as fast as before, with an id for each stored image and no bytes; each small picture is then made on the prepare thread and arrives by itself. A chip the user is waiting to send goes before stored pictures on that thread. An image whose bytes cannot be read keeps its place and its slot, and no picture ever comes for it.
+- In the conversation a message with images shows a row 120 points high above its text: each picture whole, 60 to 240 points wide by its shape, several side by side, scrolling sideways. A slot whose picture has not come is an outlined box with the photo sign. The row's height never changes, so the conversation does not move when a picture arrives. The line "N images" is gone.
+- A press on a picture leaves the keyboard where it is and does nothing else; like a request's buttons it focuses its tile only when no box holds the keyboard.
+- To a screen reader each picture is an image named "Image N of M", or "Image N of M, not loaded" while its slot waits; the row itself is not announced.
+
+The live test gained one line for it (never run by an agent): `live: the stored message's images with bytes the app could read: N of M`. `1 of 1` means the stored image block has the shape the reader expects (a base64 source), which was written by hand and never seen; `0 of 1` means it does not, and reopened sessions would show outlined boxes for good until the reader is corrected.
+
+Things to look at for it: the picture's size in the message (120 points high); the outlined box while a reopened session's pictures arrive, and whether its outline is visible enough in the dark theme; a message with several images.
+
+Left for it, by rulings 35 to 43 in the rulings file: a picture cannot be seen large; every picture of a loaded session stays in memory as a small picture (about 0.4 MB at most each) while the session is kept, shown or not; pictures are made for a history answer that is then not used because the session was loaded meanwhile. Found beside it and older than this branch: a tile and the right panel are announced as buttons by a screen reader (a group with a press handler is one to the toolkit); left for a pass over accessibility (ruling 43).
+
+Told that sent pictures were built, and that the stored image's shape rests on one live test line not yet run, Jerod said: "Merge to main". By then `main` had one commit the branch did not have, `ac9fd3a` (the window's id and the app's icon, from Jerod's other session), so the merge is a merge commit, `9e6d91d`, not a fast-forward; the two touched no file in common. On `main` after it the tests give 1220 passed, 0 failed, 2 ignored (the live tests, not run), and formatting and lints are clean. Nothing is pushed. Sent pictures were merged before Jerod saw them in the window and before the live test's new line was run: a defect found in either, and a `0 of 1` in that line, is fixed on `main`. Things to try 2 to 9 stay open.
+
+### Every decision of plan 6, with what was built
+
+The twenty decisions are the planner's; Jerod has not seen them, but for the fifteenth, which Jerod chose on 2026-11-16.
+
+1. **Drops are built although Jerod's desktop cannot deliver them.** Built in `view/tiles.rs`: each tile whose session takes a message accepts dropped files; while files are held over it, a veil in the accent colour at 12 percent with "Drop to attach" covers it under the header (`mr-drop-files`), and a drop attaches every path to that tile's session and gives it the focus and the keyboard. A tile of an ended session takes none, and a drop anywhere else does nothing. An in-app drag of a row or a header is untouched. Tested with Rune's drop events; never seen on a desktop.
+2. **Copied files can be pasted.** Built in `view/input.rs` (`pasted`): files on the clipboard become chips, also when the file manager puts their paths beside them as text, and no text is pasted. With no field focused, a paste of an image or of files goes to the focused tile (`view/mod.rs`).
+3. **One file per press of the attach button, and a plus sign for its face.** Built: `mr-attach`, the first control of the box's bottom row, as large as the send button, label and tooltip "Attach a file", disabled in a session that takes no message. It opens the desktop's file dialog titled "Attach a file" in the session's folder; a cancel does nothing, and an error shows under the box as the folder dialog's does. A press while the dialog is open does nothing. The button is a Tab stop, pressed with Space.
+4. **The chips sit in a row over the text, and the row scrolls sideways.** Built in `view/chips.rs`: `mr-chips`, 32 points high, between the queued strip and the text, there only while the session has chips; 6 points between chips. A chip is a 24-point picture (the thumbnail, or an icon for a photo, a folder or a file), the name cut in the middle at 160 points, a problem's words in the danger colour, "Reading…" in the muted colour while it is read, and a remove control labelled "Remove NAME", a Tab stop pressed with Space. Its tooltip is the whole path, "Pasted image", "Reading…", or the path and the problem. A new chip, and one whose answer is a problem, is scrolled into view, and the row fades at an edge that hides chips.
+5. **What is an image is decided by the file's first bytes, not its name.** Built in `crates/core/src/attach.rs`: the first 32 bytes; PNG, JPEG, GIF and WebP are images, anything else, an empty file too, goes by its path. A folder goes by its path. A name that is not UTF-8 or holds a line break says "Its name cannot be sent"; a file that is gone or cannot be read says "Cannot be read".
+6. **A large image is made smaller, not refused.** Built: above 2,000 pixels a side it is scaled to fit, keeping its shape; above 3,932,160 bytes it is encoded again and halved up to three times. An image with a pixel that is not opaque stays PNG. An opaque one is tried as PNG at the fitted size first, which keeps a screenshot sharp, and goes as JPEG at quality 85 when that PNG is too heavy, as a photo's is (the plan chose by the alpha channel; see the rulings). "Too large to send" for what is still too heavy after that, an image file over 32 MiB, one the decoder refuses for its size, and one over 64 million pixels by its header. An image is turned upright by its orientation tag, which is read for JPEG only. An animated GIF made smaller keeps its first frame. All of this runs on a thread of its own, and a decoder that panics costs that one chip ("Cannot be read").
+7. **An image within the limits is sent byte for byte**, but for a JPEG whose orientation tag says it is not upright: that one is turned and encoded again at quality 90, so that what the chip shows is what Claude gets (a ruling). A pasted image's bytes are copied once out of the toolkit's clipboard and shared from then on.
+8. **Send waits for the chips.** Built: `App::can_send`; while a chip is being read or shows a problem, Enter and the send button do nothing. A message can be chips alone, with no text.
+9. **A message's chips go wherever its text goes.** Built in `crates/core/src/session.rs` (`Outgoing`): into the queue while a turn runs (a second message joins the first, its chips after; the strip reads "Queued: TEXT · N attached"), back into the box with "Edit", before any chips added since, to the copy with "Continue as a copy", back to the box on "Cancel". No chip is ever on two sessions.
+10. **The same file is attached once.** Built: a path already among the session's chips, or among those of its queued message, is not added again; paths are compared as given, without reading the disk. A pasted image is always added.
+11. **A sent message names its files.** Built in `view/items.rs`: under the text, one muted line `mr-user-files-{id}` with the names joined by ", ", the whole paths in its tooltip. A stored message's `Attached files:` block is read back as its files (`crates/claude/src/encode.rs`, `split_attached`), and shown the same way, unless the live test says the store keeps another form.
+12. **A session whose first message has no text** is named after its first chip, and asks for a title from Claude with its first message that has text.
+13. **A tile with chips and no text is kept** when it is closed, as a tile with a draft is; a session with chips is not forgotten as empty.
+14. **A drop goes to the tile under the pointer**, which takes the focus. A paste goes to the box that has the keyboard, and with no box focused to the focused tile. Built as decided.
+15. **A pasted image with text beside it is pasted as text** (Jerod, 2026-11-16: "Keep text first"). Built: text first, unless the text is only white space (a ruling below); files on the clipboard always become chips. With no box focused there is nowhere for text to go, so there a paste takes the image also when text is beside it (a ruling below).
+16. **The message field is built in the app** (`view/field.rs`) from Rune's own text field, with the kit's text area's look copied call for call; the two `working` screenshots came out byte for byte as before.
+17. **The text grows as far as its tile allows.** Built: `input::lines_for` gives at most ten lines, fewer in a short tile so that 48 points of conversation stay, never under one; the chips row, the queued strip and a line under the box count against it. Where even one line does not fit, the box keeps to the bottom of its tile and what does not fit is cut off at the top. While the "open elsewhere" question shows, the tile keeps the question at its top instead and cuts the box. Nothing is read from the layout for it.
+18. **The program's input gets one writer thread.** Built in `crates/claude/src/process.rs`: every line is queued to it, the reader's answers included, so neither side can stall the other. A write that fails shows as the session's end.
+19. **No limit on how many chips.** Built as decided; a refusal by Claude Code fails the turn with its words.
+20. **`Capabilities.images` is still not read.** Unchanged.
+
+### Rulings made while the plan ran
+
+The controller made these, each with what it costs if it was wrong. All 34 are in `docs/superpowers/plans/2026-11-16-plan-6-rulings.md`. Those that change what Jerod sees:
+
+- **PNG or JPEG is decided by the pixels, and lossless is tried first**: a large screenshot stays a sharp PNG, a large photo goes as a JPEG at up to 2,000 pixels a side. The plan's rule would have sent every large pasted photo at a quarter of its pixels.
+- **A photo with an orientation tag is always sent upright**, a small one too.
+- **The cap of 64 million pixels**: an image larger than that by its header, or one the decoder refuses for its size, says "Too large to send" without being decoded.
+- **The attach button and a chip's remove control are Tab stops**, pressed with Space. While one is pressed with the mouse the field loses the keyboard for a moment and gets it back, as with the send button.
+- **A press on the attach button while its file dialog is open does nothing.**
+- **A chip that is being read says "Reading…"**, and a new chip or one with a problem is scrolled into view.
+- **The queued strip counts its chips**: "Queued: TEXT · N attached".
+- **White space beside a pasted image does not count as text**: the image becomes a chip. With no box focused, a paste takes the image also when text is beside it.
+- **A session that takes no message** (ended, a question waiting, a check in the store running) takes no chips from a paste, and the paste falls through as text.
+- **"Continue here" and "Continue as a copy" act as "Cancel"** when nothing is left to send.
+- **While the "open elsewhere" question shows, the tile cuts the box, not the question.**
+
+### Things to look at
+
+Each was decided by the build, not by the plan or the design:
+
+- A chip with a problem shows the file icon, also for a photo that is too large to send (`chips-problem`): until a chip is ready, a path's chip shows the file sign, as the plan says. Should a photo show the photo sign?
+- A thumbnail fills its 24-point square, so a wide screenshot shows only its middle. Is that enough to tell two images apart?
+- In the light theme a chip is a grey pill on the box's grey; the remove control is a small muted cross. Can you find both at a glance?
+- With a chip that cannot be sent, the send button is off and nothing but the chip's red says why Enter does nothing (`chips-problem`). Is the red enough?
+- **In the lowest stacked tile** (about 172 points) with chips in the box the conversation has about 12 points, and with a queued message as well the queued strip and its "Edit" are cut off. A permission request waiting in that tile cannot be reached until the tile is made taller. Is that acceptable for a tile that short, or should the box give way?
+- **A large pasted screenshot** should arrive sharp (PNG), **a large pasted photo** at full size (JPEG). Worth one try of each at item 5.
+- **Tab from the box** reaches the attach button and each chip's remove control; Space presses them. Does the order feel right?
+- When a send fails, the message's pasted image cannot be had back; its text can be copied from the conversation.
+
+### Left by plan 6
+
+Each of these is left by a ruling (26 to 34 in the rulings file), with what it costs if wrong:
+
+- When a send fails, or the program dies with the message, a pasted image cannot be had back.
+- Chips are not held to the 48 points of conversation; only lines of text give way.
+- A caret at the end of a long draft can sit under the last visible line, until the next key, when a chip lowers the cap on lines.
+- The live test prints counts, not shapes.
+- The message field's inner key is `input`, as the kit's was: a departure from the rule on keys, on purpose.
+- With the attach dialog open, a press that opens the folder dialog shows the toolkit's "already open" error, and the other way round a line under the box.
+- A typed message that ends in the form of an `Attached files:` block reads back as files after a restart.
+- In a tile 172 points high and narrower than about 420, the "open elsewhere" question's buttons wrap and two are cut, as before this plan.
+- A process the program started that inherited its input can keep the writer thread blocked until it ends: one idle thread.
+- Small things: `write_line` copies each line once more; view tests wait for the worker threads by counting frames; turning orientations 5 to 8 copies the decoded image and only orientation 6 is tested; tests not written for the pixel cap's edge, bad base64, `new_session` with chips, stacked tiles taking a drop, a paste while a dialog is open; `field::field` takes seven arguments by position; `glue::setup` makes the thumbnails' cache anew on every call.
+
+For plan 7 (running in the background): the window will come back from hidden often, which is why the field's scroll must not stick to its end (ruling 20); and a session's chips live in memory only, so a program stopped for being idle keeps them, and quitting loses them.
+
+### The whole-branch review of plan 6
+
+A reviewer on the most capable model read the whole branch at `56fa93b`: with fixes, nothing critical, two Important, fifteen Minor. Its report, the fix wave's brief and report, and the re-review are in the run's workspace (`.superpowers/sdd/2026-11-16-attachments/`, not in git): `final-review.md`, `final-fix-brief.md`, `final-fix-report.md`, `final-rereview.md`.
+
+The two Important findings, both fixed:
+
+- A panic while an attachment was read would have ended the library thread for the rest of the run, silently: chips stuck on "Reading…", no history loaded, a resting session that takes no message. Preparing now has a thread of its own and a guard; a panic costs one chip.
+- A pasted image always has an alpha channel, so the plan's rule never made one a JPEG, and a large pasted photo was halved to a quarter of its pixels or less. The rule now looks at the pixels.
+
+The reviewer found no way to lose, double or misroute a chip, no path that prints an image's bytes, and the writer thread sound. It thought three of the controller's rulings wrong (preparing on the library thread, no Tab stops, a tagged photo sent unturned); all three were withdrawn in the fix wave.
+
+The re-review of the wave found all eighteen items addressed and nothing new that is critical or important. It showed that the wave's own rule made every large pasted screenshot a JPEG with nothing gained; one small correction after it tries lossless first (ruling 16). That correction and three trivial points were checked by the controller, not reviewed again.
+
+What rests on what was never seen, as the review judged it: every point fails soft (a failed turn, a paste that does nothing, a line under the box), but for one doubt it could not settle: if the service refuses an image, the message stays in the program's history and later turns of that session may fail the same way; the window cannot take a message back. The app decodes every image before sending, which keeps broken ones out.
 
 ## Jerod's look at plan 5
 
@@ -68,6 +272,36 @@ What each line settles:
 Four things stay unseen after the live test: a change of effort sent while a turn runs (the test changes it between turns), that a message is made at the level read back (the test reads the level, it sends no message at the changed level), the states `reconnecting` and `policy_disabled` (they need a dropped connection or a policy), and anything typed on another device (the check below).
 
 What fails it is what failed plan 4's; this plan adds no way to fail.
+
+### What Jerod's run of the live test printed on 2026-11-16
+
+Jerod ran the live test on the plan 6 branch (plan 5 is in it) and pasted its output; it passed. Plan 5's lines, as printed:
+
+```
+live: effort at start: medium
+live: effort changed to low in 20 ms
+live: effort changed to medium in 20 ms
+live: context 3% and cost known: yes
+live: context breakdown at start: 6 parts (kinds: used, buffer, free)
+live: context breakdown after a turn: 7 parts (kinds: used, buffer, free)
+live: remote control: on in 743 ms
+live: remote control: off
+live: remote control before a first turn: on in 2331 ms
+live: remote control before a first turn: off
+live: resumed with effort medium, the program says medium
+```
+
+So everything plan 5 read in the program's text and never saw is now seen working:
+
+- `get_settings` gives the level in use, and `apply_flag_settings` changes it, both ways, in about 20 ms. Tasks 2, 4 and 5 are not reopened; the effort picker can be trusted.
+- The context share and the cost arrive with a turn's end.
+- `get_context_usage` answers when a session starts (6 parts) and after a turn (7 parts, the messages now among them), with the three kinds the panel shows. The context breakdown's ruling 33 (asked for at start too) holds: a stored session woken again shows its rows before its first turn here ends.
+- Remote Control turns on after a turn and before a first turn, and off again. No refusal was seen, so the refusal kinds stay as read.
+- `--effort` is taken on resume.
+
+Two lines of the adapter's own came with it: `mindrune: ignored a `system/background_tasks_changed` line from claude`, twice. That record type is one the protocol notes list as seen and not used since plan 1. The adapter has no use for it, and prints this note on stderr for every kind of line it does not know; nothing is wrong. It is noise in a terminal, and could be silenced for the record types the protocol notes already name.
+
+Still unseen for plan 5: a change of effort sent while a turn runs, a message made at the changed level, the states `reconnecting` and `policy_disabled` and the refusal kinds, and everything of the check with a second device (Task 13 waits for that recording).
 
 ### Before looking
 

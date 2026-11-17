@@ -5,11 +5,12 @@
 use std::path::PathBuf;
 
 use mr_agent::{
-    Answer, CommandKind, ContextBreakdown, ContextKind, ModelOption, PermissionMode, RemoteAccess,
-    RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec, StoredHistory,
-    StoredSession,
+    Answer, Attachment, CommandKind, ContextBreakdown, ContextKind, ModelOption, PermissionMode,
+    RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec,
+    StoredHistory, StoredSession,
 };
 
+use crate::attach::{Chip, ChipState, Prepared};
 use crate::conversation::{Conversation, NoticeKind};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,13 +49,20 @@ pub enum HistoryState {
     Failed(String),
 }
 
+/// A message waiting to be handed over: its text and its chips, all ready.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Outgoing {
+    pub text: String,
+    pub chips: Vec<Chip>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
     pub folder: PathBuf,
     pub id: Option<SessionId>,
     /// The agent's name for the session or, until it gives one, a stand-in made from the first
-    /// message sent; for a stored session, the store's title; the user's name once they gave
-    /// one. `None` before any message.
+    /// message sent, or from its first chip's name when it has no text; for a stored session,
+    /// the store's title; the user's name once they gave one. `None` before any message.
     pub title: Option<String>,
     /// The name the user gave in this run, or one kept from an earlier run that the program has
     /// not been told yet.
@@ -72,7 +80,9 @@ pub struct Session {
     /// Goes up whenever the conversation's items are replaced, not appended to.
     pub generation: u64,
     /// A message typed while it could not be sent yet.
-    pub queued: Option<String>,
+    pub queued: Option<Outgoing>,
+    /// What the user attached and has not sent yet, in the order attached.
+    pub chips: Vec<Chip>,
     pub cost_usd: Option<f64>,
     pub context_used: Option<f32>,
     /// What the context is made of, as the program last counted it; the next reading replaces
@@ -97,6 +107,9 @@ pub struct Session {
     effort_known: bool,
     /// `models` came from the session's own program, not from a list it was offered.
     own_models: bool,
+    /// The stand-in title a first message of chips alone gave. While it is the title, the next
+    /// message with text names the session as a first message does.
+    named_after_chip: Option<String>,
     /// It came from the store.
     from_store: bool,
     /// Messages handed over in this run, less those that could not be.
@@ -124,6 +137,7 @@ impl Session {
             history: HistoryState::Loaded,
             generation: 0,
             queued: None,
+            chips: Vec::new(),
             cost_usd: None,
             context_used: None,
             context_parts: None,
@@ -136,6 +150,7 @@ impl Session {
             mode_known: false,
             effort_known: false,
             own_models: false,
+            named_after_chip: None,
             from_store: false,
             handed_over: 0,
             ran_turn: false,
@@ -154,17 +169,18 @@ impl Session {
         session
     }
 
-    /// Puts the stored history before what this run added to the conversation. The history's
+    /// Puts the stored history before what this run added to the conversation, its user
+    /// messages with `pictures` as [`Conversation::from_history`] takes them. The history's
     /// model, effort and mode are taken when neither the user nor the program has named them
     /// yet, except Bypass or an unknown mode, which leave the mode as it is; a resting session
     /// forgets an effort level its model is known not to take. A history that is already
     /// loaded is not loaded again.
-    pub fn load_history(&mut self, history: StoredHistory) {
+    pub fn load_history(&mut self, history: StoredHistory, pictures: &[Vec<u64>]) {
         if self.history == HistoryState::Loaded {
             return;
         }
         let revision = self.conversation.revision();
-        self.conversation.put_history_first(&history);
+        self.conversation.put_history_first(&history, pictures);
         if self.conversation.revision() != revision {
             self.generation += 1;
         }
@@ -186,6 +202,18 @@ impl Session {
         self.history = HistoryState::Loaded;
     }
 
+    /// Every picture id the session still needs: those of its image chips, of its queued
+    /// message's, and of its conversation's messages.
+    pub fn picture_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        let queued = self.queued.iter().flat_map(|queued| &queued.chips);
+        self.chips
+            .iter()
+            .chain(queued)
+            .filter(|chip| is_image(chip))
+            .map(|chip| chip.id)
+            .chain(self.conversation.pictures())
+    }
+
     /// The history could not be read: `reason` says why. A history already loaded stays.
     pub fn history_failed(&mut self, reason: &str) {
         if self.history != HistoryState::Loaded {
@@ -199,23 +227,26 @@ impl Session {
         self.from_store || self.handed_over > 0 || self.ran_turn
     }
 
-    /// Resting to Opening, with `text` queued for when the program is ready. Trimmed as
-    /// [`Session::submit`] trims; a resting session is not woken by whitespace alone.
+    /// Resting to Opening, with `text` and the chips queued for when the program is ready.
+    /// Trimmed as [`Session::submit`] trims; a resting session is woken only when
+    /// [`Session::can_send`] holds, and keeps its chips otherwise.
     pub fn wake(&mut self, text: &str) {
-        if self.phase != Phase::Resting || text.trim().is_empty() {
+        if self.phase != Phase::Resting || !self.can_send(text) {
             return;
         }
         self.phase = Phase::Opening;
-        self.queue(text.trim_end());
+        let message = self.take_message(text);
+        self.queue(message);
     }
 
-    /// Undoes `wake` before a program was opened: back to Resting, giving the text back.
+    /// Undoes `wake` before a program was opened: back to Resting, giving the text back and
+    /// the chips to the session, as [`Session::take_queued`] does.
     pub fn unwake(&mut self) -> Option<String> {
         if self.phase != Phase::Opening || !self.is_stored() {
             return None;
         }
         self.phase = Phase::Resting;
-        self.queued.take()
+        self.take_queued()
     }
 
     /// How to start its program: resuming when `is_stored`, afresh otherwise; with the model,
@@ -491,35 +522,52 @@ impl Session {
         }
     }
 
-    /// Sends `text`, or queues it while it cannot be sent yet. Only trailing whitespace is
-    /// dropped: a first line's indentation is part of what was typed. A message with nothing
-    /// but whitespace is neither sent nor queued. A session's first message sent also names the
-    /// session for now and asks the agent for a title. A resting session takes nothing here:
-    /// it is woken with [`Session::wake`], since its program must be started first.
+    /// Sends `text` with the chips, or queues them while they cannot be sent yet; the session
+    /// has no chips afterwards. Only trailing whitespace is dropped: a first line's indentation
+    /// is part of what was typed. Nothing is sent or queued, and the chips stay, unless
+    /// [`Session::can_send`] holds. A session's first message sent also names the session for
+    /// now and asks the agent for a title. A resting session takes nothing here: it is woken
+    /// with [`Session::wake`], since its program must be started first.
     pub fn submit(&mut self, text: &str) -> Vec<SessionCommand> {
-        if text.trim().is_empty() {
+        if !self.can_send(text) {
             return Vec::new();
         }
-        let text = text.trim_end();
         match self.phase {
-            Phase::Idle => self.hand_over(text.into()),
+            Phase::Idle => {
+                let message = self.take_message(text);
+                self.hand_over(message)
+            }
             Phase::Opening | Phase::Working | Phase::NeedsUser => {
-                self.queue(text);
+                let message = self.take_message(text);
+                self.queue(message);
                 Vec::new()
             }
             Phase::Resting | Phase::Ended { .. } => Vec::new(),
         }
     }
 
-    /// Adds `text` to the queued message, after a blank line.
-    fn queue(&mut self, text: &str) {
-        match &mut self.queued {
-            Some(queued) => {
-                queued.push_str("\n\n");
-                queued.push_str(text);
-            }
-            None => self.queued = Some(text.into()),
+    /// `text` without its trailing whitespace, and all the chips, which leave the session.
+    fn take_message(&mut self, text: &str) -> Outgoing {
+        Outgoing {
+            text: text.trim_end().into(),
+            chips: std::mem::take(&mut self.chips),
         }
+    }
+
+    /// Adds `message` to the queued message: its text after a blank line, when both have text,
+    /// and its chips after the queued ones.
+    fn queue(&mut self, message: Outgoing) {
+        let Some(queued) = &mut self.queued else {
+            self.queued = Some(message);
+            return;
+        };
+        if !message.text.is_empty() {
+            if !queued.text.is_empty() {
+                queued.text.push_str("\n\n");
+            }
+            queued.text.push_str(&message.text);
+        }
+        queued.chips.extend(message.chips);
     }
 
     pub fn stop(&self) -> Option<SessionCommand> {
@@ -627,9 +675,12 @@ impl Session {
         Some(SessionCommand::SetPermissionMode(mode))
     }
 
-    /// Gives the queued message back, for the input box.
+    /// Gives the queued message's text back, for the input box, and puts its chips back on the
+    /// session, before the chips it has now.
     pub fn take_queued(&mut self) -> Option<String> {
-        self.queued.take()
+        let queued = self.queued.take()?;
+        self.chips.splice(0..0, queued.chips);
+        Some(queued.text)
     }
 
     /// The model in use, as the picker names it: by the option it is named by (see
@@ -675,6 +726,16 @@ impl Session {
         !matches!(self.phase, Phase::Ended { .. })
     }
 
+    /// Whether `text` with the chips makes a message ready to go: no chip is still read or has
+    /// a problem, and there is text or a chip. Whether the session takes a message now is
+    /// [`App::takes_message`](crate::App::takes_message).
+    pub fn can_send(&self, text: &str) -> bool {
+        self.chips
+            .iter()
+            .all(|chip| matches!(chip.state, ChipState::Ready(_)))
+            && (!text.trim().is_empty() || !self.chips.is_empty())
+    }
+
     /// The share of the context window in use: what the program said when it last finished a
     /// turn here; else, with a breakdown, its used parts over its window, at most all of it;
     /// else not known. So a stored session woken again shows a share before its first turn here
@@ -711,29 +772,67 @@ impl Session {
     /// Starts a turn with the queued message, when there is one.
     fn send_queued(&mut self) -> Vec<SessionCommand> {
         match self.queued.take() {
-            Some(text) => self.hand_over(text),
+            Some(queued) => self.hand_over(queued),
             None => Vec::new(),
         }
     }
 
-    /// Starts a turn with `text`: the `Send`, and when the session has no title yet, the title
-    /// is set at once to a stand-in made from the message and a `SuggestTitle` follows the
-    /// `Send`, so the agent can name the session. A session with a title, its own or a stand-in,
-    /// never asks, so each session asks at most once.
-    fn hand_over(&mut self, text: String) -> Vec<SessionCommand> {
-        self.conversation.push_user(&text);
+    /// Starts a turn with `message`: the `Send` of its text and its chips' attachments, in
+    /// their order, and the user's message with its image chips' ids as its pictures and its
+    /// files' paths. When the
+    /// session has no title yet, the title is set at once to a stand-in made from the text and
+    /// a `SuggestTitle` follows the `Send`, so the agent can name the session. A message without
+    /// text is named after its first chip and asks for nothing; the next message with text is
+    /// treated as the first was. A session with any other title, its own or a stand-in, never
+    /// asks, so each session asks at most once.
+    fn hand_over(&mut self, message: Outgoing) -> Vec<SessionCommand> {
+        let Outgoing { text, chips } = message;
+        debug_assert!(
+            chips
+                .iter()
+                .all(|chip| matches!(chip.state, ChipState::Ready(_))),
+            "a message is handed over only once every chip is ready (`can_send`)"
+        );
+        let first_chip = chips.first().map(|chip| chip.name.clone());
+        let pictures = chips
+            .iter()
+            .filter(|chip| is_image(chip))
+            .map(|chip| chip.id)
+            .collect();
+        let attachments: Vec<Attachment> = chips
+            .into_iter()
+            .filter_map(|chip| match chip.state {
+                ChipState::Ready(prepared) => Some(prepared.attachment),
+                ChipState::Reading | ChipState::Problem(_) => None,
+            })
+            .collect();
+        let files = attachments
+            .iter()
+            .filter_map(|attachment| match attachment {
+                Attachment::File { path } => Some(path.clone()),
+                Attachment::Image { .. } => None,
+            })
+            .collect();
+        self.conversation.push_user(&text, pictures, files);
         self.phase = Phase::Working;
         self.handed_over += 1;
-        let suggest = self.title.is_none().then(|| {
-            self.title = Some(title_stand_in(&text));
-            SessionCommand::SuggestTitle {
-                from: text.chars().take(TITLE_FROM_CHARS).collect(),
+        let mut suggest = None;
+        if !text.is_empty() {
+            let named_after_chip = self.named_after_chip.take();
+            if self.title.is_none() || self.title == named_after_chip {
+                self.title = Some(title_stand_in(&text));
+                suggest = Some(SessionCommand::SuggestTitle {
+                    from: text.chars().take(TITLE_FROM_CHARS).collect(),
+                });
             }
-        });
-        let send = SessionCommand::Send {
-            text,
-            attachments: vec![],
-        };
+        } else if self.title.is_none()
+            && let Some(name) = first_chip.map(|name| title_stand_in(&name))
+            && !name.is_empty()
+        {
+            self.title = Some(name.clone());
+            self.named_after_chip = Some(name);
+        }
+        let send = SessionCommand::Send { text, attachments };
         std::iter::once(send).chain(suggest).collect()
     }
 }
@@ -743,6 +842,17 @@ const STAND_IN_CHARS: usize = 60;
 
 /// The most of a first message the agent is given to name its session from, in characters.
 const TITLE_FROM_CHARS: usize = 2_000;
+
+/// The chip is ready to go as an image: its id is its picture's.
+fn is_image(chip: &Chip) -> bool {
+    matches!(
+        &chip.state,
+        ChipState::Ready(Prepared {
+            attachment: Attachment::Image { .. },
+            ..
+        })
+    )
+}
 
 /// What a session is called until the agent names it: the message's first line that is not
 /// blank, each run of whitespace made one space, cut to 60 characters with "…" in place of
@@ -863,12 +973,13 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::info;
     use super::*;
+    use crate::attach::{Kind, Prepared, Problem, Source};
     use crate::conversation::{DID_NOT_FINISH, ItemBody};
     use crate::tools::{ToolCall, ToolGroup};
     use mr_agent::{
-        HistoryItem, QuestionAnswer, RemoteAccess, RemoteFailure, SessionInfo, StoredHistory,
-        StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UserRequest,
-        UserRequestKind,
+        Attachment, HistoryItem, ImageData, QuestionAnswer, RemoteAccess, RemoteFailure,
+        SessionInfo, StoredHistory, StoredSession, ToolCallId, ToolDetail, ToolOutcome,
+        TurnSummary, UserRequest, UserRequestKind,
     };
 
     fn started() -> Session {
@@ -983,14 +1094,14 @@ mod tests {
     fn a_message_is_sent_when_idle_and_queued_otherwise() {
         let mut s = Session::opening("/p");
         assert_eq!(s.submit("early"), vec![]);
-        assert_eq!(s.queued.as_deref(), Some("early"));
+        assert_eq!(queued_text(&s), Some("early"));
         let sent = s.apply(SessionEvent::Started(info()), 0.0);
         assert_eq!(sent, vec![send("early"), suggest("early")]);
         assert_eq!((s.phase.clone(), s.queued.clone()), (Phase::Working, None));
         assert_eq!(s.submit("  "), vec![]);
         assert_eq!(s.submit("two"), vec![]);
         assert_eq!(s.submit("three"), vec![]);
-        assert_eq!(s.queued.as_deref(), Some("two\n\nthree"));
+        assert_eq!(queued_text(&s), Some("two\n\nthree"));
         let sent = s.apply(done(), 0.0);
         assert_eq!(
             sent,
@@ -1025,9 +1136,9 @@ mod tests {
         assert_eq!(shown.as_deref(), Some(as_sent));
         assert_eq!(s.submit("  - one\n"), vec![]);
         assert_eq!(s.submit("  - two \t"), vec![]);
-        assert_eq!(s.queued.as_deref(), Some("  - one\n\n  - two"));
+        assert_eq!(queued_text(&s), Some("  - one\n\n  - two"));
         assert_eq!(s.submit(" \n\t "), vec![]);
-        assert_eq!(s.queued.as_deref(), Some("  - one\n\n  - two"));
+        assert_eq!(queued_text(&s), Some("  - one\n\n  - two"));
     }
 
     #[test]
@@ -1038,7 +1149,7 @@ mod tests {
         assert_eq!(s.phase, Phase::NeedsUser);
         assert_eq!(s.submit("yes"), vec![]);
         assert_eq!(s.conversation.waiting(), 1);
-        assert_eq!(s.queued.as_deref(), Some("yes"));
+        assert_eq!(queued_text(&s), Some("yes"));
         let sent = s.answer(&RequestId("r1".into()), Answer::Allow { always: false });
         assert_eq!(
             sent,
@@ -1440,6 +1551,8 @@ mod tests {
         HistoryItem::User {
             text: text.into(),
             image_count: 0,
+            files: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -1498,24 +1611,27 @@ mod tests {
         let ls = ToolDetail::Command {
             command: "ls".into(),
         };
-        s.load_history(StoredHistory {
-            items: vec![
-                said("one"),
-                HistoryItem::AssistantText("Sure.".into()),
-                HistoryItem::Tool {
-                    id: ToolCallId("t1".into()),
-                    name: "Bash".into(),
-                    detail: ls.clone(),
-                    outcome: None,
-                },
-                HistoryItem::Compacted,
-                said("two"),
-            ],
-            earlier_left_out: true,
-            model: None,
-            permission_mode: None,
-            effort: None,
-        });
+        s.load_history(
+            StoredHistory {
+                items: vec![
+                    said("one"),
+                    HistoryItem::AssistantText("Sure.".into()),
+                    HistoryItem::Tool {
+                        id: ToolCallId("t1".into()),
+                        name: "Bash".into(),
+                        detail: ls.clone(),
+                        outcome: None,
+                    },
+                    HistoryItem::Compacted,
+                    said("two"),
+                ],
+                earlier_left_out: true,
+                model: None,
+                permission_mode: None,
+                effort: None,
+            },
+            &[],
+        );
         let closed = ToolCall {
             id: ToolCallId("t1".into()),
             name: "Bash".into(),
@@ -1533,7 +1649,9 @@ mod tests {
                 },
                 ItemBody::User {
                     text: "one".into(),
-                    image_count: 0
+                    image_count: 0,
+                    files: Vec::new(),
+                    pictures: Vec::new(),
                 },
                 ItemBody::Reply {
                     markdown: "Sure.".into(),
@@ -1546,7 +1664,9 @@ mod tests {
                 },
                 ItemBody::User {
                     text: "two".into(),
-                    image_count: 0
+                    image_count: 0,
+                    files: Vec::new(),
+                    pictures: Vec::new(),
                 },
             ]
         );
@@ -1564,7 +1684,7 @@ mod tests {
             ..StoredHistory::default()
         };
         let mut s = Session::resting(&stored());
-        s.load_history(named());
+        s.load_history(named(), &[]);
         assert_eq!(
             (s.model.as_deref(), &s.mode),
             (Some("m-2"), &PermissionMode::Plan)
@@ -1575,7 +1695,7 @@ mod tests {
         s.history = HistoryState::Loading;
         assert_eq!(s.choose_mode(PermissionMode::AcceptEdits), None);
         assert_eq!(s.choose_model("opus"), None);
-        s.load_history(named());
+        s.load_history(named(), &[]);
         assert_eq!(
             (s.model.as_deref(), &s.mode),
             (Some("claude-opus-5-5"), &PermissionMode::AcceptEdits)
@@ -1590,11 +1710,14 @@ mod tests {
             PermissionMode::Other("dontAsk".into()),
         ] {
             let mut s = Session::resting(&stored());
-            s.load_history(StoredHistory {
-                items: vec![said("one")],
-                permission_mode: Some(mode.clone()),
-                ..StoredHistory::default()
-            });
+            s.load_history(
+                StoredHistory {
+                    items: vec![said("one")],
+                    permission_mode: Some(mode.clone()),
+                    ..StoredHistory::default()
+                },
+                &[],
+            );
             assert_eq!(
                 s.mode,
                 PermissionMode::Ask,
@@ -1608,11 +1731,14 @@ mod tests {
             PermissionMode::Auto,
         ] {
             let mut s = Session::resting(&stored());
-            s.load_history(StoredHistory {
-                items: vec![said("one")],
-                permission_mode: Some(mode.clone()),
-                ..StoredHistory::default()
-            });
+            s.load_history(
+                StoredHistory {
+                    items: vec![said("one")],
+                    permission_mode: Some(mode.clone()),
+                    ..StoredHistory::default()
+                },
+                &[],
+            );
             assert_eq!(s.mode, mode, "{mode:?} is carried");
             assert_eq!(s.start_spec().permission_mode, Some(mode));
         }
@@ -1626,22 +1752,27 @@ mod tests {
         s.apply(SessionEvent::TextDelta("Hello.".into()), 0.0);
         s.apply(done(), 0.0);
         let generation = s.generation;
-        s.load_history(StoredHistory {
-            items: vec![
-                said("before"),
-                HistoryItem::AssistantText("Earlier.".into()),
-            ],
-            model: Some("m-2".into()),
-            permission_mode: Some(PermissionMode::Plan),
-            earlier_left_out: false,
-            effort: None,
-        });
+        s.load_history(
+            StoredHistory {
+                items: vec![
+                    said("before"),
+                    HistoryItem::AssistantText("Earlier.".into()),
+                ],
+                model: Some("m-2".into()),
+                permission_mode: Some(PermissionMode::Plan),
+                earlier_left_out: false,
+                effort: None,
+            },
+            &[],
+        );
         assert_eq!(
             bodies(&s),
             vec![
                 ItemBody::User {
                     text: "before".into(),
-                    image_count: 0
+                    image_count: 0,
+                    files: Vec::new(),
+                    pictures: Vec::new(),
                 },
                 ItemBody::Reply {
                     markdown: "Earlier.".into(),
@@ -1649,7 +1780,9 @@ mod tests {
                 },
                 ItemBody::User {
                     text: "hi".into(),
-                    image_count: 0
+                    image_count: 0,
+                    files: Vec::new(),
+                    pictures: Vec::new(),
                 },
                 ItemBody::Reply {
                     markdown: "Hello.".into(),
@@ -1665,10 +1798,13 @@ mod tests {
             (Some("claude-haiku-5-5"), &PermissionMode::Ask)
         );
         // A history read again changes nothing more.
-        s.load_history(StoredHistory {
-            items: vec![said("again")],
-            ..StoredHistory::default()
-        });
+        s.load_history(
+            StoredHistory {
+                items: vec![said("again")],
+                ..StoredHistory::default()
+            },
+            &[],
+        );
         assert_eq!(
             (s.conversation.items().len(), s.generation),
             (4, generation + 1)
@@ -1789,7 +1925,7 @@ mod tests {
         let mut s = Session::resting(&stored());
         s.wake("hi");
         assert_eq!(s.phase, Phase::Opening);
-        assert_eq!(s.queued.as_deref(), Some("hi"));
+        assert_eq!(queued_text(&s), Some("hi"));
         assert_eq!(
             s.apply(SessionEvent::Started(info()), 0.0),
             vec![send("hi")],
@@ -1890,7 +2026,9 @@ mod tests {
             bodies(&s),
             vec![ItemBody::User {
                 text: "go".into(),
-                image_count: 0
+                image_count: 0,
+                files: Vec::new(),
+                pictures: Vec::new(),
             }]
         );
         let mut s = started();
@@ -2064,7 +2202,7 @@ mod tests {
     #[test]
     fn a_stored_session_goes_on_with_its_effort() {
         let mut s = Session::resting(&stored());
-        s.load_history(history_with_effort("high"));
+        s.load_history(history_with_effort("high"), &[]);
         assert_eq!(s.effort.as_deref(), Some("high"));
         assert_eq!(
             s.start_spec().effort.as_deref(),
@@ -2081,19 +2219,19 @@ mod tests {
         // level.
         let mut s = Session::resting(&stored());
         s.offer_models(&offered_with_levels());
-        s.load_history(history_with_effort("max"));
+        s.load_history(history_with_effort("max"), &[]);
         assert_eq!(s.effort, None);
         assert_eq!(s.start_spec().effort, None);
         // Also when the model's levels become known after the history was read.
         let mut s = Session::resting(&stored());
-        s.load_history(history_with_effort("max"));
+        s.load_history(history_with_effort("max"), &[]);
         assert_eq!(s.effort.as_deref(), Some("max"), "not known yet");
         s.offer_models(&offered_with_levels());
         assert_eq!(s.effort, None);
         // Nor when it is known to take none.
         let mut s = Session::resting(&stored());
         s.offer_models(&offered());
-        s.load_history(history_with_effort("high"));
+        s.load_history(history_with_effort("high"), &[]);
         assert_eq!(s.effort, None);
         assert_eq!(s.start_spec().effort, None);
         // A history read while the program runs: the program's level is newer.
@@ -2102,7 +2240,7 @@ mod tests {
         s.wake("go");
         s.apply(SessionEvent::Started(leveled_info()), 0.0);
         s.apply(SessionEvent::EffortChanged(None), 0.0);
-        s.load_history(history_with_effort("high"));
+        s.load_history(history_with_effort("high"), &[]);
         assert_eq!(s.effort, None);
         // While a program runs, only the program changes the level, even one its model does
         // not list.
@@ -2111,7 +2249,7 @@ mod tests {
         s.wake("go");
         s.apply(SessionEvent::Started(leveled_info()), 0.0);
         s.apply(effort("max"), 0.0);
-        s.load_history(history_with_effort("high"));
+        s.load_history(history_with_effort("high"), &[]);
         s.offer_models(&offered_with_levels());
         assert_eq!(s.effort.as_deref(), Some("max"));
     }
@@ -2124,13 +2262,13 @@ mod tests {
         s.choose_model("m-2");
         s.history = HistoryState::Loading;
         assert_eq!(s.choose_effort("low"), None);
-        s.load_history(history_with_effort("high"));
+        s.load_history(history_with_effort("high"), &[]);
         assert_eq!(s.effort.as_deref(), Some("low"));
         assert_eq!(s.start_spec().effort.as_deref(), Some("low"));
         // Chosen after it was read.
         let mut s = Session::resting(&stored());
         s.offer_models(&offered_with_levels());
-        s.load_history(history_with_effort("high"));
+        s.load_history(history_with_effort("high"), &[]);
         assert_eq!(s.choose_effort("low"), None);
         assert_eq!(s.start_spec().effort.as_deref(), Some("low"));
     }
@@ -2589,5 +2727,363 @@ mod tests {
             s.apply(state, 0.0);
             assert_eq!(s.remote_said, None);
         }
+    }
+
+    /// The text of the queued message.
+    fn queued_text(s: &Session) -> Option<&str> {
+        s.queued.as_ref().map(|queued| queued.text.as_str())
+    }
+
+    /// The ids of the queued message's chips.
+    fn queued_chips(s: &Session) -> Vec<u64> {
+        s.queued
+            .as_ref()
+            .map_or_else(Vec::new, |queued| ids(&queued.chips))
+    }
+
+    fn ids(chips: &[Chip]) -> Vec<u64> {
+        chips.iter().map(|chip| chip.id).collect()
+    }
+
+    /// A pasted image: a few made-up bytes stand for it.
+    fn image() -> Attachment {
+        Attachment::Image {
+            media_type: "image/png".into(),
+            data: ImageData::new(vec![1u8, 2, 3]),
+        }
+    }
+
+    fn file(path: &str) -> Attachment {
+        Attachment::File { path: path.into() }
+    }
+
+    /// Chip `id`, read and ready to send as `attachment`.
+    fn ready_chip(id: u64, attachment: Attachment) -> Chip {
+        let (name, source, kind) = match &attachment {
+            Attachment::Image { data, .. } => (
+                "Pasted image".to_string(),
+                Source::Pasted(data.clone()),
+                Kind::Image,
+            ),
+            Attachment::File { path } => (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                Source::Path(path.clone()),
+                Kind::File,
+            ),
+        };
+        Chip {
+            id,
+            name,
+            source,
+            state: ChipState::Ready(Prepared {
+                kind,
+                attachment,
+                thumb: None,
+            }),
+        }
+    }
+
+    /// The `Send` of `text` with `attachments`.
+    fn send_with(text: &str, attachments: Vec<Attachment>) -> SessionCommand {
+        SessionCommand::Send {
+            text: text.into(),
+            attachments,
+        }
+    }
+
+    /// The user's messages in the conversation.
+    fn users(s: &Session) -> Vec<ItemBody> {
+        s.conversation
+            .items()
+            .iter()
+            .filter(|item| matches!(item.body, ItemBody::User { .. }))
+            .map(|item| item.body.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_message_goes_out_with_its_chips_in_order() {
+        let mut s = started();
+        s.chips = vec![
+            ready_chip(1, file("/home/alex/a.txt")),
+            ready_chip(2, image()),
+            ready_chip(3, file("/home/alex/b.txt")),
+        ];
+        let sent = s.submit("look at these");
+        assert_eq!(
+            sent,
+            vec![
+                send_with(
+                    "look at these",
+                    vec![file("/home/alex/a.txt"), image(), file("/home/alex/b.txt")]
+                ),
+                suggest("look at these"),
+            ]
+        );
+        assert_eq!(s.chips, vec![], "no chips left");
+        assert_eq!(
+            users(&s),
+            vec![ItemBody::User {
+                text: "look at these".into(),
+                image_count: 1,
+                files: vec!["/home/alex/a.txt".into(), "/home/alex/b.txt".into()],
+                pictures: vec![2],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_sent_message_keeps_its_chips_ids_as_pictures() {
+        let mut s = started();
+        s.chips = vec![
+            ready_chip(11, image()),
+            ready_chip(12, file("/home/alex/a.txt")),
+            ready_chip(13, image()),
+        ];
+        s.submit("compare these");
+        assert_eq!(
+            users(&s),
+            vec![ItemBody::User {
+                text: "compare these".into(),
+                image_count: 2,
+                files: vec!["/home/alex/a.txt".into()],
+                pictures: vec![11, 13],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_session_needs_the_pictures_of_its_chips_its_queue_and_its_conversation() {
+        let mut s = started();
+        assert_eq!(s.picture_ids().count(), 0);
+        s.chips = vec![
+            ready_chip(1, image()),
+            ready_chip(2, file("/home/alex/a.txt")),
+        ];
+        s.submit("first");
+        // Sent while the turn goes on: queued.
+        s.chips = vec![ready_chip(3, image())];
+        s.submit("second");
+        assert_eq!(queued_chips(&s), vec![3]);
+        // Attached and not sent yet: a file, an image read, and an image still being read. The
+        // last has no picture yet: it is needed once its answer makes it ready.
+        let reading = Chip {
+            id: 6,
+            name: "Pasted image".into(),
+            source: Source::Pasted(ImageData::new(vec![1u8, 2, 3])),
+            state: ChipState::Reading,
+        };
+        s.chips = vec![
+            ready_chip(4, file("/home/alex/b.txt")),
+            ready_chip(5, image()),
+            reading,
+        ];
+        let mut needed: Vec<u64> = s.picture_ids().collect();
+        needed.sort_unstable();
+        assert_eq!(
+            needed,
+            vec![1, 3, 5],
+            "neither the file nor the image being read"
+        );
+        // The queued message goes out: its picture moves to the conversation and is still
+        // needed.
+        s.apply(done(), 0.0);
+        assert_eq!(s.queued, None);
+        let mut needed: Vec<u64> = s.picture_ids().collect();
+        needed.sort_unstable();
+        assert_eq!(needed, vec![1, 3, 5]);
+        // A stored history brings its own.
+        let mut resting = Session::resting(&stored());
+        resting.load_history(
+            StoredHistory {
+                items: vec![HistoryItem::User {
+                    text: "see".into(),
+                    image_count: 1,
+                    files: Vec::new(),
+                    images: vec![None; 1],
+                }],
+                ..StoredHistory::default()
+            },
+            &[vec![1 << 63 | 7]],
+        );
+        assert_eq!(resting.picture_ids().collect::<Vec<_>>(), vec![1 << 63 | 7]);
+    }
+
+    #[test]
+    fn chips_alone_go_out() {
+        let mut s = started();
+        s.title = Some("Fix the parser".into());
+        s.chips = vec![ready_chip(1, image())];
+        assert_eq!(s.submit(" \n"), vec![send_with("", vec![image()])]);
+        assert_eq!(s.chips, vec![]);
+        assert_eq!(
+            users(&s),
+            vec![ItemBody::User {
+                text: String::new(),
+                image_count: 1,
+                files: Vec::new(),
+                pictures: vec![1],
+            }]
+        );
+        assert_eq!(s.phase, Phase::Working);
+    }
+
+    #[test]
+    fn a_message_with_an_unready_chip_is_not_sent_and_keeps_everything() {
+        let reading = Chip {
+            id: 2,
+            name: "b.txt".into(),
+            source: Source::Path("/home/alex/b.txt".into()),
+            state: ChipState::Reading,
+        };
+        let problem = Chip {
+            state: ChipState::Problem(Problem::Unreadable),
+            ..reading.clone()
+        };
+        for unready in [reading, problem] {
+            let chips = vec![ready_chip(1, file("/home/alex/a.txt")), unready];
+            let mut s = started();
+            s.chips = chips.clone();
+            assert_eq!(s.submit("hi"), vec![]);
+            assert_eq!(
+                (&s.phase, &s.chips, &s.queued, &s.title),
+                (&Phase::Idle, &chips, &None, &None)
+            );
+            assert_eq!(users(&s), vec![]);
+            // Nor is it queued behind a turn, nor does it wake a resting session.
+            s.chips = Vec::new();
+            s.submit("go");
+            s.chips = chips.clone();
+            assert_eq!(s.submit("hi"), vec![]);
+            assert_eq!((&s.chips, &s.queued), (&chips, &None));
+            let mut resting = Session::resting(&stored());
+            resting.chips = chips.clone();
+            resting.wake("hi");
+            assert_eq!(
+                (&resting.phase, &resting.chips, &resting.queued),
+                (&Phase::Resting, &chips, &None)
+            );
+        }
+    }
+
+    #[test]
+    fn a_queued_message_keeps_its_chips_and_a_second_joins_it() {
+        let mut s = started();
+        s.submit("go");
+        s.chips = vec![ready_chip(1, file("/home/alex/a.txt"))];
+        assert_eq!(s.submit("one"), vec![]);
+        assert_eq!(s.chips, vec![]);
+        assert_eq!((queued_text(&s), queued_chips(&s)), (Some("one"), vec![1]));
+        s.chips = vec![ready_chip(2, image())];
+        s.submit("");
+        assert_eq!(
+            (queued_text(&s), queued_chips(&s)),
+            (Some("one"), vec![1, 2]),
+            "chips alone leave the text as it was"
+        );
+        s.chips = vec![ready_chip(3, file("/home/alex/b.txt"))];
+        s.submit("two");
+        assert_eq!(
+            (queued_text(&s), queued_chips(&s)),
+            (Some("one\n\ntwo"), vec![1, 2, 3])
+        );
+        assert_eq!(
+            s.apply(done(), 0.0),
+            vec![send_with(
+                "one\n\ntwo",
+                vec![file("/home/alex/a.txt"), image(), file("/home/alex/b.txt")]
+            )]
+        );
+        assert_eq!(s.queued, None);
+        // The other way round: chips alone first, then a text.
+        s.chips = vec![ready_chip(4, image())];
+        s.submit("");
+        s.submit("three");
+        assert_eq!(
+            (queued_text(&s), queued_chips(&s)),
+            (Some("three"), vec![4])
+        );
+    }
+
+    #[test]
+    fn editing_the_queue_brings_the_chips_back_in_front() {
+        let mut s = started();
+        s.submit("go");
+        s.chips = vec![
+            ready_chip(1, file("/home/alex/a.txt")),
+            ready_chip(2, image()),
+        ];
+        s.submit("one");
+        // Attached in the meantime, still being read.
+        s.chips = vec![Chip {
+            id: 3,
+            name: "b.txt".into(),
+            source: Source::Path("/home/alex/b.txt".into()),
+            state: ChipState::Reading,
+        }];
+        assert_eq!(s.take_queued().as_deref(), Some("one"));
+        assert_eq!(s.queued, None);
+        assert_eq!(ids(&s.chips), vec![1, 2, 3]);
+        // A queue of chips alone gives an empty text back.
+        s.chips = vec![ready_chip(4, image())];
+        s.submit("");
+        assert_eq!(s.take_queued().as_deref(), Some(""));
+        assert_eq!(ids(&s.chips), vec![4]);
+    }
+
+    #[test]
+    fn a_woken_session_sends_its_chips_and_unwaking_brings_them_back() {
+        let mut s = Session::resting(&stored());
+        s.chips = vec![ready_chip(1, image())];
+        s.wake("hi");
+        assert_eq!(s.phase, Phase::Opening);
+        assert_eq!(s.chips, vec![]);
+        assert_eq!((queued_text(&s), queued_chips(&s)), (Some("hi"), vec![1]));
+        assert_eq!(s.unwake().as_deref(), Some("hi"));
+        assert_eq!((&s.phase, &s.queued), (&Phase::Resting, &None));
+        assert_eq!(ids(&s.chips), vec![1]);
+        // Chips alone wake it too.
+        s.wake("");
+        assert_eq!(s.phase, Phase::Opening);
+        assert_eq!(
+            s.apply(SessionEvent::Started(info()), 0.0),
+            vec![send_with("", vec![image()])]
+        );
+        assert_eq!(s.chips, vec![]);
+    }
+
+    #[test]
+    fn a_first_message_of_chips_is_named_after_the_first_chip_and_asks_for_no_title() {
+        let mut s = started();
+        let long = format!("/home/alex/{}.txt", "x".repeat(70));
+        s.chips = vec![ready_chip(1, file(&long)), ready_chip(2, image())];
+        assert_eq!(
+            s.submit(""),
+            vec![send_with("", vec![file(&long), image()])],
+            "no title is asked for"
+        );
+        assert_eq!(
+            s.title,
+            Some(format!("{}…", "x".repeat(60))),
+            "shortened as a text's stand-in is"
+        );
+        s.apply(done(), 0.0);
+        // The next message with text names it as a first message does.
+        assert_eq!(
+            s.submit("Fix the parser"),
+            vec![send("Fix the parser"), suggest("Fix the parser")]
+        );
+        assert_eq!(s.title.as_deref(), Some("Fix the parser"));
+        s.apply(done(), 0.0);
+        assert_eq!(s.submit("again"), vec![send("again")], "once only");
+        // A name the user gave in between is kept, and no title is asked for.
+        let mut s = started();
+        s.chips = vec![ready_chip(1, image())];
+        s.submit("");
+        assert_eq!(s.title.as_deref(), Some("Pasted image"));
+        s.apply(done(), 0.0);
+        s.rename("Mine");
+        assert_eq!(s.submit("go"), vec![send("go")]);
+        assert_eq!(s.title.as_deref(), Some("Mine"));
     }
 }

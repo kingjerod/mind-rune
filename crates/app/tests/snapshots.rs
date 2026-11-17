@@ -7,7 +7,7 @@ use std::process::Command;
 
 /// The scenes that make up the window's screens: one session's, in the order it meets them,
 /// then those with many sessions, the sidebar's menus, a stored session's, tiles side by side,
-/// and the right panel beside them. Each runs in the binary's own window size unless a size is given, as `--size` takes it.
+/// the right panel beside them, and the chips of an input box. Each runs in the binary's own window size unless a size is given, as `--size` takes it.
 const SCENES: &[(&str, Option<&str>)] = &[
     ("checking", None),
     ("signed-out", None),
@@ -42,6 +42,8 @@ const SCENES: &[(&str, Option<&str>)] = &[
     ("panel", Some(WIDE)),
     ("panel-remote", Some(WIDE)),
     ("panel-refused", Some(WIDE)),
+    ("chips", None),
+    ("chips-problem", None),
 ];
 
 /// A window wide enough for three tiles of more than 420 points each beside the sidebar. The

@@ -6,6 +6,8 @@
 //! view shows has changed and stays the same otherwise; and an item's
 //! [`Item::changed`] is the revision of its own last change.
 
+use std::path::PathBuf;
+
 use mr_agent::{
     HistoryItem, RequestId, SessionEvent, StoredHistory, ToolCallId, ToolOutcome, UserRequest,
 };
@@ -28,8 +30,12 @@ pub struct Item {
 pub enum ItemBody {
     User {
         text: String,
-        /// The images a stored message had; 0 for a message typed in this run.
+        /// The images the message had.
         image_count: usize,
+        /// The files the message was sent with, by path.
+        files: Vec<PathBuf>,
+        /// The id of each of its images' pictures, in order: one per image.
+        pictures: Vec<u64>,
     },
     Reply {
         markdown: String,
@@ -122,6 +128,8 @@ pub struct Conversation {
     calls: Vec<usize>,
     /// The files the edits changed, counted as each call finishes.
     changes: Changes,
+    /// The picture ids of the user's messages, in their order.
+    pictures: Vec<u64>,
 }
 
 impl Conversation {
@@ -130,24 +138,32 @@ impl Conversation {
     }
 
     /// A stored history as a finished conversation: no reply streams, no thinking goes on,
-    /// and a call that has no outcome did not finish.
-    pub fn from_history(history: &StoredHistory) -> Conversation {
+    /// and a call that has no outcome did not finish. `pictures` holds the picture ids of each
+    /// of the history's user messages in turn, as many as the message has images (see
+    /// `push_stored`).
+    pub fn from_history(history: &StoredHistory, pictures: &[Vec<u64>]) -> Conversation {
         let mut conversation = Conversation::new();
         if history.earlier_left_out {
             conversation.push_notice(NoticeKind::EarlierLeftOut, EARLIER_LEFT_OUT);
         }
+        let mut pictures = pictures.iter();
         for item in &history.items {
-            conversation.push_stored(item);
+            let ids = match item {
+                HistoryItem::User { .. } => pictures.next().cloned().unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            conversation.push_stored(item, ids);
         }
         conversation.close_calls();
         conversation
     }
 
-    /// Puts `history` before the items there are, which keep their order. Every item is
-    /// numbered again, so ids still grow with the place; a session marks this by raising its
+    /// Puts `history` before the items there are, which keep their order, its user messages
+    /// with `pictures` as [`Conversation::from_history`] gives them. Every item is numbered
+    /// again, so ids still grow with the place; a session marks this by raising its
     /// `generation`. An empty history changes nothing.
-    pub fn put_history_first(&mut self, history: &StoredHistory) {
-        let earlier = Conversation::from_history(history);
+    pub fn put_history_first(&mut self, history: &StoredHistory, pictures: &[Vec<u64>]) {
+        let mut earlier = Conversation::from_history(history, pictures);
         let shift = earlier.items.len();
         if shift == 0 {
             return;
@@ -155,6 +171,8 @@ impl Conversation {
         let later = std::mem::replace(&mut self.items, earlier.items);
         self.items.extend(later);
         self.changes = earlier.changes.then(std::mem::take(&mut self.changes));
+        earlier.pictures.append(&mut self.pictures);
+        self.pictures = earlier.pictures;
         self.revision += 1;
         for item in &mut self.items {
             item.id = ItemId(self.next_id);
@@ -185,10 +203,19 @@ impl Conversation {
         self.revision
     }
 
-    pub fn push_user(&mut self, text: &str) {
+    /// The picture id of every image of the user's messages, in their order. Costs nothing
+    /// that grows with the conversation's length.
+    pub fn pictures(&self) -> impl Iterator<Item = u64> + '_ {
+        self.pictures.iter().copied()
+    }
+
+    /// A message of the user's, with one picture id per image.
+    pub fn push_user(&mut self, text: &str, pictures: Vec<u64>, files: Vec<PathBuf>) {
         self.push(ItemBody::User {
             text: text.into(),
-            image_count: 0,
+            image_count: pictures.len(),
+            files,
+            pictures,
         });
     }
 
@@ -277,13 +304,29 @@ impl Conversation {
     }
 
     /// One stored item, pushed as the live events would have left it, but closed. Thinking
-    /// keeps no time: the store does not say how long it took.
-    fn push_stored(&mut self, item: &HistoryItem) {
+    /// keeps no time: the store does not say how long it took. A user's message takes
+    /// `pictures` as its pictures' ids, one per image; its image count is the number of ids,
+    /// so it never counts an image it has no slot for.
+    fn push_stored(&mut self, item: &HistoryItem, pictures: Vec<u64>) {
         match item {
-            HistoryItem::User { text, image_count } => self.push(ItemBody::User {
-                text: text.clone(),
-                image_count: *image_count,
-            }),
+            HistoryItem::User {
+                text,
+                image_count,
+                files,
+                ..
+            } => {
+                debug_assert_eq!(
+                    pictures.len(),
+                    *image_count,
+                    "a stored message is given one picture id per image"
+                );
+                self.push(ItemBody::User {
+                    text: text.clone(),
+                    image_count: pictures.len(),
+                    files: files.clone(),
+                    pictures,
+                })
+            }
             HistoryItem::AssistantText(markdown) => self.push(ItemBody::Reply {
                 markdown: markdown.clone(),
                 streaming: false,
@@ -309,6 +352,9 @@ impl Conversation {
     }
 
     fn push(&mut self, body: ItemBody) {
+        if let ItemBody::User { pictures, .. } = &body {
+            self.pictures.extend(pictures);
+        }
         let id = ItemId(self.next_id);
         self.next_id += 1;
         self.revision += 1;
@@ -590,7 +636,7 @@ mod tests {
     fn an_items_change_stamp_moves_only_when_it_changes() {
         let stamps = |c: &Conversation| c.items().iter().map(|i| i.changed).collect::<Vec<_>>();
         let mut c = Conversation::new();
-        c.push_user("one");
+        c.push_user("one", Vec::new(), Vec::new());
         play(&mut c, &[text("a"), read("r1")]);
         let before = stamps(&c);
         // The read's outcome changes the tool group alone.
@@ -663,7 +709,7 @@ mod tests {
         ];
         for end in endings {
             let mut c = Conversation::new();
-            c.push_user("go");
+            c.push_user("go", Vec::new(), Vec::new());
             play(&mut c, &[read("a"), read("b")]);
             c.apply(
                 &SessionEvent::ToolFinished {
@@ -725,7 +771,7 @@ mod tests {
     #[test]
     fn a_reply_streams_into_one_item() {
         let mut c = Conversation::new();
-        c.push_user("**hi**");
+        c.push_user("**hi**", Vec::new(), Vec::new());
         play(
             &mut c,
             &[
@@ -740,7 +786,9 @@ mod tests {
             vec![
                 ItemBody::User {
                     text: "**hi**".into(),
-                    image_count: 0
+                    image_count: 0,
+                    files: Vec::new(),
+                    pictures: Vec::new(),
                 },
                 ItemBody::Reply {
                     markdown: "Hello".into(),
@@ -964,7 +1012,7 @@ mod tests {
     #[test]
     fn ids_stay_put_and_the_revision_tracks_real_changes() {
         let mut c = Conversation::new();
-        c.push_user("one");
+        c.push_user("one", Vec::new(), Vec::new());
         let first = c.items()[0].id;
         let before = c.revision();
         c.apply(&SessionEvent::TitleChanged("t".into()), 0.0);
@@ -1035,20 +1083,25 @@ mod tests {
 
     #[test]
     fn a_history_is_drawn_as_a_finished_conversation() {
-        let c = Conversation::from_history(&StoredHistory {
-            items: vec![
-                HistoryItem::User {
-                    text: "Look at the parser".into(),
-                    image_count: 0,
-                },
-                HistoryItem::Thinking("hm".into()),
-                stored_read("a", Some(ToolOutcome::Ok { output: "x".into() })),
-                stored_read("b", None),
-                HistoryItem::AssistantText("It reads fine.".into()),
-            ],
-            earlier_left_out: true,
-            ..StoredHistory::default()
-        });
+        let c = Conversation::from_history(
+            &StoredHistory {
+                items: vec![
+                    HistoryItem::User {
+                        text: "Look at the parser".into(),
+                        image_count: 0,
+                        files: Vec::new(),
+                        images: Vec::new(),
+                    },
+                    HistoryItem::Thinking("hm".into()),
+                    stored_read("a", Some(ToolOutcome::Ok { output: "x".into() })),
+                    stored_read("b", None),
+                    HistoryItem::AssistantText("It reads fine.".into()),
+                ],
+                earlier_left_out: true,
+                ..StoredHistory::default()
+            },
+            &[],
+        );
         let b = bodies(&c);
         assert_eq!(b.len(), 5, "{b:?}");
         assert_eq!(
@@ -1095,7 +1148,7 @@ mod tests {
 
     #[test]
     fn a_stored_thought_reads_thought_with_no_time() {
-        let c = Conversation::from_history(&history(vec![HistoryItem::Thinking("hm".into())]));
+        let c = Conversation::from_history(&history(vec![HistoryItem::Thinking("hm".into())]), &[]);
         let ItemBody::Thinking { time, .. } = c.items()[0].body else {
             panic!("{:?}", c.items()[0].body)
         };
@@ -1104,38 +1157,182 @@ mod tests {
 
     #[test]
     fn a_stored_message_keeps_its_image_count() {
-        let c = Conversation::from_history(&history(vec![HistoryItem::User {
-            text: String::new(),
-            image_count: 2,
-        }]));
+        let c = Conversation::from_history(
+            &history(vec![HistoryItem::User {
+                text: String::new(),
+                image_count: 2,
+                files: Vec::new(),
+                images: vec![None; 2],
+            }]),
+            &[vec![STORED | 1, STORED | 2]],
+        );
         assert_eq!(
             bodies(&c),
             vec![ItemBody::User {
                 text: String::new(),
-                image_count: 2
+                image_count: 2,
+                files: Vec::new(),
+                pictures: vec![STORED | 1, STORED | 2],
             }]
         );
         let mut typed = Conversation::new();
-        typed.push_user("hi");
+        typed.push_user("hi", vec![9], Vec::new());
         assert!(matches!(
-            typed.items()[0].body,
-            ItemBody::User { image_count: 0, .. }
+            &typed.items()[0].body,
+            ItemBody::User { image_count: 1, pictures, .. } if pictures == &[9]
         ));
+    }
+
+    /// The top bit of a stored picture's id.
+    const STORED: u64 = 1 << 63;
+
+    /// A user's stored message of `text` with `images` images.
+    fn stored_said(text: &str, images: usize) -> HistoryItem {
+        HistoryItem::User {
+            text: text.into(),
+            image_count: images,
+            files: Vec::new(),
+            images: vec![None; images],
+        }
+    }
+
+    #[test]
+    fn the_conversation_knows_its_pictures() {
+        let mut c = Conversation::new();
+        assert_eq!(c.pictures().count(), 0);
+        c.push_user("two", vec![4, 5], Vec::new());
+        c.push_user("none", Vec::new(), vec!["/home/alex/a.txt".into()]);
+        play(&mut c, &[text("Seen.")]);
+        c.push_user("one", vec![6], Vec::new());
+        assert_eq!(c.pictures().collect::<Vec<_>>(), vec![4, 5, 6]);
+        // A history put first brings its own, each stored message with the ids given for it.
+        c.put_history_first(
+            &history(vec![
+                stored_said("first", 1),
+                HistoryItem::AssistantText("Earlier".into()),
+                stored_said("plain", 0),
+                stored_said("second", 2),
+            ]),
+            &[vec![STORED | 1], Vec::new(), vec![STORED | 2, STORED | 3]],
+        );
+        assert_eq!(
+            c.pictures().collect::<Vec<_>>(),
+            vec![STORED | 1, STORED | 2, STORED | 3, 4, 5, 6]
+        );
+        let held: Vec<u64> = c
+            .items()
+            .iter()
+            .flat_map(|item| match &item.body {
+                ItemBody::User { pictures, .. } => pictures.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(held, c.pictures().collect::<Vec<_>>());
+        // An empty history brings none; a conversation made of a history knows its own.
+        c.put_history_first(&StoredHistory::default(), &[]);
+        assert_eq!(c.pictures().count(), 6);
+        let stored = Conversation::from_history(
+            &history(vec![stored_said("first", 1)]),
+            &[vec![STORED | 9]],
+        );
+        assert_eq!(stored.pictures().collect::<Vec<_>>(), vec![STORED | 9]);
+    }
+
+    #[test]
+    fn a_stored_message_shows_its_files() {
+        let files: Vec<PathBuf> = vec!["/home/alex/a.txt".into(), "/home/alex/docs".into()];
+        let c = Conversation::from_history(
+            &history(vec![HistoryItem::User {
+                text: "read these".into(),
+                image_count: 1,
+                files: files.clone(),
+                images: vec![None; 1],
+            }]),
+            &[vec![STORED | 1]],
+        );
+        assert_eq!(
+            bodies(&c),
+            vec![ItemBody::User {
+                text: "read these".into(),
+                image_count: 1,
+                files,
+                pictures: vec![STORED | 1],
+            }]
+        );
+    }
+
+    /// Every user message of `c`, as its image count and its pictures.
+    fn counted(c: &Conversation) -> Vec<(usize, Vec<u64>)> {
+        c.items()
+            .iter()
+            .filter_map(|item| match &item.body {
+                ItemBody::User {
+                    image_count,
+                    pictures,
+                    ..
+                } => Some((*image_count, pictures.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stored_item_has_one_id_for_each_image() {
+        let stored = history(vec![
+            stored_said("two", 2),
+            HistoryItem::AssistantText("Seen.".into()),
+            stored_said("none", 0),
+            stored_said("one", 1),
+        ]);
+        let ids = [vec![STORED | 1, STORED | 2], Vec::new(), vec![STORED | 3]];
+        let c = Conversation::from_history(&stored, &ids);
+        assert_eq!(
+            counted(&c),
+            vec![
+                (2, vec![STORED | 1, STORED | 2]),
+                (0, Vec::new()),
+                (1, vec![STORED | 3])
+            ]
+        );
+        let mut later = Conversation::new();
+        later.push_user("live", vec![7], Vec::new());
+        later.put_history_first(&stored, &ids);
+        assert!(
+            counted(&later)
+                .iter()
+                .all(|(count, pictures)| *count == pictures.len())
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "a stored message is given one picture id per image")
+    )]
+    fn a_stored_item_given_too_few_ids_never_counts_more_images_than_it_holds() {
+        let c = Conversation::from_history(&history(vec![stored_said("two", 2)]), &[vec![9]]);
+        // Without the debug check: the count follows the ids.
+        assert_eq!(counted(&c), vec![(1, vec![9])]);
     }
 
     #[test]
     fn a_history_put_first_leaves_what_is_open_working() {
         let mut c = Conversation::new();
-        c.push_user("go");
+        c.push_user("go", Vec::new(), Vec::new());
         play(&mut c, &[read("r1"), plan("p1"), text("Work")]);
         let revision = c.revision();
-        c.put_history_first(&history(vec![
-            HistoryItem::User {
-                text: "before".into(),
-                image_count: 0,
-            },
-            HistoryItem::AssistantText("Earlier".into()),
-        ]));
+        c.put_history_first(
+            &history(vec![
+                HistoryItem::User {
+                    text: "before".into(),
+                    image_count: 0,
+                    files: Vec::new(),
+                    images: Vec::new(),
+                },
+                HistoryItem::AssistantText("Earlier".into()),
+            ]),
+            &[],
+        );
         assert!(c.revision() > revision);
         let b = bodies(&c);
         assert_eq!(
@@ -1143,7 +1340,9 @@ mod tests {
             [
                 ItemBody::User {
                     text: "before".into(),
-                    image_count: 0
+                    image_count: 0,
+                    files: Vec::new(),
+                    pictures: Vec::new(),
                 },
                 ItemBody::Reply {
                     markdown: "Earlier".into(),
@@ -1151,7 +1350,9 @@ mod tests {
                 },
                 ItemBody::User {
                     text: "go".into(),
-                    image_count: 0
+                    image_count: 0,
+                    files: Vec::new(),
+                    pictures: Vec::new(),
                 },
             ]
         );
@@ -1190,9 +1391,9 @@ mod tests {
     #[test]
     fn an_empty_history_changes_nothing() {
         let mut c = Conversation::new();
-        c.push_user("go");
+        c.push_user("go", Vec::new(), Vec::new());
         let (before, revision) = (c.items().to_vec(), c.revision());
-        c.put_history_first(&StoredHistory::default());
+        c.put_history_first(&StoredHistory::default(), &[]);
         assert_eq!((c.items(), c.revision()), (&before[..], revision));
     }
 
@@ -1401,6 +1602,8 @@ mod tests {
                 HistoryItem::User {
                     text: "tidy up".into(),
                     image_count: 0,
+                    files: Vec::new(),
+                    images: Vec::new(),
                 },
                 stored_edit("h1", MAIN, Some(ok())),
                 HistoryItem::Tool {
@@ -1418,20 +1621,27 @@ mod tests {
             ])
         };
         let mut s = Session::opening("/home/alex/app");
-        s.conversation.push_user("and the docs");
+        s.conversation
+            .push_user("and the docs", Vec::new(), Vec::new());
         play(
             &mut s.conversation,
             &[edit("e1", LIB, "two\n", "2\n"), finished("e1", ok())],
         );
         s.history = HistoryState::Loading;
-        s.load_history(stored.clone());
-        s.load_history(stored.clone());
+        s.load_history(stored.clone(), &[]);
+        s.load_history(stored.clone(), &[]);
         let expected = [change(MAIN, 2, 1), change(LIB, 3, 1)];
         assert_eq!(s.conversation.changes().files(), expected);
         // The history alone, read as often as asked, counts the same.
         let alone = [change(MAIN, 2, 1), change(LIB, 2, 0)];
-        assert_eq!(Conversation::from_history(&stored).changes().files(), alone);
-        assert_eq!(Conversation::from_history(&stored).changes().files(), alone);
+        assert_eq!(
+            Conversation::from_history(&stored, &[]).changes().files(),
+            alone
+        );
+        assert_eq!(
+            Conversation::from_history(&stored, &[]).changes().files(),
+            alone
+        );
         // A stored call's result sent again counts nothing again.
         play(&mut s.conversation, &[finished("h1", ok())]);
         assert_eq!(s.conversation.changes().files(), expected);
