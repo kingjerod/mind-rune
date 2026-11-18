@@ -36,6 +36,8 @@ pub enum ItemBody {
         files: Vec<PathBuf>,
         /// The id of each of its images' pictures, in order: one per image.
         pictures: Vec<u64>,
+        /// The message's own id in the store, when it came from there.
+        stored: Option<String>,
     },
     Reply {
         markdown: String,
@@ -216,6 +218,7 @@ impl Conversation {
             image_count: pictures.len(),
             files,
             pictures,
+            stored: None,
         });
     }
 
@@ -290,6 +293,7 @@ impl Conversation {
             | SessionEvent::EffortChanged(_)
             | SessionEvent::PermissionModeChanged(_)
             | SessionEvent::ContextBreakdown(_)
+            | SessionEvent::BackgroundTasks { .. }
             | SessionEvent::CommandFailed { .. } => {}
         }
     }
@@ -313,6 +317,7 @@ impl Conversation {
                 text,
                 image_count,
                 files,
+                stored,
                 ..
             } => {
                 debug_assert_eq!(
@@ -325,6 +330,7 @@ impl Conversation {
                     image_count: pictures.len(),
                     files: files.clone(),
                     pictures,
+                    stored: stored.clone(),
                 })
             }
             HistoryItem::AssistantText(markdown) => self.push(ItemBody::Reply {
@@ -789,6 +795,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     pictures: Vec::new(),
+                    stored: None,
                 },
                 ItemBody::Reply {
                     markdown: "Hello".into(),
@@ -1091,6 +1098,7 @@ mod tests {
                         image_count: 0,
                         files: Vec::new(),
                         images: Vec::new(),
+                        stored: None,
                     },
                     HistoryItem::Thinking("hm".into()),
                     stored_read("a", Some(ToolOutcome::Ok { output: "x".into() })),
@@ -1163,6 +1171,7 @@ mod tests {
                 image_count: 2,
                 files: Vec::new(),
                 images: vec![None; 2],
+                stored: None,
             }]),
             &[vec![STORED | 1, STORED | 2]],
         );
@@ -1173,6 +1182,7 @@ mod tests {
                 image_count: 2,
                 files: Vec::new(),
                 pictures: vec![STORED | 1, STORED | 2],
+                stored: None,
             }]
         );
         let mut typed = Conversation::new();
@@ -1193,6 +1203,7 @@ mod tests {
             image_count: images,
             files: Vec::new(),
             images: vec![None; images],
+            stored: None,
         }
     }
 
@@ -1247,6 +1258,7 @@ mod tests {
                 image_count: 1,
                 files: files.clone(),
                 images: vec![None; 1],
+                stored: None,
             }]),
             &[vec![STORED | 1]],
         );
@@ -1257,6 +1269,7 @@ mod tests {
                 image_count: 1,
                 files,
                 pictures: vec![STORED | 1],
+                stored: None,
             }]
         );
     }
@@ -1328,6 +1341,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     images: Vec::new(),
+                    stored: None,
                 },
                 HistoryItem::AssistantText("Earlier".into()),
             ]),
@@ -1343,6 +1357,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     pictures: Vec::new(),
+                    stored: None,
                 },
                 ItemBody::Reply {
                     markdown: "Earlier".into(),
@@ -1353,6 +1368,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     pictures: Vec::new(),
+                    stored: None,
                 },
             ]
         );
@@ -1604,6 +1620,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     images: Vec::new(),
+                    stored: None,
                 },
                 stored_edit("h1", MAIN, Some(ok())),
                 HistoryItem::Tool {

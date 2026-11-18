@@ -1599,6 +1599,7 @@ fn a_history_with_an_earlier_part_says_what_is_not_listed() {
             image_count: 0,
             files: Vec::new(),
             images: Vec::new(),
+            stored: None,
         }],
         earlier_left_out: true,
         ..StoredHistory::default()

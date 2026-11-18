@@ -46,7 +46,9 @@ fn installing_puts_the_entry_and_the_icons_where_a_desktop_looks() {
 
     let entry = fs::read_to_string(data.join("applications/mindrune.desktop")).unwrap();
     let exec = format!("Exec=\"{}\"", binary.display());
-    assert!(entry.lines().any(|line| line == exec), "{entry}");
+    let execs: Vec<&str> = entry.lines().filter(|l| l.starts_with("Exec=")).collect();
+    let quit = format!("{exec} --quit");
+    assert_eq!(execs, [exec, quit], "{entry}");
     assert!(entry.lines().any(|line| line == "Icon=mindrune"), "{entry}");
     for size in [16, 32, 48, 64, 128, 256, 512] {
         let installed = data.join(format!("icons/hicolor/{size}x{size}/apps/mindrune.png"));
@@ -61,6 +63,18 @@ fn installing_puts_the_entry_and_the_icons_where_a_desktop_looks() {
     assert!(
         data.join("icons/hicolor/scalable/apps/mindrune.svg")
             .is_file()
+    );
+}
+
+#[test]
+fn the_entry_starts_with_notice_and_offers_quit() {
+    let entry = fs::read_to_string(repo().join("assets/linux/mindrune.desktop")).unwrap();
+    let lines: Vec<&str> = entry.lines().collect();
+    assert!(lines.contains(&"StartupNotify=true"), "{entry}");
+    assert!(lines.contains(&"Actions=quit;"), "{entry}");
+    assert!(
+        entry.ends_with("[Desktop Action quit]\nName=Quit MindRune\nExec=mindrune --quit\n"),
+        "{entry}"
     );
 }
 

@@ -32,6 +32,19 @@ pub trait Agent: Send + Sync {
     /// When the stored session last changed, in Unix seconds; `None` when nothing is stored
     /// for it. Reads no content.
     fn last_active(&self, id: &SessionId) -> Result<Option<i64>, AgentError>;
+    /// One image of one stored message, read again: `index` counts the message's images from 0.
+    /// May block while a large file is read.
+    fn read_image(
+        &self,
+        id: &SessionId,
+        message: &str,
+        index: usize,
+    ) -> Result<ImageData, AgentError> {
+        let _ = (id, message, index);
+        Err(AgentError::Protocol(
+            "this agent cannot read an image again".into(),
+        ))
+    }
     /// Starts a session. May block for seconds. `Started` comes at most once
     /// and `Exited` exactly once, in the order [`SessionEvent`] describes. If
     /// the program exits before it is ready (a session id that cannot be
@@ -127,6 +140,8 @@ pub enum HistoryItem {
         /// The bytes of each image, in the message's order: one entry per image counted,
         /// `None` for one whose bytes the store could not give.
         images: Vec<Option<ImageData>>,
+        /// The message's own id in the store, when it has one.
+        stored: Option<String>,
     },
     AssistantText(String),
     Thinking(String),

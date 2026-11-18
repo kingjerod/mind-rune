@@ -2,16 +2,18 @@
 //! user can ask of it. Every intent returns the command to send instead of
 //! sending it, so this module stays plain data.
 
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::PathBuf;
 
 use mr_agent::{
-    Answer, Attachment, CommandKind, ContextBreakdown, ContextKind, ModelOption, PermissionMode,
-    RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec,
-    StoredHistory, StoredSession,
+    Answer, Attachment, CommandKind, ContextBreakdown, ContextKind, ImageData, ModelOption,
+    PermissionMode, RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent,
+    SessionId, StartSpec, StoredHistory, StoredSession,
 };
 
 use crate::attach::{Chip, ChipState, Prepared};
-use crate::conversation::{Conversation, NoticeKind};
+use crate::conversation::{Conversation, ItemBody, NoticeKind};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Phase {
@@ -56,6 +58,38 @@ pub struct Outgoing {
     pub chips: Vec<Chip>,
 }
 
+/// A message handed to a program that had ended: it is in the conversation and was never
+/// delivered. `Debug` prints the text and the number of attachments, never their bytes.
+#[derive(Clone, PartialEq)]
+pub struct Undelivered {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+
+impl fmt::Debug for Undelivered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Undelivered")
+            .field("text", &self.text)
+            .field("attachments", &self.attachments.len())
+            .finish()
+    }
+}
+
+/// Where the full image behind a picture is: its bytes at hand, or the stored message it can be
+/// read again from. `Debug` shows no bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FullImage {
+    AtHand(ImageData),
+    /// The image at `index` among the images of the stored message `message` of session `id`:
+    /// the id the conversation was read from, which for a copy is the original's.
+    Stored {
+        id: SessionId,
+        message: String,
+        index: usize,
+    },
+    Nowhere,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
     pub folder: PathBuf,
@@ -77,10 +111,18 @@ pub struct Session {
     pub mode: PermissionMode,
     pub conversation: Conversation,
     pub history: HistoryState,
+    /// The id the stored conversation was last read from, or is being read from: the session's
+    /// own, or for a copy the original's until it is read again from its own file. A stored
+    /// picture is read again under it.
+    pub read_from: Option<SessionId>,
     /// Goes up whenever the conversation's items are replaced, not appended to.
     pub generation: u64,
     /// A message typed while it could not be sent yet.
     pub queued: Option<Outgoing>,
+    /// Messages its program refused as closed, oldest first: they go again before the queued
+    /// message, once a program runs for the session. Nothing of them is kept between runs: one
+    /// still here at Quit is lost.
+    pub undelivered: Vec<Undelivered>,
     /// What the user attached and has not sent yet, in the order attached.
     pub chips: Vec<Chip>,
     pub cost_usd: Option<f64>,
@@ -88,6 +130,9 @@ pub struct Session {
     /// What the context is made of, as the program last counted it; the next reading replaces
     /// it. A turn does not clear it.
     pub context_parts: Option<ContextBreakdown>,
+    /// How many background tasks of its program run and need it to stay up, as the program last
+    /// said; 0 while no program runs and before it says anything.
+    pub background: usize,
     pub remote: Remote,
     /// The user asked for it; true from the press on, until a refusal or a turning off.
     pub remote_wanted: bool,
@@ -112,8 +157,15 @@ pub struct Session {
     named_after_chip: Option<String>,
     /// It came from the store.
     from_store: bool,
+    /// A clone of each image handed over in this run, under its chip's id, which is its
+    /// picture's: a clone shares the bytes. Only ids among `picture_ids` are kept.
+    sent_images: HashMap<u64, ImageData>,
     /// Messages handed over in this run, less those that could not be.
     handed_over: usize,
+    /// Its program refused a message because it had ended: nothing more goes to that program.
+    program_gone: bool,
+    /// The programs started for a message a program never got, since a turn last started.
+    redelivery_starts: usize,
     /// Its program ran a turn in this run, whoever sent the prompt.
     ran_turn: bool,
     /// `user_title` waits for a program to confirm it: it is kept between runs and told to
@@ -135,12 +187,15 @@ impl Session {
             mode: PermissionMode::Ask,
             conversation: Conversation::new(),
             history: HistoryState::Loaded,
+            read_from: None,
             generation: 0,
             queued: None,
+            undelivered: Vec::new(),
             chips: Vec::new(),
             cost_usd: None,
             context_used: None,
             context_parts: None,
+            background: 0,
             remote: Remote::Off,
             remote_wanted: false,
             remote_said: None,
@@ -152,7 +207,10 @@ impl Session {
             own_models: false,
             named_after_chip: None,
             from_store: false,
+            sent_images: HashMap::new(),
             handed_over: 0,
+            program_gone: false,
+            redelivery_starts: 0,
             ran_turn: false,
             name_pending: false,
         }
@@ -214,6 +272,71 @@ impl Session {
             .chain(self.conversation.pictures())
     }
 
+    /// Where the full image behind picture `picture` is, looked for in this order: a chip, a
+    /// chip of the queued message, the images sent in this run, a message of the conversation
+    /// that has its id in the store, under the id the conversation was read from (`read_from`,
+    /// else the session's own). Reads no file.
+    pub fn full_image(&self, picture: u64) -> FullImage {
+        let queued = self.queued.iter().flat_map(|queued| &queued.chips);
+        let chip = self
+            .chips
+            .iter()
+            .chain(queued)
+            .find_map(|chip| match &chip.state {
+                ChipState::Ready(Prepared {
+                    attachment: Attachment::Image { data, .. },
+                    ..
+                }) if chip.id == picture => Some(data),
+                _ => None,
+            });
+        if let Some(data) = chip.or_else(|| self.sent_images.get(&picture)) {
+            return FullImage::AtHand(data.clone());
+        }
+        let Some(id) = self.read_from.as_ref().or(self.id.as_ref()) else {
+            return FullImage::Nowhere;
+        };
+        self.conversation
+            .items()
+            .iter()
+            .find_map(|item| match &item.body {
+                ItemBody::User {
+                    pictures,
+                    stored: Some(message),
+                    ..
+                } => pictures
+                    .iter()
+                    .position(|&held| held == picture)
+                    .map(|index| FullImage::Stored {
+                        id: id.clone(),
+                        message: message.clone(),
+                        index,
+                    }),
+                _ => None,
+            })
+            .unwrap_or(FullImage::Nowhere)
+    }
+
+    /// Gives the conversation back to the store: `Loaded` or `Loading` becomes `NotLoaded` and the
+    /// items go. Only for a session at rest that is stored, with nothing queued or undelivered.
+    /// Says whether it did. Its `generation` goes up: the items were replaced.
+    pub fn let_go(&mut self) -> bool {
+        if self.phase != Phase::Resting
+            || !self.is_stored()
+            || self.id.is_none()
+            || self.queued.is_some()
+            || !self.undelivered.is_empty()
+            || !matches!(self.history, HistoryState::Loaded | HistoryState::Loading)
+        {
+            return false;
+        }
+        self.conversation = Conversation::new();
+        self.sent_images.clear();
+        self.history = HistoryState::NotLoaded;
+        self.read_from = None;
+        self.generation += 1;
+        true
+    }
+
     /// The history could not be read: `reason` says why. A history already loaded stays.
     pub fn history_failed(&mut self, reason: &str) {
         if self.history != HistoryState::Loaded {
@@ -225,6 +348,20 @@ impl Session {
     /// handed over in this run, or its program ran a turn, as one sent from another device.
     pub fn is_stored(&self) -> bool {
         self.from_store || self.handed_over > 0 || self.ran_turn
+    }
+
+    /// Whether its program can be stopped without the user noticing: it idles, the agent
+    /// stores it, Remote Control is neither on nor asked for, no message waits to go, no
+    /// background task runs and no request waits.
+    pub fn stoppable(&self) -> bool {
+        self.phase == Phase::Idle
+            && self.is_stored()
+            && self.remote == Remote::Off
+            && !self.remote_wanted
+            && self.queued.is_none()
+            && self.undelivered.is_empty()
+            && self.background == 0
+            && self.conversation.waiting() == 0
     }
 
     /// Resting to Opening, with `text` and the chips queued for when the program is ready.
@@ -280,6 +417,31 @@ impl Session {
         if self.phase == Phase::Working {
             self.phase = Phase::Idle;
         }
+    }
+
+    /// A message's `Send` was refused because the program had ended: the message is kept in
+    /// `undelivered` and no longer counts as handed over. When it was `this_program`, the one the
+    /// session has now, nothing more goes to it, and Working goes back to Idle. A message of an
+    /// earlier program is sent now when the session is Idle, and otherwise waits as a queued
+    /// message does.
+    pub fn keep_undelivered(
+        &mut self,
+        message: Undelivered,
+        this_program: bool,
+    ) -> Vec<SessionCommand> {
+        self.handed_over = self.handed_over.saturating_sub(1);
+        self.undelivered.push(message);
+        if this_program {
+            self.program_gone = true;
+            if self.phase == Phase::Working {
+                self.phase = Phase::Idle;
+            }
+            return Vec::new();
+        }
+        if self.phase == Phase::Idle {
+            return self.send_queued();
+        }
+        Vec::new()
     }
 
     /// Names the session `name`, trimmed, as the user's name. Returns the `Rename` for its
@@ -338,10 +500,10 @@ impl Session {
     }
 
     /// Applies an event. Returns commands the session now wants sent: at a start, the user's
-    /// name when no program has confirmed it yet and Remote Control when it is wanted; a queued
-    /// message, and the request for a title when that message is the session's first. While
-    /// the user's name holds, a title from the program only confirms it when it is the same,
-    /// and is ignored otherwise.
+    /// name when no program has confirmed it yet and Remote Control when it is wanted; the
+    /// undelivered messages and a queued message, and the request for a title when that message
+    /// is the session's first. While the user's name holds, a title from the program only
+    /// confirms it when it is the same, and is ignored otherwise.
     pub fn apply(&mut self, event: SessionEvent, now: f64) -> Vec<SessionCommand> {
         self.conversation.apply(&event, now);
         match event {
@@ -353,6 +515,7 @@ impl Session {
                     self.own_models = true;
                     self.mode = info.permission_mode;
                     self.mode_known = true;
+                    self.background = 0;
                     self.phase = Phase::Idle;
                     let mut commands: Vec<SessionCommand> = self
                         .pending_name()
@@ -369,6 +532,7 @@ impl Session {
             }
             SessionEvent::TurnStarted => {
                 self.ran_turn = true;
+                self.redelivery_starts = 0;
                 if !self.at_rest() {
                     self.phase = if self.conversation.waiting() > 0 {
                         Phase::NeedsUser
@@ -416,6 +580,7 @@ impl Session {
             }
             SessionEvent::RemoteAccess(state) => self.take_remote(state),
             SessionEvent::ContextBreakdown(breakdown) => self.context_parts = Some(breakdown),
+            SessionEvent::BackgroundTasks { running } => self.background = running,
             SessionEvent::CommandFailed { what, reason } => {
                 if what == CommandKind::Rename {
                     // The name stays on screen for this run, and is neither kept nor told again.
@@ -444,8 +609,10 @@ impl Session {
             // A clean end leaves a stored conversation that the next message carries on.
             SessionEvent::Exited { clean, detail } => {
                 self.remote = Remote::Off;
+                self.background = 0;
                 self.remote_asked = None;
                 self.effort_asked = None;
+                self.program_gone = false;
                 self.phase = if clean && self.is_stored() {
                     Phase::Resting
                 } else {
@@ -720,6 +887,29 @@ impl Session {
         self.phase = Phase::Opening;
     }
 
+    /// Resting with a message its program never got: back to `Opening`, for a program that
+    /// delivers it, at most [`REDELIVERY_STARTS`] times since a turn last started. After that
+    /// the session ends instead, with a notice that offers Restart, and the answer is false: a
+    /// program that refuses the message every time is not started without end. False too, and
+    /// nothing changes, when it does not rest or nothing is undelivered.
+    pub fn reopen_for_undelivered(&mut self) -> bool {
+        if self.phase != Phase::Resting || self.undelivered.is_empty() {
+            return false;
+        }
+        if self.redelivery_starts >= REDELIVERY_STARTS {
+            self.phase = Phase::Ended {
+                clean: true,
+                detail: String::new(),
+            };
+            self.conversation
+                .push_notice(NoticeKind::Ended, NOT_DELIVERED);
+            return false;
+        }
+        self.redelivery_starts += 1;
+        self.phase = Phase::Opening;
+        true
+    }
+
     /// It can be sent a message: its program runs or starts, or it rests and a message wakes
     /// it. An ended one takes none until it is restarted.
     pub fn takes_messages(&self) -> bool {
@@ -769,11 +959,30 @@ impl Session {
         }
     }
 
-    /// Starts a turn with the queued message, when there is one.
+    /// Starts a turn with the undelivered messages, oldest first, and then the queued message.
+    /// Nothing goes to a program that refused a message because it had ended.
     fn send_queued(&mut self) -> Vec<SessionCommand> {
-        match self.queued.take() {
-            Some(queued) => self.hand_over(queued),
-            None => Vec::new(),
+        if self.program_gone {
+            return Vec::new();
+        }
+        let undelivered = std::mem::take(&mut self.undelivered);
+        let mut commands: Vec<SessionCommand> = undelivered
+            .into_iter()
+            .map(|message| self.deliver(message))
+            .collect();
+        if let Some(queued) = self.queued.take() {
+            commands.extend(self.hand_over(queued));
+        }
+        commands
+    }
+
+    /// Hands `message` over again; it is in the conversation already.
+    fn deliver(&mut self, message: Undelivered) -> SessionCommand {
+        self.phase = Phase::Working;
+        self.handed_over += 1;
+        SessionCommand::Send {
+            text: message.text,
+            attachments: message.attachments,
         }
     }
 
@@ -794,6 +1003,15 @@ impl Session {
             "a message is handed over only once every chip is ready (`can_send`)"
         );
         let first_chip = chips.first().map(|chip| chip.name.clone());
+        for chip in &chips {
+            if let ChipState::Ready(Prepared {
+                attachment: Attachment::Image { data, .. },
+                ..
+            }) = &chip.state
+            {
+                self.sent_images.insert(chip.id, data.clone());
+            }
+        }
         let pictures = chips
             .iter()
             .filter(|chip| is_image(chip))
@@ -814,6 +1032,7 @@ impl Session {
             })
             .collect();
         self.conversation.push_user(&text, pictures, files);
+        self.keep_needed_images();
         self.phase = Phase::Working;
         self.handed_over += 1;
         let mut suggest = None;
@@ -835,7 +1054,27 @@ impl Session {
         let send = SessionCommand::Send { text, attachments };
         std::iter::once(send).chain(suggest).collect()
     }
+
+    /// Forgets each image sent in this run whose picture the session no longer needs. Today
+    /// that is none: a picture leaves `picture_ids` only when the conversation's items go, and
+    /// then [`Session::let_go`] clears the images itself. It is here for the day items can be
+    /// dropped one by one.
+    fn keep_needed_images(&mut self) {
+        if self.sent_images.is_empty() {
+            return;
+        }
+        let needed: HashSet<u64> = self.picture_ids().collect();
+        self.sent_images
+            .retain(|picture, _| needed.contains(picture));
+    }
 }
+
+/// How many programs are started in a row for a message a program never got (see
+/// [`Session::reopen_for_undelivered`]).
+pub const REDELIVERY_STARTS: usize = 2;
+
+/// What the conversation says when a message was not delivered after those starts.
+const NOT_DELIVERED: &str = "The message could not be delivered. Restart to send it.";
 
 /// The longest stand-in title, in characters, before its "…".
 const STAND_IN_CHARS: usize = 60;
@@ -981,6 +1220,7 @@ mod tests {
         SessionInfo, StoredHistory, StoredSession, ToolCallId, ToolDetail, ToolOutcome,
         TurnSummary, UserRequest, UserRequestKind,
     };
+    use std::sync::Arc;
 
     fn started() -> Session {
         let mut s = Session::opening("/p");
@@ -1502,6 +1742,32 @@ mod tests {
     }
 
     #[test]
+    fn a_new_program_has_no_background_tasks() {
+        let mut s = started();
+        assert_eq!(s.background, 0);
+        s.apply(SessionEvent::BackgroundTasks { running: 2 }, 0.0);
+        assert_eq!(s.background, 2);
+        // A program started again after its predecessor was killed has told nothing yet. The
+        // count is set by hand after the exit, so the start is seen to clear it too.
+        s.apply(killed(), 0.0);
+        s.background = 3;
+        s.reopening();
+        s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(s.background, 0);
+    }
+
+    #[test]
+    fn an_exit_clears_them() {
+        for exit in [clean_exit(), killed()] {
+            let mut s = started();
+            s.apply(SessionEvent::BackgroundTasks { running: 1 }, 0.0);
+            assert_eq!(s.background, 1);
+            s.apply(exit, 0.0);
+            assert_eq!(s.background, 0);
+        }
+    }
+
+    #[test]
     fn a_session_that_ended_before_any_message_asks_after_a_restart() {
         let mut s = started();
         s.apply(
@@ -1553,6 +1819,7 @@ mod tests {
             image_count: 0,
             files: Vec::new(),
             images: Vec::new(),
+            stored: None,
         }
     }
 
@@ -1652,6 +1919,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     pictures: Vec::new(),
+                    stored: None,
                 },
                 ItemBody::Reply {
                     markdown: "Sure.".into(),
@@ -1667,6 +1935,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     pictures: Vec::new(),
+                    stored: None,
                 },
             ]
         );
@@ -1773,6 +2042,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     pictures: Vec::new(),
+                    stored: None,
                 },
                 ItemBody::Reply {
                     markdown: "Earlier.".into(),
@@ -1783,6 +2053,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     pictures: Vec::new(),
+                    stored: None,
                 },
                 ItemBody::Reply {
                     markdown: "Hello.".into(),
@@ -2029,6 +2300,7 @@ mod tests {
                 image_count: 0,
                 files: Vec::new(),
                 pictures: Vec::new(),
+                stored: None,
             }]
         );
         let mut s = started();
@@ -2828,6 +3100,7 @@ mod tests {
                 image_count: 1,
                 files: vec!["/home/alex/a.txt".into(), "/home/alex/b.txt".into()],
                 pictures: vec![2],
+                stored: None,
             }]
         );
     }
@@ -2848,6 +3121,7 @@ mod tests {
                 image_count: 2,
                 files: vec!["/home/alex/a.txt".into()],
                 pictures: vec![11, 13],
+                stored: None,
             }]
         );
     }
@@ -2901,6 +3175,7 @@ mod tests {
                     image_count: 1,
                     files: Vec::new(),
                     images: vec![None; 1],
+                    stored: None,
                 }],
                 ..StoredHistory::default()
             },
@@ -2923,6 +3198,7 @@ mod tests {
                 image_count: 1,
                 files: Vec::new(),
                 pictures: vec![1],
+                stored: None,
             }]
         );
         assert_eq!(s.phase, Phase::Working);
@@ -3085,5 +3361,204 @@ mod tests {
         s.rename("Mine");
         assert_eq!(s.submit("go"), vec![send("go")]);
         assert_eq!(s.title.as_deref(), Some("Mine"));
+    }
+
+    #[test]
+    fn an_undelivered_message_shows_no_bytes() {
+        let message = Undelivered {
+            text: "hello".into(),
+            attachments: vec![Attachment::Image {
+                media_type: "image/png".into(),
+                data: ImageData::new(vec![137u8, 80, 78, 71]),
+            }],
+        };
+        assert_eq!(
+            format!("{message:?}"),
+            r#"Undelivered { text: "hello", attachments: 1 }"#
+        );
+    }
+
+    /// The bytes of a picture of a few pixels of `colour`: RGBA, made here.
+    fn pixels(colour: [u8; 4]) -> ImageData {
+        ImageData::new(colour.repeat(4))
+    }
+
+    fn image_of(data: &ImageData) -> Attachment {
+        Attachment::Image {
+            media_type: "image/png".into(),
+            data: data.clone(),
+        }
+    }
+
+    /// The images a `Send` among `commands` carries, in order.
+    fn images_sent(commands: &[SessionCommand]) -> Vec<ImageData> {
+        commands
+            .iter()
+            .flat_map(|command| match command {
+                SessionCommand::Send { attachments, .. } => attachments.clone(),
+                _ => Vec::new(),
+            })
+            .filter_map(|attachment| match attachment {
+                Attachment::Image { data, .. } => Some(data),
+                Attachment::File { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Whether picture `picture` is at hand, with the very bytes of `data`.
+    fn at_hand(s: &Session, picture: u64, data: &ImageData) -> bool {
+        matches!(s.full_image(picture), FullImage::AtHand(held) if Arc::ptr_eq(&held.shared(), &data.shared()))
+    }
+
+    #[test]
+    fn a_ready_chip_gives_its_image_at_hand() {
+        let mut s = started();
+        let red = pixels([200, 30, 30, 255]);
+        s.chips = vec![
+            ready_chip(1, image_of(&red)),
+            ready_chip(2, file("/home/alex/a.txt")),
+        ];
+        assert!(at_hand(&s, 1, &red));
+        assert_eq!(s.full_image(2), FullImage::Nowhere, "a file has no picture");
+        // A chip of the queued message.
+        s.submit("first");
+        let blue = pixels([30, 30, 200, 255]);
+        s.chips = vec![ready_chip(3, image_of(&blue))];
+        s.submit("second");
+        assert_eq!(queued_chips(&s), vec![3]);
+        assert!(at_hand(&s, 3, &blue));
+    }
+
+    #[test]
+    fn a_sent_picture_is_at_hand_and_shares_its_bytes() {
+        let mut s = started();
+        s.chips = vec![
+            ready_chip(4, image_of(&pixels([200, 30, 30, 255]))),
+            ready_chip(5, image_of(&pixels([30, 30, 200, 255]))),
+        ];
+        let sent = images_sent(&s.submit("look"));
+        let [first, second] = sent.as_slice() else {
+            panic!("not two images sent");
+        };
+        assert!(at_hand(&s, 4, first));
+        assert!(at_hand(&s, 5, second));
+    }
+
+    #[test]
+    fn a_stored_picture_is_asked_from_the_store() {
+        let mut s = Session::resting(&stored());
+        s.load_history(
+            StoredHistory {
+                items: vec![
+                    HistoryItem::User {
+                        text: "see".into(),
+                        image_count: 1,
+                        files: Vec::new(),
+                        images: vec![None],
+                        stored: Some("m1".into()),
+                    },
+                    HistoryItem::User {
+                        text: "and these".into(),
+                        image_count: 2,
+                        files: Vec::new(),
+                        images: vec![None, None],
+                        stored: Some("m2".into()),
+                    },
+                ],
+                ..StoredHistory::default()
+            },
+            &[vec![1 << 63 | 1], vec![1 << 63 | 2, 1 << 63 | 3]],
+        );
+        assert_eq!(
+            s.full_image(1 << 63 | 3),
+            FullImage::Stored {
+                id: SessionId("s9".into()),
+                message: "m2".into(),
+                index: 1,
+            }
+        );
+        assert_eq!(
+            s.full_image(1 << 63 | 1),
+            FullImage::Stored {
+                id: SessionId("s9".into()),
+                message: "m1".into(),
+                index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_picture_nobody_holds_is_nowhere() {
+        let mut s = Session::resting(&stored());
+        s.load_history(
+            StoredHistory {
+                items: vec![HistoryItem::User {
+                    text: "see".into(),
+                    image_count: 1,
+                    files: Vec::new(),
+                    images: vec![None],
+                    stored: None,
+                }],
+                ..StoredHistory::default()
+            },
+            &[vec![1 << 63 | 1]],
+        );
+        assert_eq!(
+            s.full_image(1 << 63 | 1),
+            FullImage::Nowhere,
+            "a message without its id in the store"
+        );
+        assert_eq!(s.full_image(7), FullImage::Nowhere, "an id nobody gave");
+        // A chip still read has no image yet.
+        s.chips = vec![Chip {
+            id: 8,
+            name: "Pasted image".into(),
+            source: Source::Pasted(pixels([200, 30, 30, 255])),
+            state: ChipState::Reading,
+        }];
+        assert_eq!(s.full_image(8), FullImage::Nowhere);
+    }
+
+    #[test]
+    fn letting_go_drops_the_kept_images() {
+        let mut s = Session::resting(&stored());
+        s.load_history(StoredHistory::default(), &[]);
+        let red = pixels([200, 30, 30, 255]);
+        s.chips = vec![ready_chip(4, image_of(&red))];
+        s.wake("look");
+        let sent = images_sent(&s.apply(SessionEvent::Started(info()), 0.0));
+        assert_eq!(sent.len(), 1);
+        s.apply(done(), 0.0);
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert!(at_hand(&s, 4, &red));
+        assert!(s.let_go());
+        assert_eq!(s.full_image(4), FullImage::Nowhere);
+        assert!(s.sent_images.is_empty());
+    }
+
+    #[test]
+    fn a_message_sent_again_still_has_its_picture_at_hand() {
+        let mut s = started();
+        let red = pixels([200, 30, 30, 255]);
+        s.chips = vec![ready_chip(4, image_of(&red))];
+        let attachments = vec![image_of(&red)];
+        assert_eq!(images_sent(&s.submit("look")), vec![red.clone()]);
+        // Its program had ended: the message waits to go again.
+        s.keep_undelivered(
+            Undelivered {
+                text: "look".into(),
+                attachments,
+            },
+            true,
+        );
+        assert!(at_hand(&s, 4, &red));
+        s.apply(killed(), 0.0);
+        assert!(at_hand(&s, 4, &red));
+        s.reopening();
+        let again = images_sent(&s.apply(SessionEvent::Started(info()), 0.0));
+        assert_eq!(again, vec![red.clone()], "sent again");
+        assert!(at_hand(&s, 4, &red));
+        assert_eq!(s.sent_images.len(), 1, "held once");
     }
 }

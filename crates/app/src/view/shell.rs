@@ -1,5 +1,6 @@
 //! The shell: the sidebar, with the new-session button, the list of groups and sessions and the
-//! usage footer, the main area beside it, and the right panel beside that.
+//! footer (the account, Quit and the usage), the main area beside it, and the right panel beside
+//! that.
 
 use mr_core::{UsageLine, account_line, usage_lines};
 use rune::{El, KeyEvent, Tx, col, el, row, text};
@@ -8,7 +9,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
 
 pub use rune_kit::shell::is_sidebar_toggle;
 
-use crate::glue::Ui;
+use crate::glue::{self, Ui};
 use crate::theme::{self, USAGE_BAR_HEIGHT};
 use crate::view::{folder, panel, sidebar};
 
@@ -66,27 +67,45 @@ fn sidebar(ui: &Ui, kit: &'static Kit) -> El {
         .build(kit)
 }
 
-/// Who is signed in, then the two usage lines, each with its bar and reset wording.
+/// Who is signed in, with the button that quits at the right end of its line, then the two
+/// usage lines, each with its bar and reset wording. The button shows also when no account is
+/// known.
 fn footer(ui: &Ui, kit: &Kit) -> El {
     let [session, weekly] = usage_lines(&ui.app.usage, ui.app.now_unix);
-    let mut footer = col()
+    let mut account = row()
+        .key("mr-account-line")
+        .w_full()
+        .gap(8.0)
+        .items_center();
+    account = match &ui.app.account {
+        Some(known) => account.child(
+            text(account_line(known))
+                .key("mr-account")
+                .font(kit.ty.ui_medium)
+                .color(kit.c.text_base)
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        ),
+        None => account.child(el().grow(1.0)),
+    };
+    let quit = Button::new("Quit")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .help("Quit MindRune (Ctrl+Q)")
+        .on_press_tx(|ui: &mut Ui, tx: &mut Tx| {
+            glue::ask_quit(ui, tx);
+        })
+        .build(kit)
+        .key("mr-quit");
+    col()
         .key("mr-footer")
         .w_full()
         .gap(10.0)
         .px(8.0)
         .pt(6.0)
-        .pb(4.0);
-    if let Some(account) = &ui.app.account {
-        footer = footer.child(
-            text(account_line(account))
-                .key("mr-account")
-                .font(kit.ty.ui_medium)
-                .color(kit.c.text_base)
-                .truncate()
-                .w_full(),
-        );
-    }
-    footer
+        .pb(4.0)
+        .child(account.child(quit))
         .child(usage(&session, "mr-usage-session", kit))
         .child(usage(&weekly, "mr-usage-weekly", kit))
 }

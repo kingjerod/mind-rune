@@ -333,12 +333,14 @@ mod tests {
         assistant_by(uuid, parent, text, "claude-x-1")
     }
 
-    fn said(text: &str) -> HistoryItem {
+    /// The user's message `uuid` of `text`.
+    fn said(uuid: &str, text: &str) -> HistoryItem {
         HistoryItem::User {
             text: text.into(),
             image_count: 0,
             files: Vec::new(),
             images: Vec::new(),
+            stored: Some(uuid.into()),
         }
     }
 
@@ -368,9 +370,9 @@ mod tests {
         assert_eq!(
             history.items,
             vec![
-                said("first question"),
+                said("u1", "first question"),
                 answered("first answer"),
-                said("second question"),
+                said("u3", "second question"),
                 answered("second answer"),
             ]
         );
@@ -398,9 +400,9 @@ mod tests {
         assert_eq!(
             read_all(&path).items,
             vec![
-                said("first question"),
+                said("u1", "first question"),
                 answered("first answer"),
-                said("second question"),
+                said("u2", "second question"),
                 answered("second answer"),
             ]
         );
@@ -435,10 +437,10 @@ mod tests {
         assert_eq!(
             history.items,
             vec![
-                said("first question"),
+                said("u1", "first question"),
                 answered("first answer"),
                 HistoryItem::Compacted,
-                said("second question"),
+                said("u2", "second question"),
                 answered("second answer"),
             ]
         );
@@ -474,7 +476,7 @@ mod tests {
             history.items,
             vec![
                 answered("answer 8"),
-                said("question 9"),
+                said("u9", "question 9"),
                 answered("answer 9")
             ]
         );
@@ -503,10 +505,12 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() > 4096);
 
         let history = read_tail(&path, usize::MAX, 4096).unwrap();
-        assert_eq!(history.items.last(), Some(&said("turn 199")));
+        assert_eq!(history.items.last(), Some(&said("m199", "turn 199")));
         assert!(history.earlier_left_out);
         assert!(history.items.len() < 200);
-        let whole: Vec<HistoryItem> = (0..200).map(|n| said(&format!("turn {n:03}"))).collect();
+        let whole: Vec<HistoryItem> = (0..200)
+            .map(|n| said(&format!("m{n:03}"), &format!("turn {n:03}")))
+            .collect();
         assert!(whole.ends_with(&history.items), "{:?}", history.items);
     }
 
@@ -528,7 +532,7 @@ mod tests {
         );
         assert_eq!(
             read_all(&path).items,
-            vec![said("first question"), answered("first answer")]
+            vec![said("u1", "first question"), answered("first answer")]
         );
     }
 
@@ -633,9 +637,9 @@ mod tests {
         assert_eq!(
             read_all(&path).items,
             vec![
-                said("first question"),
+                said("u1", "first question"),
                 answered("first answer"),
-                said("second question"),
+                said("u2", "second question"),
             ]
         );
     }
@@ -658,7 +662,7 @@ mod tests {
         assert_eq!(
             read_all(&path).items,
             vec![
-                said("Fix the reconnect bug please"),
+                said("u1", "Fix the reconnect bug please"),
                 HistoryItem::Thinking("hm".into()),
                 answered("On it."),
                 HistoryItem::Tool {
@@ -684,7 +688,7 @@ mod tests {
         let path = write(dir.path(), &lines(&[USER, side, meta, wrapper]));
         assert_eq!(
             read_all(&path).items,
-            vec![said("Fix the reconnect bug please")]
+            vec![said("u1", "Fix the reconnect bug please")]
         );
     }
 
@@ -700,6 +704,7 @@ mod tests {
                 image_count: 1,
                 files: Vec::new(),
                 images: vec![None],
+                stored: Some("u1".into()),
             }]
         );
     }
@@ -820,6 +825,7 @@ mod tests {
                 image_count,
                 files,
                 images,
+                ..
             },
         ] = history.items.as_slice()
         else {
@@ -885,7 +891,7 @@ mod tests {
         }
         std::fs::write(&path, bytes).unwrap();
         let history = read_all(&path);
-        assert_eq!(history.items, vec![said("caf\u{e9}")]);
+        assert_eq!(history.items, vec![said("o5", "caf\u{e9}")]);
         assert!(!history.earlier_left_out);
     }
 

@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mr_agent::{
-    Account, Agent, AgentError, Capabilities, EventSink, SessionCommand, SessionEvent,
+    Account, Agent, AgentError, Capabilities, EventSink, ImageData, SessionCommand, SessionEvent,
     SessionHandle, SessionId, StartSpec, StoredHistory, StoredSession,
 };
 use serde_json::Value;
@@ -28,7 +28,7 @@ use crate::encode::{
     user_message,
 };
 use crate::env::child_env;
-use crate::history::{DescriptionTable, find_session, modified_unix, stored_sessions};
+use crate::history::{DescriptionTable, find_session, modified_unix, read_image, stored_sessions};
 use crate::history_tail::{TAIL_BYTES, read_tail};
 use crate::process::{ClaudeProcess, ExitInfo, SpawnConfig};
 use crate::translate::{SessionStart, Tracked, Translator};
@@ -130,6 +130,15 @@ impl Agent for ClaudeAgent {
         let path = find_session(&self.projects_dir, id)
             .ok_or_else(|| AgentError::Protocol(format!("no stored session {}", id.0)))?;
         read_tail(&path, max_items, TAIL_BYTES)
+    }
+
+    fn read_image(
+        &self,
+        id: &SessionId,
+        message: &str,
+        index: usize,
+    ) -> Result<ImageData, AgentError> {
+        read_image(&self.projects_dir, id, message, index)
     }
 
     fn last_active(&self, id: &SessionId) -> Result<Option<i64>, AgentError> {
@@ -466,6 +475,17 @@ mod tests {
         let status =
             r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan"}"#;
         assert!(!matches!(parse_line(status), Incoming::Ignored { .. }));
+        // A record of background tasks is read, whatever its list holds. With an empty list it
+        // was seen live (twice in `v1-remote.jsonl`); never with a task in it.
+        for tasks in [r#","tasks":[]"#, r#","tasks":"x""#, ""] {
+            let record = format!(
+                r#"{{"type":"system","subtype":"background_tasks_changed"{tasks},"uuid":"u"}}"#
+            );
+            assert!(
+                !matches!(parse_line(&record), Incoming::Ignored { .. }),
+                "{record}"
+            );
+        }
     }
 
     #[test]

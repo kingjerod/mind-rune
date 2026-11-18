@@ -5,18 +5,19 @@
 //! Every open has a thread of its own, which makes that open's `Agent::open` call and every
 //! `send` for it, in order; it ends with its session. Every look has a thread of its own too.
 //! One more thread, the library thread, makes the other calls one at a time in the order they
-//! were sent: the account, the listing, a history, an activity time. It also reads the git
-//! branch of a folder. The preparing thread reads and checks each attachment, in the order
-//! they were attached, and then makes the picture of each image a history holds. So a slow
-//! call holds up only what was sent after it to the same thread.
+//! were sent: the account, the listing, a history, an activity time, an image read again. It
+//! also reads the git branch of a folder. The preparing thread reads and checks each
+//! attachment, in the order they were attached, and then makes the picture of each image a
+//! history holds. So a slow call holds up only what was sent after it to the same thread. A
+//! history no longer wanted is not read, answered or drawn.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,10 @@ pub enum ToBackend {
         id: SessionId,
         max_items: usize,
     },
+    /// `key`'s history is no longer wanted.
+    DropHistory {
+        key: SessionKey,
+    },
     CheckActivity {
         key: SessionKey,
         id: SessionId,
@@ -65,6 +70,14 @@ pub enum ToBackend {
     Prepare {
         chip: u64,
         source: Source,
+    },
+    /// Read again the full image behind picture `picture`: the image at `index` of the stored
+    /// message `message` of session `id`.
+    ReadImage {
+        picture: u64,
+        id: SessionId,
+        message: String,
+        index: usize,
     },
 }
 
@@ -124,6 +137,11 @@ pub enum FromBackend {
         id: u64,
         thumb: Option<Thumb>,
     },
+    /// The full image behind picture `picture`, read again from the store.
+    Image {
+        picture: u64,
+        result: Result<ImageData, AgentError>,
+    },
 }
 
 /// Called after every message is queued for the window, on whichever thread
@@ -139,6 +157,29 @@ type Picturer = Arc<dyn Fn(&ImageData) -> Option<Thumb> + Send + Sync>;
 /// The top bit of every stored picture's id, which no chip's id has.
 const STORED_PICTURE: u64 = 1 << 63;
 
+/// The sessions whose history is wanted: a `ReadHistory` adds its key, a `DropHistory` takes it
+/// out. The window's end, the library thread and the preparing thread share it.
+#[derive(Clone, Default)]
+struct Wanted(Arc<Mutex<HashSet<SessionKey>>>);
+
+impl Wanted {
+    fn set(&self) -> MutexGuard<'_, HashSet<SessionKey>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, key: SessionKey) {
+        self.set().insert(key);
+    }
+
+    fn remove(&self, key: SessionKey) {
+        self.set().remove(&key);
+    }
+
+    fn has(&self, key: SessionKey) -> bool {
+        self.set().contains(&key)
+    }
+}
+
 /// The window's end of the backend. Neither `send` nor `try_recv` blocks: the first only
 /// pushes onto channels (or starts a thread) and the second polls one.
 ///
@@ -152,6 +193,7 @@ pub struct Backend {
     inbox: Receiver<FromBackend>,
     /// Set when the `Backend` is dropped: every thread skips what is still queued.
     stopping: Arc<AtomicBool>,
+    wanted: Wanted,
     library: Sender<LibraryJob>,
     preparing: Sender<PrepareJob>,
     lanes: RefCell<HashMap<u64, Arc<Lane>>>,
@@ -186,12 +228,14 @@ impl Backend {
         let (sender, inbox) = mpsc::channel();
         let outbox = Outbox { sender, wake };
         let stopping = Arc::new(AtomicBool::new(false));
+        let wanted = Wanted::default();
         let (preparing, prepare_jobs) = mpsc::channel();
         let (library, jobs) = mpsc::channel();
         let thread = Library {
             agent: agent.clone(),
             outbox: outbox.clone(),
             stopping: stopping.clone(),
+            wanted: wanted.clone(),
             preparing: preparing.clone(),
             next_picture: 0,
         };
@@ -202,6 +246,7 @@ impl Backend {
         let thread = Preparing {
             outbox: outbox.clone(),
             stopping: stopping.clone(),
+            wanted: wanted.clone(),
             prepare,
             picture,
         };
@@ -214,6 +259,7 @@ impl Backend {
             outbox,
             inbox,
             stopping,
+            wanted,
             library,
             preparing,
             lanes: RefCell::new(HashMap::new()),
@@ -223,7 +269,7 @@ impl Backend {
     }
 
     /// Never blocks. A `Send` for an open that has no thread is answered `SendFailed` with
-    /// `AgentError::Closed`.
+    /// `AgentError::Closed`. A history is wanted from its `ReadHistory` until its `DropHistory`.
     pub fn send(&self, message: ToBackend) {
         match message {
             ToBackend::CheckAccount => self.ask_library(LibraryJob::Account),
@@ -231,8 +277,10 @@ impl Backend {
                 self.ask_library(LibraryJob::Sessions { since_unix })
             }
             ToBackend::ReadHistory { key, id, max_items } => {
+                self.wanted.add(key);
                 self.ask_library(LibraryJob::History { key, id, max_items })
             }
+            ToBackend::DropHistory { key } => self.wanted.remove(key),
             ToBackend::CheckActivity { key, id } => {
                 self.ask_library(LibraryJob::Activity { key, id })
             }
@@ -244,6 +292,17 @@ impl Backend {
                 // A send fails only once the preparing thread has ended; there is nobody to ask.
                 let _ = self.preparing.send(PrepareJob::Prepare { chip, source });
             }
+            ToBackend::ReadImage {
+                picture,
+                id,
+                message,
+                index,
+            } => self.ask_library(LibraryJob::Image {
+                picture,
+                id,
+                message,
+                index,
+            }),
         }
     }
 
@@ -252,8 +311,8 @@ impl Backend {
         self.inbox.try_recv().ok()
     }
 
-    /// Waits up to `timeout` for the next message. This one blocks: it is only for the window
-    /// closing, which waits a bounded time for its session to end (see `glue::close_session`).
+    /// Waits up to `timeout` for the next message. This one blocks: it is only for the app
+    /// quitting, which waits a bounded time for its sessions to end (see `glue::close_session`).
     pub fn recv_timeout(&self, timeout: Duration) -> Option<FromBackend> {
         self.inbox.recv_timeout(timeout).ok()
     }
@@ -421,6 +480,12 @@ enum LibraryJob {
     Branch {
         folder: PathBuf,
     },
+    Image {
+        picture: u64,
+        id: SessionId,
+        message: String,
+        index: usize,
+    },
     Flush(FlushToken),
 }
 
@@ -428,6 +493,7 @@ struct Library {
     agent: Arc<dyn Agent>,
     outbox: Outbox,
     stopping: Arc<AtomicBool>,
+    wanted: Wanted,
     /// Where the pictures of a history's images are made.
     preparing: Sender<PrepareJob>,
     /// The number of the next stored picture's id.
@@ -447,9 +513,14 @@ impl Library {
                     since_unix,
                     result: self.agent.list_sessions(since_unix),
                 },
+                // A history no longer wanted is not read, nor answered when it stopped being
+                // wanted while it was read.
+                LibraryJob::History { key, .. } if !self.wanted.has(key) => continue,
                 LibraryJob::History { key, id, max_items } => {
                     let result = self.agent.read_session(&id, max_items);
-                    self.answer_history(key, result);
+                    if self.wanted.has(key) {
+                        self.answer_history(key, result);
+                    }
                     continue;
                 }
                 LibraryJob::Activity { key, id } => FromBackend::Activity {
@@ -459,6 +530,15 @@ impl Library {
                 LibraryJob::Branch { folder } => FromBackend::Branch {
                     branch: git::branch(&folder),
                     folder,
+                },
+                LibraryJob::Image {
+                    picture,
+                    id,
+                    message,
+                    index,
+                } => FromBackend::Image {
+                    picture,
+                    result: self.agent.read_image(&id, &message, index),
                 },
                 LibraryJob::Flush(token) => {
                     // Answered behind the pictures asked for so far, or dropped once the
@@ -506,7 +586,7 @@ impl Library {
             pictures,
         });
         for (id, image) in images {
-            let _ = self.preparing.send(PrepareJob::Picture { id, image });
+            let _ = self.preparing.send(PrepareJob::Picture { key, id, image });
         }
     }
 
@@ -519,8 +599,16 @@ impl Library {
 }
 
 enum PrepareJob {
-    Prepare { chip: u64, source: Source },
-    Picture { id: u64, image: ImageData },
+    Prepare {
+        chip: u64,
+        source: Source,
+    },
+    /// The picture of a stored image of `key`'s history.
+    Picture {
+        key: SessionKey,
+        id: u64,
+        image: ImageData,
+    },
     Flush(FlushToken),
 }
 
@@ -530,6 +618,7 @@ enum PrepareJob {
 struct Preparing {
     outbox: Outbox,
     stopping: Arc<AtomicBool>,
+    wanted: Wanted,
     prepare: Preparer,
     picture: Picturer,
 }
@@ -576,12 +665,17 @@ impl Preparing {
                     .unwrap_or(Err(Problem::Unreadable));
                 self.outbox.queue(FromBackend::Prepared { chip, result });
             }
-            PrepareJob::Picture { id, image } => {
+            // The picture of a history no longer wanted is not made, nor answered when the
+            // history stopped being wanted while it was made.
+            PrepareJob::Picture { key, .. } if !self.wanted.has(key) => {}
+            PrepareJob::Picture { key, id, image } => {
                 // A stored image is read as a file is: a decoder that panics costs its own
                 // picture.
                 let thumb = panic::catch_unwind(AssertUnwindSafe(|| (self.picture)(&image)))
                     .unwrap_or(None);
-                self.outbox.queue(FromBackend::Picture { id, thumb });
+                if self.wanted.has(key) {
+                    self.outbox.queue(FromBackend::Picture { id, thumb });
+                }
             }
             PrepareJob::Flush(token) => {
                 let _ = token.send(());
@@ -1087,6 +1181,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     images: Vec::new(),
+                    stored: None,
                 },
                 HistoryItem::AssistantText("Done, alex.".into()),
             ],
@@ -1594,6 +1689,7 @@ mod tests {
                     image_count: images.len(),
                     files: Vec::new(),
                     images,
+                    stored: None,
                 },
                 HistoryItem::AssistantText("Seen, alex.".into()),
             ],
@@ -2055,5 +2151,167 @@ mod tests {
                 event: SessionEvent::Started(_)
             })
         ));
+    }
+
+    /// Every message the backend holds now.
+    fn drain(backend: &Backend) -> Vec<FromBackend> {
+        std::iter::from_fn(|| backend.try_recv()).collect()
+    }
+
+    #[test]
+    fn a_read_that_is_dropped_before_its_turn_is_never_done() {
+        let fake = FakeAgent::new();
+        let (a, b) = (SessionId("stored-1".into()), SessionId("stored-2".into()));
+        fake.set_history(&a, stored_history());
+        fake.set_history(&b, stored_history());
+        fake.pause_reads();
+        let (backend, _) = start(&fake);
+        for (key, id) in [(SessionKey(1), a), (SessionKey(2), b)] {
+            backend.send(ToBackend::ReadHistory {
+                key,
+                id,
+                max_items: 10,
+            });
+        }
+        eventually("the first read to start", || fake.history_reads() == 1);
+        backend.send(ToBackend::DropHistory { key: SessionKey(2) });
+        fake.resume_reads();
+        backend.flush();
+        assert_eq!(fake.history_reads(), 1);
+        let answers = drain(&backend);
+        assert!(
+            matches!(
+                answers.as_slice(),
+                [FromBackend::History {
+                    key: SessionKey(1),
+                    result: Ok(_),
+                    ..
+                }]
+            ),
+            "{answers:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_dropped_while_it_ran_answers_nothing() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.set_history(&id, history_with_images(vec![Some(png(4, 4))]));
+        fake.pause_reads();
+        let (backend, _) = start(&fake);
+        backend.send(ToBackend::ReadHistory {
+            key: SessionKey(1),
+            id,
+            max_items: 10,
+        });
+        eventually("the read to start", || fake.history_reads() == 1);
+        backend.send(ToBackend::DropHistory { key: SessionKey(1) });
+        fake.resume_reads();
+        backend.flush();
+        assert_eq!(fake.history_reads(), 1);
+        let answers = drain(&backend);
+        assert!(answers.is_empty(), "{answers:?}");
+    }
+
+    #[test]
+    fn a_picture_whose_history_was_dropped_is_not_made() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.set_history(
+            &id,
+            history_with_images(vec![Some(png(4, 4)), Some(png(5, 5))]),
+        );
+        // The first picture waits until the test lets it go; it says when it starts.
+        let (entered, began) = mpsc::channel::<()>();
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let entered = Mutex::new(entered);
+        let picture: Picturer = Arc::new(move |image: &ImageData| {
+            let _ = entered.lock().unwrap().send(());
+            let _ = gate.lock().unwrap().recv();
+            attach::picture_of(image)
+        });
+        let backend = Backend::start_with(
+            Arc::new(fake.clone()),
+            Arc::new(|| {}),
+            Arc::new(attach::prepare),
+            picture,
+        );
+        read_history(&backend, SessionKey(1), &id);
+        began.recv_timeout(LIMIT).expect("the first picture began");
+        backend.send(ToBackend::DropHistory { key: SessionKey(1) });
+        drop(release);
+        backend.flush();
+        let answers = drain(&backend);
+        assert!(answers.is_empty(), "{answers:?}");
+        assert!(began.try_recv().is_err(), "the second picture was made");
+    }
+
+    /// A stored history of one message of the user's, `m1`, with `images`.
+    fn history_of_message(images: Vec<Option<ImageData>>) -> StoredHistory {
+        let mut history = history_with_images(images);
+        if let HistoryItem::User { stored, .. } = &mut history.items[0] {
+            *stored = Some("m1".into());
+        }
+        history
+    }
+
+    #[test]
+    fn an_image_read_comes_back_under_its_picture_id() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        let (first, second) = (png(3, 3), png(4, 4));
+        fake.set_history(
+            &id,
+            history_of_message(vec![Some(first), Some(second.clone())]),
+        );
+        let (backend, _) = start(&fake);
+        backend.send(ToBackend::ReadImage {
+            picture: STORED_PICTURE | 41,
+            id,
+            message: "m1".into(),
+            index: 1,
+        });
+        match wait(&backend) {
+            FromBackend::Image {
+                picture,
+                result: Ok(image),
+            } => {
+                assert_eq!(picture, STORED_PICTURE | 41);
+                assert!(Arc::ptr_eq(&image.shared(), &second.shared()));
+            }
+            other => panic!("not the image: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_read_comes_back_as_its_error() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.set_history(&id, history_of_message(vec![Some(png(3, 3))]));
+        let (backend, _) = start(&fake);
+        let read = |picture: u64, message: &str| ToBackend::ReadImage {
+            picture,
+            id: id.clone(),
+            message: message.into(),
+            index: 0,
+        };
+        backend.send(read(7, "m9"));
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Image {
+                picture: 7,
+                result: Err(AgentError::Io("the message is not in the session".into())),
+            }
+        );
+        fake.fail_image("the disk is gone");
+        backend.send(read(8, "m1"));
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Image {
+                picture: 8,
+                result: Err(AgentError::Io("the disk is gone".into())),
+            }
+        );
     }
 }

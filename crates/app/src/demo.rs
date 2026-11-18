@@ -144,6 +144,9 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("panel-refused", panel_refused),
     ("chips", chips),
     ("chips-problem", chips_problem),
+    ("quit-ask", quit_ask),
+    ("viewer", viewer),
+    ("viewer-failed", viewer_failed),
 ];
 
 /// Replaces the state with a fresh demo state.
@@ -845,6 +848,7 @@ fn sessions(ui: &mut Ui) {
                     image_count: 0,
                     files: Vec::new(),
                     images: Vec::new(),
+                    stored: None,
                 },
                 HistoryItem::AssistantText(
                     "The two beds by the south fence get sun from morning to late afternoon. \
@@ -1009,6 +1013,7 @@ pub(crate) fn parser_history() -> StoredHistory {
                 image_count: 0,
                 files: Vec::new(),
                 images: Vec::new(),
+                stored: None,
             },
             HistoryItem::Thinking(
                 "It returns as soon as one statement fails, so nothing after it is looked at."
@@ -1034,6 +1039,7 @@ pub(crate) fn parser_history() -> StoredHistory {
                 image_count: 1,
                 files: Vec::new(),
                 images: vec![None; 1],
+                stored: None,
             },
             HistoryItem::AssistantText(
                 "Three errors, each with its line: the parser goes on after each one now.".into(),
@@ -1778,6 +1784,286 @@ fn window_thumb() -> Thumb {
     }
 }
 
+/// Two tiles and the question whether to quit over them, as Ctrl+Q asks it: on the left the
+/// `conversation` scene's session with Remote Control on, on the right, focused, a session at
+/// work. `glue::ask_quit` puts away what lies over the window and shows the question when
+/// something runs; a scene has no `Tx` to call it with, so it does the same itself.
+fn quit_ask(ui: &mut Ui) {
+    conversation(ui);
+    let remote = ui.app.focused().expect("a session is shown");
+    let effects = ui.app.set_remote(remote, true);
+    glue::run(ui, effects);
+    emit_to(
+        ui,
+        remote,
+        SessionEvent::RemoteAccess(RemoteAccess::Starting),
+    );
+    emit_to(
+        ui,
+        remote,
+        SessionEvent::RemoteAccess(RemoteAccess::On {
+            url: Some(REMOTE_ADDRESS.into()),
+        }),
+    );
+    pump_until(ui, "Remote Control on", |ui| {
+        ui.app
+            .sessions
+            .get(remote)
+            .is_some_and(|entry| matches!(entry.session.remote, Remote::On { .. }))
+    });
+    live_at(
+        ui,
+        Place::Side,
+        SKETCHES,
+        "Wait half a minute, then tell me",
+        "Waiting half a minute",
+        thinking_on(),
+    );
+    glue::put_away(ui);
+    ui.quit_ask = true;
+    // As the window is while the question shows: the question has the keyboard, so no input
+    // box is drawn with it. The first tile's box still had it from the scene's first message.
+    for tiled in ui.app.tiles.keys() {
+        glue::view_mut(ui, tiled).draft.focused = false;
+    }
+}
+
+/// The message the `viewer` scene's picture was sent with, Claude's reply, and the title Claude
+/// gives the session.
+const BLOCKS_MESSAGE: &str = "Which of these colours would suit the buttons?";
+const BLOCKS_REPLY: &str = "The blue of the second row reads well on both themes.";
+const BLOCKS_TITLE: &str = "Choosing a colour for the buttons";
+
+/// How large the `viewer` scene's picture is, in pixels.
+const VIEWER_SIZE: (u32, u32) = (900, 600);
+
+/// A message sent with a picture of coloured blocks, 900 by 600 pixels and made in code, and
+/// Claude's reply; then a press on the sent picture opened it large over the window. A picture
+/// sent in this run is at hand in full, so it shows at once: the scene waits for it to be
+/// decoded, as a snapshot paints nothing of an image still being decoded.
+fn viewer(ui: &mut Ui) {
+    empty(ui);
+    let key = ui.app.focused().expect("a session is shown");
+    let picture = SCENE_CHIPS + 1;
+    let (width, height) = VIEWER_SIZE;
+    let rgb = blocks(width, height);
+    let path = "/home/alex/project/colours.png";
+    let source = Source::Path(path.into());
+    let chip = Chip {
+        id: picture,
+        name: mr_core::name_of(&source),
+        source,
+        state: ChipState::Ready(Prepared {
+            kind: AttachKind::Image,
+            attachment: Attachment::Image {
+                media_type: "image/png".into(),
+                data: ImageData::new(png(width, height, &rgb)),
+            },
+            thumb: Some(thumb_of(width, height, &rgb)),
+        }),
+    };
+    put_chips(ui, key, vec![chip]);
+    fake(ui).reply(vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(0.0, SessionEvent::TextDelta(BLOCKS_REPLY.into())),
+        FakeStep::at(0.0, SessionEvent::BlockFinished),
+        FakeStep::at(0.0, finished()),
+    ]);
+    say(ui, BLOCKS_MESSAGE, BLOCKS_TITLE);
+    pump_until(ui, "the reply to the picture", |ui| {
+        ui.focused_session()
+            .is_some_and(|s| s.phase == Phase::Idle && s.conversation.items().len() == 2)
+    });
+    glue::open_picture(ui, key, picture);
+    let full = ui
+        .viewing
+        .as_ref()
+        .and_then(|viewing| viewing.full.clone())
+        .expect("a picture sent in this run is at hand");
+    full.wait().expect("a picture made in code decodes");
+}
+
+/// Why the `viewer-failed` scene's picture cannot be read again, as the store would say it.
+const IMAGE_FAILURE: &str = "the message is not in the session";
+
+/// The `resting` scene's stored session, whose message with a screenshot kept the screenshot's
+/// bytes, and a press on its picture: the full image is asked of the store, which cannot give
+/// it. The small picture stays, with the line that says so.
+fn viewer_failed(ui: &mut Ui) {
+    let mut history = parser_history();
+    for item in &mut history.items {
+        if let HistoryItem::User { images, stored, .. } = item
+            && !images.is_empty()
+        {
+            let (width, height) = (640, 400);
+            *images = vec![Some(ImageData::new(png(
+                width,
+                height,
+                &terminal(width, height),
+            )))];
+            *stored = Some("stored-screenshot".into());
+        }
+    }
+    let key = parser_listed(ui, Ok(history));
+    fake(ui).fail_image(IMAGE_FAILURE);
+    let effects = ui.app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    pump_until(ui, "the stored history and its picture", |ui| {
+        ui.focused_session().is_some_and(|s| {
+            s.history == HistoryState::Loaded
+                && s.conversation
+                    .pictures()
+                    .any(|id| ui.thumbs.contains_key(&id))
+        })
+    });
+    let picture = ui
+        .focused_session()
+        .and_then(|s| {
+            s.conversation
+                .pictures()
+                .find(|id| ui.thumbs.contains_key(id))
+        })
+        .expect("the picture is drawn");
+    ui.thumbs[&picture]
+        .wait()
+        .expect("a picture made in code is drawn");
+    glue::open_picture(ui, key, picture);
+    pump_until(ui, "the failed read", |ui| {
+        ui.viewing.as_ref().is_some_and(|viewing| viewing.failed)
+    });
+}
+
+/// `width` by `height` pixels of coloured blocks, six across and four down, the hue changing
+/// across and the shade down, with thin pale lines between them and round the whole picture:
+/// as RGB, row by row.
+fn blocks(width: u32, height: u32) -> Vec<u8> {
+    const HUES: [[f32; 3]; 6] = [
+        [220.0, 70.0, 60.0],
+        [235.0, 150.0, 40.0],
+        [225.0, 200.0, 60.0],
+        [70.0, 170.0, 90.0],
+        [50.0, 120.0, 210.0],
+        [140.0, 80.0, 190.0],
+    ];
+    let (across, down) = (6, 4);
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let (column, row) = (x * across / width, y * down / height);
+            // On the left and top of each block, and along the picture's right and bottom
+            // edge, so that the picture is framed all round and does not look cut off.
+            let line = (x * across) % width < across * 4
+                || (y * down) % height < down * 4
+                || x + 4 >= width
+                || y + 4 >= height;
+            let pixel = if line {
+                [236, 238, 242]
+            } else {
+                let shade = 1.0 - 0.18 * row as f32;
+                HUES[column as usize].map(|c| (c * shade) as u8)
+            };
+            rgb.extend_from_slice(&pixel);
+        }
+    }
+    rgb
+}
+
+/// `width` by `height` pixels of a terminal: a dark ground and three lines of output, each a
+/// red mark and a pale run of text, as RGB, row by row.
+fn terminal(width: u32, height: u32) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let line = (0..3).find(|n| (60 + n * 60..84 + n * 60).contains(&y));
+            let pixel = match line {
+                Some(_) if (40..64).contains(&x) => [225, 85, 75],
+                Some(n) if (80..440 - n * 70).contains(&x) => [210, 214, 222],
+                _ => [30, 32, 38],
+            };
+            rgb.extend_from_slice(&pixel);
+        }
+    }
+    rgb
+}
+
+/// The thumbnail of `rgb`, `width` by `height` pixels: as wide as a chip's thumbnail may be, its
+/// pixels the nearest of the picture's.
+fn thumb_of(width: u32, height: u32, rgb: &[u8]) -> Thumb {
+    let (thumb_width, thumb_height) = (THUMB_SIDE, THUMB_SIDE * height / width);
+    let mut rgba = Vec::with_capacity((thumb_width * thumb_height * 4) as usize);
+    for y in 0..thumb_height {
+        for x in 0..thumb_width {
+            let at = ((y * height / thumb_height) * width + x * width / thumb_width) as usize * 3;
+            rgba.extend_from_slice(&rgb[at..at + 3]);
+            rgba.push(255);
+        }
+    }
+    Thumb {
+        width: thumb_width,
+        height: thumb_height,
+        rgba: rgba.into(),
+    }
+}
+
+/// `rgb`, `width` by `height` pixels, as a PNG whose rows are stored as they are, without
+/// compression: the demo makes its pictures in code, and the app has no image encoder of its
+/// own to make them with.
+fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(rgb.len() + height as usize);
+    for row in rgb.chunks(width as usize * 3) {
+        // Each row starts with its filter: none.
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    // A zlib stream of stored blocks of at most 65,535 bytes, ended by the data's Adler-32.
+    let mut zlib = vec![0x78, 0x01];
+    let count = raw.chunks(65_535).count();
+    for (n, block) in raw.chunks(65_535).enumerate() {
+        zlib.push(u8::from(n + 1 == count));
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    // Eight bits a channel, RGB, deflate, the standard filters, not interlaced.
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png_chunk(&mut png, b"IHDR", &header);
+    png_chunk(&mut png, b"IDAT", &zlib);
+    png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Adds a chunk of `kind` holding `data` to `png`: its length, its kind, the data, and the
+/// CRC-32 of kind and data.
+fn png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let start = png.len();
+    png.extend_from_slice(kind);
+    png.extend_from_slice(data);
+    let mut crc = !0u32;
+    for &byte in &png[start..] {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    png.extend_from_slice(&(!crc).to_be_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1831,5 +2117,79 @@ mod tests {
         assert!(rt.state.thumbs[&picture].is_ready());
         assert!(!testkit::tile_has_text(&rt, sent, "1 image"));
         assert!(testkit::tile_has_text(&rt, sent, "plan.md, shapes.txt"));
+    }
+
+    #[test]
+    fn a_png_made_here_decodes_to_its_pixels() {
+        let rgb: Vec<u8> = (0..5 * 3)
+            .flat_map(|n| [n as u8, 100, 255 - n as u8])
+            .collect();
+        let decoded = image::load_from_memory(&png(5, 3, &rgb)).expect("the PNG decodes");
+        assert_eq!((decoded.width(), decoded.height()), (5, 3));
+        assert_eq!(decoded.to_rgb8().into_raw(), rgb);
+    }
+
+    #[test]
+    fn a_png_larger_than_one_stored_block_decodes() {
+        let (width, height) = (300, 200);
+        let rgb: Vec<u8> = (0..width * height * 3).map(|n| (n % 251) as u8).collect();
+        let decoded = image::load_from_memory(&png(width, height, &rgb)).expect("the PNG decodes");
+        assert_eq!(decoded.to_rgb8().into_raw(), rgb);
+    }
+
+    #[test]
+    fn the_quit_ask_scene_asks_over_a_working_tile_and_a_remote_one() {
+        let rt = testkit::window("quit-ask");
+        assert_eq!(testkit::tile_keys(&rt).len(), 2);
+        assert!(rt.state.quit_ask);
+        assert_eq!(
+            rt.state.app.busy(),
+            mr_core::Busy {
+                working: 1,
+                remote: 1
+            }
+        );
+        assert!(testkit::has_text(
+            &rt,
+            "1 session is working and 1 has Remote Control on."
+        ));
+        assert!(testkit::find(&rt, "mr-quit-yes").is_some());
+        // No input box is drawn with the keyboard under the question.
+        let working = testkit::focused(&rt).expect("a focused tile");
+        for key in testkit::tile_keys(&rt) {
+            assert!(!glue::view_of(&rt.state, key).draft.focused, "{key:?}");
+        }
+        // Cancel leaves the focus on the working tile, and the keyboard in no other tile's box.
+        let mut rt = rt;
+        testkit::click(&mut rt, "mr-quit-cancel");
+        testkit::step(&mut rt);
+        assert!(!rt.state.quit_ask);
+        assert_eq!(testkit::focused(&rt), Some(working));
+        let typing = glue::typing_in(&rt.state);
+        assert!(typing.is_none_or(|key| key == working), "{typing:?}");
+    }
+
+    #[test]
+    fn the_viewer_scene_shows_a_sent_picture_in_full() {
+        let rt = testkit::window("viewer");
+        let viewing = rt.state.viewing.as_ref().expect("a picture is open");
+        assert!(!viewing.failed);
+        let full = viewing.full.as_ref().expect("its full image is at hand");
+        assert_eq!(full.size(), Some([VIEWER_SIZE.0, VIEWER_SIZE.1]));
+        assert!(rt.state.thumbs[&viewing.picture].is_ready());
+        assert!(testkit::find(&rt, "mr-viewer-image").is_some());
+        assert!(testkit::find(&rt, "mr-viewer-error").is_none());
+    }
+
+    #[test]
+    fn the_viewer_failed_scene_shows_the_small_picture_and_says_why() {
+        let rt = testkit::window("viewer-failed");
+        let viewing = rt.state.viewing.as_ref().expect("a picture is open");
+        assert!(viewing.failed);
+        assert!(viewing.full.is_none());
+        assert!(rt.state.thumbs[&viewing.picture].is_ready());
+        let session = &rt.state.app.sessions.get(viewing.key).unwrap().session;
+        assert_eq!(session.phase, Phase::Resting);
+        assert!(testkit::has_text(&rt, "The full picture cannot be read."));
     }
 }

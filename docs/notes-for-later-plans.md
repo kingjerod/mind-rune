@@ -1,8 +1,267 @@
 # Notes for later plans
 
-Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column), plan 5 (the effort level, the right panel and Remote Control) and plan 6 (attachments). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+**Commit ids in these notes, in the plans and in the rulings files are from before the first push.** On 2026-11-17, at Jerod's word, the history was squashed for that push into one commit for each plan, so the ids named here (`fe0dd63`, `622c6ba` and the rest) are not in the pushed history. On Jerod's machine the old history is kept under the ref `refs/backup/before-squash-2026-11-17` and in the file `.git/backup-before-squash-2026-11-17.bundle`; neither is pushed.
 
-Plan 6's section comes first, then plan 5's, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column), plan 5 (the effort level, the right panel and Remote Control), plan 6 (attachments) and plan 7 (running in the background, and opening a picture). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+
+Plan 7's section comes first, then plan 6's, then plan 5's, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## Jerod's look at plan 7
+
+Plan 7 (`docs/superpowers/plans/2026-11-16-background-and-pictures.md`) does two things. Closing the window no longer ends the app: its sessions keep working and stay reachable through Remote Control, launching MindRune again shows the same window, a tray icon offers Show and Quit, and Quit is explicit and asks first when something would be cut off. A program that has done nothing for half an hour is stopped without the user noticing, and the next message starts it again. And a press on a picture, in a sent message or on a chip before sending, opens it large over the window.
+
+It is built on the branch `plan-7-background-pictures`, cut from `main` at `3a4b4c1`: Tasks 1 to 10 in eleven commits, from `207d02b` to `eabf589`, one of them a fix after Task 7's review (`5c48e7f`), then Task 11's four commits (the scenes, the live test's new lines, these notes, and a fix to the live test after its review, `4762c99`). Every task had its own review. The whole branch was then reviewed (2026-11-17), and a fix wave of five commits followed, from `1884154` on, with one correction after its re-review: what it changed is under "The whole-branch review of plan 7", below, and everything in this section describes the branch after it. Told that the branch was built and reviewed and that their live test and look had not happened, Jerod said on 2026-11-17: "Merge now". It was merged into `main` by the merge commit `622c6ba` (1388 tests on the merged tree) and the branch is gone. Nothing is pushed. The live test and the look below are still to come, now on `main`. After the fix wave `cargo test --workspace` gives 1388 passed, 0 failed, 2 ignored (the live tests, not run by any agent), and formatting and lints are clean.
+
+The rulings made while the plan ran are in `docs/superpowers/plans/2026-11-17-plan-7-rulings.md`.
+
+As for plans 5 and 6, the live test comes first. Jerod runs, in their own terminal, on `main`:
+
+```bash
+MINDRUNE_LIVE=1 cargo test -p mindrune --test live -- --ignored --nocapture
+```
+
+Then, after quitting any MindRune that runs (see "Before looking"), the window:
+
+```bash
+cargo run --release -p mindrune
+```
+
+Closing that window no longer ends the command: the app stays, and `cargo run` with it. Quit it with Ctrl+Q in the window, with "Quit" in the tray's menu, or from another terminal with the command below. When something is running, that command does not quit: the app shows its question in the window, and the command says `mindrune: something is running; answer the question in its window` and ends.
+
+```bash
+cargo run --release -p mindrune -- --quit
+```
+
+For the launcher's part (things to try 3 and 6), the desktop entry has to be installed again, since it gained two lines; that is Jerod's to run, after a release build:
+
+```bash
+cargo build --release -p mindrune
+scripts/install-desktop-entry.sh
+```
+
+`cargo test --workspace` writes the screenshots of the three new scenes (`quit-ask`, `viewer` and `viewer-failed`, dark and light) to `target/snap/final`. Neither they nor the folder are in git.
+
+### The live test
+
+It needs Claude Code installed and signed in, as before. It now starts the real `claude` six times: plan 6's five, and once more in the second run, when the test's session is started again after its program was stopped for idling. It stores no session more than before. It now takes at least a minute longer: it waits for the idle stop, with the idle length set to the shortest the app takes, one minute from the program's last word. Once the app has sent the idle `Close`, the test sets the idle length back to half an hour, so the program that is started next is not stopped again before it has answered. Like the window, the test now brings the app's clock up to date before it takes in what the programs send, so every event is stamped with the time it came.
+
+What it now prints, on stderr, one per line. None of these fails the test. No line holds a path, a session's id, an image's bytes or anything of a permission request.
+
+After plan 5's `live: resumed with effort …`, in the second run:
+
+- `live: a program closed while idle ended cleanly: yes|no`. The test leaves the session alone until the app sends the program `Close` for idling (at most 180 seconds), then waits for the program's end. In its place: `live: the test's session has no program running; no idle stop is tried`, `live: the program was not stopped for idling within 180 s`, `live: the program ended by itself before the idle stop (clean: true|false)`, or `live: a program closed while idle had not ended 20 s after Close`. When the session does not rest afterwards, `live: after the stop the session ended (clean: …) instead of resting; it is not started again` or `live: after the stop the session does not rest; it is not started again`, and nothing more of this part.
+- `live: started again, the session answered: yes|no`. The test sends "Reply with the single word: back", which starts the session again with the model, effort and mode it had, and waits up to 120 seconds for a finished reply. Should the app ask first whether another app has the session open (it is not expected to), a line says so and the test continues here. A `no` says why in brackets: no program was opened within 30 s, it asked the user (the turn is then stopped), its program ended (clean or not), its program ended cleanly before it answered, or no reply within 120 s. From the idle stop on, nothing the test's session does fails the test, and the steps after it run whatever happened.
+- `live: started again with the model, effort and mode it had: yes|no`: the model's label, the effort level and the permission mode after the reply, against those before the stop. `no` also when there was no answer.
+
+In the attachments part, after plan 6's `live: the stored message's images with bytes the app could read: N of M`, which stays as it was:
+
+- `live: the stored message has an id: yes|no`: the history reader found the message's own id in the store (its `uuid`).
+- `live: its image read again by that id: N bytes, the same as were sent: yes|no`: the image of that message read again by the id, through the backend, as a press on a picture of a reopened session reads it, compared byte for byte with the image the message went out with. In its place: `live: its image read again by that id: not read (…)`, with the reader's own words, `… no answer within 30 s`, or `… not tried (no image was sent)` when the message went out without its image.
+
+Then, still in the session for attachments, the test asks the program to run `sleep 20` in the background with its shell tool and to answer with one word. The program asks for permission before it runs a command. The test is the user here, and answers through the app, as a press on "Allow" does: it allows a request of the shell tool whose whole command is `sleep` and a number of seconds, and denies any other request, also one that puts anything after or beside that command. The `sleep` ends by itself after 20 seconds, and the session is closed as the others are. It prints:
+
+- `live: a background task record that counted at least one task arrived: yes|no`. `yes` means the program sent its own record with a task in it while the `sleep` ran. The test waits for it until the turn ends and five seconds more.
+- `live: the adapter's own guard counted the tool call: yes|no`. `yes` means the tool call went out with `run_in_background` set, and the adapter counted one task from the call alone (see decision 13). The app sees one count for both cases, so the test tells them apart by their order alone: a count that comes directly after the shell call is the guard's, and a count that comes on its own is the record's. That can put a count on the wrong line. A record of the program's that arrives right after a call the guard did not count is read as the guard's, and a count the guard gives for a call a sub-agent makes, with no shell call seen before it, is read as the record's. Both mistakes err towards "a task is running", so neither makes the idle stop look safer than it is; but one `yes` and one `no` does not prove which of the two works.
+- In place of both lines: `live: a background task record that counted at least one task arrived: not tried (the program asked for something else)` when the program asked for anything but that one command, `… not tried (the program ran no shell command)` when it answered without running one, or `… not tried (the session was not ready for a message)`. Before them, `live: the turn that starts a background task did not end within 120 s` when that happened.
+
+At the end of the second run:
+
+- `live: background task records that arrived: N`, counted over both runs and every program the test ran, and, when there was one, `live: the last one counted M task(s)`. The number counts every count of tasks the adapter gave: one for each record of the program's, and one for the guard when it counted the tool call.
+
+What each line settles:
+
+- `ended cleanly: yes` with `answered: yes` and `the model, effort and mode it had: yes`: a program closed while idle ends cleanly and its session resumes as it was, in one go. Closing and resuming were each seen before (the live test of 2026-11-16), never one after the other. `ended cleanly: no` is no failure of the app: a stop that had to kill the program still leaves the session resting with no notice (decision 14).
+- `has an id: yes` with `the same as were sent: yes`: a stored image can be read again by its message's id, so a picture of a reopened session opens large. `no`, or `not read`, means the reader is wrong, and it is corrected from what the test prints. Until then only pictures of reopened sessions are affected: they show small in the viewer, with the line "The full picture cannot be read.".
+- The background lines: the program's record was seen in plan 1's recording of Remote Control (V1 in `docs/protocol-notes.md`), with an empty list; a record with a task in it was never seen. `a record … arrived: yes` is the first sight of one, and means the idle stop can rely on the record. `no` with `the adapter's own guard counted the tool call: yes` means the program sends no record when a task starts, and only the guard keeps such a program from being stopped. `no` and `no` means neither works for this version of the program: do not trust the idle stop with background work until that is looked into. See also things to try, item 8.
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- **Nothing pops up when a session needs you while the window is closed.** The tray icon's menu says "1 needs you"; you have to look.
+- **Where the desktop shows no tray icons there is none.** Ubuntu's GNOME shows them; plain GNOME needs an extension. Without one the way back is to launch MindRune again, and Quit is Ctrl+Q in the window, "Quit MindRune" on the launcher icon's menu, or `mindrune --quit`. That short form needs `mindrune` on the `PATH`, as the installed desktop entry has it; from the checkout, use the `cargo run --release -p mindrune -- --quit` form above.
+- **Started again from a terminal, the window may come up behind others.** The desktop lets a window take the front only with a token that a launcher hands over. From the launcher it comes to the front, once the desktop entry is installed again (it gains two lines).
+- **A logout, or a `kill`, ends the app without the question.** The toolkit hears neither on Linux. The programs end with the app, as they do today.
+- **A new build started while an old copy still runs shows the old copy's window.** It says so on stderr ("mindrune: already running; its window is shown"). Quit the old one first (`mindrune --quit`, or the `cargo run` form above).
+- After a Quit nothing is running. Sessions are in the history and continue with the next message.
+- A draft and its chips now survive closing the window. They are still lost by Quit.
+- The first message to a session whose program was stopped for being idle takes a second or two longer. A permission given "for this session" is forgotten by then, because the program that held it is gone.
+- An image sent in this run is kept in memory in full for as long as its conversation is held, up to 3.9 MB each, so that it opens at once. There is no ceiling per session yet: a session in a tile that is sent many pictures holds them all until it has rested out of every tile for ten minutes or the app quits.
+- The large picture is the image as it was sent. An image over the limits was made smaller before it went, so that is what opens, not the file on disk.
+- A sent picture opens with the pointer only. A chip's picture also opens from the keyboard.
+- Only Linux and macOS keep running after the window closes. On Windows the close still ends the app.
+
+And before the look itself:
+
+- **Quit any MindRune that runs first.** A copy built from `main` before this plan knows nothing of the socket, so it would run beside the new one; a copy of this branch would be shown in place of the new build.
+- **Install the desktop entry again** (the commands above). The entry now says that the launcher hands over its token (`StartupNotify=true`), which brings the window to the front, and adds "Quit MindRune" to the launcher icon's menu (`mindrune --quit`). Without it, things to try 3 and 6 cannot be seen.
+- **Where the running copy is found.** The socket and a lock file are in `$XDG_RUNTIME_DIR/mindrune`, a folder only you can read. When `XDG_RUNTIME_DIR` is not set, they are in a folder `run` beside the app's saved file (`~/.config/mindrune/run`, or under `RUNE_PREFS_DIR` when that is set); a launch from an environment without the variable will not find a copy that used the runtime folder. When `RUNE_DIRS_ROOT` is set, the socket is under that root instead, so a run moved off the real folders never finds the real running copy. With no folder to be had, the app runs alone, and closing its window ends it.
+- **A copy that does not answer.** A second launch then says "mindrune: a running copy does not answer" with the lock file's path. The lock file holds the running copy's process id, so it can be ended by hand:
+
+  ```bash
+  kill "$(cat "$XDG_RUNTIME_DIR/mindrune/lock")"
+  ```
+
+  A `kill` ends the app without the question, and its programs end with it.
+- `MINDRUNE_IDLE_SECONDS` sets another idle length for one run, at least 60 seconds; a value that is not a whole number says so on stderr and keeps half an hour. The demo window's clock stands still, so it never stops a program.
+- The demo window (`cargo run -p mindrune -- --demo`) behaves as before: it claims no socket, starts no tray, and closing it ends it. Its new scenes draw their pictures in code and read nothing from the disk.
+
+### What to try in the window
+
+1. Start a long turn and close the window. Launch MindRune again: the same tiles, the turn still going or done, a draft still in its box.
+2. The tray icon in the top bar: a click shows the window; its menu has the standing, "Show MindRune" and "Quit".
+3. With the window closed, launch from the launcher and from a terminal: does the window come to the front both times?
+4. `mindrune ~/some/folder` while it runs: a new session in that folder.
+5. Ctrl+Q with nothing running: it quits at once. With a turn running: the question, its words wrapped inside the dialog; Return presses "Cancel", as does Escape; then Ctrl+Q again and a press on "Quit".
+6. The "Quit" button at the sidebar's foot, and "Quit MindRune" on the launcher icon's menu.
+7. Remote Control on, close the window, write from the other device: it still answers. Quit then asks.
+8. The idle stop, in three parts, started with the idle length set to two minutes:
+
+   ```bash
+   MINDRUNE_IDLE_SECONDS=120 cargo run --release -p mindrune
+   ```
+
+   The programs of the running copy, each a `claude` process, are listed by this command. Other Claude Code sessions on the computer are not in its list:
+
+   ```bash
+   pgrep -a -P "$(cat "$XDG_RUNTIME_DIR/mindrune/lock")"
+   ```
+
+   First part: leave a session alone for three minutes with the window open. Its program is gone from the list; the next message is answered, with the same model and effort. Second part: the same with the window closed. Third part, which is a condition of trusting the idle stop at all: ask a session to run `sleep 600` in the background, allow it, and leave the session alone for three minutes. Its program must still be in the list. If it is gone, the app would also end a build or a dev server after half an hour, and the idle stop must not be relied on until that is fixed. Never tried by anyone: a wake-up the program schedules for itself, as a loop with a pause longer than the idle time. Whether such a wake-up counts as a background task is not known; if it does not, the loop ends without a word when its program is stopped.
+9. A press on a sent picture: large over the window, the zoom bar, Escape, a press beside it. The same in a session opened again, and on a chip before sending.
+10. Close the window with a picture open and come back: no picture, the same tiles.
+11. Quit with the window closed, which nothing but this tries: close the window, then "Quit" in the tray's menu, once with nothing running and once with a turn running; and the same with `--quit` from a terminal. With nothing running the app is gone at once. With a turn running the window opens with the question, and `--quit` says `mindrune: something is running; answer the question in its window`. After each quit, this prints nothing:
+
+    ```bash
+    pgrep mindrune
+    ```
+
+12. Let a session's program be stopped for idling (item 8), then turn Remote Control on for it in the right panel: its program starts again and Remote Control comes on, with no message typed.
+13. Show one stored session, then another in the same tile, and go back and forth: neither is read again (no "loading" in between). A session left out of every tile for ten minutes is read again when it is shown.
+
+Seen, 2026-11-17, on `main` after the merge. Jerod was given the commands for the idle stop (item 8's three parts and item 12) and for Quit (items 5, 6 and 11), ran them, and said: "It all seems to run well." Earlier the same day they saw the app's icon on a window of a build of `main`. Not reported yet: the live test's output for this plan, the pictures (items 9, 10 and 13), the first four items one by one, and the launcher's part (items 3 and 6), which needs the desktop entry installed again.
+
+### Every decision of plan 7, with what was built
+
+The twenty-four decisions are the planner's; Jerod has not seen them.
+
+**Running in the background**
+
+1. **Closing the window never ends the app, also when nothing is running.** Built for Linux and macOS, for the copy that found no other running: the window goes and the app stays (the toolkit's way to run without a window). As it goes, the app saves what it keeps between runs and puts away what lay over the window (decision 9). In the demo window, in a run with no window at all, and for a copy that could not take the socket, the close ends the app as before.
+2. **The ways back:** launching MindRune again, from the launcher or as `mindrune` in a terminal; a click on the tray icon; "Show MindRune" in its menu. Built: each shows the window and, given the launcher's token, brings it to the front. The token is passed on and never printed.
+3. **Launching again with a folder** opens a new session in that folder in the running copy. Built: in the focused tile, as a folder chosen in the folder dialog is opened (the same code). Nothing opens when the folder is gone, before the main screen, or while the app quits.
+4. **The ways to quit.** Built: Ctrl+Q (Ctrl+Shift+Q quits too); a "Quit" button at the sidebar's foot, to the right of the account's name, whose help says "Quit MindRune (Ctrl+Q)"; "Quit" in the tray's menu; "Quit MindRune" on the launcher icon's menu; `mindrune --quit`, which says "mindrune: not running" when no copy runs.
+5. **Quit asks when a session is working or has Remote Control on.** Built: the question "Quit MindRune?" says what would stop ("1 session is working and 1 has Remote Control on.") and that "Quitting stops everything that is running. Sessions stay in the history and can be continued." The words wrap inside the dialog. Its buttons are "Cancel" and "Quit"; "Quit" is drawn in the danger colour, and Return presses "Cancel": the question protects what runs, so its default is the answer that stops nothing (the plan had Return press "Quit"; the whole-branch review reversed it). Escape, a press outside and the close button cancel too. The words follow what runs while the question shows. Working means a turn runs, a request waits for the user, a message waits for a program (queued, undelivered, or held by the question whether to continue a session open elsewhere), or the program has a background task. A Quit asked for while the window is closed opens the window for the question, and `mindrune --quit` then says so and ends. While the question shows, Ctrl+Q changes nothing and no other key reaches a tile.
+6. **One running copy per user, found through a socket.** Built: a lock and a socket in `$XDG_RUNTIME_DIR/mindrune` (the folder only the user can read), both with the sticky bit, so that a cleanup of the runtime folder leaves them. A second launch tells the first to show its window, with the launcher's token and a folder when there is one, says "mindrune: already running; its window is shown" and ends. The running copy answers `ok` when it carried the ask out, and `asked` when a quit was asked for and it shows its question instead; `mindrune --quit` then says "mindrune: something is running; answer the question in its window". A first copy that does not answer within two seconds: "mindrune: a running copy does not answer (…)", and the second ends with an error. One exception, for `mindrune --quit`: a quit that is carried out can end the running copy before its answer is written, so when no answer comes the command looks whether the copy still holds its lock, and ends quietly with success when the copy has gone. What arrives on the socket is one line of at most 4,096 bytes, read with a time limit; anything else is dropped, and the line can only show the window, open a session in a folder that exists, or ask for Quit. A token that is not plain printable text, or is longer than 512 bytes, is refused (the first a fix after Task 7's review: such a token would have crashed the running copy).
+7. **The tray is the toolkit's own.** Built on a thread of its own, never the window's: the app's icon, the tooltip "MindRune", and a menu of a line of standing when there is something to say ("2 working · 1 needs you · 1 finished", greyed), "Show MindRune" and "Quit". The standing counts the sessions as the sidebar marks them. Where no tray can be had, one line on stderr, "mindrune: no tray icon: …", and the app runs on without one; on macOS that line is printed each start.
+8. **With the window closed, nothing counts as seen.** Built: a turn that ends in the focused tile while no window shows leaves its session marked, and the mark goes when the window is back. The same holds while the desktop reports the window as minimised or wholly covered: the toolkit tells the app that no window shows then too.
+9. **Closing the window puts away what lay over it:** open menus and pickers, a rename (not kept), a drag, a file being dropped, the folder menu, the quit question and the large picture. Drafts, chips and scroll stay.
+10. **The store is listed again every minute also while the window is closed.** Built: the app's clock runs without a window, so the listing goes on as before. The usage limits are different: once a usage window's reset time has passed the app asks for them again, once. A program that runs is asked. With none running the app would have to start one (a look), and it does that only while a window shows: asked for while the window is closed, the look is made when the window comes back. A lapsed usage window that the answer leaves out is cleared, and nothing more is asked until a program reports a new one.
+
+**Stopping idle programs**
+
+11. **Idle means half an hour** without a message sent to the session and without anything from its program. Built, with `MINDRUNE_IDLE_SECONDS` for another length (at least 60 seconds). An answer to the app's own ask for the usage limits does not count as something from the program.
+12. **A program is never stopped** while a turn runs, a request waits, Remote Control is on or asked for, a message is queued or undelivered, the "open elsewhere" question shows, the store is being asked about it, or the program has a background task; nor a session that has never had a message. Built, in one place. Remote Control turned on for a session whose program was stopped this way starts the program again, so the session is reachable without a message typed on this computer; a resting session this app has not run in this run still waits for its next start, as plan 5 built it.
+13. **The program's background tasks are read from its own record.** Built: a task marked as off this computer does not count; a record that cannot be read counts as one task. And a second guard, added by the whole-branch review because the record was never seen with a task in it: a tool call that asks to run in the background counts as one running task from then on, until a record arrives and decides. If records never come, a program that started a background task is never stopped for idling.
+14. **A stop that had to kill the program still counts as a quiet one.** Built: the session rests and shows no "ended" notice, and no mark.
+15. **A message that could not be delivered because its program had just ended is sent when the session starts again**, and a clean end starts it again at once. Built, with the controller's first two amendments: the program refuses such a message before it is gone, so the message waits for that program's end and is never sent to it again. Two additions by ruling: once the app quits, nothing is started again for such a message; and a program that ends before it has started is not started again at once (see "What is left"). And a bound: a program is started for such a message at most twice in a row. If the second one refuses it too, the session is left ended, with the notice "The message could not be delivered. Restart to send it.", and Restart delivers it.
+16. **A resting session that is in no tile gives its conversation back to the store**, and reads it again when it is shown. Built, at a later moment than the plan chose (the whole-branch review reversed it): only once the session has been out of every tile for ten minutes, and only the app's clock looks, not the close of its tile, another session shown in its place, or its program's exit. So switching between two resting sessions in one tile reads neither again. A read asked for and no longer wanted is skipped, and so are its pictures.
+
+**Opening a picture**
+
+17. **The picture opens over the whole window**, not over its tile. Built: a darkening layer over the whole window, the sidebar included (black at 70%, the same in both themes), and the picture over it.
+18. **The viewer is the kit's.** Built: it fits the picture to the window and never enlarges it past a pixel a point; the zoom bar has minus, the zoom in percent, plus and a close button (the kit's own bar would have drawn two dashes; the theme's minus and plus are given to it); Escape fits a zoomed picture first and closes it second; a press beside the picture closes it.
+19. **A chip's picture opens too**, showing the image as it will be sent. Built: it is a Tab stop pressed with Space, with a focus ring, named "Open NAME" to a screen reader.
+20. **A sent picture opens with the pointer only.** Built: it is no Tab stop, and a press leaves the keyboard where it was; to a screen reader it is a button "Open image N of M".
+21. **An image sent in this run stays in memory in full** for as long as its conversation is held. Built: the bytes the message went with are kept (shared, not copied), and dropped when the conversation is given back to the store. There is no ceiling per session (see "Before looking").
+22. **A picture of a reopened session is read again from the store** by its message's id, from the whole file and not only its last 16 MiB. Built; never seen working (the live test settles it). It is asked for under the id the conversation was read from, so a session continued as a copy asks under the original's id until its conversation has been given back and read again from its own file.
+23. **Until the full image is there the small picture shows**, at its own size. Built: if the full image cannot be had, or its bytes are no image, the small one stays with the line "The full picture cannot be read." in a small box just above the zoom bar. A press on that line closes the picture, as a press beside the picture does.
+24. **A picture that has not loaded yet does not open.** Built: the outlined box is not pressable.
+
+### Rulings made while the plan ran
+
+All are in `docs/superpowers/plans/2026-11-17-plan-7-rulings.md`. Those that change what Jerod sees or may meet:
+
+- **Ctrl+Q is looked at first, also under the question or the picture.** Under the question it changes nothing; under the picture it asks to quit, and the picture is put away. Every other key is left alone while either shows.
+- **The app keeps running without its window only when it is the first copy**: with no socket there would be no way back, so it must not stay behind.
+- **`RUNE_DIRS_ROOT` wins over `XDG_RUNTIME_DIR` for the socket's folder**, and no shared temporary folder is ever used (the app runs alone instead). This reverses the plan's order.
+- **A message that is queued or undelivered counts as working for the question in every phase**, not only while its program starts; decision 5 says "a message waits for its program", and a Quit then would lose it without a word. Built by the fix wave, with the message that the "open elsewhere" question holds.
+- **The Quit button's help says "Ctrl+Q" on every system**, as the plan words it; on macOS the key is Cmd+Q.
+- **The tray hears the standing only once it is there**, so a standing that changed before the tray came up is not lost.
+- **The live test starts one background task** and prints whether the program's record and the adapter's own guard counted it (see "The live test").
+
+### Things to look at
+
+- The question's look over two tiles (`target/snap/final/quit-ask-dark.png` and `-light.png`): its words on three lines inside the dialog, the close button at the dialog's top right, "Cancel" and a red "Quit" at its bottom right. The defect found in the first screenshots (the words on one line, running out of the window) is fixed.
+- The darkening under the large picture and the question. Under the picture it is black at 70% in both themes, so the window behind reads as behind (`viewer-*.png`). Under the question it is the toolkit's own in the light theme, and stronger in the dark theme (black at 60%), where the toolkit's hardly showed and the dialog's edge was hard to find.
+- The line "The full picture cannot be read." sits in its own small box above the zoom bar, readable in both themes, and over the input box behind it (`viewer-failed-*.png`). With a large picture it may lie over the picture's lower edge.
+- Whether a resting session looks different enough from one whose program idles. A session whose program was stopped looks the same in the sidebar.
+
+### What no agent could see
+
+No agent ran Claude Code or saw the real window or the desktop. What the look or the live test must settle:
+
+| Point | Read where | Seen working | Made sure by |
+| --- | --- | --- | --- |
+| With the window closed on GNOME Wayland, it is destroyed and comes back with the same tiles, drafts and scroll | the toolkit's source and README | no | Jerod's look, items 1 and 10 |
+| Timers and the app's clock run while no window shows | the toolkit's source | no | Jerod's look, item 8, with the idle time set short |
+| The tray icon shows on Ubuntu's GNOME | the toolkit's source (a StatusNotifierItem); Ubuntu ships a host for those | no | Jerod's look, item 2 |
+| A launch from the launcher brings the window in front with the keyboard | the toolkit's and winit's source (an activation token) | no | Jerod's look, item 3 |
+| A program closed while idle ends cleanly and its session resumes with model, effort and mode | closing and resuming were each seen (the live test, 2026-11-16) | each alone, yes | the live test, in one go |
+| The program's record of its background tasks: a list `tasks`, replaced whole each time, an entry's `off_host` | the program's own text (2.1.323) | the record and an empty list, yes; a task in it, no | the live test starts a task and prints whether a record counted it; a list that cannot be read counts as busy |
+| A tool call run in the background carries `run_in_background: true` in its input | the program's own text | no | the live test prints whether the guard counted the call |
+| A wake-up the program schedules for itself (a loop with a long pause) is among its background tasks | nowhere | no | nothing yet; see item 8 |
+| A quit asked for with no window ends the app | the toolkit's source | no | Jerod's look, item 11 |
+| A stored message's own id (`uuid`) finds it again, with its images | the history reader already follows `uuid` links | the links, yes; an image by it, no | the live test |
+
+And three points on the record of background tasks, none of them seen, from the build:
+
+- That an entry marks a task running off this computer with the key `off_host`. If the key is named otherwise, such a task counts and keeps the program up: safe.
+- That `tasks` lists only the tasks still running. If finished ones stay in it, they keep the program up: safe.
+- That a record comes whenever a background task starts. If none comes, the count from the records stays 0 while a task runs. The adapter's own guard covers that case from the tool call, if the call carries `run_in_background`. The live test tries both and prints what it found; item 8's third part tries it in the window. Until one of them has shown a program kept up by a background task, the idle stop is not to be trusted with one.
+
+### What is left
+
+- **This run's notices in a conversation are lost when a resting session gives its conversation back to the store** (for example "Could not rename the session"), which is after ten minutes out of every tile. The history read again does not hold them.
+- **A model, effort or mode chosen in the second or two while an idle program is being stopped does not take**; the session shows the old value. Remote Control asked for in that moment does take: the session is started again when its program has ended.
+- **A message typed in the moment its program goes is delivered after the restart.** If the program then ends again before it has started, the message waits for the user's next message, and nothing shows that it waits. (A program that starts and refuses the message twice in a row leaves the session ended with a notice; see decision 15.)
+- **A picture of a session continued as a copy** is asked for under the original's id while the copy holds the conversation it was made from. Once the copy has given its conversation back and read it again from its own file, it asks under its own id. Whether the copy's file keeps the original messages' ids is not known; if not, the picture then shows small with the line, never as another picture.
+- Undelivered messages are lost at Quit, as a draft is. Quit asks first while one waits.
+- **A second launch's folder can be dropped without a word.** When MindRune is launched again with a folder before the running copy has reached its main screen (a launch a second after the first), or with a folder whose name is not valid UTF-8, the window shows and no session opens, while the second launch still says "already running; its window is shown".
+- **A session this app ran is not asked about again, however long it has rested.** The question whether another app has a session open is skipped for a session whose program this app ran in this run. A session stopped for idling in the morning and continued in a terminal in the afternoon is joined from MindRune without the question, and its tile still shows the morning's conversation. For a later plan: remember when the program was stopped, and ask the store again when the next message comes long after.
+- A stored picture is read from the whole session file on the thread that also answers the store's other questions, and the read is not skipped when its viewer has closed meanwhile. With a session file of hundreds of megabytes a press on a picture can hold up a message to a stored session for about a second.
+- A sent image is kept in full while its conversation is held, with no ceiling per session (decision 21).
+- On macOS the tray is not there and says so on stderr at each start; only Linux was looked at. On Windows the close still ends the app.
+- Smaller things: a divider drag cut off by the window's close is saved as dragged, and the next save puts that right; one test is still not written (a peer on the socket that connects and then says nothing more). The other small things the task reviews deferred were done by the fix wave: the warning on stderr when a program does not end now says "as the app quit", the tray hears its first standing at once, and the dialog's close button and a press outside it have tests.
+- Not in this plan, on purpose: desktop notifications, starting at login, sessions that come back running after a Quit, keeping a draft across a Quit, a background service, more than one window, moving between pictures with the arrow keys, and Task 13 of plan 5, which still waits for Jerod's recording.
+
+### The whole-branch review of plan 7
+
+The whole branch was reviewed on 2026-11-17, after Task 11. The review found nothing critical and four things it called important, all where the idle stop meets something it had not been weighed against. A fix wave followed, in five commits from `1884154` on.
+
+#### What was fixed
+
+- **Remote Control turned on for a session whose program was stopped for idling now comes on.** The session is started for it, also when it was asked in the second or two while the program was being stopped. A resting session whose program this app did not run in this run still waits for its next start, as plan 5 built it.
+- **The usage refresh no longer works against the idle stop.** An answer to the app's own ask for the usage limits does not count as something from the program. After a usage window's reset the app asks once, and clears a lapsed window the answer leaves out. No program is started for it while no window shows. Before, a program could stay up for hours on those answers, and a closed app could start a program every five minutes through the night.
+- **A second guard for background tasks**, in the adapter, from the tool call itself (decision 13), and the live test now starts a background task and reports on it.
+- **A message its program never got starts the program at most twice in a row** (decision 15).
+- **Quit during an idle stop waits for the program that is being stopped**, as it waits for the others.
+- **A conversation is given back to the store later**, after ten minutes out of every tile (decision 16).
+- **The question's words wrap, and Return presses "Cancel"** (decision 5). The question also counts a message that waits in any phase.
+- **`mindrune --quit` says when the app asks instead of quitting** (decision 6).
+- **The darkening under a picture and, in the dark theme, under the question is stronger.**
+- **A copy asks for its stored pictures under the id its conversation was read from** (decision 22).
+- **A second answer for a picture that already shows in full changes nothing.** Before, a picture opened, closed and opened again quickly could show the line "The full picture cannot be read." over a good picture.
+- Smaller things: the lock and the socket get the sticky bit; a token longer than 512 bytes is refused; the large picture is named "Image, enlarged" to a screen reader and its error line is no longer read as disabled; a stored image is decoded alone, not with its message's other images; and the tests the task reviews had found missing were written.
+
+#### What was left, and why
+
+Each of these is in "What is left", above: a choice made while an idle program is being stopped, a message held after a program ended before it started, a second launch's folder dropped without a word, the question about another app after a long rest, a picture's read that is not skipped when its viewer has closed, and a ceiling on the images kept. None of them loses work or stops a program that should run.
+
+Two things in the fix wave are worth a look, because the fixer chose them:
+
+- After the restart bound, the session that is left ended is marked in the sidebar as finished when it is not in the focused tile or no window shows, as a program that died out of sight is. Without the mark nothing would show that a message was not delivered.
+- The error line under a large picture is no longer passed through by the pointer: a press on it closes the picture.
 
 ## Jerod's look at plan 6
 
@@ -80,7 +339,7 @@ What this window will not do yet, so it is judged for what it is:
 - **Dropping a file onto the window does nothing in a Wayland session**, which is what Jerod's desktop runs. The toolkit hears no file drops there (winit 0.30 reports none). The drop is built and tested, and works under X11. Until the toolkit hears drops on Wayland the ways in are: paste an image, copy files in the file manager and paste them, or the attach button.
 - **The attach button picks one file at a time.** The toolkit's dialog has no way to pick several. Press it again for the next.
 - **The button shows a plus sign, not a paperclip.** The theme has no paperclip.
-- A sent image is shown small in its message, since the addition of 2026-11-16. A press on it does nothing yet: it cannot be seen large.
+- A sent image is shown small in its message, since the addition of 2026-11-16. A press on it does nothing yet: it cannot be seen large. Jerod asked for that on 2026-11-16: it is in plan 7 (see "Left by plan 6").
 - Chips are lost when the app closes, as a draft's text is.
 - An image larger than 2,000 pixels a side, or heavier than about 3.9 MB, is made smaller before it is sent. The file on disk is never changed.
 - A file that is not a PNG, JPEG, GIF or WebP image goes by its path, also a PDF, an SVG or a HEIC photo. Claude reads it from disk with its own tools.
@@ -192,6 +451,16 @@ Each of these is left by a ruling (26 to 34 in the rulings file), with what it c
 - Small things: `write_line` copies each line once more; view tests wait for the worker threads by counting frames; turning orientations 5 to 8 copies the decoded image and only orientation 6 is tested; tests not written for the pixel cap's edge, bad base64, `new_session` with chips, stacked tiles taking a drop, a paste while a dialog is open; `field::field` takes seven arguments by position; `glue::setup` makes the thumbnails' cache anew on every call.
 
 For plan 7 (running in the background): the window will come back from hidden often, which is why the field's scroll must not stick to its end (ruling 20); and a session's chips live in memory only, so a program stopped for being idle keeps them, and quitting loses them.
+
+**Asked for plan 7 by Jerod on 2026-11-16, after plan 6 was merged:** "Add to plan 7, being able to click an attached picture to open it." So plan 7 holds two things: running in the background, and a press on a picture that opens it. This takes back the "does nothing" of ruling 41 in the plan 6 rulings. What the plan's writer needs to know:
+
+- Their words are "an attached picture". Read as both places a picture shows unless they say otherwise: a sent picture in the conversation (`mr-user-picture-{id}`) and a chip's picture in the box before sending (`mr-chip-thumb-{id}`).
+- What "open" means was asked the same day (large inside the window, or the desktop's image viewer), and Jerod chose: "In the window". A pressed picture opens large inside the MindRune window, and closes with Escape or a click. Whether it lies over its tile or over the whole window is the plan's to decide.
+- The app holds only the small picture (320 pixels on its longer side) once a message is sent. The full image is in a chip's `Source` until the send, and afterwards only in the program's stored record of the session, which the history reader reads (the last 16 MiB of it, as today) and could read again for one image. An image over the limits was made smaller before it went, so what is stored is what Claude got, not the user's file.
+- A press on a picture today focuses its tile and leaves the keyboard where it is (ruling 41); the pictures row is nothing to a screen reader and each picture is an image (ruling 43). A picture that can be pressed becomes a button to a screen reader at this Rune, so its name must say what the press does.
+- A chip's picture sits beside its remove control, which is a Tab stop; whether an openable picture is one too is the plan's to decide.
+
+Plan 7 was written on 2026-11-16 at Jerod's word ("Write plan 7"): `docs/superpowers/plans/2026-11-16-background-and-pictures.md`, eleven tasks, 24 decisions of the planner's that Jerod has not seen. It is not approved and nothing of it is built. It opens the picture over the whole window with the kit's own viewer, makes a chip's picture a Tab stop, and keeps a sent image in memory in full while its conversation is held. Two research reports made for it are on disk and not in git, under `.superpowers/sdd/plan-7-research/`. *On 2026-11-17 Jerod said "Yes, build it"; it is built on the branch `plan-7-background-pictures`: see "Jerod's look at plan 7".*
 
 ### The whole-branch review of plan 6
 
@@ -308,7 +577,7 @@ Still unseen for plan 5: a change of effort sent while a turn runs, a message ma
 What this window will not do yet, so it is judged for what it is:
 
 - A prompt typed on a phone or at claude.ai/code runs, and its reply streams into the tile, but the prompt itself is not shown above the reply. That is Task 13, which waits for a recording (see "Left by plan 5").
-- The Remote Control switch does not start a session's program. On a session that is resting it is remembered, the panel says "Turns on when the session starts.", and it is turned on with the next message.
+- The Remote Control switch does not start a session's program. On a session that is resting it is remembered, the panel says "Turns on when the session starts.", and it is turned on with the next message. (Since plan 7 there is one exception: a resting session whose program this app ran in this run, as one stopped for idling, is started for it.)
 - Remote Control is not turned on again by itself after the app is closed and opened, but for new sessions when "On for new sessions" is set.
 - Closing the window still ends every session's program, so Remote Control ends with it. Running in the background is plan 7.
 - The list of changed files is what the session's own edits say, not what git says, and it knows only the part of a long session that is loaded. A notebook edit is not counted.
@@ -365,7 +634,7 @@ The seventeen decisions are the planner's; Jerod has not seen them.
 5. **A stored session goes on with the effort it last used.** Built: the history gives the `effort` of the last `assistant` record that names one, and the session passes it with `--effort` when it wakes. A level the model is known not to take is forgotten while the session rests. The list has no "default" entry.
 6. **In a tile too narrow for three pickers the mode is cut first, then the effort, and the model's name last.** Built: the mode sits in a slot that takes the free room, so it gives up width first; the effort then shrinks to 48 points; the model gets what the others leave (`input::model_room`). At 48 points a trigger shows only an ellipsis and its chevron (see "Things to look at").
 7. **The switch shows what was asked at once.** Built in `view/panel/mod.rs`: the switch `mr-panel-remote` shows on while Remote Control is wanted or while the program says it is not off, and a press asks for the opposite of what it shows. The session remembers what its running program was last asked until the program's answer settles it, so a second press before the first was answered is sent too (since the fix wave). The line under it says "Connecting…" from the press on. A refusal puts it back to off, with the reason under the switch and as a line in the conversation, once, also when the program tells it twice. The reasons are the plan's own words; a bare `/login` from the program is never shown.
-8. **The switch never starts a program.** Built: on a resting or opening session the wish is kept and the line says "Turns on when the session starts."; the session asks when its program has started, after a rename and before the queued message.
+8. **The switch never starts a program.** Built: on a resting or opening session the wish is kept and the line says "Turns on when the session starts."; the session asks when its program has started, after a rename and before the queued message. (Since plan 7 the switch does start the program of a resting session that this app ran in this run; see plan 7's decision 12.)
 9. **What was asked is kept for the run of the app.** Built: `Session.remote_wanted` survives the program's end, so a program started again for the session turns Remote Control on again. It is not saved.
 10. **"On for new sessions".** Built: a second switch under the first, `mr-panel-remote-new`, off by default, saved in `Saved.remote_for_new`. It holds for sessions made with "New session" and for the session of a folder given at launch, not for stored sessions or a copy made by "Continue as a copy". It also shows when no session is open, and is disabled, as the first switch is, when the agent has no Remote Control ("Remote Control is not available.").
 11. **The mark.** Built in `view/tiles.rs`: "Remote" (`mr-tile-remote`) between the state word and the close button, in the accent while on and muted while connecting or reconnecting. It takes its room from the title. A press on it is a press on the header.

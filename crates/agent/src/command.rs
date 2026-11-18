@@ -70,6 +70,11 @@ impl ImageData {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// The bytes behind their shared pointer, without a copy.
+    pub fn shared(&self) -> Arc<[u8]> {
+        self.0.clone()
+    }
 }
 
 /// Says how many bytes there are, never what they are.
@@ -141,5 +146,6 @@ mod tests {
         let data = ImageData::new(vec![1u8, 2, 3]);
         let copy = data.clone();
         assert_eq!(data.as_bytes().as_ptr(), copy.as_bytes().as_ptr());
+        assert!(Arc::ptr_eq(&data.shared(), &copy.shared()));
     }
 }

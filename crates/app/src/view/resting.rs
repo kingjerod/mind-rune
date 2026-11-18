@@ -452,6 +452,7 @@ mod tests {
                     image_count: 3,
                     files: Vec::new(),
                     images: vec![None; 3],
+                    stored: None,
                 },
                 HistoryItem::AssistantText("Three screenshots of the same error.".into()),
             ],
@@ -899,6 +900,7 @@ mod tests {
                         image_count: 0,
                         files: Vec::new(),
                         images: Vec::new(),
+                        stored: None,
                     },
                     HistoryItem::AssistantText(format!("Answer {n}")),
                 ]

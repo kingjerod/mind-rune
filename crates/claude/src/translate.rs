@@ -108,6 +108,10 @@ pub struct Translator {
     request_calls: HashSet<String>,
     /// The requests to send next, in order. See [`Translator::take_requests`].
     requests: Vec<(Tracked, Value)>,
+    /// The background tasks last counted: by the program's own record, or as at least one
+    /// since a tool call ran in the background (see [`Translator::background_started`]). A
+    /// translator serves one program, so the next program starts with none.
+    background: usize,
 }
 
 /// The model a record names when the program made it itself rather than a model's reply.
@@ -216,6 +220,24 @@ impl Translator {
                 failure_kind,
             } => self.bridge_state(&state, detail, failure_kind.as_deref()),
             Incoming::TitleChanged { title } => self.title_changed(title).into_iter().collect(),
+            Incoming::BackgroundTasks { tasks } => {
+                self.background = background_tasks(&tasks);
+                vec![SessionEvent::BackgroundTasks {
+                    running: self.background,
+                }]
+            }
+            // A sub-agent's work is not reported, but a task it leaves running is the program's.
+            Incoming::Assistant {
+                parent: Some(_),
+                blocks,
+                ..
+            } => blocks
+                .iter()
+                .filter(
+                    |block| matches!(block, Block::ToolUse { input, .. } if in_background(input)),
+                )
+                .map(|_| self.background_started())
+                .collect(),
             Incoming::ControlResponse {
                 request_id,
                 ok,
@@ -240,7 +262,6 @@ impl Translator {
             ),
             // Sub-agent records (`parent` set) and the kinds later rules cover.
             Incoming::Stream { .. }
-            | Incoming::Assistant { .. }
             | Incoming::ToolResults { .. }
             | Incoming::ControlRequest { .. }
             | Incoming::Ignored { .. } => Vec::new(),
@@ -599,6 +620,9 @@ impl Translator {
                         name,
                         detail,
                     });
+                    if in_background(&input) {
+                        events.push(self.background_started());
+                    }
                 }
                 Block::Text(text) if !streamed && !text.is_empty() => {
                     events.push(SessionEvent::TextDelta(text));
@@ -615,6 +639,17 @@ impl Translator {
             }
         }
         events
+    }
+
+    /// A tool call was run in the background: from now on at least one task counts as running,
+    /// until a record of the program's tasks arrives and decides. A second guard beside that
+    /// record, which was never seen with a task in it: should none come when a task starts, a
+    /// program that started one is still not taken for idle.
+    fn background_started(&mut self) -> SessionEvent {
+        self.background = self.background.max(1);
+        SessionEvent::BackgroundTasks {
+            running: self.background,
+        }
     }
 
     fn can_use_tool(&mut self, request_id: String, body: &Value) -> Vec<SessionEvent> {
@@ -914,6 +949,25 @@ fn context_breakdown(body: &Value) -> Option<SessionEvent> {
         parts,
         window,
     }))
+}
+
+/// Counts the tasks that need the program to stay up: every entry but those that run off this
+/// computer. A list that cannot be read, and an entry that is not an object, count as a task:
+/// a program is never stopped because its record could not be read.
+fn background_tasks(tasks: &Value) -> usize {
+    match tasks.as_array() {
+        Some(list) => list
+            .iter()
+            .filter(|task| task.get("off_host").and_then(Value::as_bool) != Some(true))
+            .count(),
+        None => 1,
+    }
+}
+
+/// Whether a tool call's input asks for the tool to run in the background: the field
+/// `run_in_background`, set to `true`.
+fn in_background(input: &Value) -> bool {
+    input.get("run_in_background").and_then(Value::as_bool) == Some(true)
 }
 
 fn command_failed(what: CommandKind, reason: String) -> SessionEvent {
@@ -3486,5 +3540,156 @@ mod tests {
                 "{response}"
             );
         }
+    }
+
+    // The `background_tasks_changed` records below are written by hand from what the program
+    // says it sends: never seen live with a task in them. Their values are made up.
+
+    /// A record of the program's background tasks, with `tasks` as given.
+    fn background(tasks: &str) -> String {
+        format!(
+            r#"{{"type":"system","subtype":"background_tasks_changed","tasks":{tasks},"uuid":"u","session_id":"s"}}"#
+        )
+    }
+
+    fn running(n: usize) -> Vec<SessionEvent> {
+        vec![SessionEvent::BackgroundTasks { running: n }]
+    }
+
+    #[test]
+    fn background_tasks_are_counted() {
+        // A task that runs off this computer does not need the program to stay up.
+        let tasks = r#"[
+            {"task_id":"t1","task_type":"local_bash","description":"npm run dev"},
+            {"task_id":"t2","task_type":"local_agent","description":"review","off_host":true}
+        ]"#
+        .replace('\n', "");
+        assert_eq!(feed(&[&background(&tasks)]), running(1));
+        let on_host = r#"[{"task_id":"t1","off_host":false},{"task_id":"t2"}]"#;
+        assert_eq!(feed(&[&background(on_host)]), running(2));
+    }
+
+    #[test]
+    fn an_empty_list_is_no_task() {
+        assert_eq!(feed(&[&background("[]")]), running(0));
+        let off_host = r#"[{"task_id":"t1","off_host":true}]"#;
+        assert_eq!(feed(&[&background(off_host)]), running(0));
+    }
+
+    #[test]
+    fn a_list_that_cannot_be_read_counts_as_one() {
+        assert_eq!(feed(&[&background(r#""x""#)]), running(1));
+        assert_eq!(feed(&[&background("null")]), running(1));
+        let missing =
+            r#"{"type":"system","subtype":"background_tasks_changed","uuid":"u","session_id":"s"}"#;
+        assert_eq!(feed(&[missing]), running(1));
+        // An entry that is not an object counts as a task of its own.
+        let odd = r#"["t1",{"task_id":"t2","off_host":true},7]"#;
+        assert_eq!(feed(&[&background(odd)]), running(2));
+    }
+
+    #[test]
+    fn each_record_replaces_the_count() {
+        let two = r#"[{"task_id":"t1"},{"task_id":"t2"}]"#;
+        let one = r#"[{"task_id":"t2"}]"#;
+        assert_eq!(
+            feed(&[&background(two), &background(one), &background("[]")]),
+            [running(2), running(1), running(0)].concat()
+        );
+    }
+
+    // The tool calls below are written by hand: `run_in_background` is the field the program's
+    // shell and agent tools take for a task that outlives the call. Never seen live.
+
+    /// A top-level record with one call of the shell tool, its input as given.
+    fn shell_call(id: &str, input: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"id":"m2","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{input}}}]}}}}"#
+        )
+    }
+
+    /// The background task counts among `events`, in order.
+    fn counts(events: &[SessionEvent]) -> Vec<usize> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::BackgroundTasks { running } => Some(*running),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const IN_BACKGROUND: &str = r#"{"command":"npm run dev","run_in_background":true}"#;
+
+    #[test]
+    fn a_tool_call_run_in_the_background_counts_until_a_record_says_otherwise() {
+        let events = feed(&[&shell_call("t1", IN_BACKGROUND)]);
+        assert!(
+            matches!(&events[0], SessionEvent::ToolStarted { name, .. } if name == "Bash"),
+            "{events:?}"
+        );
+        assert_eq!(events[1..], running(1), "after the call it belongs to");
+        // No record ever comes: nothing later takes the count back, not a call that is not in
+        // the background and not the end of the turn.
+        let later = feed(&[
+            &shell_call("t1", IN_BACKGROUND),
+            &shell_call("t2", r#"{"command":"ls"}"#),
+            RESULT_OK,
+            MSG_START,
+            ASSISTANT_OK,
+            RESULT_OK,
+        ]);
+        assert_eq!(counts(&later), vec![1]);
+        // A second such call still counts as one: only the records know how many run.
+        let twice = feed(&[
+            &shell_call("t1", IN_BACKGROUND),
+            &shell_call("t2", IN_BACKGROUND),
+        ]);
+        assert_eq!(counts(&twice), vec![1, 1]);
+        // A call a sub-agent makes is not shown, and counts all the same.
+        let sub = r#"{"type":"assistant","parent_tool_use_id":"t9","message":{"id":"m3","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"make","run_in_background":true}}]}}"#;
+        assert_eq!(feed(&[sub]), running(1));
+        // Each program has a translator of its own: the next one starts with nothing counted.
+        let fresh = feed(&[&shell_call("t1", r#"{"command":"ls"}"#)]);
+        assert!(counts(&fresh).is_empty());
+    }
+
+    #[test]
+    fn a_record_after_it_takes_over() {
+        let one = r#"[{"task_id":"t1"}]"#;
+        let events = feed(&[
+            &shell_call("t1", IN_BACKGROUND),
+            &background(one),
+            &background("[]"),
+            &shell_call("t2", r#"{"command":"ls"}"#),
+        ]);
+        assert_eq!(counts(&events), vec![1, 1, 0], "the records decide");
+        // A call after a record counts again, and never takes away what the record counted.
+        let two = r#"[{"task_id":"t1"},{"task_id":"t2"}]"#;
+        let events = feed(&[
+            &background("[]"),
+            &shell_call("t1", IN_BACKGROUND),
+            &background(two),
+            &shell_call("t2", IN_BACKGROUND),
+        ]);
+        assert_eq!(counts(&events), vec![0, 1, 2, 2]);
+    }
+
+    #[test]
+    fn a_tool_call_not_in_the_background_counts_nothing() {
+        for input in [
+            r#"{"command":"ls"}"#,
+            r#"{"command":"ls","run_in_background":false}"#,
+            r#"{"command":"ls","run_in_background":null}"#,
+            r#"{"command":"ls","run_in_background":"true"}"#,
+            r#""run_in_background""#,
+        ] {
+            let events = feed(&[&shell_call("t1", input)]);
+            assert!(counts(&events).is_empty(), "{input}");
+            assert_eq!(events.len(), 1, "{input}: the call itself");
+        }
+        // A tool that asks the user is no task, whatever its input says.
+        let ask = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"t_q","name":"AskUserQuestion","input":{"questions":[],"run_in_background":true}}]}}"#;
+        assert_eq!(feed(&[ask]), vec![]);
     }
 }

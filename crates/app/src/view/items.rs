@@ -277,10 +277,12 @@ fn user_message(
 /// The pictures of the user's message `id`, one per picture id, in a row keyed
 /// `mr-user-pictures-{id}` that is [`PICTURE_HEIGHT`] high whatever has come, scrolls sideways
 /// and never wraps. A picture whose handle is made is drawn whole in a box its shape asks for
-/// (`mr-user-picture-{picture}`); until then, and for good when it never comes, a slot of the
-/// bubble's own colour, outlined, with the image icon stands in its place
-/// (`mr-user-picture-wait-{picture}`). A press on the row focuses `key`'s tile and leaves the
-/// keyboard where it was. None for a message with no image.
+/// (`mr-user-picture-{picture}`), and a press on it opens it large (`glue::open_picture`); until
+/// then, and for good when it never comes, a slot of the bubble's own colour, outlined, with the
+/// image icon stands in its place (`mr-user-picture-wait-{picture}`). A press on the row
+/// focuses `key`'s tile and leaves the keyboard where it was; a press on a picture hands the
+/// keyboard to the viewer until it closes. Neither is a Tab stop. None for a message with no
+/// image.
 fn pictures(
     thumbs: &HashMap<u64, Image>,
     key: SessionKey,
@@ -298,13 +300,16 @@ fn pictures(
             .get(&picture)
             .and_then(|image| Some((image, image.size()?)));
         match made {
-            Some((image, [width, height])) => el()
-                .key(format!("mr-user-picture-{picture}"))
-                .size(picture_width(width, height), PICTURE_HEIGHT)
-                .radius(PICTURE_RADIUS)
-                .pixels_fit(image.pixels(), SurfaceFit::Fit)
-                .role("img")
-                .label(label),
+            // A press opens it large; the keyboard stays where it is.
+            Some((image, [width, height])) => requests::unfocusable(
+                el().key(format!("mr-user-picture-{picture}"))
+                    .size(picture_width(width, height), PICTURE_HEIGHT)
+                    .radius(PICTURE_RADIUS)
+                    .pixels_fit(image.pixels(), SurfaceFit::Fit)
+                    .role("button")
+                    .label(format!("Open image {} of {count}", n + 1))
+                    .on_press(move |ui: &mut Ui| glue::open_picture(ui, key, picture)),
+            ),
             None => rune::row()
                 .key(format!("mr-user-picture-wait-{picture}"))
                 .size(PICTURE_HEIGHT, PICTURE_HEIGHT)
@@ -1325,6 +1330,7 @@ mod tests {
                     image_count: 2,
                     files: Vec::new(),
                     images: vec![None; 2],
+                    stored: None,
                 },
                 HistoryItem::AssistantText("Read them all.".into()),
             ],
@@ -1478,7 +1484,7 @@ mod tests {
                 shown.rect,
                 row.rect
             );
-            assert_eq!(shown.label, Some(format!("Image {} of 3", n + 1)));
+            assert_eq!(shown.label, Some(format!("Open image {} of 3", n + 1)));
             assert_eq!(shown.radius, 6.0);
             assert_eq!(shown.fill.a, 0.0, "the bands are the bubble's own colour");
             assert!(!shown.focusable);
@@ -1515,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn a_screen_reader_hears_the_pictures_and_no_button() {
+    fn a_screen_reader_hears_a_button_that_opens_the_picture() {
         let mut rt = testkit::window("empty");
         let (_, id) = say_pictures(&mut rt, "Which one?", &[(4, 3), (3, 4)]);
         let ids = pictures_of(&rt, id);
@@ -1534,11 +1540,12 @@ mod tests {
         };
         let (drawn, above_drawn) = keyed(&format!("mr-user-picture-{}", ids[0]));
         let (waiting, above_waiting) = keyed(&format!("mr-user-picture-wait-{}", ids[1]));
-        assert_eq!(drawn["role"], "image");
-        assert_eq!(drawn["name"], "Image 1 of 2");
+        assert_eq!(drawn["role"], "button");
+        assert_eq!(drawn["name"], "Open image 1 of 2");
         assert_eq!(waiting["role"], "image");
         assert_eq!(waiting["name"], "Image 2 of 2, not loaded");
-        // Within its row of the conversation: the tile around it is not this task's.
+        // Within its row of the conversation, nothing around either is a button: the tile
+        // around it is not this task's.
         for above in [above_drawn, above_waiting] {
             let row = above
                 .iter()
@@ -1713,6 +1720,8 @@ mod tests {
         );
         rt.pointer_up(x, y);
         testkit::step(&mut rt);
+        // The picture opens large over the window; put away, it gives the keyboard back.
+        close_picture(&mut rt, picture);
         assert!(testkit::box_focused(&rt, key), "the box keeps the keyboard");
         let draft = &glue::view_of(&rt.state, key).draft;
         assert_eq!(draft.text, "and then");
@@ -1740,6 +1749,8 @@ mod tests {
         let draft = glue::view_of(&rt.state, asks).draft.clone();
         testkit::click(&mut rt, &shown);
         testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(asks));
+        close_picture(&mut rt, picture);
         assert!(testkit::box_focused(&rt, asks));
         assert_eq!(testkit::focused(&rt), Some(asks));
         let after = &glue::view_of(&rt.state, asks).draft;
@@ -1751,10 +1762,20 @@ mod tests {
         testkit::click(&mut rt, &shown);
         testkit::step(&mut rt);
         assert_eq!(testkit::focused(&rt), Some(sent));
+        close_picture(&mut rt, picture);
+        assert_eq!(testkit::focused(&rt), Some(sent));
         assert!(
             !testkit::box_focused(&rt, sent),
             "the keyboard stays where it was"
         );
+    }
+
+    /// Puts away picture `picture`, which a press opened large, with Escape.
+    fn close_picture(rt: &mut Runtime<Ui>, picture: u64) {
+        assert_eq!(rt.state.viewing.as_ref().map(|v| v.picture), Some(picture));
+        testkit::press(rt, rune::Key::Escape);
+        testkit::step(rt);
+        assert!(rt.state.viewing.is_none());
     }
 
     /// A file named `name` in `dir`, with a line in it.
@@ -1824,6 +1845,7 @@ mod tests {
                         "/home/alex/notes/todo.txt".into(),
                     ],
                     images: Vec::new(),
+                    stored: None,
                 },
                 HistoryItem::AssistantText("Read them.".into()),
             ],

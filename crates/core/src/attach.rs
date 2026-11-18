@@ -129,7 +129,8 @@ pub fn prepare(source: &Source) -> Result<Prepared, Problem> {
 
 /// The picture of an image stored with a message, made as a chip's thumb is: the format known
 /// by its first bytes, the same limits, a JPEG turned upright by its tag. `None` for anything
-/// that is not a readable image. Slow: the backend's preparing thread only.
+/// that is not a readable image. Slow: never on the UI thread. The backend's preparing thread
+/// calls it, and the tray's thread for its icon.
 pub fn picture_of(image: &ImageData) -> Option<Thumb> {
     let format = image_format(image.as_bytes())?;
     let (decoded, _) = decode(image.as_bytes(), format, Limits::default()).ok()?;

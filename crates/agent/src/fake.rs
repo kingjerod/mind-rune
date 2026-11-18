@@ -15,13 +15,13 @@
 //! or a `SetEffort` is recorded and not answered: a test answers it with `emit`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::agent::{
-    Account, Agent, AgentError, Capabilities, EventSink, SessionHandle, StartSpec, StoredHistory,
-    StoredSession,
+    Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, SessionHandle, StartSpec,
+    StoredHistory, StoredSession,
 };
-use crate::command::SessionCommand;
+use crate::command::{ImageData, SessionCommand};
 use crate::event::{
     ContextBreakdown, ContextKind, ContextPart, ModelOption, PermissionMode, SessionEvent,
     SessionInfo,
@@ -74,6 +74,12 @@ struct Inner {
     waiting: HashMap<SessionId, HashSet<RequestId>>,
     /// The detail the next `open` dies with, if a test asked for that.
     fail_next_open: Option<String>,
+    /// `read_session` waits until a test resumes reads.
+    reads_paused: bool,
+    /// How many times `read_session` was called, each counted as it starts.
+    history_reads: usize,
+    /// The detail every `read_image` fails with, once a test asked for that.
+    image_failure: Option<String>,
 }
 
 impl Inner {
@@ -114,6 +120,8 @@ impl Inner {
 #[derive(Clone)]
 pub struct FakeAgent {
     inner: Arc<Mutex<Inner>>,
+    /// Wakes the reads waiting while reads are paused.
+    resumed: Arc<Condvar>,
 }
 
 impl Default for FakeAgent {
@@ -145,7 +153,11 @@ impl FakeAgent {
                 ended: HashSet::new(),
                 waiting: HashMap::new(),
                 fail_next_open: None,
+                reads_paused: false,
+                history_reads: 0,
+                image_failure: None,
             })),
+            resumed: Arc::new(Condvar::new()),
         }
     }
 
@@ -239,6 +251,29 @@ impl FakeAgent {
     pub fn sent(&self) -> Vec<(SessionId, SessionCommand)> {
         self.lock().sent.clone()
     }
+
+    /// Make every later `read_image` fail with `AgentError::Io(detail)`.
+    pub fn fail_image(&self, detail: &str) {
+        self.lock().image_failure = Some(detail.to_string());
+    }
+
+    /// Makes every `read_session` wait, once counted, until `resume_reads`; every `read_image`
+    /// waits too.
+    pub fn pause_reads(&self) {
+        self.lock().reads_paused = true;
+    }
+
+    /// Lets the waiting reads, and every later one, go on.
+    pub fn resume_reads(&self) {
+        self.lock().reads_paused = false;
+        self.resumed.notify_all();
+    }
+
+    /// How many times `read_session` was called, counted as each starts: one waiting while
+    /// reads are paused counts.
+    pub fn history_reads(&self) -> usize {
+        self.lock().history_reads
+    }
 }
 
 impl Agent for FakeAgent {
@@ -263,7 +298,12 @@ impl Agent for FakeAgent {
     }
 
     fn read_session(&self, id: &SessionId, max_items: usize) -> Result<StoredHistory, AgentError> {
-        let mut history = match self.lock().history.get(id) {
+        let mut inner = self.lock();
+        inner.history_reads += 1;
+        while inner.reads_paused {
+            inner = self.resumed.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+        let mut history = match inner.history.get(id) {
             Some(Ok(history)) => history.clone(),
             Some(Err(detail)) => return Err(AgentError::Io(detail.clone())),
             None => {
@@ -279,6 +319,42 @@ impl Agent for FakeAgent {
             history.earlier_left_out = true;
         }
         Ok(history)
+    }
+
+    /// The image at `index` of the user's message whose `stored` id is `message`, in the history
+    /// given for `id`.
+    fn read_image(
+        &self,
+        id: &SessionId,
+        message: &str,
+        index: usize,
+    ) -> Result<ImageData, AgentError> {
+        let mut inner = self.lock();
+        while inner.reads_paused {
+            inner = self.resumed.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+        if let Some(detail) = &inner.image_failure {
+            return Err(AgentError::Io(detail.clone()));
+        }
+        let io = |words: &str| AgentError::Io(words.into());
+        let Some(Ok(history)) = inner.history.get(id) else {
+            return Err(io("the session is not in the store"));
+        };
+        let images = history
+            .items
+            .iter()
+            .find_map(|item| match item {
+                HistoryItem::User { images, stored, .. } if stored.as_deref() == Some(message) => {
+                    Some(images)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| io("the message is not in the session"))?;
+        images
+            .get(index)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| io("the message has no such image"))
     }
 
     fn last_active(&self, id: &SessionId) -> Result<Option<i64>, AgentError> {
@@ -483,7 +559,6 @@ impl SessionHandle for FakeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::HistoryItem;
     use crate::command::Answer;
     use crate::event::{CommandKind, ContextKind, TurnSummary, UserRequest, UserRequestKind};
     use crate::ids::RequestId;
@@ -644,6 +719,7 @@ mod tests {
                     image_count: 1,
                     files: Vec::new(),
                     images: vec![Some(image.clone())],
+                    stored: None,
                 }],
                 ..StoredHistory::default()
             },
@@ -656,6 +732,44 @@ mod tests {
             panic!("not one image read: {images:?}");
         };
         assert_eq!(read.as_bytes().as_ptr(), image.as_bytes().as_ptr());
+    }
+
+    #[test]
+    fn the_fake_reads_an_image_again_by_its_message() {
+        let fake = FakeAgent::new();
+        let id = SessionId("s1".into());
+        let image = crate::command::ImageData::new(vec![9u8, 8, 7]);
+        fake.set_history(
+            &id,
+            StoredHistory {
+                items: vec![HistoryItem::User {
+                    text: "see".into(),
+                    image_count: 2,
+                    files: Vec::new(),
+                    images: vec![None, Some(image.clone())],
+                    stored: Some("m1".into()),
+                }],
+                ..StoredHistory::default()
+            },
+        );
+        let read = fake.read_image(&id, "m1", 1).unwrap();
+        assert!(Arc::ptr_eq(&read.shared(), &image.shared()));
+        let io = |words: &str| Err(AgentError::Io(words.into()));
+        assert_eq!(
+            fake.read_image(&id, "m1", 0),
+            io("the message has no such image")
+        );
+        assert_eq!(
+            fake.read_image(&id, "m2", 0),
+            io("the message is not in the session")
+        );
+        let other = SessionId("s2".into());
+        assert_eq!(
+            fake.read_image(&other, "m1", 0),
+            io("the session is not in the store")
+        );
+        fake.fail_image("gone");
+        assert_eq!(fake.read_image(&id, "m1", 1), io("gone"));
     }
 
     #[test]

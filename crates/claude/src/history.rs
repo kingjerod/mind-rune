@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -367,6 +367,53 @@ pub fn find_session(projects_dir: &Path, id: &SessionId) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// One image of the stored message `message` of session `id`, read again: `index` counts the
+/// message's images from 0. The whole file is read from its start, a line at a time, and only
+/// a line that contains the id is parsed: the message is the first record whose `uuid` it is.
+/// Of its images only the one asked for is decoded.
+pub fn read_image(
+    projects_dir: &Path,
+    id: &SessionId,
+    message: &str,
+    index: usize,
+) -> Result<ImageData, AgentError> {
+    let said = |words: &str| AgentError::Io(words.into());
+    let path =
+        find_session(projects_dir, id).ok_or_else(|| said("the session is not in the store"))?;
+    if message.is_empty() {
+        return Err(said("the message is not in the session"));
+    }
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(said("the session is not in the store"));
+        }
+        Err(e) => return Err(AgentError::Io(e.to_string())),
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let record = loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| AgentError::Io(e.to_string()))?;
+        if read == 0 {
+            return Err(said("the message is not in the session"));
+        }
+        if contains(&line, message.as_bytes())
+            && let Some(record) = parse_record(&line)
+            && record.get("uuid").and_then(Value::as_str) == Some(message)
+        {
+            break record;
+        }
+    };
+    drop(line);
+    image_blocks(&record)
+        .nth(index)
+        .and_then(image_bytes)
+        .ok_or_else(|| said("the message has no such image"))
+}
+
 /// Adds what one record of a conversation shows to `items`. Side chains, meta
 /// records and compaction summaries show nothing. A tool result fills in the
 /// outcome of the tool at its position in `tool_positions`. A user's message comes without
@@ -408,6 +455,10 @@ fn add_user(record: &Value, items: &mut Vec<HistoryItem>, tool_positions: &HashM
         image_count: content.image_count,
         files: content.files,
         images: vec![None; content.image_count],
+        stored: record
+            .get("uuid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     });
 }
 
@@ -469,14 +520,18 @@ fn add_assistant(
 /// for an image held any other way than as base64, or whose base64 does not decode. Slow for
 /// large images: for the messages a history keeps only.
 pub(crate) fn stored_images(record: &Value) -> Vec<Option<ImageData>> {
-    let Some(Value::Array(blocks)) = record.get("message").and_then(|m| m.get("content")) else {
-        return Vec::new();
-    };
-    blocks
-        .iter()
+    image_blocks(record).map(image_bytes).collect()
+}
+
+/// The image blocks of a `user` record, in their order.
+fn image_blocks(record: &Value) -> impl Iterator<Item = &Value> {
+    record
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
-        .map(image_bytes)
-        .collect()
 }
 
 /// The bytes of an image block of the form
@@ -982,6 +1037,7 @@ mod tests {
                     PathBuf::from("/home/alex/proj/plan.md"),
                 ],
                 images: vec![None],
+                stored: Some("u1".into()),
             }]
         );
     }
@@ -997,6 +1053,7 @@ mod tests {
                 image_count: 0,
                 files: vec![PathBuf::from("/home/alex/proj/notes.txt")],
                 images: Vec::new(),
+                stored: Some("u1".into()),
             }]
         );
     }
@@ -1014,5 +1071,183 @@ mod tests {
             &[files_alone, with_text],
         );
         assert_eq!(describe(&path).title.as_deref(), Some("Fix the parser"));
+    }
+
+    /// The bytes of a picture of `count` pixels of one colour, made here: RGBA, as a picture
+    /// is drawn. The reader does not decode images.
+    fn pixels(colour: [u8; 4], count: usize) -> Vec<u8> {
+        colour.repeat(count)
+    }
+
+    /// A message of the user's with id `uuid`, its text and an image block for each of
+    /// `images`. Written by hand, field names and shapes only: never seen live.
+    fn message_with(uuid: &str, images: &[&[u8]]) -> String {
+        let mut content = vec![serde_json::json!({"type": "text", "text": "look"})];
+        content.extend(images.iter().map(|bytes| {
+            serde_json::json!({"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": STANDARD.encode(bytes),
+            }})
+        }));
+        serde_json::json!({
+            "type": "user", "uuid": uuid, "parentUuid": null,
+            "message": {"role": "user", "content": content},
+        })
+        .to_string()
+    }
+
+    /// A reply to `parent`, with id `uuid`. Written by hand, field names and shapes only:
+    /// never seen live.
+    fn reply_to(uuid: &str, parent: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "uuid": uuid, "parentUuid": parent,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Seen."}]},
+        })
+        .to_string()
+    }
+
+    fn image_of(bytes: &[u8]) -> ImageData {
+        ImageData::new(bytes.to_vec())
+    }
+
+    #[test]
+    fn a_stored_message_has_its_id() {
+        let record = message_with("m1", &[]);
+        let items = read_one(&record);
+        let [HistoryItem::User { stored, .. }] = items.as_slice() else {
+            panic!("not one message of the user's");
+        };
+        assert_eq!(stored.as_deref(), Some("m1"));
+        // The reader of a history fills it in too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "-home-alex-proj", "s1", &[&record]);
+        let history = crate::history_tail::read_tail(&path, 10, 1 << 20).unwrap();
+        let [HistoryItem::User { stored, .. }] = history.items.as_slice() else {
+            panic!("not one message of the user's");
+        };
+        assert_eq!(stored.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn an_image_is_read_again_by_its_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let red = pixels([200, 30, 30, 255], 4);
+        let blue = pixels([30, 30, 200, 255], 6);
+        let other = pixels([30, 200, 30, 255], 4);
+        write(
+            dir.path(),
+            "-home-alex-proj",
+            "s1",
+            &[
+                &message_with("m0", &[&other]),
+                &reply_to("a0", "m0"),
+                &message_with("m1", &[&red, &blue]),
+                &reply_to("a1", "m1"),
+            ],
+        );
+        let id = SessionId("s1".into());
+        assert_eq!(read_image(dir.path(), &id, "m1", 1), Ok(image_of(&blue)));
+        assert_eq!(read_image(dir.path(), &id, "m1", 0), Ok(image_of(&red)));
+    }
+
+    #[test]
+    fn a_message_at_the_start_of_a_long_file_is_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let red = pixels([200, 30, 30, 255], 4);
+        let first = message_with("m1", &[&red]);
+        // More than the end a history is read from, in lines of 64 KiB.
+        let filler = reply_to("a1", &"x".repeat(65_536));
+        let count = (crate::history_tail::TAIL_BYTES as usize) / filler.len() + 2;
+        let mut lines = vec![first.as_str()];
+        lines.extend(std::iter::repeat_n(filler.as_str(), count));
+        write(dir.path(), "-home-alex-proj", "s1", &lines);
+        let id = SessionId("s1".into());
+        assert_eq!(read_image(dir.path(), &id, "m1", 0), Ok(image_of(&red)));
+    }
+
+    #[test]
+    fn a_message_that_is_gone_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let red = pixels([200, 30, 30, 255], 4);
+        write(
+            dir.path(),
+            "-home-alex-proj",
+            "s1",
+            &[&message_with("m1", &[&red])],
+        );
+        assert_eq!(
+            read_image(dir.path(), &SessionId("s1".into()), "m2", 0),
+            Err(AgentError::Io("the message is not in the session".into()))
+        );
+        assert_eq!(
+            read_image(dir.path(), &SessionId("s2".into()), "m1", 0),
+            Err(AgentError::Io("the session is not in the store".into()))
+        );
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_decoded_keeps_its_place() {
+        // Written by hand: an image held by its address, as the program can store one, before
+        // one held as base64. Never seen live.
+        let dir = tempfile::tempdir().unwrap();
+        let red = pixels([200, 30, 30, 255], 4);
+        let message = serde_json::json!({
+            "type": "user", "uuid": "m1", "parentUuid": null,
+            "message": {"role": "user", "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://example.org/a.png"}},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": STANDARD.encode(&red),
+                }},
+            ]},
+        })
+        .to_string();
+        write(dir.path(), "-home-alex-proj", "s1", &[&message]);
+        let id = SessionId("s1".into());
+        assert_eq!(read_image(dir.path(), &id, "m1", 1), Ok(image_of(&red)));
+        assert_eq!(
+            read_image(dir.path(), &id, "m1", 0),
+            Err(AgentError::Io("the message has no such image".into()))
+        );
+    }
+
+    #[test]
+    fn an_index_past_the_messages_images_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let red = pixels([200, 30, 30, 255], 4);
+        let blue = pixels([30, 30, 200, 255], 4);
+        write(
+            dir.path(),
+            "-home-alex-proj",
+            "s1",
+            &[&message_with("m1", &[&red, &blue])],
+        );
+        assert_eq!(
+            read_image(dir.path(), &SessionId("s1".into()), "m1", 2),
+            Err(AgentError::Io("the message has no such image".into()))
+        );
+    }
+
+    #[test]
+    fn a_line_that_only_mentions_the_id_is_not_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = SessionId("s1".into());
+        write(
+            dir.path(),
+            "-home-alex-proj",
+            "s1",
+            &[&reply_to("a1", "m1")],
+        );
+        assert_eq!(
+            read_image(dir.path(), &id, "m1", 0),
+            Err(AgentError::Io("the message is not in the session".into()))
+        );
+        // The line that names it comes first; the message is still the one taken.
+        let red = pixels([200, 30, 30, 255], 4);
+        write(
+            dir.path(),
+            "-home-alex-proj",
+            "s1",
+            &[&reply_to("a1", "m1"), &message_with("m1", &[&red])],
+        );
+        assert_eq!(read_image(dir.path(), &id, "m1", 0), Ok(image_of(&red)));
     }
 }

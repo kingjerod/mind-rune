@@ -22,8 +22,8 @@ use crate::ids::{RequestId, SessionId, ToolCallId};
 ///   starts with `ThinkingStarted`, before any `ThinkingDelta`, and
 ///   `BlockFinished` ends it, whether or not any thinking text came.
 /// - `UsageLimits`, `RemoteAccess`, `TitleChanged`, `ModelChanged`,
-///   `EffortChanged`, `PermissionModeChanged`, `ContextBreakdown` and
-///   `CommandFailed` can come between turns or inside one.
+///   `EffortChanged`, `PermissionModeChanged`, `ContextBreakdown`,
+///   `BackgroundTasks` and `CommandFailed` can come between turns or inside one.
 /// - `Exited` comes last, exactly once, also after a normal `Close`. It ends any
 ///   open turn and every request still waiting for the user; no separate
 ///   `TurnFailed` or `RequestWithdrawn` is sent for them.
@@ -72,6 +72,11 @@ pub enum SessionEvent {
     /// What the context is made of, as the program last counted it. Given whenever the program
     /// answers, after `Started` and after a turn ends; never an error when it does not.
     ContextBreakdown(ContextBreakdown),
+    /// How many background tasks of the program are running and need it to stay up. Each one
+    /// replaces the last; none came means none runs.
+    BackgroundTasks {
+        running: usize,
+    },
     /// A SetModel, Rename etc. was refused.
     CommandFailed {
         what: CommandKind,

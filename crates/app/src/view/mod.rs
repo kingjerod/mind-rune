@@ -12,16 +12,18 @@ mod chips;
 mod conversation;
 mod drag;
 mod field;
-mod folder;
+pub(crate) mod folder;
 mod input;
 mod items;
 mod panel;
+mod quit;
 mod requests;
 mod resting;
 mod shell;
 mod sidebar;
 mod signin;
 mod tiles;
+mod viewer;
 mod width;
 
 pub(crate) use chips::chip_key;
@@ -52,6 +54,8 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
         }
         Screen::Checking | Screen::SignedOut | Screen::NotInstalled => signin::screen(ui, kit),
     };
+    quit::question(ui, kit, &mut layer);
+    viewer::layer(ui, cx, kit, &mut layer);
     // The app's own root, under the kit's: what a screenshot's tree is checked for.
     let base = el().key("mr-root").child(base.w_full().h_full());
     rune_kit::root(base, layer).on_paste_content(paste)
@@ -102,22 +106,31 @@ fn pane(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, key: SessionKey, layer: &mu
     width::column(ui, cx, kit, key, content)
 }
 
-/// `AppSpec::on_key`, for keys no focused text field took: the kit's sidebar shortcut shows and
-/// hides the sidebar; on the main screen, Ctrl+Alt+B shows and hides the right panel once per
-/// press, Ctrl+N asks for a new session's folder, and Ctrl+Shift+N for one to the side, F6 and
-/// Shift+F6 move to the next and the previous tile, and
-/// Ctrl+W closes the focused one, once per press, the last three unless a picker's list or a
-/// menu is open (a text field leaves all of them alone); Ctrl+Shift+PageUp and
+/// `AppSpec::on_key`, for keys no focused text field took: Ctrl+Q quits, or asks first
+/// ([`glue::ask_quit`]), on every screen and also while the question shows, where it changes
+/// nothing, and while a picture is open large, which it puts away; while either shows no other key
+/// is taken here ([`overlay_open`]). Else the kit's sidebar shortcut shows and hides the sidebar;
+/// on the main screen, Ctrl+Alt+B shows and hides the right panel once per press, Ctrl+N asks for a
+/// new session's folder, and Ctrl+Shift+N for one to the side, F6 and Shift+F6 move to the next and
+/// the previous tile, and Ctrl+W closes the focused one, once per press, the last three unless a
+/// picker's list or a menu is open (a text field leaves all of them alone); Ctrl+Shift+PageUp and
 /// Ctrl+Shift+PageDown move the focused tile one place along the row, and Ctrl+Alt+PageUp and
 /// Ctrl+Alt+PageDown up or down in a column, also held, on the same terms, and are taken on the
-/// main screen even when nothing moves; and Escape shuts the folder menu when it is open, or
-/// else stops the focused tile's running turn (a focused text area catches its own Escape,
-/// which never gets here). With neither, Escape is left alone. An open picker or menu, and the
-/// field a name is edited in, take Escape before this. Ctrl+N and
-/// Ctrl+Shift+N keep a name being edited first; F6 keeps it as the field loses the keyboard,
-/// and Ctrl+W drops it with the tile whose header it was edited in. While a sidebar row or a
-/// tile's header is dragged, the drag takes them first ([`drag_key`]).
+/// main screen even when nothing moves; and Escape shuts the folder menu when it is open, or else
+/// stops the focused tile's running turn (a focused text area catches its own Escape, which never
+/// gets here). With neither, Escape is left alone. An open picker or menu, and the field a name is
+/// edited in, take Escape before this. Ctrl+N and Ctrl+Shift+N keep a name being edited first; F6
+/// keeps it as the field loses the keyboard, and Ctrl+W drops it with the tile whose header it was
+/// edited in. While a sidebar row or a tile's header is dragged, the drag takes them first
+/// ([`drag_key`]).
 pub fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if quit::is_quit_key(ev) {
+        glue::ask_quit(ui, tx);
+        return true;
+    }
+    if overlay_open(ui) {
+        return false;
+    }
     if shell::is_sidebar_toggle(ev) {
         ui.sidebar.toggle();
         return true;
@@ -206,6 +219,12 @@ fn drag_key(ui: &mut Ui, ev: &KeyEvent) -> bool {
         || tiles::move_step(ev).is_some()
         || tiles::stack_step(ev).is_some()
         || tiles::is_close_key(ev)
+}
+
+/// Something lies over the whole window that holds every key but Ctrl+Q: the question whether
+/// to quit, or a picture open large. Escape and Return go on to it.
+fn overlay_open(ui: &Ui) -> bool {
+    ui.quit_ask || ui.viewing.is_some()
 }
 
 /// A picker's list or a menu is open. It holds the keyboard until it shuts: Ctrl+Shift+N, F6 and

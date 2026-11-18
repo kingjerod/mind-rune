@@ -7,3 +7,9 @@ Icon=mindrune
 Terminal=false
 Categories=Development;
 StartupWMClass=mindrune
+StartupNotify=true
+Actions=quit;
+
+[Desktop Action quit]
+Name=Quit MindRune
+Exec=mindrune --quit

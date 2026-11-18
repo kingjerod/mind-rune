@@ -6,8 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use mr_agent::{
-    Account, AgentError, Answer, Capabilities, CommandKind, ImageData, ModelOption, PermissionMode,
-    RequestId, SessionCommand, SessionEvent, SessionId, StartSpec, StoredSession, UsageLimits,
+    Account, AgentError, Answer, Capabilities, CommandKind, ImageData, LimitWindow, ModelOption,
+    PermissionMode, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec, StoredSession,
+    UsageLimits,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +18,8 @@ use crate::conversation::NoticeKind;
 use crate::git::Branch;
 use crate::groups::{GroupId, Groups, Recency, SidebarModel, sidebar_model};
 use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile, remember_folder};
-use crate::session::{HistoryState, Phase, Session};
-use crate::sessions::{Entry, Prompt, SessionKey, Sessions};
+use crate::session::{FullImage, HistoryState, Phase, Remote, Session, Undelivered};
+use crate::sessions::{Entry, Mark, Prompt, SessionKey, Sessions};
 use crate::tiles::{Column, Place, Put, RowSize, Spot, Tiles, Under};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +28,22 @@ pub enum Screen {
     NotInstalled,
     SignedOut,
     Main,
+}
+
+/// What a quit would cut off, in sessions: those whose program works for the user, and those
+/// with Remote Control on. One session can be in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Busy {
+    pub working: usize,
+    pub remote: usize,
+}
+
+/// How the sessions stand, counted by their mark: what the tray's menu says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Standing {
+    pub working: usize,
+    pub needs_you: usize,
+    pub finished: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,9 +67,16 @@ pub const ELSEWHERE_SECONDS: i64 = 120;
 pub const OWN_EXIT_SLACK_SECONDS: i64 = 10;
 /// How often the recent listing is asked for again: seconds.
 pub const RELIST_SECONDS: i64 = 60;
-/// How long after asking for the usage limits they are asked for again, once a window has
-/// reset: seconds.
+/// How long after the usage limits were last asked for they may be asked for once more, once a
+/// window has reset: seconds. An answer on its way is waited for that long.
 pub const USAGE_RETRY_SECONDS: i64 = 300;
+/// How long a program does nothing before it is stopped, when the user would not notice (see
+/// [`Session::stoppable`]): seconds.
+pub const IDLE_SECONDS: i64 = 30 * 60;
+
+/// How long a resting session is out of every tile before it gives its conversation back to
+/// the store (see [`App::let_go`]): seconds.
+pub const LET_GO_SECONDS: i64 = 10 * 60;
 
 /// How far the listing of stored sessions has come.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +128,11 @@ pub enum Effect {
         id: SessionId,
         max_items: usize,
     },
+    /// `key`'s history is no longer wanted: a read not done yet is skipped, and one under way
+    /// answers nothing.
+    DropHistory {
+        key: SessionKey,
+    },
     CheckActivity {
         key: SessionKey,
         id: SessionId,
@@ -119,6 +148,13 @@ pub enum Effect {
     Prepare {
         chip: u64,
         source: Source,
+    },
+    /// Read again the full image behind picture `picture` (see [`App::full_image`]).
+    ReadImage {
+        picture: u64,
+        id: SessionId,
+        message: String,
+        index: usize,
     },
     /// Write what is kept between runs.
     SaveState(Box<Saved>),
@@ -176,6 +212,9 @@ pub struct App {
     looked: bool,
     /// When the usage limits were last asked for, by a program or by a look.
     usage_asked_unix: Option<i64>,
+    /// The latest reset time, of the usage windows whose reset had passed, that the limits were
+    /// asked about again for: each such reset is asked about once.
+    usage_reset_asked: Option<i64>,
     /// What `sidebar` was built from; `None` before the first [`App::settle`].
     settled: Option<Settled>,
     /// The size of the tile row as the window last laid it out; each `None` until it has.
@@ -195,6 +234,12 @@ pub struct App {
     branches: HashMap<PathBuf, Branch>,
     /// The id of the latest chip. Each chip gets the next, so an id is never reused.
     chip: u64,
+    /// [`App::close`] was called: no program is started again for a message it never got.
+    closing: bool,
+    /// How long a program does nothing before it is stopped: seconds.
+    idle_after: i64,
+    /// A window shows ([`App::set_window`]).
+    window: bool,
 }
 
 /// The tiles of the last run, as [`Saved`] had them.
@@ -275,6 +320,7 @@ impl App {
             all_asked: false,
             looked: false,
             usage_asked_unix: None,
+            usage_reset_asked: None,
             settled: None,
             row: RowSize::default(),
             restore,
@@ -283,6 +329,9 @@ impl App {
             names: saved.names,
             branches: HashMap::new(),
             chip: 0,
+            closing: false,
+            idle_after: IDLE_SECONDS,
+            window: true,
         };
         (app, vec![Effect::CheckAccount])
     }
@@ -296,9 +345,56 @@ impl App {
         self.focused().and_then(|key| self.sessions.get(key))
     }
 
+    /// The full image behind a picture of `key`'s session: its bytes when they are at hand, else
+    /// the effect that reads them from the store, under the id the conversation was read from,
+    /// else neither.
+    pub fn full_image(&self, key: SessionKey, picture: u64) -> (Option<ImageData>, Vec<Effect>) {
+        let Some(entry) = self.sessions.get(key) else {
+            return (None, Vec::new());
+        };
+        match entry.session.full_image(picture) {
+            FullImage::AtHand(image) => (Some(image), Vec::new()),
+            FullImage::Stored { id, message, index } => (
+                None,
+                vec![Effect::ReadImage {
+                    picture,
+                    id,
+                    message,
+                    index,
+                }],
+            ),
+            FullImage::Nowhere => (None, Vec::new()),
+        }
+    }
+
     /// The branch last read for `key`'s folder.
     pub fn branch_of(&self, key: SessionKey) -> Option<&Branch> {
         self.branches.get(&self.sessions.get(key)?.session.folder)
+    }
+
+    /// Whether a window shows. While none does, a turn that ends leaves its session unseen also
+    /// in the focused tile, and no look is made for the usage limits; when one shows again the
+    /// focused session counts as seen, and the limits are asked for when that is due (see
+    /// [`App::usage_after_reset`]).
+    pub fn set_window(&mut self, shown: bool) -> Vec<Effect> {
+        self.window = shown;
+        if !shown {
+            return Vec::new();
+        }
+        if let Some(key) = self.focused()
+            && let Some(mut entry) = self.sessions.get_mut(key)
+        {
+            entry.unseen = false;
+        }
+        if self.screen != Screen::Main {
+            return Vec::new();
+        }
+        self.usage_after_reset()
+    }
+
+    /// Another idle length for this run; anything under 60 is taken as 60.
+    pub fn set_idle_after(&mut self, seconds: i64) {
+        self.idle_after = seconds.max(60);
     }
 
     /// The width of the tile row, as the window last laid it out.
@@ -384,6 +480,11 @@ impl App {
         self.event(open, exited, 0.0)
     }
 
+    /// A command to the open numbered `open` could not be sent. A message refused because its
+    /// program had ended is kept to go again (see [`Session::keep_undelivered`]), also when the
+    /// open has ended already: a session that rests is then started again at once. Any other
+    /// failure counts only for a session's current open. A refused ask for the usage limits is
+    /// the app's own business: it does not count for the idle stop.
     pub fn send_failed(
         &mut self,
         open: u64,
@@ -391,10 +492,35 @@ impl App {
         error: AgentError,
     ) -> Vec<Effect> {
         let now_unix = self.now_unix;
+        let undelivered = match (command, &error) {
+            (SessionCommand::Send { text, attachments }, AgentError::Closed) => Some(Undelivered {
+                text: text.clone(),
+                attachments: attachments.clone(),
+            }),
+            _ => None,
+        };
         let Some(mut entry) = self.sessions.by_open(open) else {
-            return Vec::new();
+            let Some(message) = undelivered else {
+                return Vec::new();
+            };
+            let Some(mut entry) = self.sessions.by_past_open(open) else {
+                return Vec::new();
+            };
+            let key = entry.key;
+            let commands = entry.session.keep_undelivered(message, false);
+            drop(entry);
+            let mut effects = self.send(key, commands);
+            effects.extend(self.start_undelivered(key));
+            return effects;
         };
         entry.last_own_unix = Some(now_unix);
+        if !matches!(command, SessionCommand::RefreshUsage) {
+            entry.idle_from_unix = Some(now_unix);
+        }
+        if let Some(message) = undelivered {
+            entry.session.keep_undelivered(message, true);
+            return Vec::new();
+        }
         if let SessionCommand::Send { .. } = command {
             entry.session.send_failed();
         }
@@ -417,17 +543,41 @@ impl App {
 
     /// Applies `event` to the session whose current open is `open`, stamped `now`. A turn that
     /// ends in a session other than the focused one leaves it unseen, also when it is in a
-    /// tile; one that ends in the focused session asks for the branch of its folder. A program
-    /// that is gone lets go of its open. A save is asked for when the name kept for the session
-    /// changed: its id became known, or its program confirmed or refused it.
+    /// tile, and so does one in the focused session while no window shows; one that ends in the
+    /// focused session asks for the branch of its folder. A program that is gone lets go of its
+    /// open; one stopped for idleness ([`App::stop_idle`]) is taken as gone cleanly whatever it
+    /// says, so its session rests with no notice and no mark. When the session then rests with
+    /// a message a program never got, it is started again, unless that program ended before it
+    /// started; and one stopped for idleness whose session wants Remote Control by then is
+    /// started again too. Its conversation stays: only the tick lets one go ([`App::let_go`]).
+    /// What answers the app's own ask for the usage limits does not count for the idle stop. A
+    /// save is asked for when the name kept for the session changed: its id became known, or
+    /// its program confirmed or refused it.
     pub fn event(&mut self, open: u64, event: SessionEvent, now: f64) -> Vec<Effect> {
-        let (now_unix, focused) = (self.now_unix, self.focused());
+        let (now_unix, focused, window) = (self.now_unix, self.focused(), self.window);
         let Some(mut entry) = self.sessions.by_open(open) else {
             return Vec::new();
         };
+        // A program stopped for idleness ends as a clean one does, also when it had to be killed.
+        let stopped = entry.stopping == Some(open) && matches!(event, SessionEvent::Exited { .. });
+        let event = match event {
+            SessionEvent::Exited { detail, .. } if stopped => SessionEvent::Exited {
+                clean: true,
+                detail,
+            },
+            event => event,
+        };
         if let SessionEvent::UsageLimits(limits) = &event {
-            take_usage(&mut self.usage, limits);
+            take_usage(&mut self.usage, limits, now_unix);
         }
+        let usage_answer = matches!(
+            event,
+            SessionEvent::UsageLimits(_)
+                | SessionEvent::CommandFailed {
+                    what: CommandKind::RefreshUsage,
+                    ..
+                }
+        );
         let models = match &event {
             SessionEvent::Started(info) => Some(info.models.clone()),
             _ => None,
@@ -439,6 +589,9 @@ impl App {
         } else {
             None
         };
+        // A program that ends before it started is not started again for a message it never
+        // got: one that always does so would be started over and over.
+        let had_started = entry.session.phase != Phase::Opening;
         let ends_turn = matches!(
             event,
             SessionEvent::TurnFinished(_)
@@ -446,6 +599,9 @@ impl App {
                 | SessionEvent::Exited { clean: false, .. }
         );
         entry.last_own_unix = Some(now_unix);
+        if !usage_answer {
+            entry.idle_from_unix = Some(now_unix);
+        }
         // Only these change the name kept for it.
         let names_event = matches!(
             event,
@@ -464,7 +620,7 @@ impl App {
             .map(|command| Effect::Send { open, command })
             .collect();
         let names_changed = kept.is_some_and(|kept| entry.session.kept_name() != kept);
-        if ends_turn && focused != Some(entry.key) {
+        if ends_turn && (focused != Some(entry.key) || !window) {
             entry.unseen = true;
         }
         if ends_turn && focused == Some(entry.key) {
@@ -472,8 +628,10 @@ impl App {
                 folder: entry.session.folder.clone(),
             });
         }
-        if entry.session.at_rest() {
-            entry.open = None;
+        let gone = entry.session.at_rest();
+        if gone {
+            entry.past_open = entry.open.take();
+            entry.stopping = None;
         }
         let key = entry.key;
         let id = if started {
@@ -502,6 +660,12 @@ impl App {
         if names_changed {
             effects.push(self.save_state());
         }
+        if had_started {
+            effects.extend(self.start_undelivered(key));
+        }
+        if stopped {
+            effects.extend(self.start_for_remote(key));
+        }
         effects
     }
 
@@ -524,7 +688,11 @@ impl App {
                 result,
                 pictures,
             } => {
-                if let Some(mut entry) = self.sessions.get_mut(key) {
+                // Only a read still waited for is taken: a session that let its history go
+                // meanwhile does not want this one.
+                if let Some(mut entry) = self.sessions.get_mut(key)
+                    && entry.session.history == HistoryState::Loading
+                {
                     match result {
                         Ok(history) => entry.session.load_history(history, &pictures),
                         Err(error) => entry.session.history_failed(&error.to_string()),
@@ -535,7 +703,7 @@ impl App {
             FromBackend::Activity { key, result } => self.activity_checked(key, result),
             FromBackend::Look { models, usage, .. } => {
                 if let Some(limits) = usage {
-                    take_usage(&mut self.usage, &limits);
+                    take_usage(&mut self.usage, &limits, self.now_unix);
                 }
                 self.learn_models(models);
                 Vec::new()
@@ -553,6 +721,8 @@ impl App {
             }
             // The window keeps the drawn picture; a picture nobody holds any more is dropped.
             FromBackend::Picture { .. } => Vec::new(),
+            // The full image read again is the window's to show; the app keeps nothing of it.
+            FromBackend::Image { .. } => Vec::new(),
         }
     }
 
@@ -753,9 +923,10 @@ impl App {
     /// its tile focused. The session counts as seen and is offered the models known, and a
     /// stored history not read yet is asked for, then the branch of its folder. The session
     /// taken out of its tile, if any, is closed and forgotten when it is empty, unless `leaving`
-    /// says to keep it. Asks to save when a tile opened beside the focused one, at a place, or
-    /// over or under a tile. A session shown in the focused tile, the first tile included, is
-    /// saved with the next change that asks.
+    /// says to keep it; one kept keeps its conversation for now (see [`App::let_go`]). Asks to
+    /// save when a tile opened beside the focused one, at a place, or over or under a tile. A
+    /// session shown in the focused tile, the first tile included, is saved with the next change
+    /// that asks.
     pub fn show(&mut self, key: SessionKey, place: Place, leaving: Leaving) -> Vec<Effect> {
         if self.focused() == Some(key) || self.sessions.get(key).is_none() {
             return Vec::new();
@@ -771,6 +942,9 @@ impl App {
             (Put::Replaced(left), Leaving::ForgetIfEmpty) => self.forget_if_empty(left),
             _ => Vec::new(),
         };
+        if let Put::Replaced(left) = put {
+            self.left_tiles(left);
+        }
         effects.extend(read);
         effects.extend(self.read_branch());
         if put == Put::Added && place != Place::Focused {
@@ -786,10 +960,11 @@ impl App {
         self.focus(key).into_iter().collect()
     }
 
-    /// Takes `key`'s tile out of the row; its session leaves as `leaving` says. When that tile
-    /// had the focus, the focus goes to the other tile of its column when it has two; else to
-    /// the upper tile of the column on its right, else of the one on its left, and the branch
-    /// of its session's folder is asked for. Asks to save.
+    /// Takes `key`'s tile out of the row; its session leaves as `leaving` says, and one kept keeps
+    /// its conversation for now (see [`App::let_go`]). When that tile had the focus, the focus
+    /// goes to the other tile of its column when it has two; else to the upper tile of the
+    /// column on its right, else of the one on its left, and the branch of its session's folder
+    /// is asked for. Asks to save.
     pub fn close_tile(&mut self, key: SessionKey, leaving: Leaving) -> Vec<Effect> {
         let focused = self.focused();
         if !self.remove_tile(key) {
@@ -899,10 +1074,12 @@ impl App {
     }
 
     /// The app is going away, at `now_unix` by the wall clock: its state saved first, then
-    /// `Close` for every session whose program has not ended. The state keeps, for every
+    /// `Close` for every session whose program has not ended and is not being stopped already
+    /// (it was sent one). The state keeps, for every
     /// session whose program this run ran, that this app closed it then.
     pub fn close(&mut self, now_unix: i64) -> Vec<Effect> {
         self.now_unix = now_unix;
+        self.closing = true;
         let mut saved = self.saved();
         let ran = self
             .sessions
@@ -917,7 +1094,7 @@ impl App {
         effects.extend(
             self.sessions
                 .iter()
-                .filter(|entry| entry.live())
+                .filter(|entry| entry.live() && entry.stopping.is_none())
                 .filter_map(|entry| entry.open)
                 .map(|open| Effect::Send {
                     open,
@@ -1031,14 +1208,48 @@ impl App {
         names
     }
 
+    /// What a quit would cut off now. A session is working while a turn runs, while a message
+    /// waits for a program (queued, undelivered, or held by the question whether to continue a
+    /// session open elsewhere), whatever its phase, and while its program runs a background
+    /// task.
+    pub fn busy(&self) -> Busy {
+        let mut busy = Busy::default();
+        for entry in self.sessions.iter() {
+            let session = &entry.session;
+            let working = matches!(session.phase, Phase::Working | Phase::NeedsUser)
+                || session.queued.is_some()
+                || !session.undelivered.is_empty()
+                || matches!(entry.prompt, Some(Prompt::OpenElsewhere { .. }))
+                || session.background > 0;
+            busy.working += usize::from(working);
+            busy.remote += usize::from(session.remote != Remote::Off);
+        }
+        busy
+    }
+
+    /// The sessions by their mark (`Entry::mark`).
+    pub fn standing(&self) -> Standing {
+        let mut standing = Standing::default();
+        for entry in self.sessions.iter() {
+            match entry.mark() {
+                Mark::Working => standing.working += 1,
+                Mark::NeedsYou => standing.needs_you += 1,
+                Mark::Finished => standing.finished += 1,
+                Mark::None => {}
+            }
+        }
+        standing
+    }
+
     /// No session has a program still running.
     pub fn all_ended(&self) -> bool {
         !self.sessions.iter().any(Entry::live)
     }
 
-    /// Starts an ended session's program again. A resting one is woken by a message instead.
-    /// This and the session intents below first focus the session's tile, when it is in one
-    /// without it, and then ask for the branch of its folder.
+    /// Starts an ended session's program again: a message its program never got goes to the new
+    /// one when it has started. A resting one is woken by a message instead. This and the
+    /// session intents below first focus the session's tile, when it is in one without it, and
+    /// then ask for the branch of its folder.
     pub fn restart(&mut self, key: SessionKey) -> Vec<Effect> {
         let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
         let Some(mut entry) = self.sessions.get_mut(key) else {
@@ -1221,14 +1432,18 @@ impl App {
         self.send(key, command)
     }
 
-    /// Turns Remote Control on or off for `key`'s session (see [`Session::set_remote`]). The
-    /// focus does not move.
+    /// Turns Remote Control on or off for `key`'s session (see [`Session::set_remote`]). Turned
+    /// on for a resting session whose program this app ran in this run, as one stopped for
+    /// idleness, the session is started for it (see [`App::start_for_remote`]); any other
+    /// resting session waits for its next start. The focus does not move.
     pub fn set_remote(&mut self, key: SessionKey, on: bool) -> Vec<Effect> {
         let command = self
             .sessions
             .get_mut(key)
             .and_then(|mut entry| entry.session.set_remote(on));
-        self.send(key, command)
+        let mut effects = self.send(key, command);
+        effects.extend(self.start_for_remote(key));
+        effects
     }
 
     /// Sets the preference and asks to save. Nothing when it is already so.
@@ -1270,13 +1485,30 @@ impl App {
         effects
     }
 
-    /// Brings the clock up to date and returns what is due: a new listing, a usage refresh.
+    /// Brings the clock up to date and returns what is due: a new listing, a usage refresh, the
+    /// history of each session long enough in no tile that may let it go (see [`App::let_go`]:
+    /// nothing else lets one go), and the `Close` of each program idle too long (see
+    /// [`App::stop_idle`]).
     pub fn tick(&mut self, now_unix: i64) -> Vec<Effect> {
         self.now_unix = now_unix;
         if self.screen != Screen::Main {
             return Vec::new();
         }
-        let mut effects = Vec::new();
+        let held: Vec<SessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.session.history,
+                    HistoryState::Loaded | HistoryState::Loading
+                ) && !self.tiles.contains(entry.key)
+            })
+            .map(|entry| entry.key)
+            .collect();
+        let mut effects: Vec<Effect> = held
+            .into_iter()
+            .filter_map(|key| self.let_go(key))
+            .collect();
         if self
             .listed_unix
             .is_some_and(|asked| now_unix - asked >= RELIST_SECONDS)
@@ -1284,7 +1516,43 @@ impl App {
             effects.push(self.list_recent());
         }
         effects.extend(self.usage_after_reset());
+        effects.extend(self.stop_idle());
         effects
+    }
+
+    /// Stops, once, each program that has done nothing for the idle length when the user would
+    /// not notice: its session is [`Session::stoppable`], no question waits about it and the
+    /// store is not being asked about it. Nothing its program said and no message the user sent
+    /// came in that time; an answer to the app's own ask for the usage limits is not counted
+    /// (`Entry::idle_from_unix`). Its exit then leaves it resting (see [`App::event`]).
+    fn stop_idle(&mut self) -> Vec<Effect> {
+        let (now_unix, idle_after) = (self.now_unix, self.idle_after);
+        let idle: Vec<(SessionKey, u64)> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.stopping.is_none()
+                    && entry.prompt.is_none()
+                    && !entry.checking
+                    && entry.session.stoppable()
+                    && now_unix
+                        - entry
+                            .idle_from_unix
+                            .unwrap_or(0)
+                            .max(entry.last_active_unix)
+                        >= idle_after
+            })
+            .filter_map(|entry| Some((entry.key, entry.open?)))
+            .collect();
+        idle.into_iter()
+            .filter_map(|(key, open)| {
+                self.sessions.get_mut(key)?.stopping = Some(open);
+                Some(Effect::Send {
+                    open,
+                    command: SessionCommand::Close,
+                })
+            })
+            .collect()
     }
 
     /// Answers the question waiting about `key`'s session and clears it. `ContinueHere` wakes
@@ -1356,6 +1624,7 @@ impl App {
                     )
                 {
                     entry.session.history = HistoryState::Loading;
+                    entry.session.read_from = Some(id.clone());
                     effects.push(Effect::ReadHistory {
                         key: copy,
                         id,
@@ -1504,6 +1773,56 @@ impl App {
         self.start_with(key, spec)
     }
 
+    /// Starts `key`'s session again, with no question to the store, when it rests with a message
+    /// its program never got. Not once the app is going away. And not without end: after the
+    /// starts [`Session::reopen_for_undelivered`] allows, the session is left ended with a
+    /// notice, marked as a program that died out of sight is, and [`App::restart`] delivers the
+    /// message.
+    fn start_undelivered(&mut self, key: SessionKey) -> Vec<Effect> {
+        let (focused, window) = (self.focused(), self.window);
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return Vec::new();
+        };
+        if self.closing
+            || entry.session.phase != Phase::Resting
+            || entry.session.undelivered.is_empty()
+        {
+            return Vec::new();
+        }
+        if !entry.session.reopen_for_undelivered() {
+            if focused != Some(key) || !window {
+                entry.unseen = true;
+            }
+            return Vec::new();
+        }
+        drop(entry);
+        self.start(key)
+    }
+
+    /// Starts `key`'s session again, with no question to the store, when it rests wanting
+    /// Remote Control and this app ran its program in this run: the program that starts is
+    /// asked for it (see [`Session::apply`]). Not for a session that is not stored, has a
+    /// question waiting or is being asked about in the store, and not once the app is going
+    /// away.
+    fn start_for_remote(&mut self, key: SessionKey) -> Vec<Effect> {
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return Vec::new();
+        };
+        if self.closing
+            || entry.session.phase != Phase::Resting
+            || !entry.session.remote_wanted
+            || entry.last_own_unix.is_none()
+            || !entry.session.is_stored()
+            || entry.prompt.is_some()
+            || entry.checking
+        {
+            return Vec::new();
+        }
+        entry.session.reopening();
+        drop(entry);
+        self.start(key)
+    }
+
     /// Starts a program for `key`'s session as `spec` says, under the next open's number.
     fn start_with(&mut self, key: SessionKey, spec: StartSpec) -> Vec<Effect> {
         let Some(mut entry) = self.sessions.get_mut(key) else {
@@ -1550,35 +1869,49 @@ impl App {
             )
     }
 
-    /// Once a usage window's reset time has passed, and the limits were last asked for more
-    /// than [`USAGE_RETRY_SECONDS`] ago: `RefreshUsage` to a session whose program runs, or a
-    /// look when none does and the app looks.
+    /// Once a usage window's reset time has passed, the limits are asked for again, once for
+    /// that reset, and not within [`USAGE_RETRY_SECONDS`] of the last ask: `RefreshUsage` to a
+    /// session whose program runs and is not being stopped, or a look when none does, the app
+    /// looks and a window shows. A look starts a program: with no window to show the limits
+    /// in, it waits for one ([`App::set_window`]). The answer clears a lapsed window it leaves
+    /// out (see [`take_usage`]); whatever it says, nothing more is asked until a program
+    /// reports a window that then lapses.
     fn usage_after_reset(&mut self) -> Vec<Effect> {
         let now_unix = self.now_unix;
-        let reset = [&self.usage.session, &self.usage.weekly]
+        let lapsed = [&self.usage.session, &self.usage.weekly]
             .into_iter()
             .flatten()
-            .any(|window| window.resets_at_unix <= now_unix);
-        let asked_lately = self
+            .map(|window| window.resets_at_unix)
+            .filter(|reset| *reset <= now_unix)
+            .max();
+        let Some(lapsed) = lapsed.filter(|reset| self.usage_reset_asked.is_none_or(|a| a < *reset))
+        else {
+            return Vec::new();
+        };
+        if self
             .usage_asked_unix
-            .is_some_and(|asked| now_unix - asked <= USAGE_RETRY_SECONDS);
-        if !reset || asked_lately {
+            .is_some_and(|asked| now_unix - asked <= USAGE_RETRY_SECONDS)
+        {
             return Vec::new();
         }
         let live = self
             .sessions
             .iter()
-            .filter(|entry| entry.live())
+            .filter(|entry| entry.live() && entry.stopping.is_none())
             .find_map(|entry| entry.open);
         match live {
             Some(open) => {
                 self.usage_asked_unix = Some(now_unix);
+                self.usage_reset_asked = Some(lapsed);
                 vec![Effect::Send {
                     open,
                     command: SessionCommand::RefreshUsage,
                 }]
             }
-            None if self.launch.look => vec![self.look()],
+            None if self.launch.look && self.window => {
+                self.usage_reset_asked = Some(lapsed);
+                vec![self.look()]
+            }
             None => Vec::new(),
         }
     }
@@ -1594,12 +1927,14 @@ impl App {
         self.known_models = models;
     }
 
-    /// Marks `key`'s session as one put in a tile: it counts as seen and is offered the models
-    /// known. Its stored history, when not read yet, is asked for.
+    /// Marks `key`'s session as one put in a tile: it counts as seen, is no longer out of every
+    /// tile, and is offered the models known. Its stored history, when not read yet, is asked
+    /// for.
     fn mark_shown(&mut self, key: SessionKey) -> Option<Effect> {
         let mut entry = self.sessions.get_mut(key)?;
         entry.unseen = false;
         entry.touched = true;
+        entry.hidden_unix = None;
         if !self.known_models.is_empty() {
             entry.session.offer_models(&self.known_models);
         }
@@ -1637,6 +1972,7 @@ impl App {
         if !self.tiles.remove(key) {
             return false;
         }
+        self.left_tiles(key);
         if let Some(focused) = self.focused()
             && let Some(mut entry) = self.sessions.get_mut(focused)
         {
@@ -1668,6 +2004,41 @@ impl App {
         }
     }
 
+    /// Notes when `key`'s session left its last tile, if it is in none now.
+    fn left_tiles(&mut self, key: SessionKey) {
+        if self.tiles.contains(key) {
+            return;
+        }
+        let now_unix = self.now_unix;
+        if let Some(mut entry) = self.sessions.get_mut(key) {
+            entry.hidden_unix = Some(now_unix);
+        }
+    }
+
+    /// `key`'s session gives its conversation back to the store ([`Session::let_go`]) when it
+    /// has been in no tile for [`LET_GO_SECONDS`], no question waits about it and the store is
+    /// not being asked about it: the backend is then told the history is no longer wanted. Only
+    /// [`App::tick`] calls this, so a session swapped out of a tile and back within that time
+    /// is not read again. One that was never in a tile counts from when its program last said
+    /// anything, which at rest is its exit: a session that did not come from the store has had
+    /// a program.
+    fn let_go(&mut self, key: SessionKey) -> Option<Effect> {
+        if self.tiles.contains(key) {
+            return None;
+        }
+        let now_unix = self.now_unix;
+        let mut entry = self.sessions.get_mut(key)?;
+        let since = entry.hidden_unix.or(entry.last_own_unix)?;
+        if now_unix - since < LET_GO_SECONDS
+            || entry.prompt.is_some()
+            || entry.checking
+            || !entry.session.let_go()
+        {
+            return None;
+        }
+        Some(Effect::DropHistory { key })
+    }
+
     /// The commands for `key`'s session, sent to its current open.
     fn send(
         &self,
@@ -1684,14 +2055,18 @@ impl App {
     }
 }
 
-/// Takes in the windows `limits` reports, keeping one it does not.
-fn take_usage(usage: &mut UsageLimits, limits: &UsageLimits) {
-    if limits.session.is_some() {
-        usage.session = limits.session.clone();
-    }
-    if limits.weekly.is_some() {
-        usage.weekly = limits.weekly.clone();
-    }
+/// Takes in the windows `limits` reports. One it does not report is kept, unless its reset time
+/// has passed by `now_unix`: what it said no longer holds, so it is cleared.
+fn take_usage(usage: &mut UsageLimits, limits: &UsageLimits, now_unix: i64) {
+    let take = |held: &mut Option<LimitWindow>, reported: &Option<LimitWindow>| {
+        if reported.is_some() {
+            *held = reported.clone();
+        } else if held.as_ref().is_some_and(|w| w.resets_at_unix <= now_unix) {
+            *held = None;
+        }
+    };
+    take(&mut usage.session, &limits.session);
+    take(&mut usage.weekly, &limits.weekly);
 }
 
 /// Takes the asks to save out of `effects`. True when there was one.
@@ -1708,6 +2083,7 @@ fn read_history(entry: &mut Entry) -> Option<Effect> {
     }
     let id = entry.session.id.clone()?;
     entry.session.history = HistoryState::Loading;
+    entry.session.read_from = Some(id.clone());
     Some(Effect::ReadHistory {
         key: entry.key,
         id,
@@ -1718,7 +2094,10 @@ fn read_history(entry: &mut Entry) -> Option<Effect> {
 /// Nothing was handed over in it, nothing waits to be and nothing is attached: the agent stores
 /// nothing for it, so leaving it forgets it.
 fn empty(session: &Session) -> bool {
-    !session.is_stored() && session.queued.is_none() && session.chips.is_empty()
+    !session.is_stored()
+        && session.queued.is_none()
+        && session.undelivered.is_empty()
+        && session.chips.is_empty()
 }
 
 #[cfg(test)]
@@ -1828,6 +2207,7 @@ mod tests {
                     image_count: 0,
                     files: Vec::new(),
                     images: Vec::new(),
+                    stored: None,
                 },
                 HistoryItem::AssistantText("It reads tokens.".into()),
             ],
@@ -2069,19 +2449,26 @@ mod tests {
 
     #[test]
     fn usage_keeps_a_window_that_was_not_reported_this_time() {
+        // A window that has not reset yet.
+        let ahead = |used| {
+            Some(LimitWindow {
+                used,
+                resets_at_unix: NOW + 3600,
+            })
+        };
         let (mut app, _) = ready();
         app.event(
             1,
             SessionEvent::UsageLimits(UsageLimits {
-                session: window(0.2),
-                weekly: window(0.4),
+                session: ahead(0.2),
+                weekly: ahead(0.4),
             }),
             0.0,
         );
         app.event(
             1,
             SessionEvent::UsageLimits(UsageLimits {
-                session: window(0.3),
+                session: ahead(0.3),
                 weekly: None,
             }),
             0.0,
@@ -2089,8 +2476,26 @@ mod tests {
         assert_eq!(
             app.usage,
             UsageLimits {
-                session: window(0.3),
-                weekly: window(0.4)
+                session: ahead(0.3),
+                weekly: ahead(0.4)
+            }
+        );
+        // Once its reset time has passed, a window a report leaves out is cleared: what it
+        // said no longer holds.
+        app.tick(NOW + 3600);
+        app.event(
+            1,
+            SessionEvent::UsageLimits(UsageLimits {
+                session: None,
+                weekly: window(0.1),
+            }),
+            0.0,
+        );
+        assert_eq!(
+            app.usage,
+            UsageLimits {
+                session: None,
+                weekly: window(0.1)
             }
         );
     }
@@ -2306,6 +2711,284 @@ mod tests {
         app.send_failed(1, &suggest, AgentError::Io("broken pipe".into()));
         app.send_failed(1, &suggest, AgentError::Protocol("odd".into()));
         assert!(session(&app, key).conversation.items().is_empty());
+    }
+
+    /// [`ready`] with "first" handed over, so the agent stores the session, and its turn
+    /// finished; then "hello" handed over to open 1.
+    fn sent_hello() -> (App, SessionKey) {
+        let (mut app, key) = ready();
+        app.submit(key, "first");
+        app.event(1, done(), 0.0);
+        app.submit(key, "hello");
+        (app, key)
+    }
+
+    /// The backend's word that the `Send` of `text` with `attachments` to `open` was refused
+    /// because its program had ended.
+    fn closed_send(open: u64, text: &str, attachments: Vec<Attachment>) -> FromBackend {
+        FromBackend::SendFailed {
+            open,
+            command: SessionCommand::Send {
+                text: text.into(),
+                attachments,
+            },
+            error: AgentError::Closed,
+        }
+    }
+
+    fn exit_of(open: u64, clean: bool) -> FromBackend {
+        FromBackend::Event {
+            open,
+            event: exited(clean),
+        }
+    }
+
+    fn started_on(open: u64) -> FromBackend {
+        FromBackend::Event {
+            open,
+            event: SessionEvent::Started(info()),
+        }
+    }
+
+    /// The opens `effects` start.
+    fn opened(effects: &[Effect]) -> Vec<&StartSpec> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Open { spec, .. } => Some(spec),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The text and attachments of each message `effects` send, in order.
+    fn sent_messages(effects: &[Effect]) -> Vec<(&str, &[Attachment])> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Send {
+                    command: SessionCommand::Send { text, attachments },
+                    ..
+                } => Some((text.as_str(), attachments.as_slice())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many of the conversation's items are the user's message `text`.
+    fn user_messages(session: &Session, text: &str) -> usize {
+        session
+            .conversation
+            .items()
+            .iter()
+            .filter(|item| matches!(&item.body, ItemBody::User { text: t, .. } if t == text))
+            .count()
+    }
+
+    #[test]
+    fn a_send_that_fails_after_a_clean_exit_starts_the_session_again_with_it() {
+        let (mut app, key) = sent_hello();
+        assert!(opened(&app.receive(exit_of(1, true), 0.0)).is_empty());
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+        let specs = opened(&effects);
+        assert_eq!(specs.len(), 1, "{effects:?}");
+        assert_eq!(specs[0].resume, Some(id("s1")));
+        assert_eq!(mark(&app, key), Mark::Working);
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+        let effects = app.receive(started_on(2), 0.0);
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert!(sends_text(&effects, 2, "hello"));
+        assert!(session(&app, key).undelivered.is_empty());
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+    }
+
+    #[test]
+    fn after_an_unclean_exit_it_waits_for_the_restart() {
+        let (mut app, key) = sent_hello();
+        app.receive(exit_of(1, false), 0.0);
+        let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+        assert_eq!(opened(&app.restart(key)).len(), 1);
+        let effects = app.receive(started_on(2), 0.0);
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert!(session(&app, key).undelivered.is_empty());
+    }
+
+    #[test]
+    fn an_undelivered_message_goes_before_the_queued_one() {
+        let (mut app, key) = sent_hello();
+        app.receive(exit_of(1, false), 0.0);
+        app.receive(closed_send(1, "hello", vec![]), 0.0);
+        app.restart(key);
+        app.submit(key, "later");
+        let effects = app.receive(started_on(2), 0.0);
+        let texts: Vec<&str> = sent_messages(&effects).iter().map(|(t, _)| *t).collect();
+        assert_eq!(texts, vec!["hello", "later"]);
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+        assert_eq!(user_messages(session(&app, key), "later"), 1);
+    }
+
+    #[test]
+    fn an_undelivered_message_keeps_its_images() {
+        let (mut app, key) = sent_hello();
+        app.receive(exit_of(1, false), 0.0);
+        let image = pasted_image();
+        app.receive(closed_send(1, "hello", vec![image.clone()]), 0.0);
+        app.restart(key);
+        let effects = app.receive(started_on(2), 0.0);
+        let sent = sent_messages(&effects);
+        assert_eq!(sent, vec![("hello", &[image.clone()][..])]);
+        let (Attachment::Image { data: was, .. }, [Attachment::Image { data: is, .. }]) =
+            (&image, sent[0].1)
+        else {
+            panic!("an image went");
+        };
+        assert!(
+            std::ptr::eq(was.as_bytes(), is.as_bytes()),
+            "the bytes are shared, not copied"
+        );
+    }
+
+    #[test]
+    fn a_failure_of_an_open_before_the_last_is_dropped() {
+        let (mut app, key) = sent_hello();
+        app.receive(exit_of(1, false), 0.0);
+        app.restart(key);
+        app.receive(started_on(2), 0.0);
+        app.receive(exit_of(2, false), 0.0);
+        let before = session(&app, key).clone();
+        assert_eq!(app.receive(closed_send(1, "hello", vec![]), 0.0), vec![]);
+        assert!(session(&app, key).undelivered.is_empty());
+        assert_eq!(session(&app, key), &before);
+    }
+
+    #[test]
+    fn a_failed_answer_after_the_exit_is_still_dropped() {
+        let (mut app, key) = sent_hello();
+        app.receive(exit_of(1, true), 0.0);
+        let before = session(&app, key).clone();
+        let answer = SessionCommand::Answer {
+            id: RequestId("r1".into()),
+            answer: Answer::Allow { always: false },
+        };
+        let send = SessionCommand::Send {
+            text: "hello".into(),
+            attachments: vec![],
+        };
+        for (command, error) in [
+            (answer.clone(), AgentError::Closed),
+            (answer, AgentError::Protocol("not waiting".into())),
+            (send, AgentError::Io("broken pipe".into())),
+        ] {
+            let failed = FromBackend::SendFailed {
+                open: 1,
+                command,
+                error,
+            };
+            assert_eq!(app.receive(failed, 0.0), vec![]);
+        }
+        assert_eq!(session(&app, key), &before, "no notice, nothing kept");
+    }
+
+    #[test]
+    fn a_session_with_an_undelivered_message_is_not_forgotten() {
+        let mut app = main_screen();
+        let other = app.sessions.add(stored("s9"), NOW - 60);
+        let a = busy(&mut app, "/a");
+        let open = open_of(&app, a);
+        app.receive(closed_send(open, "go", vec![]), 0.0);
+        app.receive(exit_of(open, true), 0.0);
+        assert!(!session(&app, a).is_stored(), "nothing reached the agent");
+        app.show(other, Place::Focused, Leaving::ForgetIfEmpty);
+        assert!(app.sessions.get(a).is_some());
+        assert_eq!(session(&app, a).undelivered.len(), 1);
+    }
+
+    #[test]
+    fn a_send_that_fails_before_the_exit_is_not_sent_again_on_that_open() {
+        let (mut app, key) = sent_hello();
+        app.receive(
+            FromBackend::Event {
+                open: 1,
+                event: permission("r1"),
+            },
+            0.0,
+        );
+        let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+        assert!(sent_messages(&effects).is_empty(), "{effects:?}");
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+        app.submit(key, "later");
+        let effects = app.receive(
+            FromBackend::Event {
+                open: 1,
+                event: done(),
+            },
+            0.0,
+        );
+        assert!(sent_messages(&effects).is_empty(), "{effects:?}");
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+    }
+
+    #[test]
+    fn then_a_clean_exit_starts_the_session_again_with_it() {
+        let (mut app, key) = sent_hello();
+        assert_eq!(session(&app, key).phase, Phase::Working);
+        let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+        assert!(sent_messages(&effects).is_empty(), "{effects:?}");
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        let effects = app.receive(exit_of(1, true), 0.0);
+        let specs = opened(&effects);
+        assert_eq!(specs.len(), 1, "{effects:?}");
+        assert_eq!(specs[0].resume, Some(id("s1")));
+        assert_eq!(session(&app, key).phase, Phase::Opening);
+        assert_eq!(mark(&app, key), Mark::Working);
+        let effects = app.receive(started_on(2), 0.0);
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert!(sends_text(&effects, 2, "hello"));
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+    }
+
+    #[test]
+    fn then_an_unclean_exit_waits_for_the_restart() {
+        let (mut app, key) = sent_hello();
+        app.receive(closed_send(1, "hello", vec![]), 0.0);
+        let effects = app.receive(exit_of(1, false), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+        assert_eq!(opened(&app.restart(key)).len(), 1);
+        let effects = app.receive(started_on(2), 0.0);
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+    }
+
+    #[test]
+    fn a_program_that_ends_before_it_starts_is_not_started_again() {
+        let (mut app, key) = sent_hello();
+        app.receive(closed_send(1, "hello", vec![]), 0.0);
+        app.receive(exit_of(1, true), 0.0);
+        assert_eq!(session(&app, key).phase, Phase::Opening);
+        let effects = app.receive(exit_of(2, true), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+        let effects = app.submit(key, "again");
+        assert_eq!(opened(&effects).len(), 1, "a new message wakes it");
+        let effects = app.receive(started_on(3), 0.0);
+        let texts: Vec<&str> = sent_messages(&effects).iter().map(|(t, _)| *t).collect();
+        assert_eq!(texts, vec!["hello", "again"]);
+    }
+
+    #[test]
+    fn a_session_closing_with_the_app_is_not_started_again() {
+        let (mut app, key) = sent_hello();
+        app.receive(closed_send(1, "hello", vec![]), 0.0);
+        app.close(NOW);
+        assert!(opened(&app.receive(exit_of(1, true), 0.0)).is_empty());
+        assert!(app.all_ended(), "nothing is left to wait for");
+        assert_eq!(session(&app, key).undelivered.len(), 1);
     }
 
     #[test]
@@ -2597,7 +3280,8 @@ mod tests {
         assert!(app.sessions.get(a).is_some(), "kept");
         assert_eq!(
             app.show(a, Place::Focused, Leaving::ForgetIfEmpty),
-            vec![reads_branch("/a")]
+            vec![reads_branch("/a")],
+            "the stored one it takes the place of keeps its history for now"
         );
         // A new session in another folder keeps it too.
         assert_eq!(
@@ -3711,7 +4395,8 @@ mod tests {
                 .filter(|e| matches!(e, Effect::ReadHistory { .. }))
                 .count()
         };
-        app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        // Beside it, so that the stored session stays in its tile.
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
         assert_eq!(
             reads(&app.show(key, Place::Focused, Leaving::ForgetIfEmpty)),
             0,
@@ -3723,6 +4408,7 @@ mod tests {
                 image_count: 0,
                 files: Vec::new(),
                 images: Vec::new(),
+                stored: None,
             }],
             ..StoredHistory::default()
         };
@@ -3734,7 +4420,7 @@ mod tests {
         assert_eq!(app.receive(answer(key), 0.0), vec![]);
         assert_eq!(session(&app, key).history, HistoryState::Loaded);
         assert_eq!(session(&app, key).conversation.items().len(), 1);
-        app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        app.new_session("/c".into(), Place::Side, Leaving::ForgetIfEmpty);
         assert_eq!(
             reads(&app.show(key, Place::Focused, Leaving::ForgetIfEmpty)),
             0,
@@ -4023,6 +4709,8 @@ mod tests {
     #[test]
     fn continue_as_a_copy_forks() {
         let (mut app, key, _) = checked(5);
+        let before = session(&app, key).conversation.items().to_vec();
+        assert_eq!(before.len(), 2);
         let (effects, back) = app.answer_prompt(key, PromptChoice::ContinueAsCopy);
         assert_eq!((back, app.prompt(key)), (None, None));
         let mut spec = resume_a1();
@@ -4035,8 +4723,9 @@ mod tests {
         let (original, forked) = (session(&app, key), session(&app, copy));
         assert_eq!(forked.title.as_deref(), Some("Fix the parser"));
         assert_eq!(forked.folder, original.folder);
-        assert_eq!(forked.conversation.items(), original.conversation.items());
-        assert_eq!(forked.conversation.items().len(), 2);
+        assert_eq!(forked.conversation.items(), &before[..]);
+        // The original, in no tile now, keeps its conversation until the tick lets it go.
+        assert_eq!(original.conversation.items(), &before[..]);
         assert_eq!(forked.phase, Phase::Opening);
         assert_eq!(queued_text(forked), Some("carry on"));
         assert_eq!(original.phase, Phase::Resting);
@@ -4279,7 +4968,13 @@ mod tests {
         }];
         assert_eq!(usage_asks(app.tick(NOW + 1000)), refresh);
         assert_eq!(usage_asks(app.tick(NOW + 1300)), vec![]);
-        assert_eq!(usage_asks(app.tick(NOW + 1301)), refresh);
+        assert_eq!(usage_asks(app.tick(NOW + 1301)), vec![], "asked once");
+        assert_eq!(usage_asks(app.tick(NOW + 9000)), vec![]);
+        // Its program reports a new window: when that one has reset, it is asked about.
+        app.event(1, limits(NOW + 9500), 0.0);
+        assert_eq!(usage_asks(app.tick(NOW + 9499)), vec![]);
+        assert_eq!(usage_asks(app.tick(NOW + 9500)), refresh);
+        assert_eq!(usage_asks(app.tick(NOW + 9801)), vec![]);
 
         let (mut app, _) = App::new(caps(), Width::Unlimited, looking(), NOW);
         app.account_checked(signed_in());
@@ -4300,7 +4995,7 @@ mod tests {
         assert_eq!(usage_asks(app.tick(NOW + 301)), look);
         assert_eq!(usage_asks(app.tick(NOW + 302)), vec![]);
         assert_eq!(usage_asks(app.tick(NOW + 601)), vec![]);
-        assert_eq!(usage_asks(app.tick(NOW + 602)), look);
+        assert_eq!(usage_asks(app.tick(NOW + 602)), vec![], "asked once");
     }
 
     const DAY: i64 = 86_400;
@@ -6203,5 +6898,1187 @@ mod tests {
             "{effects:?}"
         );
         assert_eq!(session(&app, copy).chips, vec![]);
+    }
+
+    /// The sessions whose history `effects` let go, in order.
+    fn drops(effects: &[Effect]) -> Vec<SessionKey> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::DropHistory { key } => Some(*key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The sessions whose history `effects` ask for, in order.
+    fn history_asks(effects: &[Effect]) -> Vec<SessionKey> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ReadHistory { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_resting_session_out_of_every_tile_lets_its_conversation_go_after_ten_minutes() {
+        let (mut app, key) = shows_stored();
+        assert_eq!(session(&app, key).conversation.items().len(), 2);
+        let generation = session(&app, key).generation;
+        let effects = app.close_tile(key, Leaving::Keep);
+        assert_eq!(drops(&effects), vec![], "the tick alone lets go");
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![key]);
+        let session = session(&app, key);
+        assert_eq!(session.history, HistoryState::NotLoaded);
+        assert!(session.conversation.items().is_empty());
+        assert!(session.generation > generation, "the items were replaced");
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![], "once");
+    }
+
+    #[test]
+    fn showing_it_again_reads_it_again() {
+        let (mut app, key) = shows_stored();
+        app.close_tile(key, Leaving::Keep);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![key]);
+        let effects = app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        assert_eq!(history_asks(&effects), vec![key]);
+        assert!(effects.contains(&reads(key, "a1")));
+        assert_eq!(session(&app, key).history, HistoryState::Loading);
+    }
+
+    #[test]
+    fn a_session_whose_program_runs_keeps_its_conversation() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        let effects = app.close_tile(a, Leaving::Keep);
+        assert_eq!(drops(&effects), vec![]);
+        app.event(open_of(&app, a), done(), 0.0);
+        assert_eq!(session(&app, a).phase, Phase::Idle);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![]);
+        assert_eq!(session(&app, a).history, HistoryState::Loaded);
+        assert_eq!(user_messages(session(&app, a), "go"), 1);
+    }
+
+    #[test]
+    fn a_queued_or_undelivered_message_keeps_it() {
+        // Undelivered: its program refused "hello" and the one started for it ended at once.
+        let (mut app, key) = sent_hello();
+        app.receive(closed_send(1, "hello", vec![]), 0.0);
+        app.receive(exit_of(1, true), 0.0);
+        app.receive(exit_of(2, true), 0.0);
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+        assert_eq!(drops(&app.close_tile(key, Leaving::Keep)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![]);
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+
+        // Queued, as a resting session cannot be through the intents: the rule still holds.
+        let (mut app, key) = shows_stored();
+        app.sessions.get_mut(key).unwrap().session.queued = Some(crate::session::Outgoing {
+            text: "later".into(),
+            chips: Vec::new(),
+        });
+        assert_eq!(drops(&app.close_tile(key, Leaving::Keep)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![]);
+        assert_eq!(session(&app, key).history, HistoryState::Loaded);
+        // Without the queued message, the same tick lets it go: nothing else kept it.
+        app.sessions.get_mut(key).unwrap().session.queued = None;
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![key]);
+    }
+
+    #[test]
+    fn a_question_waiting_keeps_it_until_it_is_answered() {
+        let (mut app, key, _) = checked(5);
+        assert!(app.prompt(key).is_some());
+        assert_eq!(drops(&app.close_tile(key, Leaving::Keep)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![]);
+        app.answer_prompt(key, PromptChoice::Cancel);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![key]);
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+    }
+
+    #[test]
+    fn a_clean_exit_of_a_session_in_no_tile_lets_go_at_the_tick() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        assert_eq!(tile_keys(&app), vec![app.focused().unwrap()]);
+        let open = open_of(&app, a);
+        app.event(open, done(), 0.0);
+        assert_eq!(mark(&app, a), Mark::Finished);
+        // Its program runs on for an hour out of every tile, and then ends.
+        assert_eq!(drops(&app.tick(NOW + 3600)), vec![], "its program runs");
+        let effects = app.event(open, exited(true), 0.0);
+        assert_eq!(drops(&effects), vec![], "not at the exit");
+        assert_eq!(session(&app, a).history, HistoryState::Loaded);
+        assert_eq!(
+            drops(&app.tick(NOW + 3601)),
+            vec![a],
+            "ten minutes are long over"
+        );
+        assert_eq!(session(&app, a).history, HistoryState::NotLoaded);
+        assert!(session(&app, a).conversation.items().is_empty());
+        assert_eq!(mark(&app, a), Mark::Finished, "its mark stays");
+    }
+
+    #[test]
+    fn a_history_for_a_session_that_let_go_is_dropped() {
+        let mut app = main_screen();
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
+        listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![a1]);
+        let key = by_id(&app, "a1");
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        assert_eq!(session(&app, key).history, HistoryState::Loading);
+        app.close_tile(key, Leaving::Keep);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![key]);
+        let history = StoredHistory {
+            items: vec![HistoryItem::AssistantText("It reads tokens.".into())],
+            ..StoredHistory::default()
+        };
+        app.receive(
+            FromBackend::History {
+                key,
+                result: Ok(history),
+                pictures: Vec::new(),
+            },
+            0.0,
+        );
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+        assert!(session(&app, key).conversation.items().is_empty());
+        app.receive(
+            FromBackend::History {
+                key,
+                result: Err(AgentError::Io("gone".into())),
+                pictures: Vec::new(),
+            },
+            0.0,
+        );
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+    }
+
+    #[test]
+    fn the_chips_of_a_session_that_let_go_stay() {
+        let (mut app, key) = shows_stored();
+        app.attach(key, vec![pasted()]);
+        let chips = chips_of(&app, key);
+        assert_eq!(chips.len(), 1);
+        app.close_tile(key, Leaving::Keep);
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![key]);
+        assert_eq!(chips_of(&app, key), chips);
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+    }
+
+    #[test]
+    fn the_session_a_copy_leaves_keeps_its_history_and_the_copy_gets_its_own() {
+        let mut app = main_screen();
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
+        listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![a1]);
+        let key = by_id(&app, "a1");
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        // The question comes while the original's history is still being read.
+        app.submit(key, "carry on");
+        app.receive(
+            FromBackend::Activity {
+                key,
+                result: Ok(Some(NOW - 5)),
+            },
+            0.0,
+        );
+        let (effects, _) = app.answer_prompt(key, PromptChoice::ContinueAsCopy);
+        let copy = app.focused().unwrap();
+        assert_eq!(
+            drops(&effects),
+            vec![],
+            "the original is in no tile: for the tick"
+        );
+        assert_eq!(history_asks(&effects), vec![copy]);
+        let history = StoredHistory {
+            items: vec![HistoryItem::AssistantText("It reads tokens.".into())],
+            ..StoredHistory::default()
+        };
+        for at in [key, copy] {
+            app.receive(
+                FromBackend::History {
+                    key: at,
+                    result: Ok(history.clone()),
+                    pictures: Vec::new(),
+                },
+                0.0,
+            );
+        }
+        assert_eq!(session(&app, key).history, HistoryState::Loaded);
+        assert_eq!(session(&app, copy).history, HistoryState::Loaded);
+        assert!(!session(&app, copy).conversation.items().is_empty());
+        // Ten minutes on, the original lets go and the copy, in its tile, does not.
+        assert_eq!(drops(&app.tick(NOW + LET_GO_SECONDS)), vec![key]);
+        assert_eq!(session(&app, copy).history, HistoryState::Loaded);
+    }
+
+    /// [`ready`] with "first" handed over and its turn finished: its program idles at `NOW`, and
+    /// the agent stores the session.
+    fn idle() -> (App, SessionKey) {
+        let (mut app, key) = ready();
+        app.submit(key, "first");
+        app.event(1, done(), 0.0);
+        (app, key)
+    }
+
+    /// [`idle`], its program at the effort high, which its model takes, and in the mode that
+    /// accepts edits.
+    fn idle_as_chosen() -> (App, SessionKey) {
+        let (mut app, key) = idle();
+        let mut entry = app.sessions.get_mut(key).unwrap();
+        for option in &mut entry.session.models {
+            option.effort_levels = vec!["low".into(), "high".into()];
+        }
+        drop(entry);
+        app.event(1, SessionEvent::EffortChanged(Some("high".into())), 0.0);
+        let mode = SessionEvent::PermissionModeChanged(PermissionMode::AcceptEdits);
+        app.event(1, mode, 0.0);
+        (app, key)
+    }
+
+    /// How many notices that its program ended `session`'s conversation holds.
+    fn ended_notices(session: &Session) -> usize {
+        session
+            .conversation
+            .items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.body,
+                    ItemBody::Notice {
+                        kind: NoticeKind::Ended,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn busy_counts_what_a_quit_would_cut_off() {
+        let mut app = main_screen();
+        assert_eq!(app.busy(), Busy::default(), "no session");
+        fn add(app: &mut App, name: &str, change: &dyn Fn(&mut Entry)) {
+            let key = app.sessions.add(stored(name), NOW - 60);
+            change(&mut app.sessions.get_mut(key).unwrap());
+        }
+        let queued = || {
+            Some(crate::session::Outgoing {
+                text: "go on".into(),
+                chips: Vec::new(),
+            })
+        };
+        let undelivered = || {
+            vec![Undelivered {
+                text: "go on".into(),
+                attachments: Vec::new(),
+            }]
+        };
+        add(&mut app, "s1", &|e| e.session.phase = Phase::Working);
+        add(&mut app, "s2", &|e| e.session.phase = Phase::NeedsUser);
+        add(&mut app, "s3", &|e| {
+            e.session.phase = Phase::Opening;
+            e.session.queued = queued();
+        });
+        add(&mut app, "s4", &|e| {
+            e.session.phase = Phase::Idle;
+            e.session.background = 1;
+        });
+        add(&mut app, "s5", &|e| {
+            e.session.phase = Phase::Idle;
+            e.session.remote = Remote::On { url: None };
+        });
+        add(&mut app, "s6", &|e| e.session.phase = Phase::Idle);
+        assert_eq!(
+            app.busy(),
+            Busy {
+                working: 4,
+                remote: 1
+            }
+        );
+        // A message that waits for a program counts in every phase: a quit would lose it.
+        add(&mut app, "s7", &|e| {
+            e.session.phase = Phase::Idle;
+            e.session.queued = queued();
+        });
+        add(&mut app, "s8", &|e| e.session.undelivered = undelivered());
+        add(&mut app, "s9", &|e| {
+            e.session.phase = Phase::Ended {
+                clean: true,
+                detail: String::new(),
+            };
+            e.session.undelivered = undelivered();
+        });
+        add(&mut app, "s10", &|e| {
+            e.session.phase = Phase::Opening;
+            e.session.undelivered = undelivered();
+        });
+        // So does the message the "open elsewhere" question holds.
+        add(&mut app, "s11", &|e| {
+            e.prompt = Some(Prompt::OpenElsewhere {
+                text: "go on".into(),
+            });
+        });
+        add(&mut app, "s12", &|_| {});
+        assert_eq!(
+            app.busy(),
+            Busy {
+                working: 9,
+                remote: 1
+            }
+        );
+    }
+
+    #[test]
+    fn the_standing_counts_sessions_by_their_mark() {
+        let mut app = main_screen();
+        assert_eq!(app.standing(), Standing::default(), "no session");
+        let mut add = |name: &str, change: &dyn Fn(&mut Entry)| {
+            let key = app.sessions.add(stored(name), NOW - 60);
+            change(&mut app.sessions.get_mut(key).unwrap());
+        };
+        add("s1", &|e| e.session.phase = Phase::Working);
+        add("s2", &|e| {
+            e.session.phase = Phase::Opening;
+            e.session.queued = Some(crate::session::Outgoing {
+                text: "go on".into(),
+                chips: Vec::new(),
+            });
+        });
+        add("s3", &|e| e.session.phase = Phase::NeedsUser);
+        add("s4", &|e| {
+            e.prompt = Some(Prompt::OpenElsewhere {
+                text: "go on".into(),
+            });
+        });
+        add("s5", &|e| {
+            e.session.phase = Phase::Idle;
+            e.unseen = true;
+        });
+        add("s6", &|e| e.unseen = true);
+        add("s7", &|e| e.session.phase = Phase::Idle);
+        add("s8", &|_| {});
+        assert_eq!(
+            app.standing(),
+            Standing {
+                working: 2,
+                needs_you: 2,
+                finished: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_quit_sends_no_second_close_to_a_program_being_stopped() {
+        let (mut app, key) = idle();
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        assert!(closes(&app.close(NOW + 1801)).is_empty());
+        assert_eq!(app.sessions.get(key).unwrap().stopping, Some(1));
+    }
+
+    #[test]
+    fn a_stored_session_idle_for_half_an_hour_is_closed() {
+        let (mut app, key) = idle();
+        assert!(closes(&app.tick(NOW + 1799)).is_empty());
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        assert_eq!(app.sessions.get(key).unwrap().stopping, Some(1));
+        assert!(closes(&app.tick(NOW + 1801)).is_empty(), "once");
+    }
+
+    #[test]
+    fn what_keeps_a_program_running() {
+        let (mut app, _) = idle();
+        assert_eq!(closes(&app.tick(NOW + 7200)), vec![1], "nothing keeps it");
+
+        /// Puts on the session one thing that keeps its program running.
+        type Keep = fn(&mut App, SessionKey);
+        let cases: Vec<(&str, Keep)> = vec![
+            ("a turn running", |app, key| {
+                app.submit(key, "more");
+            }),
+            // Outside a turn, so that the request alone keeps it.
+            ("a request waiting", |app, _| {
+                app.event(1, permission("r1"), 0.0);
+            }),
+            ("Remote Control on", |app, _| {
+                let url = Some("https://example.org/session".into());
+                app.event(1, SessionEvent::RemoteAccess(RemoteAccess::On { url }), 0.0);
+            }),
+            ("Remote Control asked for", |app, key| {
+                app.set_remote(key, true);
+            }),
+            // A running session hands a message over at once: one is queued only by hand.
+            ("a queued message", |app, key| {
+                app.sessions.get_mut(key).unwrap().session.queued =
+                    Some(crate::session::Outgoing {
+                        text: "later".into(),
+                        chips: Vec::new(),
+                    });
+            }),
+            ("an undelivered message", |app, key| {
+                app.submit(key, "more");
+                app.receive(closed_send(1, "more", vec![]), 0.0);
+            }),
+            ("a background task", |app, _| {
+                app.event(1, SessionEvent::BackgroundTasks { running: 1 }, 0.0);
+            }),
+            // Asked only about a resting session today: put on a running one by hand.
+            ("the open elsewhere question", |app, key| {
+                app.sessions.get_mut(key).unwrap().prompt = Some(Prompt::OpenElsewhere {
+                    text: "later".into(),
+                });
+            }),
+            ("the store being asked", |app, key| {
+                app.sessions.get_mut(key).unwrap().checking = true;
+            }),
+        ];
+        for (what, keep) in cases {
+            let (mut app, key) = idle();
+            keep(&mut app, key);
+            assert!(closes(&app.tick(NOW + 7200)).is_empty(), "{what}");
+            assert_eq!(app.sessions.get(key).unwrap().stopping, None, "{what}");
+        }
+
+        let (mut app, key) = ready();
+        assert!(!session(&app, key).is_stored());
+        assert!(
+            closes(&app.tick(NOW + 7200)).is_empty(),
+            "a session that never had a message"
+        );
+    }
+
+    #[test]
+    fn anything_from_the_program_moves_the_deadline() {
+        let (mut app, _) = idle();
+        assert!(closes(&app.tick(NOW + 1000)).is_empty());
+        app.event(1, SessionEvent::TitleChanged("Parser".into()), 0.0);
+        assert!(closes(&app.tick(NOW + 1800)).is_empty());
+        // But not an answer to the app's own ask for the usage limits.
+        app.tick(NOW + 2000);
+        app.event(1, SessionEvent::UsageLimits(no_limits()), 0.0);
+        assert_eq!(closes(&app.tick(NOW + 2800)), vec![1]);
+    }
+
+    #[test]
+    fn after_a_quiet_stop_the_session_rests_as_it_was() {
+        let (mut app, key) = idle_as_chosen();
+        let before = session(&app, key).clone();
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        let effects = app.receive(exit_of(1, true), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        let entry = app.sessions.get(key).unwrap();
+        assert_eq!(entry.session.phase, Phase::Resting);
+        assert_eq!(entry.open, None);
+        assert_eq!(entry.stopping, None);
+        assert_eq!(
+            entry.session.conversation.items(),
+            before.conversation.items()
+        );
+        assert_eq!(entry.session.model, before.model);
+        assert_eq!(entry.session.effort, Some("high".into()));
+        assert_eq!(entry.session.mode, PermissionMode::AcceptEdits);
+        assert_eq!(entry.mark(), Mark::None);
+    }
+
+    #[test]
+    fn a_quiet_stop_that_had_to_kill_still_rests() {
+        let (mut app, key) = idle();
+        // Another session takes the focus: an ended turn would leave this one unseen.
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        assert!(app.tiles.contains(key) && app.focused() != Some(key));
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        app.receive(exit_of(1, false), 0.0);
+        let entry = app.sessions.get(key).unwrap();
+        assert_eq!(entry.session.phase, Phase::Resting);
+        assert_eq!(entry.open, None);
+        assert_eq!(entry.stopping, None);
+        assert_eq!(ended_notices(&entry.session), 0);
+        assert_eq!(entry.mark(), Mark::None);
+    }
+
+    #[test]
+    fn the_next_message_starts_it_as_it_was() {
+        let (mut app, key) = idle_as_chosen();
+        let spec = session(&app, key).start_spec();
+        assert_eq!(spec.resume, Some(id("s1")));
+        assert_eq!(spec.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(spec.effort.as_deref(), Some("high"));
+        assert_eq!(spec.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        app.receive(exit_of(1, true), 0.0);
+        let effects = app.submit(key, "again");
+        assert_eq!(opened(&effects), vec![&spec], "{effects:?}");
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CheckActivity { .. })),
+            "the store is not asked: this app ran it"
+        );
+    }
+
+    #[test]
+    fn a_message_sent_while_it_stops_is_delivered_after_the_restart() {
+        let (mut app, key) = idle();
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        assert!(sends_text(&app.submit(key, "hello"), 1, "hello"));
+        assert!(opened(&app.receive(exit_of(1, true), 0.0)).is_empty());
+        let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+        assert_eq!(opened(&effects).len(), 1, "{effects:?}");
+        let effects = app.receive(started_on(2), 0.0);
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert!(sends_text(&effects, 2, "hello"));
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+        assert_eq!(ended_notices(session(&app, key)), 0);
+    }
+
+    #[test]
+    fn a_message_sent_while_it_stops_is_delivered_whichever_comes_first() {
+        // The usual order: the backend refuses the message as soon as the `Close` shut its lane,
+        // and the program's exit follows. Even an exit that had to kill it is a quiet one.
+        for clean in [true, false] {
+            let (mut app, key) = idle();
+            assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+            app.submit(key, "hello");
+            // Another session takes the focus: an ended turn would leave this one unseen.
+            app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+            assert!(app.tiles.contains(key) && app.focused() != Some(key));
+            let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+            assert!(opened(&effects).is_empty(), "{effects:?}");
+            let effects = app.receive(exit_of(1, clean), 0.0);
+            assert_eq!(opened(&effects).len(), 1, "clean {clean}: {effects:?}");
+            let entry = app.sessions.get(key).unwrap();
+            assert!(!entry.unseen, "clean {clean}");
+            assert_eq!(entry.stopping, None);
+            assert_eq!(ended_notices(&entry.session), 0, "clean {clean}");
+            let open = entry.open.unwrap();
+            let effects = app.receive(started_on(open), 0.0);
+            assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+            assert!(sends_text(&effects, open, "hello"));
+            assert_eq!(user_messages(session(&app, key), "hello"), 1);
+        }
+    }
+
+    #[test]
+    fn a_stopped_session_in_no_tile_lets_go_at_the_next_tick() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        let open = open_of(&app, a);
+        app.event(open, done(), 0.0);
+        app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        assert!(!app.tiles.contains(a));
+        let effects = app.tick(NOW + 1800);
+        assert_eq!(closes(&effects), vec![open]);
+        assert_eq!(drops(&effects), vec![], "its program still runs");
+        let effects = app.receive(exit_of(open, true), 0.0);
+        assert_eq!(drops(&effects), vec![], "not at the exit");
+        assert_eq!(session(&app, a).phase, Phase::Resting);
+        assert_eq!(session(&app, a).history, HistoryState::Loaded);
+        // It left its tile half an hour ago: the next tick lets it go.
+        assert_eq!(drops(&app.tick(NOW + 1801)), vec![a]);
+        assert_eq!(session(&app, a).history, HistoryState::NotLoaded);
+    }
+
+    #[test]
+    fn the_idle_length_can_be_set_and_never_under_a_minute() {
+        assert_eq!(IDLE_SECONDS, 30 * 60);
+        let (mut app, _) = idle();
+        app.set_idle_after(120);
+        assert!(closes(&app.tick(NOW + 119)).is_empty());
+        assert_eq!(closes(&app.tick(NOW + 120)), vec![1]);
+        let (mut app, _) = idle();
+        app.set_idle_after(5);
+        assert!(closes(&app.tick(NOW + 59)).is_empty());
+        assert_eq!(closes(&app.tick(NOW + 60)), vec![1]);
+    }
+
+    #[test]
+    fn a_turn_that_ends_with_no_window_is_unseen_also_in_the_focused_tile() {
+        let (mut app, key) = ready();
+        app.submit(key, "hello");
+        assert!(app.set_window(false).is_empty());
+        app.event(1, done(), 0.0);
+        assert_eq!(app.focused(), Some(key));
+        assert!(app.sessions.get(key).unwrap().unseen);
+        assert_eq!(mark(&app, key), Mark::Finished);
+    }
+
+    #[test]
+    fn the_window_coming_back_counts_the_focused_session_as_seen() {
+        let (mut app, key) = ready();
+        app.submit(key, "hello");
+        app.set_window(false);
+        app.event(1, done(), 0.0);
+        assert!(app.sessions.get(key).unwrap().unseen);
+        assert!(app.set_window(true).is_empty());
+        assert!(!app.sessions.get(key).unwrap().unseen);
+        assert_eq!(mark(&app, key), Mark::None);
+        // With the window back, a turn that ends in the focused session is seen there.
+        app.submit(key, "again");
+        app.event(1, done(), 0.0);
+        assert!(!app.sessions.get(key).unwrap().unseen);
+    }
+
+    #[test]
+    fn a_picture_gives_its_bytes_or_the_read_of_them() {
+        let mut app = main_screen();
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
+        listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![a1]);
+        let key = by_id(&app, "a1");
+        app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        let history = StoredHistory {
+            items: vec![HistoryItem::User {
+                text: "see these".into(),
+                image_count: 2,
+                files: Vec::new(),
+                images: vec![None, None],
+                stored: Some("m1".into()),
+            }],
+            ..StoredHistory::default()
+        };
+        let pictures = vec![vec![1 << 63 | 1, 1 << 63 | 2]];
+        app.receive(
+            FromBackend::History {
+                key,
+                result: Ok(history),
+                pictures,
+            },
+            0.0,
+        );
+        assert_eq!(
+            app.full_image(key, 1 << 63 | 2),
+            (
+                None,
+                vec![Effect::ReadImage {
+                    picture: 1 << 63 | 2,
+                    id: id("a1"),
+                    message: "m1".into(),
+                    index: 1,
+                }]
+            )
+        );
+        let red = ImageData::new([200u8, 30, 30, 255].repeat(4));
+        app.sessions.get_mut(key).unwrap().session.chips = vec![Chip {
+            id: 5,
+            name: "Pasted image".into(),
+            source: Source::Pasted(red.clone()),
+            state: ChipState::Ready(Prepared {
+                kind: AttachKind::Image,
+                attachment: Attachment::Image {
+                    media_type: "image/png".into(),
+                    data: red.clone(),
+                },
+                thumb: None,
+            }),
+        }];
+        assert_eq!(app.full_image(key, 5), (Some(red), Vec::new()));
+        assert_eq!(app.full_image(key, 6), (None, Vec::new()));
+        assert_eq!(app.full_image(SessionKey(99), 5), (None, Vec::new()));
+    }
+
+    /// `Remote Control` asked of open `open`.
+    fn asks_remote(effects: &[Effect], open: u64) -> bool {
+        effects.contains(&Effect::Send {
+            open,
+            command: SessionCommand::SetRemoteAccess { on: true },
+        })
+    }
+
+    /// [`idle`], its program stopped for idleness and gone: the session rests.
+    fn stopped_for_idling() -> (App, SessionKey) {
+        let (mut app, key) = idle();
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        app.receive(exit_of(1, true), 0.0);
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        (app, key)
+    }
+
+    #[test]
+    fn remote_control_asked_of_a_session_stopped_for_idling_starts_it() {
+        let (mut app, key) = stopped_for_idling();
+        let effects = app.set_remote(key, true);
+        let specs = opened(&effects);
+        assert_eq!(specs.len(), 1, "{effects:?}");
+        assert_eq!(specs[0].resume, Some(id("s1")));
+        assert_eq!(session(&app, key).phase, Phase::Opening);
+        assert!(app.set_remote(key, true).is_empty(), "started once");
+        let effects = app.receive(started_on(2), 0.0);
+        assert!(asks_remote(&effects, 2), "{effects:?}");
+        assert!(closes(&app.tick(NOW + 9000)).is_empty(), "and it stays up");
+    }
+
+    #[test]
+    fn remote_control_asked_while_it_stops_starts_it_again_after_the_exit() {
+        // Even an exit that had to kill it is a quiet one.
+        for clean in [true, false] {
+            let (mut app, key) = idle();
+            assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+            // Its program still stands as running: it is asked, and the ask ends with it.
+            app.set_remote(key, true);
+            let effects = app.receive(exit_of(1, clean), 0.0);
+            let specs = opened(&effects);
+            assert_eq!(specs.len(), 1, "clean {clean}: {effects:?}");
+            assert_eq!(specs[0].resume, Some(id("s1")));
+            assert_eq!(ended_notices(session(&app, key)), 0, "clean {clean}");
+            let effects = app.receive(started_on(2), 0.0);
+            assert!(asks_remote(&effects, 2), "clean {clean}: {effects:?}");
+        }
+        // With a message its program never got as well, it is started once.
+        let (mut app, key) = idle();
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        app.set_remote(key, true);
+        app.submit(key, "hello");
+        app.receive(closed_send(1, "hello", vec![]), 0.0);
+        let effects = app.receive(exit_of(1, true), 0.0);
+        assert_eq!(opened(&effects).len(), 1, "{effects:?}");
+    }
+
+    #[test]
+    fn remote_control_asked_of_a_session_never_run_here_still_waits() {
+        let (mut app, key) = shows_stored();
+        assert_eq!(app.set_remote(key, true), vec![]);
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        assert!(session(&app, key).remote_wanted, "for its next start");
+
+        // Nor is one started that this app ran, while a question waits about it, while the
+        // store is asked about it, or once the app is going away.
+        type Hold = fn(&mut App, SessionKey);
+        let cases: Vec<(&str, Hold)> = vec![
+            ("a question waiting", |app, key| {
+                app.sessions.get_mut(key).unwrap().prompt = Some(Prompt::OpenElsewhere {
+                    text: "later".into(),
+                });
+            }),
+            ("the store being asked", |app, key| {
+                app.sessions.get_mut(key).unwrap().checking = true;
+            }),
+            ("the app going away", |app, _| {
+                app.close(NOW + 1900);
+            }),
+        ];
+        for (what, hold) in cases {
+            let (mut app, key) = stopped_for_idling();
+            hold(&mut app, key);
+            let effects = app.set_remote(key, true);
+            assert!(opened(&effects).is_empty(), "{what}: {effects:?}");
+            assert_eq!(session(&app, key).phase, Phase::Resting, "{what}");
+        }
+
+        // A program that ends by itself with Remote Control wanted is not started again.
+        let (mut app, key) = idle();
+        app.set_remote(key, true);
+        let effects = app.receive(exit_of(1, true), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        // Turning it off starts nothing.
+        let (mut app, key) = stopped_for_idling();
+        assert!(app.set_remote(key, false).is_empty());
+    }
+
+    /// A usage report with the session window alone, resetting at `resets_at_unix`.
+    fn session_limit(resets_at_unix: i64) -> UsageLimits {
+        UsageLimits {
+            session: Some(LimitWindow {
+                used: 0.9,
+                resets_at_unix,
+            }),
+            weekly: None,
+        }
+    }
+
+    /// A usage report that names no window.
+    fn no_limits() -> UsageLimits {
+        UsageLimits {
+            session: None,
+            weekly: None,
+        }
+    }
+
+    #[test]
+    fn an_answer_to_the_apps_own_usage_ask_does_not_keep_a_program_from_the_idle_stop() {
+        let (mut app, _) = idle();
+        app.event(1, SessionEvent::UsageLimits(session_limit(NOW + 10)), 0.0);
+        let mut closed = Vec::new();
+        for minute in 1..=4 * 60 {
+            let now = NOW + minute * 60;
+            let effects = app.tick(now);
+            closed.extend(closes(&effects).into_iter().map(|open| (open, now)));
+            // Each ask is answered, the lapsed window left out; and every ten minutes an answer
+            // and a refusal come anyway, as they would to asks made at every start.
+            let asked = !usage_asks(effects).is_empty();
+            if asked || minute % 10 == 0 {
+                app.event(1, SessionEvent::UsageLimits(no_limits()), 0.0);
+                let refresh = SessionCommand::RefreshUsage;
+                app.send_failed(1, &refresh, AgentError::Io("broken pipe".into()));
+                let refused = SessionEvent::CommandFailed {
+                    what: CommandKind::RefreshUsage,
+                    reason: "not now".into(),
+                };
+                app.event(1, refused, 0.0);
+            }
+        }
+        assert_eq!(closed, vec![(1, NOW + 1800)], "closed once, on time");
+    }
+
+    /// An app that looks, signed in, with no session, its first look answered with a session
+    /// window that resets ten seconds after `NOW`.
+    fn looked_with_a_window() -> App {
+        let (mut app, _) = App::new(caps(), Width::Unlimited, looking(), NOW);
+        app.account_checked(signed_in());
+        let effects = listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![]);
+        assert_eq!(usage_asks(effects).len(), 1, "the first look");
+        app.receive(look_answer(Some(session_limit(NOW + 10))), 0.0);
+        app
+    }
+
+    fn look_answer(usage: Option<UsageLimits>) -> FromBackend {
+        FromBackend::Look {
+            models: Vec::new(),
+            model: None,
+            usage,
+        }
+    }
+
+    #[test]
+    fn a_lapsed_usage_window_is_asked_about_once() {
+        // What the look answers: the lapsed window left out, the same window again, nothing
+        // about usage, and no answer at all.
+        let answers = [
+            Some(look_answer(Some(no_limits()))),
+            Some(look_answer(Some(session_limit(NOW + 10)))),
+            Some(look_answer(None)),
+            None,
+        ];
+        for (case, answer) in answers.into_iter().enumerate() {
+            let mut app = looked_with_a_window();
+            let mut looks = 0;
+            for minute in 1..=8 * 60 {
+                for ask in usage_asks(app.tick(NOW + minute * 60)) {
+                    assert!(matches!(ask, Effect::Look { .. }), "nothing runs");
+                    looks += 1;
+                    if let Some(answer) = answer.clone() {
+                        app.receive(answer, 0.0);
+                    }
+                }
+            }
+            assert_eq!(looks, 1, "case {case}");
+            if case == 0 {
+                assert_eq!(app.usage.session, None, "left out: cleared, not kept");
+            }
+        }
+    }
+
+    #[test]
+    fn no_look_is_made_for_usage_while_no_window_shows() {
+        let mut app = looked_with_a_window();
+        app.set_window(false);
+        for minute in 1..=8 * 60 {
+            let asks = usage_asks(app.tick(NOW + minute * 60));
+            assert_eq!(asks, vec![], "minute {minute}");
+        }
+    }
+
+    #[test]
+    fn the_usage_look_is_made_when_the_window_comes_back() {
+        let mut app = looked_with_a_window();
+        app.set_window(false);
+        assert_eq!(usage_asks(app.tick(NOW + 3600)), vec![]);
+        let look = vec![Effect::Look {
+            folder: "/home/alex".into(),
+        }];
+        assert_eq!(usage_asks(app.set_window(true)), look);
+        assert_eq!(usage_asks(app.set_window(true)), vec![], "once");
+        assert_eq!(usage_asks(app.tick(NOW + 7200)), vec![]);
+        // A program that runs is asked also while no window shows: nothing is started for it.
+        let (mut app, _) = idle();
+        app.event(1, SessionEvent::UsageLimits(session_limit(NOW + 10)), 0.0);
+        app.set_window(false);
+        let refresh = vec![Effect::Send {
+            open: 1,
+            command: SessionCommand::RefreshUsage,
+        }];
+        assert_eq!(usage_asks(app.tick(NOW + 301)), refresh);
+    }
+
+    /// The notices that a message could not be delivered in `session`'s conversation.
+    fn not_delivered_notices(session: &Session) -> usize {
+        session
+            .conversation
+            .items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    &item.body,
+                    ItemBody::Notice { kind: NoticeKind::Ended, text }
+                        if text == "The message could not be delivered. Restart to send it."
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_program_that_keeps_refusing_is_started_twice_and_no_more() {
+        let (mut app, key) = sent_hello();
+        // Each program refuses "hello" as closed and ends cleanly.
+        for open in 1..=2 {
+            app.receive(closed_send(open, "hello", vec![]), 0.0);
+            let effects = app.receive(exit_of(open, true), 0.0);
+            assert_eq!(opened(&effects).len(), 1, "open {open}: {effects:?}");
+            assert_eq!(not_delivered_notices(session(&app, key)), 0);
+            let effects = app.receive(started_on(open + 1), 0.0);
+            assert!(sends_text(&effects, open + 1, "hello"), "open {open}");
+        }
+        app.receive(closed_send(3, "hello", vec![]), 0.0);
+        let effects = app.receive(exit_of(3, true), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert!(matches!(session(&app, key).phase, Phase::Ended { .. }));
+        assert_eq!(not_delivered_notices(session(&app, key)), 1);
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+        assert_eq!(app.sessions.get(key).unwrap().open, None);
+        assert!(!app.takes_message(key), "until it is restarted");
+        // Restart delivers it.
+        assert_eq!(opened(&app.restart(key)).len(), 1);
+        let effects = app.receive(started_on(4), 0.0);
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert!(session(&app, key).undelivered.is_empty());
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+    }
+
+    #[test]
+    fn a_turn_that_starts_lets_a_later_message_be_started_for_twice_again() {
+        let (mut app, key) = sent_hello();
+        let mut open = 1;
+        // Two rounds of two starts each, a turn started between them.
+        for round in 0..2 {
+            for _ in 0..2 {
+                app.receive(closed_send(open, "hello", vec![]), 0.0);
+                let effects = app.receive(exit_of(open, true), 0.0);
+                assert_eq!(opened(&effects).len(), 1, "round {round}: {effects:?}");
+                open += 1;
+                app.receive(started_on(open), 0.0);
+            }
+            app.event(open, SessionEvent::TurnStarted, 0.0);
+            app.event(open, done(), 0.0);
+            app.submit(key, "hello");
+        }
+        assert_eq!(not_delivered_notices(session(&app, key)), 0);
+    }
+
+    #[test]
+    fn a_copy_asks_for_its_stored_picture_under_the_id_it_was_read_from() {
+        let picture = 1 << 63 | 1;
+        let history = StoredHistory {
+            items: vec![HistoryItem::User {
+                text: "see this".into(),
+                image_count: 1,
+                files: Vec::new(),
+                images: vec![None],
+                stored: Some("m1".into()),
+            }],
+            ..StoredHistory::default()
+        };
+        let loaded = |key| FromBackend::History {
+            key,
+            result: Ok(history.clone()),
+            pictures: vec![vec![picture]],
+        };
+        let read_under = |text: &str| {
+            vec![Effect::ReadImage {
+                picture,
+                id: id(text),
+                message: "m1".into(),
+                index: 0,
+            }]
+        };
+        // The copy is made of a conversation that is loaded, or of one still being read.
+        for loaded_first in [true, false] {
+            let mut app = main_screen();
+            let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
+            listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![a1]);
+            let key = by_id(&app, "a1");
+            app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+            if loaded_first {
+                app.receive(loaded(key), 0.0);
+            }
+            app.submit(key, "carry on");
+            let recent = FromBackend::Activity {
+                key,
+                result: Ok(Some(NOW - 5)),
+            };
+            app.receive(recent, 0.0);
+            app.answer_prompt(key, PromptChoice::ContinueAsCopy);
+            let copy = app.focused().unwrap();
+            assert_ne!(copy, key);
+            if !loaded_first {
+                app.receive(loaded(copy), 0.0);
+            }
+            // Its program gives the copy an id of its own.
+            let open = open_of(&app, copy);
+            app.event(open, SessionEvent::Started(info()), 0.0);
+            assert_eq!(session(&app, copy).id, Some(id("s1")));
+            assert_eq!(
+                app.full_image(copy, picture),
+                (None, read_under("a1")),
+                "loaded first {loaded_first}: read from the original's file"
+            );
+            // Let go and read again, from its own file by then, it asks under its own id.
+            app.event(open, done(), 0.0);
+            app.event(open, exited(true), 0.0);
+            app.close_tile(copy, Leaving::Keep);
+            app.tick(NOW + 3600);
+            assert_eq!(session(&app, copy).history, HistoryState::NotLoaded);
+            let effects = app.show(copy, Place::Focused, Leaving::ForgetIfEmpty);
+            assert!(effects.contains(&reads(copy, "s1")), "{effects:?}");
+            app.receive(loaded(copy), 0.0);
+            assert_eq!(app.full_image(copy, picture), (None, read_under("s1")));
+        }
+    }
+
+    #[test]
+    fn a_message_refused_by_the_last_program_goes_to_the_one_running_now() {
+        let (mut app, key) = sent_hello();
+        app.receive(exit_of(1, false), 0.0);
+        app.restart(key);
+        app.receive(started_on(2), 0.0);
+        assert_eq!(session(&app, key).phase, Phase::Idle);
+        // The refusal of open 1 comes only now: the message goes to open 2 at once.
+        let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert!(sends_text(&effects, 2, "hello"), "{effects:?}");
+        assert!(session(&app, key).undelivered.is_empty());
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+
+        // While the newer program works, it waits for the turn to end, as a queued one does.
+        let (mut app, key) = sent_hello();
+        app.receive(exit_of(1, false), 0.0);
+        app.restart(key);
+        app.receive(started_on(2), 0.0);
+        app.submit(key, "more");
+        assert_eq!(session(&app, key).phase, Phase::Working);
+        let effects = app.receive(closed_send(1, "hello", vec![]), 0.0);
+        assert_eq!(effects, vec![]);
+        assert_eq!(session(&app, key).undelivered.len(), 1);
+        let effects = app.event(2, done(), 0.0);
+        assert_eq!(sent_messages(&effects), vec![("hello", &[][..])]);
+        assert!(sends_text(&effects, 2, "hello"), "{effects:?}");
+        assert_eq!(user_messages(session(&app, key), "hello"), 1);
+    }
+
+    #[test]
+    fn a_session_the_store_is_asked_about_keeps_its_conversation() {
+        // Closed between the message and the store's answer.
+        let (mut app, key) = shows_stored();
+        let effects = app.submit(key, "carry on");
+        assert_eq!(effects, vec![Effect::CheckActivity { key, id: id("a1") }]);
+        assert!(app.sessions.get(key).unwrap().checking);
+        assert_eq!(drops(&app.close_tile(key, Leaving::Keep)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + 3600)), vec![]);
+        assert_eq!(session(&app, key).history, HistoryState::Loaded);
+        assert_eq!(session(&app, key).conversation.items().len(), 2);
+
+        // The check alone keeps it, as a resting session cannot be asked about through the
+        // intents: the rule still holds.
+        let (mut app, key) = shows_stored();
+        app.sessions.get_mut(key).unwrap().checking = true;
+        assert_eq!(drops(&app.close_tile(key, Leaving::Keep)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + 3600)), vec![]);
+        assert_eq!(session(&app, key).history, HistoryState::Loaded);
+        app.sessions.get_mut(key).unwrap().checking = false;
+        assert_eq!(drops(&app.tick(NOW + 3600)), vec![key]);
+    }
+
+    #[test]
+    fn a_session_out_of_its_tile_for_less_than_ten_minutes_keeps_its_conversation() {
+        assert_eq!(LET_GO_SECONDS, 10 * 60);
+        let (mut app, key) = shows_stored();
+        assert_eq!(app.sessions.get(key).unwrap().hidden_unix, None, "shown");
+        let generation = session(&app, key).generation;
+        app.tick(NOW + 100);
+        let effects = app.close_tile(key, Leaving::Keep);
+        assert_eq!(drops(&effects), vec![], "not when its tile closes");
+        assert_eq!(app.sessions.get(key).unwrap().hidden_unix, Some(NOW + 100));
+        assert_eq!(drops(&app.tick(NOW + 699)), vec![]);
+        assert_eq!(session(&app, key).history, HistoryState::Loaded);
+        assert_eq!(session(&app, key).conversation.items().len(), 2);
+        assert_eq!(drops(&app.tick(NOW + 700)), vec![key]);
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+        assert!(session(&app, key).conversation.items().is_empty());
+        assert!(session(&app, key).generation > generation);
+        assert_eq!(drops(&app.tick(NOW + 701)), vec![], "once");
+
+        // Shown again in time, it counts anew from when it next leaves every tile.
+        let (mut app, key) = shows_stored();
+        app.close_tile(key, Leaving::Keep);
+        app.tick(NOW + 500);
+        let effects = app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+        assert_eq!(history_asks(&effects), vec![], "still held");
+        assert_eq!(app.sessions.get(key).unwrap().hidden_unix, None);
+        assert_eq!(drops(&app.tick(NOW + 5000)), vec![], "in a tile");
+        app.close_tile(key, Leaving::Keep);
+        assert_eq!(drops(&app.tick(NOW + 5599)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + 5600)), vec![key]);
+    }
+
+    #[test]
+    fn switching_between_two_resting_sessions_reads_neither_again() {
+        let mut app = main_screen();
+        let stored = vec![
+            store("a1", "Fix the parser", "/home/alex/project", NOW - 3600),
+            store("a2", "Write the docs", "/home/alex/docs", NOW - 7200),
+        ];
+        listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), stored);
+        let (a, b) = (by_id(&app, "a1"), by_id(&app, "a2"));
+        let history = StoredHistory {
+            items: vec![HistoryItem::AssistantText("It reads tokens.".into())],
+            ..StoredHistory::default()
+        };
+        for key in [a, b] {
+            let effects = app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+            assert_eq!(history_asks(&effects), vec![key], "the first time");
+            assert_eq!(drops(&effects), vec![]);
+            let loaded = FromBackend::History {
+                key,
+                result: Ok(history.clone()),
+                pictures: Vec::new(),
+            };
+            app.receive(loaded, 0.0);
+        }
+        let generations = [a, b].map(|key| session(&app, key).generation);
+        // Back and forth in the one tile, a minute apart, for longer than ten minutes in all.
+        for minute in 1..=12 {
+            let key = if minute % 2 == 1 { a } else { b };
+            assert_eq!(drops(&app.tick(NOW + minute * 60)), vec![]);
+            let effects = app.show(key, Place::Focused, Leaving::ForgetIfEmpty);
+            assert_eq!(app.focused(), Some(key));
+            assert_eq!(history_asks(&effects), vec![], "minute {minute}");
+            assert_eq!(drops(&effects), vec![], "minute {minute}");
+            assert_eq!(session(&app, key).history, HistoryState::Loaded);
+        }
+        assert_eq!([a, b].map(|key| session(&app, key).generation), generations);
+        // Left alone, the one in no tile lets go ten minutes after it left.
+        assert_eq!(app.focused(), Some(b));
+        assert_eq!(drops(&app.tick(NOW + 12 * 60 + 599)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + 12 * 60 + 600)), vec![a]);
+    }
+
+    #[test]
+    fn a_session_never_in_a_tile_counts_from_its_programs_exit() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        let open = open_of(&app, a);
+        app.event(open, done(), 0.0);
+        // Never shown since this entry was made: as one the row had no room for.
+        app.new_session("/b".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        app.sessions.get_mut(a).unwrap().hidden_unix = None;
+        app.tick(NOW + 5000);
+        let effects = app.event(open, exited(true), 0.0);
+        assert_eq!(drops(&effects), vec![], "not at the exit");
+        assert_eq!(drops(&app.tick(NOW + 5599)), vec![]);
+        assert_eq!(drops(&app.tick(NOW + 5600)), vec![a]);
     }
 }

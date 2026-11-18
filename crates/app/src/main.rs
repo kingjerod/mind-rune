@@ -1,20 +1,25 @@
-//! MindRune: a desktop window for Claude Code. `mindrune [FOLDER] [--demo]`.
+//! MindRune: a desktop window for Claude Code. `mindrune [FOLDER] [--demo]`, `mindrune --quit`.
 
 mod demo;
 mod glue;
+mod instance;
 #[cfg(test)]
 mod testkit;
 mod theme;
+mod tray;
 mod view;
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, OnceLock};
 
 use mr_claude::ClaudeAgent;
-use rune::AppSpec;
+use mr_core::IDLE_SECONDS;
 use rune::prefs::Prefs;
+use rune::{AppHandle, AppSpec, Tx};
 
 use crate::glue::Ui;
+use crate::instance::{Ask, Claim, Listener, Told};
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq)]
@@ -23,6 +28,8 @@ struct Launch {
     /// ended is shown again, or the window says how to start one.
     folder: Option<PathBuf>,
     demo: bool,
+    /// `--quit`: the running copy is asked to quit, and nothing starts.
+    quit: bool,
 }
 
 static LAUNCH: OnceLock<Launch> = OnceLock::new();
@@ -42,13 +49,21 @@ fn main() {
         eprintln!("mindrune: {message}");
         std::process::exit(2);
     });
+    let headless = rune::is_headless();
+    // Before anything of the app is built: a second copy ends without touching its state.
+    let first = if claims(&launch, headless) {
+        one_copy(&launch)
+    } else {
+        not_claimed(&launch)
+    };
+    let stays = stays_without_window(&launch, headless, first.is_some());
     let _ = LAUNCH.set(launch);
     rune::set_app_id(APP_ID);
     if let Err(message) = rune::set_app_icon(ICON) {
         eprintln!("mindrune: {message}");
     }
-    // As `rune::run`, with a hook that ends the session when the window closes.
-    rune::App::new(AppSpec {
+    // As `rune::run`, with hooks for the window's close and the app's quit.
+    let app = rune::App::new(AppSpec {
         min_size: Some((560.0, 400.0)),
         scenes: demo::SCENES,
         fonts: rune_theme_opencode::FONTS,
@@ -57,9 +72,173 @@ fn main() {
         poll: Some(glue::poll),
         on_key: Some(view::on_key),
         ..AppSpec::new("MindRune", (1200.0, 800.0), init, view::view)
-    })
-    .on_close(glue::closing)
-    .run();
+    });
+    let app = if stays {
+        app.keep_running()
+            .on_close(glue::closing)
+            .on_quit(glue::quitting)
+            .on_visibility(glue::shown)
+    } else {
+        app.on_close(glue::quitting)
+    };
+    if let Some(listener) = first {
+        let handle = app.handle();
+        if stays {
+            let tray = tray::start(handle.clone());
+            handle.update(move |ui, _tx| ui.tray = Some(tray));
+            // So the next poll tells the tray how the sessions stand, not one half a minute on.
+            handle.wake();
+        }
+        listen(listener, handle);
+    }
+    app.run();
+}
+
+/// Whether the app, its sessions with it, keeps running when its window closes: on Unix,
+/// outside the demo and outside a headless run, and only as the `first` copy, which a launch
+/// can find again. Otherwise closing the window ends the app.
+fn stays_without_window(launch: &Launch, headless: bool, first: bool) -> bool {
+    cfg!(unix) && !launch.demo && !headless && first
+}
+
+/// Whether this launch looks for a running copy: not in the demo and not in a headless run.
+fn claims(launch: &Launch, headless: bool) -> bool {
+    !launch.demo && !headless
+}
+
+/// Claims the socket: the first copy gets its listener. A second copy tells the running one
+/// what was asked and ends here, as `--quit` does. Where there is no way back to this copy,
+/// it runs alone.
+fn one_copy(launch: &Launch) -> Option<Listener> {
+    let Some(dir) = instance::folder() else {
+        return not_claimed(launch);
+    };
+    let claim = instance::claim(&dir).unwrap_or_else(|error| {
+        eprintln!("mindrune: {}: {error}", dir.display());
+        Claim::Alone
+    });
+    match claim {
+        Claim::First(_) if launch.quit => not_running(),
+        Claim::First(listener) => Some(listener),
+        Claim::Second => {
+            // A quit whose answer did not come is no failure when the copy has gone.
+            let told = if launch.quit {
+                instance::quit(&dir)
+            } else {
+                instance::tell(
+                    &dir,
+                    &Ask::Show {
+                        token: activation_token(),
+                        folder: launch.folder.clone(),
+                    },
+                )
+            };
+            let Ok(told) = told else {
+                let lock = instance::lock_path(&dir);
+                eprintln!(
+                    "mindrune: a running copy does not answer ({})",
+                    lock.display()
+                );
+                std::process::exit(1);
+            };
+            if let Some(line) = said_after(told, launch.quit) {
+                eprintln!("{line}");
+            }
+            std::process::exit(0);
+        }
+        Claim::Alone => not_claimed(launch),
+    }
+}
+
+/// What a later launch says on stderr once the running copy has answered: that its window is
+/// shown, or, when a quit was asked for and the app asks the user first, where the question is.
+/// Nothing for a quit that was carried out.
+fn said_after(told: Told, quit: bool) -> Option<&'static str> {
+    match (told, quit) {
+        (Told::Asked, _) => {
+            Some("mindrune: something is running; answer the question in its window")
+        }
+        (Told::Ok, false) => Some("mindrune: already running; its window is shown"),
+        (Told::Ok, true) => None,
+    }
+}
+
+/// A launch that found no running copy and is not the first: `--quit` ends here.
+fn not_claimed(launch: &Launch) -> Option<Listener> {
+    if launch.quit {
+        not_running();
+    }
+    None
+}
+
+fn not_running() -> ! {
+    eprintln!("mindrune: not running");
+    std::process::exit(0);
+}
+
+/// The token the desktop gave this launch to bring a window to the front, passed on to the
+/// running copy when it is [one](instance::is_token). Never printed.
+fn activation_token() -> Option<String> {
+    activation_token_from(|key| std::env::var(key).ok())
+}
+
+fn activation_token_from(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"]
+        .into_iter()
+        .find_map(|key| var(key).filter(|token| instance::is_token(token)))
+}
+
+/// Serves the copies launched after this one: a launch shows the window, opening a session in
+/// its folder, and `--quit` quits as Quit does, asking first when something would be cut off.
+/// The window opens for that question, and the copy that asked is told of it.
+fn listen(listener: Listener, handle: AppHandle<Ui>) {
+    listener.serve(move |ask| match ask {
+        Ask::Show { token, folder } => {
+            handle.update(move |ui, tx| glue::launched_again(ui, tx, folder));
+            show(&handle, token);
+            None
+        }
+        Ask::Quit => Some(ask_to_quit(&handle)),
+    });
+}
+
+/// Shows the window in front from another thread (a later launch, the tray), with the
+/// desktop's `token` when there is one. The token is never printed.
+fn show(handle: &AppHandle<Ui>, token: Option<String>) {
+    handle.open();
+    if let Some(token) = token {
+        handle.activate(token);
+    }
+}
+
+/// Asks for Quit from another thread (a later launch's `--quit`, the tray's Quit): the app
+/// quits, or the window opens for the question when something would be cut off. Which of the
+/// two comes on the receiver, from the UI thread.
+fn ask_to_quit(handle: &AppHandle<Ui>) -> Receiver<Told> {
+    let (say, word) = mpsc::channel();
+    let again = handle.clone();
+    handle.update(move |ui, tx| {
+        // Nobody may be listening: the tray asks and does not wait.
+        let asks = quit_for(ui, tx, |told| {
+            let _ = say.send(told);
+        });
+        if asks {
+            again.open();
+        }
+    });
+    word
+}
+
+/// A quit asked for from outside the window, on the UI thread. What the asker is told is said
+/// before anything is done: a quit that is carried out may wait for the programs to end, and
+/// ends the listener with the app. True when the question shows.
+fn quit_for(ui: &mut Ui, tx: &mut Tx, say: impl FnOnce(Told)) -> bool {
+    say(if glue::quit_asks(ui) {
+        Told::Asked
+    } else {
+        Told::Ok
+    });
+    glue::ask_quit(ui, tx)
 }
 
 fn init() -> Ui {
@@ -69,7 +248,11 @@ fn init() -> Ui {
     }
     let agent = Arc::new(ClaudeAgent::from_environment());
     let launch = core_launch(launch, rune::dirs::home());
-    Ui::new(agent, None, launch, Prefs::open("mindrune"))
+    let mut ui = Ui::new(agent, None, launch, Prefs::open("mindrune"));
+    let idle = std::env::var_os("MINDRUNE_IDLE_SECONDS");
+    let idle = idle.as_deref().map(|value| value.to_string_lossy());
+    ui.app.set_idle_after(idle_seconds(idle.as_deref()));
+    ui
 }
 
 /// What the app starts with: the command line's folder, if any, and the user's `home` folder,
@@ -88,13 +271,30 @@ fn core_launch(launch: &Launch, home: Option<PathBuf>) -> mr_core::Launch {
     }
 }
 
-/// `[FOLDER] [--demo]`. The folder, when one is given, must exist.
+/// The idle length `MINDRUNE_IDLE_SECONDS` asks for when it has `value`, in seconds: a whole
+/// number is taken; anything else is said on stderr, and the usual length stays.
+fn idle_seconds(value: Option<&str>) -> i64 {
+    let Some(value) = value else {
+        return IDLE_SECONDS;
+    };
+    value.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "mindrune: MINDRUNE_IDLE_SECONDS is not a number of seconds; using {IDLE_SECONDS}"
+        );
+        IDLE_SECONDS
+    })
+}
+
+/// `[FOLDER] [--demo]` or `--quit`. The folder, when one is given, must exist.
 fn parse(args: &[String]) -> Result<Launch, String> {
     let mut demo = false;
+    let mut quit = false;
     let mut folder = None;
     for arg in args {
         if arg == "--demo" {
             demo = true;
+        } else if arg == "--quit" {
+            quit = true;
         } else if arg.starts_with('-') {
             return Err(format!("unknown option: {arg}"));
         } else if folder.is_none() {
@@ -103,6 +303,9 @@ fn parse(args: &[String]) -> Result<Launch, String> {
             return Err(format!("only one folder can be opened: {arg}"));
         }
     }
+    if quit && folder.is_some() {
+        return Err("--quit takes no folder".into());
+    }
     let folder = match folder {
         Some(folder) if !folder.is_dir() => {
             return Err(format!("not a folder: {}", folder.display()));
@@ -110,7 +313,7 @@ fn parse(args: &[String]) -> Result<Launch, String> {
         Some(folder) => Some(std::path::absolute(&folder).unwrap_or(folder)),
         None => None,
     };
-    Ok(Launch { folder, demo })
+    Ok(Launch { folder, demo, quit })
 }
 
 #[cfg(test)]
@@ -129,14 +332,16 @@ mod tests {
             parse(&[]),
             Ok(Launch {
                 folder: None,
-                demo: false
+                demo: false,
+                quit: false
             })
         );
         assert_eq!(
             parse(&args(&["--demo"])),
             Ok(Launch {
                 folder: None,
-                demo: true
+                demo: true,
+                quit: false
             })
         );
         assert_eq!(
@@ -149,8 +354,31 @@ mod tests {
             parse(&args(&["--demo", path])),
             Ok(Launch {
                 folder: Some(dir.path().into()),
-                demo: true
+                demo: true,
+                quit: false
             })
+        );
+    }
+
+    #[test]
+    fn quit_takes_no_folder() {
+        assert_eq!(
+            parse(&args(&["--quit"])),
+            Ok(Launch {
+                folder: None,
+                demo: false,
+                quit: true
+            })
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert_eq!(
+            parse(&args(&["--quit", path])),
+            Err("--quit takes no folder".into())
+        );
+        assert_eq!(
+            parse(&args(&[path, "--quit"])),
+            Err("--quit takes no folder".into())
         );
     }
 
@@ -263,5 +491,102 @@ mod tests {
     fn without_a_home_the_current_folder_stands_in() {
         let core = core_launch(&parse(&[]).unwrap(), None);
         assert_eq!(core.home, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn the_app_stays_without_its_window_only_outside_the_demo_and_a_headless_run() {
+        let app = parse(&[]).unwrap();
+        let demo = parse(&args(&["--demo"])).unwrap();
+        assert_eq!(stays_without_window(&app, false, true), cfg!(unix));
+        assert!(!stays_without_window(&app, true, true));
+        assert!(!stays_without_window(&demo, false, true));
+        assert!(!stays_without_window(&demo, true, true));
+    }
+
+    #[test]
+    fn only_the_first_copy_stays_without_its_window() {
+        let app = parse(&[]).unwrap();
+        assert!(!stays_without_window(&app, false, false));
+    }
+
+    #[test]
+    fn the_demo_and_a_headless_run_claim_nothing() {
+        let app = parse(&[]).unwrap();
+        let quit = parse(&args(&["--quit"])).unwrap();
+        let demo = parse(&args(&["--demo"])).unwrap();
+        assert!(claims(&app, false));
+        assert!(claims(&quit, false));
+        assert!(!claims(&app, true));
+        assert!(!claims(&demo, false));
+        assert!(!claims(&demo, true));
+    }
+
+    #[test]
+    fn only_a_printable_token_is_passed_on() {
+        let token = |pairs: &[(&str, &str)]| {
+            activation_token_from(|key| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        assert_eq!(
+            token(&[("XDG_ACTIVATION_TOKEN", "abc_1")]),
+            Some("abc_1".into())
+        );
+        assert_eq!(
+            token(&[("DESKTOP_STARTUP_ID", "id_TIME1")]),
+            Some("id_TIME1".into())
+        );
+        assert_eq!(token(&[("XDG_ACTIVATION_TOKEN", "a\nb")]), None);
+        assert_eq!(
+            token(&[("XDG_ACTIVATION_TOKEN", "a b"), ("DESKTOP_STARTUP_ID", "")]),
+            None
+        );
+        assert_eq!(token(&[]), None);
+    }
+
+    #[test]
+    fn a_later_launch_says_what_the_running_copy_answered() {
+        assert_eq!(
+            said_after(Told::Ok, false),
+            Some("mindrune: already running; its window is shown")
+        );
+        assert_eq!(said_after(Told::Ok, true), None, "it quit: nothing to say");
+        let asked = Some("mindrune: something is running; answer the question in its window");
+        assert_eq!(said_after(Told::Asked, true), asked);
+        assert_eq!(said_after(Told::Asked, false), asked);
+    }
+
+    #[test]
+    fn a_quit_from_outside_says_whether_the_app_asks_first() {
+        // A turn runs: the app asks, and says so.
+        let mut rt = testkit::window("working");
+        let mut told = None;
+        let asks = rt.update_if(|ui, tx| quit_for(ui, tx, |word| told = Some(word)));
+        assert!(asks);
+        assert_eq!(told, Some(Told::Asked));
+        assert!(rt.state.quit_ask && !rt.state.quitting);
+        // Asked again while the question shows: the same answer, and nothing else changes.
+        let mut told = None;
+        assert!(rt.update_if(|ui, tx| quit_for(ui, tx, |word| told = Some(word))));
+        assert_eq!(told, Some(Told::Asked));
+        assert!(rt.state.quit_ask && !rt.state.quitting);
+        // Nothing runs: the quit is carried out.
+        let mut rt = testkit::window("empty");
+        let mut told = None;
+        let asks = rt.update_if(|ui, tx| quit_for(ui, tx, |word| told = Some(word)));
+        assert!(!asks);
+        assert_eq!(told, Some(Told::Ok));
+        assert!(rt.state.quitting && !rt.state.quit_ask);
+        assert_eq!(rt.shell_request, Some(rune::Shell::Quit));
+    }
+
+    #[test]
+    fn the_idle_length_is_read_from_the_environment() {
+        assert_eq!(idle_seconds(Some("120")), 120);
+        assert_eq!(idle_seconds(Some("soon")), IDLE_SECONDS);
+        assert_eq!(idle_seconds(None), IDLE_SECONDS);
     }
 }

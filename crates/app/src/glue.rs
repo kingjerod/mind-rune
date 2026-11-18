@@ -5,19 +5,21 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mr_agent::{Agent, FakeAgent, RequestId};
+use mr_agent::{Agent, AgentError, FakeAgent, ImageData, RequestId};
 #[cfg(test)]
 use mr_core::EntryMut;
 use mr_core::{
-    App, Backend, DEFAULT_WIDTH, Effect, FromBackend, GroupId, ItemBody, ItemId, Launch, Leaving,
-    Line, Phase, Place, Prepared, RequestState, SAVED_VERSION, Saved, Screen, Session, SessionKey,
-    Source, Spot, ToBackend, Width,
+    App, Backend, Busy, DEFAULT_WIDTH, Effect, FromBackend, GroupId, ItemBody, ItemId, Launch,
+    Leaving, Line, Phase, Place, Prepared, RequestState, SAVED_VERSION, Saved, Screen, Session,
+    SessionKey, Source, Spot, Standing, ToBackend, Width,
 };
 use rune::prefs::Prefs;
 use rune::runtime::Waker;
 use rune::{Image, ImageCache, PointerPress, TextEdit, Tx};
+use rune_kit::ImageZoom;
 use rune_kit::shell::PaneState;
 
 use crate::demo;
@@ -205,6 +207,17 @@ fn let_go(edit: &mut TextEdit) {
     *edit = fresh;
 }
 
+/// The picture open large over the window (`view::viewer`).
+pub struct Viewing {
+    pub picture: u64,
+    pub key: SessionKey,
+    /// The full image, once its bytes are there. It may still be decoding.
+    pub full: Option<Image>,
+    pub failed: bool,
+    /// The full image was seen decoded ([`full_made`]), so the view has drawn it.
+    made: bool,
+}
+
 pub struct Ui {
     pub app: App,
     pub agent: Arc<dyn Agent>,
@@ -302,6 +315,18 @@ pub struct Ui {
     /// Chips whose answer said they cannot be sent, to be scrolled into view in their row by
     /// the next [`poll`].
     pub reveal_chips: Vec<u64>,
+    /// The programs were told to end ([`quitting`]); set once.
+    pub quitting: bool,
+    /// The question whether to quit shows (`view::quit`): something would be cut off.
+    pub quit_ask: bool,
+    /// The picture open large over the window, if one is ([`open_picture`]).
+    pub viewing: Option<Viewing>,
+    /// How far the open picture is zoomed and panned: the kit's viewer keeps it here.
+    pub zoom: ImageZoom,
+    /// Tells the tray how the sessions stand; there only where a tray was started.
+    pub tray: Option<Sender<Standing>>,
+    /// The standing the tray was last told ([`poll`]).
+    tray_said: Standing,
 }
 
 impl Ui {
@@ -381,6 +406,12 @@ impl Ui {
             unready: Vec::new(),
             file_picker_open: false,
             reveal_chips: Vec::new(),
+            quitting: false,
+            quit_ask: false,
+            viewing: None,
+            zoom: ImageZoom::new(),
+            tray: None,
+            tray_said: Standing::default(),
         };
         run(&mut ui, effects);
         (ui, warning)
@@ -710,9 +741,10 @@ pub fn setup(ui: &mut Ui, waker: Waker) {
     ui.backend = Some(backend);
 }
 
-/// `AppSpec::poll`. The app's clock is brought up to date first, so what is taken in after is
-/// stamped with it. Tiles that come or go with what was taken in (a row restored, a session
-/// gone) do so at once, as when the user opens or closes one.
+/// `AppSpec::poll`, which also runs while no window shows: nothing here needs a frame. The
+/// app's clock is brought up to date first, so what is taken in after is stamped with it.
+/// Tiles that come or go with what was taken in (a row restored, a session gone) do so at once,
+/// as when the user opens or closes one.
 pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
     // A press that did not follow the release that set it never comes now. Nothing shows it.
     ui.swallow_row_press = false;
@@ -738,7 +770,12 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
         now
     };
     changed |= take_in(ui, stamp);
+    tell_tray(ui);
     changed |= handles_made(ui);
+    changed |= full_made(ui);
+    if ui.viewing.is_some() {
+        changed |= ui.zoom.poll(now, tx);
+    }
     for chip in ui.reveal_chips.drain(..) {
         tx.scroll_into_view(view::chip_key(chip));
     }
@@ -747,6 +784,20 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Tells the tray how the sessions stand when that changed since it was last told. Nothing
+/// is said, or remembered as said, while there is no tray to tell; a tray that is gone hears
+/// nothing.
+fn tell_tray(ui: &mut Ui) {
+    let Some(tray) = &ui.tray else {
+        return;
+    };
+    let standing = ui.app.standing();
+    if standing != ui.tray_said {
+        let _ = tray.send(standing);
+        ui.tray_said = standing;
+    }
 }
 
 /// Carries effects out: backend messages are sent, the width is saved, and so is the state kept
@@ -790,6 +841,7 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
             Effect::ReadHistory { key, id, max_items } => {
                 ToBackend::ReadHistory { key, id, max_items }
             }
+            Effect::DropHistory { key } => ToBackend::DropHistory { key },
             Effect::CheckActivity { key, id } => ToBackend::CheckActivity { key, id },
             // A folder that is gone (a removed worktree, say) would start nothing and learn
             // nothing: the look runs at home instead.
@@ -800,6 +852,17 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
             Effect::ReadBranch { .. } if !ui.reads_branches => continue,
             Effect::ReadBranch { folder } => ToBackend::ReadBranch { folder },
             Effect::Prepare { chip, source } => ToBackend::Prepare { chip, source },
+            Effect::ReadImage {
+                picture,
+                id,
+                message,
+                index,
+            } => ToBackend::ReadImage {
+                picture,
+                id,
+                message,
+                index,
+            },
         };
         match &ui.backend {
             Some(backend) => backend.send(message),
@@ -909,7 +972,17 @@ fn tidy_sidebar(ui: &mut Ui) {
 /// - The drawn picture of an id that no session needs any more (`Session::picture_ids`: its
 ///   chips', its queued message's, its conversation's) is dropped, and so is one for an id no
 ///   session ever held.
+/// - The picture open large closes when its session is gone or no longer holds its id.
 fn tidy_views(ui: &mut Ui) {
+    let shown = ui.viewing.as_ref().is_none_or(|viewing| {
+        ui.app
+            .sessions
+            .get(viewing.key)
+            .is_some_and(|entry| entry.session.picture_ids().any(|id| id == viewing.picture))
+    });
+    if !shown {
+        close_picture(ui);
+    }
     let Ui {
         app,
         views,
@@ -982,17 +1055,131 @@ fn shut_disabled_picker(view: &mut SessionView, session: &Session) {
     }
 }
 
-/// How long closing the window waits for its sessions to end, all of them together: a little
-/// more than the adapter gives `claude` after its input closes before it kills it, so their end
-/// is always seen.
+/// How long quitting waits for the sessions to end, all of them together: a little more than
+/// the adapter gives `claude` after its input closes before it kills it, so their end is always
+/// seen.
 const CLOSE_WAIT: Duration = Duration::from_millis(2500);
 
-/// `App::on_close`: the window is closing, and the app with it. Ends every session, waiting up
-/// to [`CLOSE_WAIT`] for them, so no program that runs one is left going without a window.
+/// `App::on_close` where the app keeps running without its window: the window goes, the app
+/// and its sessions stay. The state is saved, what lies over the window is put away, and the
+/// core is told that no window shows. Nothing while the app quits: [`quitting`] has ended it.
 pub fn closing(ui: &mut Ui, _tx: &mut Tx) {
+    if rune::quitting() {
+        return;
+    }
+    let effects = ui.app.save_now();
+    run(ui, effects);
+    put_away(ui);
+    let effects = ui.app.set_window(false);
+    run(ui, effects);
+}
+
+/// `App::on_quit`, and `App::on_close` where closing the window ends the app: ends every
+/// session, waiting up to [`CLOSE_WAIT`] for them, so no program that runs one is left going
+/// without the app. Only the first call does anything.
+pub fn quitting(ui: &mut Ui, _tx: &mut Tx) {
+    if ui.quitting {
+        return;
+    }
+    ui.quitting = true;
     if let Some(warning) = close_warning(ui, CLOSE_WAIT) {
         eprintln!("{warning}");
     }
+}
+
+/// Whether a quit asked for now shows its question instead of quitting: the question shows
+/// already, or something would be cut off. What [`ask_quit`] then returns.
+pub fn quit_asks(ui: &Ui) -> bool {
+    ui.quit_ask || ui.app.busy() != Busy::default()
+}
+
+/// Quits, or asks first when something would be cut off. True when the question now shows.
+pub fn ask_quit(ui: &mut Ui, tx: &mut Tx) -> bool {
+    if !quit_asks(ui) {
+        quit_now(ui, tx);
+        return false;
+    }
+    if !ui.quit_ask {
+        put_away(ui);
+        ui.quit_ask = true;
+    }
+    true
+}
+
+/// Ends the programs (`quitting`) and the app (`Tx::quit`).
+/// They are told here, whether or not Rune runs `on_quit` for a window that is closed.
+pub fn quit_now(ui: &mut Ui, tx: &mut Tx) {
+    ui.quit_ask = false;
+    quitting(ui, tx);
+    tx.quit();
+}
+
+/// The app was launched again: with a folder that exists, a new session opens there, in the
+/// focused tile, as a folder chosen in the folder dialog does. Only on the main screen, and
+/// not while the app quits: nothing would end its program.
+pub fn launched_again(ui: &mut Ui, tx: &mut Tx, folder: Option<PathBuf>) {
+    let Some(folder) = folder else {
+        return;
+    };
+    if ui.quitting || ui.app.screen != Screen::Main || !(ui.folder_exists)(&folder) {
+        return;
+    }
+    view::folder::start(ui, tx, folder, None, Place::Focused);
+}
+
+/// `App::on_visibility`: the window went off screen or came back.
+pub fn shown(ui: &mut Ui, shown: bool, _tx: &mut Tx) {
+    let effects = ui.app.set_window(shown);
+    run(ui, effects);
+}
+
+/// Shuts what lies over the window: menus, pickers, a rename, a row's or a header's drag, the
+/// question whether to quit. A draft and its chips stay.
+///
+/// A divider, a line or a width being dragged is left alone here. As the window goes, Rune
+/// cancels the pointer's drag: the handler hears its release as cancelled and puts back what it
+/// kept at the press (`divider_press`, `split_press`), so that must still be there. That comes
+/// after [`closing`] has saved, so the saved state holds the dragged shares until the next
+/// save writes the ones put back.
+pub fn put_away(ui: &mut Ui) {
+    ui.quit_ask = false;
+    ui.side_menu = None;
+    view::folder::close(ui);
+    for view in ui.views.values_mut() {
+        view.open_picker = None;
+    }
+    end_rename(ui, false);
+    ui.drag = None;
+    ui.file_drop = None;
+    close_picture(ui);
+}
+
+/// Opens picture `picture` of `key`'s session large over the window, after focusing its tile
+/// as a press there does and putting away what lies over the window. Its full image is loaded
+/// at once when its bytes are at hand, else read from the store ([`take`] loads the answer);
+/// until it shows, the small picture stands in. With neither, it says the full picture cannot
+/// be read.
+pub fn open_picture(ui: &mut Ui, key: SessionKey, picture: u64) {
+    focus_tile(ui, key, false);
+    put_away(ui);
+    ui.zoom.reset();
+    let (bytes, effects) = ui.app.full_image(key, picture);
+    let full = bytes.and_then(|bytes| Some(ui.images.as_ref()?.load(bytes.shared())));
+    let failed = full.is_none() && effects.is_empty();
+    ui.viewing = Some(Viewing {
+        picture,
+        key,
+        full,
+        failed,
+        made: false,
+    });
+    run(ui, effects);
+}
+
+/// Closes the picture open large, which lets its full image go, and forgets its zoom.
+pub fn close_picture(ui: &mut Ui) {
+    ui.viewing = None;
+    ui.zoom.reset();
 }
 
 /// Ends the sessions as [`close_session`] does, and says so when one had not ended after `limit`.
@@ -1003,28 +1190,26 @@ pub(crate) fn close_warning(ui: &mut Ui, limit: Duration) -> Option<String> {
         return None;
     }
     Some(format!(
-        "mindrune: the session had not ended {} ms after the window closed",
+        "mindrune: the session had not ended {} ms as the app quit",
         limit.as_millis()
     ))
 }
 
 /// Writes the state kept between runs, then sends `Close` for every session whose program has
-/// not ended and waits up to `limit` in all for them to end. True when no session is left
+/// not ended and waits up to `limit` in all for them to end: also for one that was sent its
+/// `Close` before, as a program being stopped for idleness. True when no session is left
 /// running. The demo's fake is only told to close: its time does not pass unless it is pumped,
 /// so nothing would come.
 ///
 /// This wait is the one exception to the rule that the window's thread never blocks. It is
-/// bounded, and it happens only as the window closes: once the app has quit, nothing would be
-/// left to see that the program stops, and the adapter's own kill after its grace period runs
-/// on a thread that dies with the app.
+/// bounded, and it happens only as the app quits: once it has, nothing would be left to see
+/// that the program stops, and the adapter's own kill after its grace period runs on a thread
+/// that dies with the app.
 pub(crate) fn close_session(ui: &mut Ui, limit: Duration) -> bool {
     let effects = ui.app.close((ui.unix_clock)());
-    let closing = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Send { .. }));
     // The state is written here, before the wait, so it is kept even if the wait is cut short.
     run(ui, effects);
-    if !closing {
+    if ui.app.all_ended() {
         return true;
     }
     if ui.fake.is_some() {
@@ -1099,8 +1284,51 @@ fn take(ui: &mut Ui, message: FromBackend, now: f64) {
     {
         ui.reveal_chips.push(*chip);
     }
+    if let FromBackend::Image { picture, result } = message {
+        full_image(ui, picture, result);
+        return;
+    }
     let effects = ui.app.receive(message, now);
     run(ui, effects);
+}
+
+/// The full image of picture `picture`, read again: loaded when that picture is open large,
+/// else dropped. One that could not be read says so. A picture opened, closed and opened
+/// again before its first read answered gets two answers: once a good full image is there,
+/// another answer changes nothing, whatever it says.
+fn full_image(ui: &mut Ui, picture: u64, result: Result<ImageData, AgentError>) {
+    let Some(viewing) = ui.viewing.as_mut().filter(|v| v.picture == picture) else {
+        return;
+    };
+    if viewing.full.as_ref().is_some_and(|f| f.error().is_none()) {
+        return;
+    }
+    match result {
+        Ok(bytes) => {
+            viewing.full = ui.images.as_ref().map(|images| images.load(bytes.shared()));
+            viewing.failed = viewing.full.is_none();
+        }
+        Err(_) => viewing.failed = true,
+    }
+}
+
+/// Whether the open picture's full image was decoded since the last call: the view draws it
+/// in place of the small picture then, or, when it cannot be decoded, says so.
+fn full_made(ui: &mut Ui) -> bool {
+    let Some(viewing) = &mut ui.viewing else {
+        return false;
+    };
+    let Some(full) = &viewing.full else {
+        return false;
+    };
+    if viewing.made || !full.is_ready() {
+        return false;
+    }
+    viewing.made = true;
+    if full.error().is_some() {
+        viewing.failed = true;
+    }
+    true
 }
 
 /// Whether a handle in `thumbs` was made since the last call: the rows that draw it are built
@@ -1151,9 +1379,9 @@ mod tests {
     use super::*;
     use crate::{demo, testkit};
     use mr_agent::{
-        Account, AgentError, Capabilities, EventSink, FakeAgent, HistoryItem, PermissionMode,
-        SessionCommand, SessionEvent, SessionHandle, SessionId, SessionInfo, StartSpec,
-        StoredHistory, StoredSession, ToolCallId, ToolDetail, ToolOutcome,
+        Account, AgentError, Capabilities, EventSink, FakeAgent, FakeStep, HistoryItem,
+        PermissionMode, SessionCommand, SessionEvent, SessionHandle, SessionId, SessionInfo,
+        StartSpec, StoredHistory, StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary,
     };
     use mr_core::{HistoryState, ItemBody, Phase, Screen, ThinkingTime, Thumb, Width};
     use rune::prefs::Prefs;
@@ -1219,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_demo_window_closes_its_session_without_waiting() {
+    fn close_session_tells_the_demo_to_close_without_waiting() {
         let mut rt = testkit::window("working");
         let started = Instant::now();
         assert!(!close_session(&mut rt.state, CLOSE_WAIT));
@@ -1239,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_demo_window_has_nothing_to_report() {
+    fn close_warning_has_nothing_to_say_in_the_demo() {
         let mut rt = testkit::window("working");
         assert_eq!(close_warning(&mut rt.state, CLOSE_WAIT), None);
         rt.state.backend.as_ref().unwrap().flush();
@@ -1341,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_window_waits_for_the_session_to_end() {
+    fn close_session_waits_for_the_session_to_end() {
         let agent = Arc::new(SlowExit {
             exit_after: Some(Duration::from_millis(300)),
             closes: Arc::new(AtomicUsize::new(0)),
@@ -1360,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_window_waits_no_longer_than_its_limit() {
+    fn close_warning_waits_no_longer_than_its_limit() {
         let agent = Arc::new(SlowExit {
             exit_after: None,
             closes: Arc::new(AtomicUsize::new(0)),
@@ -1370,7 +1598,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             close_warning(&mut ui, limit).as_deref(),
-            Some("mindrune: the session had not ended 200 ms after the window closed")
+            Some("mindrune: the session had not ended 200 ms as the app quit")
         );
         let waited = started.elapsed();
         assert!(
@@ -1378,6 +1606,42 @@ mod tests {
             "{waited:?}"
         );
         assert_eq!(agent.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn close_session_waits_for_a_program_being_stopped_for_idleness() {
+        let agent = Arc::new(SlowExit {
+            exit_after: Some(Duration::from_millis(300)),
+            closes: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut ui = idle_over(agent.clone());
+        let key = ui.app.focused().unwrap();
+        // A message and the end of its turn: the agent stores the session, and it idles.
+        let effects = ui.app.submit(key, "hello");
+        run(&mut ui, effects);
+        let open = ui.app.sessions.get(key).unwrap().open.unwrap();
+        let done = SessionEvent::TurnFinished(mr_agent::TurnSummary {
+            cost_usd: 0.01,
+            context_used: None,
+            duration_ms: 1,
+            interrupted: false,
+        });
+        ui.app.event(open, done, 0.0);
+        // Half an hour later the tick stops it, and the quit comes while it goes.
+        let effects = ui.app.tick((ui.unix_clock)() + 3600);
+        let close = Effect::Send {
+            open,
+            command: SessionCommand::Close,
+        };
+        assert!(effects.contains(&close), "{effects:?}");
+        run(&mut ui, effects);
+        assert_eq!(ui.app.sessions.get(key).unwrap().stopping, Some(open));
+        assert!(close_session(&mut ui, CLOSE_WAIT));
+        assert!(
+            ui.app.all_ended(),
+            "the program being stopped was waited for"
+        );
+        assert_eq!(agent.closes.load(Ordering::SeqCst), 1, "no second Close");
     }
 
     /// What the window says when the saved state cannot be read.
@@ -1656,6 +1920,7 @@ mod tests {
                 image_count: 0,
                 files: Vec::new(),
                 images: Vec::new(),
+                stored: None,
             }],
             ..StoredHistory::default()
         };
@@ -1686,7 +1951,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_ends_every_session_and_saves() {
+    fn quitting_ends_every_session_and_saves() {
         let mut rt = testkit::window("empty");
         for folder in ["/home/alex/a", "/home/alex/b", "/home/alex/c"] {
             testkit::add_session(&mut rt, folder);
@@ -1696,7 +1961,7 @@ mod tests {
         // The scene's own session, forgotten, was closed already.
         let before = fake.sent().len();
         rt.state.prefs.remove(STATE_KEY).unwrap();
-        close_session(&mut rt.state, CLOSE_WAIT);
+        quitting(&mut rt.state, &mut Tx::default());
         rt.state.backend.as_ref().unwrap().flush();
         let closed: HashSet<SessionId> = fake.sent()[before..]
             .iter()
@@ -1705,6 +1970,208 @@ mod tests {
             .collect();
         assert_eq!(closed.len(), 3, "{:?}", fake.sent());
         assert!(rt.state.prefs.get::<Saved>(STATE_KEY).is_some());
+    }
+
+    #[test]
+    fn quitting_ends_every_program_once() {
+        let mut rt = testkit::window("empty");
+        for folder in ["/home/alex/a", "/home/alex/b"] {
+            testkit::add_session(&mut rt, folder);
+        }
+        let fake = rt.state.fake.clone().unwrap();
+        let before = fake.sent().len();
+        quitting(&mut rt.state, &mut Tx::default());
+        quitting(&mut rt.state, &mut Tx::default());
+        assert!(rt.state.quitting);
+        rt.state.backend.as_ref().unwrap().flush();
+        let mut closed: Vec<SessionId> = fake.sent()[before..]
+            .iter()
+            .filter(|(_, command)| *command == SessionCommand::Close)
+            .map(|(id, _)| id.clone())
+            .collect();
+        closed.sort_by(|a, b| a.0.cmp(&b.0));
+        let count = closed.len();
+        closed.dedup();
+        assert_eq!((count, closed.len()), (2, 2), "{:?}", fake.sent());
+    }
+
+    #[test]
+    fn closing_the_window_ends_no_program() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::add_session(&mut rt, "/home/alex/a");
+        let fake = rt.state.fake.clone().unwrap();
+        let before = fake.sent().len();
+        rt.state.prefs.remove(STATE_KEY).unwrap();
+        closing(&mut rt.state, &mut Tx::default());
+        rt.state.backend.as_ref().unwrap().flush();
+        assert!(
+            !fake.sent()[before..]
+                .iter()
+                .any(|(_, command)| *command == SessionCommand::Close),
+            "{:?}",
+            fake.sent()
+        );
+        assert!(!rt.state.quitting);
+        let session = &rt.state.app.sessions.get(key).unwrap().session;
+        assert_eq!(session.phase, Phase::Idle);
+        assert!(rt.state.prefs.get::<Saved>(STATE_KEY).is_some(), "saved");
+    }
+
+    #[test]
+    fn a_turn_goes_on_with_the_window_closed() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::add_session(&mut rt, "/home/alex/a");
+        let fake = rt.state.fake.clone().unwrap();
+        fake.reply(vec![
+            FakeStep::at(0.0, SessionEvent::TurnStarted),
+            FakeStep::at(0.5, SessionEvent::TextDelta("All tidy now.".into())),
+            FakeStep::at(
+                1.0,
+                SessionEvent::TurnFinished(TurnSummary {
+                    cost_usd: 0.0,
+                    context_used: None,
+                    duration_ms: 1,
+                    interrupted: false,
+                }),
+            ),
+        ]);
+        let ui = &mut rt.state;
+        let effects = ui.app.submit(key, "Tidy the notes");
+        run(ui, effects);
+        closing(ui, &mut Tx::default());
+        let replied = |ui: &Ui| {
+            ui.app.sessions.get(key).is_some_and(|entry| {
+                entry.session.phase == Phase::Idle
+                    && entry.session.conversation.items().iter().any(|item| {
+                        matches!(&item.body, ItemBody::Reply { markdown, .. }
+                            if markdown == "All tidy now.")
+                    })
+            })
+        };
+        let mut now = 100.0;
+        while !replied(ui) && now < 110.0 {
+            now += 0.25;
+            poll(ui, now, &mut Tx::default());
+        }
+        assert!(replied(ui), "the reply came in with no window");
+        let entry = ui.app.sessions.get(key).unwrap();
+        assert!(entry.unseen, "no one saw it end");
+    }
+
+    #[test]
+    fn the_tray_is_told_when_the_standing_changes_and_only_then() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        // The turn starts at once and ends only after the polls here.
+        rt.state.fake.clone().unwrap().reply(vec![
+            FakeStep::at(0.0, SessionEvent::TurnStarted),
+            FakeStep::at(
+                60.0,
+                SessionEvent::TurnFinished(TurnSummary {
+                    cost_usd: 0.0,
+                    context_used: None,
+                    duration_ms: 1,
+                    interrupted: false,
+                }),
+            ),
+        ]);
+        let ui = &mut rt.state;
+        // The standing changes before the tray is there: it is told once the tray is.
+        ui.app.sessions.get_mut(key).unwrap().unseen = true;
+        poll(ui, 0.0, &mut Tx::default());
+        let (tray, told) = std::sync::mpsc::channel();
+        ui.tray = Some(tray);
+        poll(ui, 0.0, &mut Tx::default());
+        poll(ui, 0.0, &mut Tx::default());
+        let finished = Standing {
+            finished: 1,
+            ..Standing::default()
+        };
+        assert_eq!(told.try_iter().collect::<Vec<_>>(), vec![finished]);
+        let effects = ui.app.submit(key, "Tidy the notes");
+        run(ui, effects);
+        poll(ui, 0.0, &mut Tx::default());
+        poll(ui, 0.0, &mut Tx::default());
+        let working = Standing {
+            working: 1,
+            ..Standing::default()
+        };
+        assert_eq!(told.try_iter().collect::<Vec<_>>(), vec![working]);
+    }
+
+    #[test]
+    fn closing_the_window_still_delivers_a_message_its_program_never_got() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::add_session(&mut rt, "/home/alex/a");
+        let ui = &mut rt.state;
+        closing(ui, &mut Tx::default());
+        let open = ui.app.sessions.get(key).unwrap().open.unwrap();
+        // The message goes as its program ends: the backend refuses it, then the exit comes.
+        let _ = ui.app.submit(key, "One more thing");
+        let refused = FromBackend::SendFailed {
+            open,
+            command: SessionCommand::Send {
+                text: "One more thing".into(),
+                attachments: Vec::new(),
+            },
+            error: AgentError::Closed,
+        };
+        assert!(ui.app.receive(refused, 0.0).is_empty());
+        let exited = FromBackend::Event {
+            open,
+            event: SessionEvent::Exited {
+                clean: true,
+                detail: String::new(),
+            },
+        };
+        let effects = ui.app.receive(exited, 0.0);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Open { .. })),
+            "started again: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn closing_puts_away_what_was_open() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::add_session(&mut rt, "/home/alex/a");
+        let ui = &mut rt.state;
+        let title = ui.app.sessions.get(key).unwrap().session.title.clone();
+        view_mut(ui, key).draft = TextEdit::new("Half a thought");
+        view_mut(ui, key).open_picker = Some(Picker::Model);
+        start_rename(ui, Renaming::Row(key));
+        ui.rename = TextEdit::new("Not kept");
+        ui.side_menu = Some(SideMenu {
+            target: MenuTarget::Row(key),
+            at: PointerPress { x: 0.0, y: 0.0 },
+            sub_open: true,
+        });
+        ui.folder_menu = Some(None);
+        ui.folder_offers = vec!["/home/alex/a".into(), "/home/alex/b".into()];
+        ui.folder_side = true;
+        ui.file_drop = Some(key);
+        closing(ui, &mut Tx::default());
+        assert_eq!(view_of(ui, key).open_picker, None);
+        assert_eq!(view_of(ui, key).draft.text, "Half a thought");
+        assert_eq!(ui.renaming, None);
+        assert_eq!(ui.app.sessions.get(key).unwrap().session.title, title);
+        assert_eq!(ui.side_menu, None);
+        assert_eq!((ui.folder_menu.clone(), ui.folder_side), (None, false));
+        assert!(ui.folder_offers.is_empty(), "the menu's folders go with it");
+        assert_eq!(ui.file_drop, None);
+        // A drag on its own: an open menu would have ended it already.
+        ui.drag = Some(RowDrag {
+            key,
+            at: [10.0, 10.0],
+            over: None,
+            heard: true,
+            missed: 0,
+            from: DragFrom::Row,
+        });
+        closing(ui, &mut Tx::default());
+        assert_eq!(ui.drag, None);
     }
 
     #[test]
@@ -1763,6 +2230,7 @@ mod tests {
                 image_count: 1,
                 files: Vec::new(),
                 images: vec![Some(png)],
+                stored: None,
             },
             HistoryItem::AssistantText("Seen.".into()),
         ]
@@ -1916,7 +2384,8 @@ mod tests {
         testkit::show(&mut rt, one);
         pictures_come(&mut rt, one);
         let two = stored_with(&mut rt, "stored-two", with_image("Two", 3, 4));
-        testkit::show(&mut rt, two);
+        // Beside it, so that both are in a tile.
+        testkit::show_side(&mut rt, two);
         pictures_come(&mut rt, two);
         let (a, b) = (pictures(&rt, one)[0], pictures(&rt, two)[0]);
         assert!(rt.state.thumbs.contains_key(&a) && rt.state.thumbs.contains_key(&b));
@@ -1927,5 +2396,194 @@ mod tests {
             rt.state.thumbs.contains_key(&a),
             "the other session's stays"
         );
+    }
+
+    #[test]
+    fn the_pictures_of_a_session_that_let_go_are_dropped() {
+        let mut rt = testkit::window("resting");
+        rt.state.images = cache();
+        let one = stored_with(&mut rt, "stored-one", with_image("One", 4, 3));
+        testkit::show(&mut rt, one);
+        pictures_come(&mut rt, one);
+        let a = pictures(&rt, one)[0];
+        assert!(rt.state.thumbs.contains_key(&a));
+        let two = stored_with(&mut rt, "stored-two", with_image("Two", 3, 4));
+        testkit::show(&mut rt, two);
+        let session = &rt.state.app.sessions.get(one).unwrap().session;
+        assert_eq!(session.history, HistoryState::Loaded, "kept for now");
+        assert!(rt.state.thumbs.contains_key(&a));
+        // Ten minutes out of every tile, and the tick lets it go.
+        rt.state.unix_clock = || demo::NOW_UNIX + mr_core::LET_GO_SECONDS;
+        let effects = rt.state.app.tick((rt.state.unix_clock)());
+        run(&mut rt.state, effects);
+        let session = &rt.state.app.sessions.get(one).unwrap().session;
+        assert_eq!(session.history, HistoryState::NotLoaded);
+        assert!(!rt.state.thumbs.contains_key(&a), "gone with its history");
+    }
+
+    /// A message of the user's stored as `m1`, with one image of 4 by 3 pixels the store
+    /// gives again, and Claude's answer.
+    fn with_stored_image() -> Vec<HistoryItem> {
+        let mut items = with_image("Look", 4, 3);
+        if let HistoryItem::User { stored, .. } = &mut items[0] {
+            *stored = Some("m1".into());
+        }
+        items
+    }
+
+    #[test]
+    fn a_second_answer_for_the_same_picture_changes_nothing() {
+        let mut rt = testkit::window("resting");
+        rt.state.images = cache();
+        let key = stored_with(&mut rt, "stored-one", with_stored_image());
+        testkit::show(&mut rt, key);
+        pictures_come(&mut rt, key);
+        let picture = pictures(&rt, key)[0];
+        // Opened, closed and opened again before the first read answers: two reads are on
+        // their way. The fake is out of the window meanwhile, so no frame waits for them.
+        let fake = rt.state.fake.take().unwrap();
+        fake.pause_reads();
+        open_picture(&mut rt.state, key, picture);
+        close_picture(&mut rt.state);
+        open_picture(&mut rt.state, key, picture);
+        assert!(rt.state.viewing.as_ref().unwrap().full.is_none());
+        // The first answer is good.
+        let image = |result| FromBackend::Image { picture, result };
+        let good = || Ok(mr_agent::ImageData::new(testkit::png(4, 3)));
+        take(&mut rt.state, image(good()), 0.0);
+        let full = rt.state.viewing.as_ref().unwrap().full.clone();
+        let full = full.expect("the full image's handle");
+        full.clone().wait().expect("an image made in the test");
+        testkit::step(&mut rt);
+        assert!(rt.state.viewing.as_ref().unwrap().made, "it is drawn");
+        // The second says the file is gone: the good image stays, and nothing says otherwise.
+        take(
+            &mut rt.state,
+            image(Err(AgentError::Io("gone".into()))),
+            0.0,
+        );
+        testkit::step(&mut rt);
+        let viewing = rt.state.viewing.as_ref().unwrap();
+        assert!(!viewing.failed);
+        assert_eq!(viewing.full.as_ref().unwrap().size(), Some([4, 3]));
+        assert!(!testkit::has_text(&rt, "The full picture cannot be read."));
+        // A second good answer is dropped as well: what is drawn stays drawn.
+        take(&mut rt.state, image(good()), 0.0);
+        let viewing = rt.state.viewing.as_ref().unwrap();
+        assert!(viewing.made && !viewing.failed);
+        // The two reads that were under way answer at last, and change nothing either.
+        fake.resume_reads();
+        rt.state.fake = Some(fake);
+        settle_backend(&mut rt);
+        let viewing = rt.state.viewing.as_ref().unwrap();
+        assert!(viewing.made && !viewing.failed);
+        assert_eq!(viewing.full.as_ref().unwrap().size(), Some([4, 3]));
+        // A picture whose first answer failed still takes a good one.
+        close_picture(&mut rt.state);
+        let fake = rt.state.fake.take().unwrap();
+        fake.pause_reads();
+        open_picture(&mut rt.state, key, picture);
+        take(
+            &mut rt.state,
+            image(Err(AgentError::Io("gone".into()))),
+            0.0,
+        );
+        assert!(rt.state.viewing.as_ref().unwrap().failed);
+        take(&mut rt.state, image(good()), 0.0);
+        let viewing = rt.state.viewing.as_ref().unwrap();
+        assert!(viewing.full.is_some() && !viewing.failed);
+        fake.resume_reads();
+        rt.state.fake = Some(fake);
+        settle_backend(&mut rt);
+    }
+
+    #[test]
+    fn a_draft_survives_its_conversation_being_let_go() {
+        let mut rt = testkit::window("resting");
+        let one = stored_with(&mut rt, "stored-one", with_image("One", 4, 3));
+        testkit::show(&mut rt, one);
+        settle_backend(&mut rt);
+        view_mut(&mut rt.state, one).draft = TextEdit::new("Half a thought");
+        // Another session takes its tile; ten minutes later the tick lets the first one go.
+        let two = stored_with(&mut rt, "stored-two", with_image("Two", 3, 4));
+        testkit::show(&mut rt, two);
+        settle_backend(&mut rt);
+        let generation = rt.state.app.sessions.get(one).unwrap().session.generation;
+        rt.state.unix_clock = || demo::NOW_UNIX + mr_core::LET_GO_SECONDS;
+        let effects = rt.state.app.tick((rt.state.unix_clock)());
+        run(&mut rt.state, effects);
+        let session = &rt.state.app.sessions.get(one).unwrap().session;
+        assert_eq!(session.history, HistoryState::NotLoaded);
+        assert!(session.generation > generation, "its items were replaced");
+        assert_eq!(view_of(&rt.state, one).draft.text, "Half a thought");
+        // Shown again, it is read again, and the draft is in its box.
+        testkit::show(&mut rt, one);
+        settle_backend(&mut rt);
+        let session = &rt.state.app.sessions.get(one).unwrap().session;
+        assert_eq!(session.history, HistoryState::Loaded);
+        assert_eq!(view_of(&rt.state, one).draft.text, "Half a thought");
+    }
+
+    #[test]
+    fn a_second_launch_with_a_folder_opens_a_session_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window("conversation");
+        let before = testkit::focused(&rt);
+        let folder = dir.path().to_path_buf();
+        rt.update(|ui, tx| launched_again(ui, tx, Some(folder)));
+        testkit::step(&mut rt);
+        assert_ne!(testkit::focused(&rt), before);
+        let shown = rt.state.focused_session().unwrap();
+        assert_eq!(shown.folder, dir.path());
+        assert_eq!(testkit::shown_open(&rt), Some(2));
+        assert_eq!(
+            typing_in(&rt.state),
+            testkit::focused(&rt),
+            "it takes the keys"
+        );
+
+        let sessions = rt.state.app.sessions.len();
+        let focused = testkit::focused(&rt);
+        rt.update(|ui, tx| launched_again(ui, tx, None));
+        assert_eq!(rt.state.app.sessions.len(), sessions, "without a folder");
+        assert_eq!(testkit::focused(&rt), focused);
+    }
+
+    #[test]
+    fn with_a_folder_that_is_gone_it_opens_nothing() {
+        let mut rt = testkit::window("conversation");
+        rt.state.folder_exists = |_| false;
+        let sessions = rt.state.app.sessions.len();
+        let focused = testkit::focused(&rt);
+        rt.update(|ui, tx| launched_again(ui, tx, Some("/home/alex/gone".into())));
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.app.sessions.len(), sessions);
+        assert_eq!(testkit::focused(&rt), focused);
+    }
+
+    #[test]
+    fn before_the_main_screen_a_second_launch_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window("signed-out");
+        let sessions = rt.state.app.sessions.len();
+        let folder = dir.path().to_path_buf();
+        rt.update(|ui, tx| launched_again(ui, tx, Some(folder)));
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.app.sessions.len(), sessions);
+        assert_ne!(rt.state.app.screen, Screen::Main);
+    }
+
+    #[test]
+    fn a_launch_while_quitting_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window("conversation");
+        rt.state.quitting = true;
+        let sessions = rt.state.app.sessions.len();
+        let focused = testkit::focused(&rt);
+        let folder = dir.path().to_path_buf();
+        rt.update(|ui, tx| launched_again(ui, tx, Some(folder)));
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.app.sessions.len(), sessions);
+        assert_eq!(testkit::focused(&rt), focused);
     }
 }

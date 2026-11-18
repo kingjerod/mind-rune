@@ -109,7 +109,7 @@ fn chip(ui: &Ui, kit: &Kit, key: SessionKey, held: &Chip) -> El {
         .radius(kit.radius.sm)
         .fill(c.layer_02)
         .border(1.0, border(held, kit))
-        .child(picture(ui, kit, held))
+        .child(picture(ui, kit, key, held))
         .child(name)
         .children(note)
         .child(remove);
@@ -128,21 +128,26 @@ fn border(held: &Chip, kit: &Kit) -> Color {
     }
 }
 
-/// A chip's picture: an image's thumbnail filling the square (`mr-chip-thumb-{id}`), or the
-/// icon of what it is, in a square keyed by it: `mr-chip-photo-{id}`, `mr-chip-folder-{id}` or
-/// `mr-chip-file-{id}`.
-fn picture(ui: &Ui, kit: &Kit, held: &Chip) -> El {
+/// A chip's picture: an image's thumbnail filling the square (`mr-chip-thumb-{id}`), a button
+/// that opens what will be sent large (`glue::open_picture`), or the icon of what it is, in a
+/// square keyed by it: `mr-chip-photo-{id}`, `mr-chip-folder-{id}` or `mr-chip-file-{id}`.
+fn picture(ui: &Ui, kit: &Kit, key: SessionKey, held: &Chip) -> El {
+    let id = held.id;
     let (glyph, what) = match &held.state {
         ChipState::Ready(prepared) => match prepared.kind {
-            AttachKind::Image => match ui.thumbs.get(&held.id) {
+            AttachKind::Image => match ui.thumbs.get(&id) {
+                // A Tab stop that Space presses, as the remove control is.
                 Some(thumb) if thumb.error().is_none() => {
                     return el()
-                        .key(format!("mr-chip-thumb-{}", held.id))
+                        .key(format!("mr-chip-thumb-{id}"))
                         .size(PICTURE, PICTURE)
                         .radius(THUMB_RADIUS)
                         .pixels_fit(thumb.pixels(), SurfaceFit::Fill)
-                        .role("img")
-                        .label(held.name.clone());
+                        .role("button")
+                        .label(format!("Open {}", held.name))
+                        .focusable(true)
+                        .focus_ring(2.0, 2.5, kit.c.border_focus)
+                        .on_press(move |ui: &mut Ui| glue::open_picture(ui, key, id));
                 }
                 _ => (&PHOTO, "photo"),
             },

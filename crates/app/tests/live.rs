@@ -6,10 +6,11 @@
 //! ```
 //!
 //! It needs Claude Code installed and signed in. It runs the app twice, as the window would be
-//! opened, closed and opened again, and starts the real program five times in all: the session
+//! opened, closed and opened again, and starts the real program six times in all: the session
 //! of the first run, the look the first run takes, a second session opened to the side in the
-//! first run, the first session resumed in the second run, and a session for attachments opened
-//! to the side in the second run. The account is checked once; the second run is handed what the
+//! first run, the first session resumed in the second run, the same session started again
+//! there after its program was stopped for idling, and a session for attachments opened to the
+//! side in the second run. The account is checked once; the second run is handed what the
 //! first found.
 //!
 //! The first run opens with no folder, so it lists the stored sessions and looks, as the window
@@ -40,12 +41,28 @@
 //! also says that this app closed the session, so the second run is not expected to ask
 //! whether another app has it open; it prints whether it did.
 //!
+//! Then the session is left alone, the idle length set to a minute, until the app stops its
+//! program unnoticed, as it stops one idle for half an hour. It prints whether the program
+//! ended cleanly, then sends one more message, which starts the session again, and prints
+//! whether it answered and whether its model, effort and mode are those it had. None of this
+//! fails the test.
+//!
 //! Then, in the second run, a session of its own opens to the side and is sent a message with a
 //! red image made by the test and a file the test writes into its folder, each attached as the
 //! window attaches it and read on the preparing thread. It prints whether the answer names the
-//! colour and the file's first word, what the stored history gives back for that message, and
-//! whether a second message, with an image of noise a little under the largest sent as it is,
+//! colour and the file's first word, what the stored history gives back for that message,
+//! whether that message has its own id in the store and what reading its image again by that
+//! id gives, and whether a second message, with an image of noise a little under the largest sent as it is,
 //! was answered. None of that fails the test, nor does anything that session's program does.
+//!
+//! Then that session is asked to run `sleep 20` in the background with its shell tool and to
+//! answer with one word. The program asks for permission, and the test, which is the user
+//! here, answers through the app as a press on "Allow" does: it allows a request of the shell
+//! tool for the command `sleep` and a number, exactly, and denies anything else. It prints whether
+//! a background task record that counted at least one task arrived, and whether the adapter's
+//! own guard counted the tool call. The `sleep` ends by itself. Last it prints how many
+//! background task records the test's programs sent in both runs, and how many tasks the last
+//! one counted.
 //!
 //! Every way out of the test, a failed assertion included, closes its sessions, so no `claude`
 //! is left running, and every wait has a deadline that says what it waited for. Of the user's
@@ -60,14 +77,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mr_agent::{
-    Account, Agent, Attachment, CommandKind, ContextBreakdown, ContextKind, HistoryItem, ImageData,
-    PermissionMode, RemoteAccess, RemoteFailure, SessionCommand, SessionEvent, SessionId,
+    Account, Agent, Answer, Attachment, CommandKind, ContextBreakdown, ContextKind, HistoryItem,
+    ImageData, PermissionMode, RemoteAccess, RemoteFailure, RequestId, SessionCommand,
+    SessionEvent, SessionId, ToolDetail, UserRequestKind,
 };
 use mr_claude::ClaudeAgent;
 use mr_core::{
     App, Backend, ChipState, DEFAULT_WIDTH, Effect, FromBackend, HISTORY_ITEMS, HistoryState,
-    ItemBody, Launch, Leaving, MAX_BYTES, MAX_SIDE, Phase, Place, Prompt, PromptChoice, Saved,
-    Screen, Session, SessionKey, Source, ToBackend, Width, mode_label,
+    IDLE_SECONDS, ItemBody, Launch, Leaving, MAX_BYTES, MAX_SIDE, Phase, Place, Prompt,
+    PromptChoice, RequestState, Saved, Screen, Session, SessionKey, Source, ToBackend, Width,
+    mode_label,
 };
 
 /// The whole run, from the account check to the reply; also a resumed session's reply.
@@ -156,6 +175,35 @@ const NOISE_SIZE: (u32, u32) = (1120, 1160);
 /// How long the chips of a message may take to be read.
 const PREPARE_LIMIT: Duration = Duration::from_secs(30);
 
+/// The message that starts the test's session again once its program was stopped for idling.
+const QUIET_MESSAGE: &str = "Reply with the single word: back";
+
+/// The idle length the test sets: the shortest the app takes, a minute.
+const QUIET_AFTER: i64 = 60;
+
+/// How long the test waits for the app to stop the idle program: the idle length, the events
+/// its program may still send after a turn, and a margin.
+const QUIET_LIMIT: Duration = Duration::from_secs(180);
+
+/// What the session for attachments is asked last: one command in the background, which ends
+/// by itself, and a short answer.
+const BACKGROUND_MESSAGE: &str = "Run the shell command `sleep 20` in the background with your \
+    shell tool (set run_in_background), do not wait for it, and then reply with the single word: \
+    started";
+
+/// The shell tool's name, as its permission request gives it.
+const SHELL_TOOL: &str = "Bash";
+
+/// How the one command the test allows starts; only digits may follow ([`allowed_command`]).
+const ALLOWED_COMMAND: &str = "sleep ";
+
+/// How long after the turn's end a background task record is still waited for.
+const RECORD_LIMIT: Duration = Duration::from_secs(5);
+
+/// The picture number the test reads a stored image under: one no session holds, so the
+/// answer is for the test alone.
+const READ_PICTURE: u64 = u64::MAX;
+
 #[test]
 #[ignore = "starts the real claude; run with MINDRUNE_LIVE=1 and --ignored"]
 fn a_real_turn_the_store_the_look_and_the_session_resumed() {
@@ -192,6 +240,7 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
         .expect("the session to the side has the agent's id");
     let saved = live.close_app();
     let account = live.app.account.clone().expect("the account was checked");
+    let background = std::mem::take(&mut live.background);
     drop(live);
 
     // The second run: the window opened again with what the first kept.
@@ -202,10 +251,13 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
         saved,
     };
     let mut again = Live::start(agent, launch, &folder, Some(account));
+    again.background = background;
     again.read_back(&id);
     again.restored(&id, &side_id);
     again.resume(&id);
+    again.stop_while_idle();
     again.attachments();
+    again.report_background();
     again.close_app();
 }
 
@@ -287,6 +339,63 @@ struct Live {
     stored_pictures: Vec<u64>,
     /// How many of them a picture answer came for: the reader gave their bytes.
     stored_read: usize,
+    /// The picture number a stored image was asked for under, until its answer came.
+    image_asked: Option<u64>,
+    /// What that read gave: the image's bytes, or why it failed.
+    image_read: Option<Result<ImageData, String>>,
+    /// How many tasks each background task record counted, in order, of every program the test
+    /// ran; the first run's are handed to the second.
+    background: Vec<usize>,
+    /// What the session for attachments' program said about background tasks while it was
+    /// asked to start one ([`Live::background_task`]).
+    tasks: Tasks,
+    /// Every program's exit, by its open number, with whether it was clean.
+    exits: Vec<(u64, bool)>,
+    /// Every open the app sent `Close`, in order.
+    closes: Vec<u64>,
+    /// The test's session is past the steps that check it: from the idle stop on it is
+    /// reported on and never failed on, and closing the app takes it as closed once its program
+    /// has ended, cleanly or not.
+    quiet: bool,
+}
+
+/// What came of asking a program to start a background task. The adapter gives a count of
+/// tasks in two cases, which look the same to the app: from its own guard, in the same breath
+/// as the tool call it saw, and from the program's record, on its own. The test tells them
+/// apart by that: a count that comes directly after a shell call is the guard's.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tasks {
+    /// The step runs: the events of the session for attachments are looked at.
+    watching: bool,
+    /// How many calls of the shell tool were seen.
+    shell_calls: usize,
+    /// The event before was a shell call.
+    after_shell_call: bool,
+    /// A count of at least one came directly after a shell call.
+    guard_counted: bool,
+    /// A count of at least one came on its own.
+    record_counted: bool,
+}
+
+impl Tasks {
+    /// Takes in one event of the watched program.
+    fn see(&mut self, event: &SessionEvent) {
+        let after_shell_call = std::mem::take(&mut self.after_shell_call);
+        match event {
+            SessionEvent::ToolStarted {
+                detail: ToolDetail::Command { .. },
+                ..
+            } => {
+                self.shell_calls += 1;
+                self.after_shell_call = true;
+            }
+            SessionEvent::BackgroundTasks { running } if after_shell_call => {
+                self.guard_counted |= *running >= 1;
+            }
+            SessionEvent::BackgroundTasks { running } => self.record_counted |= *running >= 1,
+            _ => {}
+        }
+    }
 }
 
 /// What a program said of Remote Control, without the address it may carry.
@@ -373,6 +482,13 @@ impl Live {
             stored: None,
             stored_pictures: Vec::new(),
             stored_read: 0,
+            image_asked: None,
+            image_read: None,
+            background: Vec::new(),
+            tasks: Tasks::default(),
+            exits: Vec::new(),
+            closes: Vec::new(),
+            quiet: false,
         };
         if let Some(account) = account {
             effects.retain(|effect| *effect != Effect::CheckAccount);
@@ -1113,16 +1229,7 @@ impl Live {
         assert!(!spec.fork, "it resumes, not forks");
         self.running = true;
 
-        let replied = |live: &Live| {
-            live.phase() == Some(Phase::Idle) && {
-                let items = live.items();
-                let asked = items.iter().rposition(|body| {
-                    matches!(body, ItemBody::User { text, .. } if text.contains(SECOND_MESSAGE))
-                });
-                asked.is_some_and(|at| !finished_replies(&items[at..]).is_empty())
-            }
-        };
-        if !self.wait_for(TURN_LIMIT, replied) {
+        if !self.wait_for(TURN_LIMIT, |live| live.has_reply_to(SECOND_MESSAGE)) {
             panic!(
                 "no reply to the second message within {} s (phase {:?}); conversation:\n{:#?}",
                 TURN_LIMIT.as_secs(),
@@ -1220,6 +1327,10 @@ impl Live {
                     Attachment::Image { .. } => None,
                 })
                 .collect();
+            let sent = attachments.iter().find_map(|attachment| match attachment {
+                Attachment::Image { data, .. } => Some(data.clone()),
+                Attachment::File { .. } => None,
+            });
             if images == 1 && files == [note.as_path()] {
                 eprintln!("live: image and file sent");
             } else {
@@ -1242,7 +1353,7 @@ impl Live {
                 "live: the answer names the file's word: {}",
                 yes(names(NOTE_WORD))
             );
-            self.report_stored(key);
+            self.report_stored(key, sent);
         }
 
         let noise = noise_png();
@@ -1261,7 +1372,114 @@ impl Live {
                 eprintln!("live: the noise image was made smaller, so no 3 MB line was sent");
             }
         }
+        self.background_task(key);
         self.close_attached(key);
+    }
+
+    /// Asks `key`'s session, the one sent attachments, to run `sleep 20` in the background
+    /// and to answer with one word, and prints whether a background task record that counted
+    /// at least one task arrived and whether the adapter's own guard counted the tool call.
+    /// The program asks before it runs a command: the test answers as the user would, through
+    /// the app, and allows only the shell tool with `sleep` and a number as its whole command. Any
+    /// other request is denied, and the first line then reads "not tried". Nothing of a
+    /// request is printed. Every wait has a limit, and the `sleep` ends by itself. Fails on
+    /// nothing.
+    fn background_task(&mut self, key: SessionKey) {
+        const RECORD: &str =
+            "live: a background task record that counted at least one task arrived";
+        if self.phase_of(key) != Some(Phase::Idle) {
+            eprintln!("{RECORD}: not tried (the session was not ready for a message)");
+            return;
+        }
+        self.tasks = Tasks {
+            watching: true,
+            ..Tasks::default()
+        };
+        let before = self.attached_ends.len();
+        let effects = self.app.submit(key, BACKGROUND_MESSAGE);
+        self.carry_out(effects);
+        let deadline = Instant::now() + TURN_LIMIT;
+        let mut other = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let settled = |live: &Live| {
+                live.attached_ends.len() > before
+                    || !matches!(live.phase_of(key), Some(Phase::Working))
+            };
+            self.wait_for(left, settled);
+            if self.phase_of(key) != Some(Phase::NeedsUser) {
+                break;
+            }
+            for (id, allowed) in self.waiting_requests(key) {
+                other |= !allowed;
+                let answer = if allowed {
+                    Answer::Allow { always: false }
+                } else {
+                    Answer::Deny { message: None }
+                };
+                let effects = self.app.answer(key, &id, answer);
+                self.carry_out(effects);
+            }
+            // A request that cannot be answered so (a question, a plan), or time that is up.
+            if self.phase_of(key) == Some(Phase::NeedsUser) || left.is_zero() {
+                other |= self.phase_of(key) == Some(Phase::NeedsUser);
+                let effects = self.app.stop(key);
+                self.carry_out(effects);
+                self.wait_for(CLOSE_LIMIT, |live| {
+                    live.attached_ends.len() > before
+                        || !matches!(live.phase_of(key), Some(Phase::NeedsUser | Phase::Working))
+                });
+                break;
+            }
+        }
+        if other {
+            self.tasks.watching = false;
+            eprintln!("{RECORD}: not tried (the program asked for something else)");
+            return;
+        }
+        if self.attached_ends.len() == before {
+            eprintln!(
+                "live: the turn that starts a background task did not end within {} s",
+                TURN_LIMIT.as_secs()
+            );
+        }
+        // The record may come a moment after the call's own result.
+        self.wait_for(RECORD_LIMIT, |live| live.tasks.record_counted);
+        self.tasks.watching = false;
+        if self.tasks.shell_calls == 0 {
+            eprintln!("{RECORD}: not tried (the program ran no shell command)");
+            return;
+        }
+        eprintln!("{RECORD}: {}", yes(self.tasks.record_counted));
+        eprintln!(
+            "live: the adapter's own guard counted the tool call: {}",
+            yes(self.tasks.guard_counted)
+        );
+    }
+
+    /// The requests that wait in `key`'s session, each with whether the test allows it: a
+    /// permission request of the shell tool for a command [`allowed_command`] takes.
+    fn waiting_requests(&self, key: SessionKey) -> Vec<(RequestId, bool)> {
+        self.items_of(key)
+            .into_iter()
+            .filter_map(|body| match body {
+                ItemBody::Request {
+                    request,
+                    state: RequestState::Waiting,
+                } => {
+                    let allowed = matches!(
+                        &request.kind,
+                        UserRequestKind::Permission {
+                            tool,
+                            detail: ToolDetail::Command { command },
+                            ..
+                        } if tool == SHELL_TOOL && allowed_command(command)
+                    );
+                    Some((request.id, allowed))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Attaches `sources` to `key`'s session, waits until every chip is read, and sends `text`
@@ -1401,8 +1619,10 @@ impl Live {
 
     /// Reads `key`'s session's stored history through the backend, as a stored session's is
     /// read, and prints what it gives for the first message of the user's: how many images and
-    /// files, and whether its text is the message as typed. Fails on nothing.
-    fn report_stored(&mut self, key: SessionKey) {
+    /// files, and whether its text is the message as typed. Then whether that message has its
+    /// own id in the store, and what reading its first image again by that id gives, compared
+    /// with `sent`, the image the message went out with. Fails on nothing.
+    fn report_stored(&mut self, key: SessionKey, sent: Option<ImageData>) {
         let Some(id) = self
             .app
             .sessions
@@ -1416,7 +1636,7 @@ impl Live {
         self.stored_asked = true;
         self.backend.send(ToBackend::ReadHistory {
             key,
-            id,
+            id: id.clone(),
             max_items: HISTORY_ITEMS,
         });
         self.wait_for(HISTORY_LIMIT, |live| live.stored.is_some());
@@ -1435,15 +1655,16 @@ impl Live {
                 return;
             }
         };
-        let users: Vec<(&String, usize, usize)> = items
+        let users: Vec<(&String, usize, usize, Option<&String>)> = items
             .iter()
             .filter_map(|item| match item {
                 HistoryItem::User {
                     text,
                     image_count,
                     files,
+                    stored,
                     ..
-                } => Some((text, *image_count, files.len())),
+                } => Some((text, *image_count, files.len(), stored.as_ref())),
                 _ => None,
             })
             .collect();
@@ -1452,7 +1673,7 @@ impl Live {
             users.len()
         );
         match users.first() {
-            Some((text, images, files)) => {
+            Some((text, images, files, stored)) => {
                 eprintln!(
                     "live: the stored message shows {images} image(s) and {files} file(s), text \
                      kept whole: {}",
@@ -1466,8 +1687,215 @@ impl Live {
                      {images}",
                     self.stored_read
                 );
+                eprintln!(
+                    "live: the stored message has an id: {}",
+                    yes(stored.is_some())
+                );
+                match (stored, &sent) {
+                    (Some(message), Some(sent)) => {
+                        let message = (*message).clone();
+                        self.report_image_read(id, message, sent);
+                    }
+                    (Some(_), None) => eprintln!(
+                        "live: its image read again by that id: not tried (no image was sent)"
+                    ),
+                    (None, _) => {}
+                }
             }
             None => eprintln!("live: the stored history holds no message of the user's"),
+        }
+    }
+
+    /// Reads again, through the backend, the first image of the stored message `message` of
+    /// session `id`, as a press on a picture of a reopened session asks for it, and prints how
+    /// many bytes came and whether they are `sent`'s. Fails on nothing.
+    fn report_image_read(&mut self, id: SessionId, message: String, sent: &ImageData) {
+        self.image_asked = Some(READ_PICTURE);
+        self.image_read = None;
+        self.backend.send(ToBackend::ReadImage {
+            picture: READ_PICTURE,
+            id,
+            message,
+            index: 0,
+        });
+        self.wait_for(HISTORY_LIMIT, |live| live.image_read.is_some());
+        self.image_asked = None;
+        match self.image_read.take() {
+            Some(Ok(read)) => eprintln!(
+                "live: its image read again by that id: {} bytes, the same as were sent: {}",
+                read.len(),
+                yes(read.as_bytes() == sent.as_bytes())
+            ),
+            Some(Err(reason)) => {
+                eprintln!("live: its image read again by that id: not read ({reason})");
+            }
+            None => eprintln!(
+                "live: its image read again by that id: no answer within {} s",
+                HISTORY_LIMIT.as_secs()
+            ),
+        }
+    }
+
+    /// Leaves the test's session idle, the idle length set to [`QUIET_AFTER`] and the app's
+    /// clock ticked as the window ticks it, until the app stops its program unnoticed; prints
+    /// whether the program ended cleanly. Then sends [`QUIET_MESSAGE`], which starts the
+    /// session again, and prints whether it answered and whether its model, effort and mode are
+    /// those it had before the stop. From here on the test's session is reported on and never
+    /// failed on (`quiet`): every wait ends by its limit and says what it found, and the steps
+    /// after this one run whatever happened. The idle length is set back to half an hour once
+    /// the idle `Close` is seen, before the session is started again, and in any case after.
+    fn stop_while_idle(&mut self) {
+        self.quiet = true;
+        self.app.set_idle_after(QUIET_AFTER);
+        self.stop_and_start_again();
+        self.app.set_idle_after(IDLE_SECONDS);
+    }
+
+    /// [`Live::stop_while_idle`]'s steps, each of which may end the part with a line.
+    fn stop_and_start_again(&mut self) {
+        let key = self.key.expect("the test's session");
+        let shown = |live: &Live| {
+            live.session()
+                .map(|s| (s.model_label(), s.effort.clone(), s.mode.clone()))
+        };
+        let before = shown(self);
+        let Some(open) = self.open() else {
+            eprintln!("live: the test's session has no program running; no idle stop is tried");
+            return;
+        };
+        let exit = |live: &Live| {
+            live.exits
+                .iter()
+                .find(|(exited, _)| *exited == open)
+                .map(|(_, clean)| *clean)
+        };
+        // `take_in` ticks the clock, and the tick sends the idle `Close`.
+        self.wait_for(QUIET_LIMIT, |live| {
+            live.closes.contains(&open) || exit(live).is_some()
+        });
+        if !self.closes.contains(&open) {
+            match exit(self) {
+                Some(clean) => eprintln!(
+                    "live: the program ended by itself before the idle stop (clean: {clean})"
+                ),
+                None => eprintln!(
+                    "live: the program was not stopped for idling within {} s",
+                    QUIET_LIMIT.as_secs()
+                ),
+            }
+            return;
+        }
+        // The idle `Close` is seen: the usual length again, so the program that is started
+        // next is not stopped for idling before it has answered.
+        self.app.set_idle_after(IDLE_SECONDS);
+        self.wait_for(CLOSE_LIMIT, |live| exit(live).is_some());
+        let Some(clean) = exit(self) else {
+            eprintln!(
+                "live: a program closed while idle had not ended {} s after Close",
+                CLOSE_LIMIT.as_secs()
+            );
+            return;
+        };
+        eprintln!(
+            "live: a program closed while idle ended cleanly: {}",
+            yes(clean)
+        );
+        match self.phase() {
+            Some(Phase::Resting) => {}
+            Some(Phase::Ended { clean, .. }) => {
+                eprintln!(
+                    "live: after the stop the session ended (clean: {clean}) instead of resting; \
+                     it is not started again"
+                );
+                return;
+            }
+            _ => {
+                eprintln!(
+                    "live: after the stop the session does not rest; it is not started again"
+                );
+                return;
+            }
+        }
+
+        self.opened = None;
+        let effects = self.app.submit(key, QUIET_MESSAGE);
+        self.carry_out(effects);
+        let decided = self.wait_for(ACTIVITY_LIMIT, |live| {
+            live.app.prompt(key).is_some() || live.opened.is_some()
+        });
+        if let Some(Prompt::OpenElsewhere { .. }) = self.app.prompt(key) {
+            eprintln!(
+                "live: started again: the app asked whether another app has it; continued here"
+            );
+            let (effects, _) = self.app.answer_prompt(key, PromptChoice::ContinueHere);
+            self.carry_out(effects);
+        } else if !decided {
+            eprintln!(
+                "live: started again, the session answered: no (no program was opened within {} \
+                 s)",
+                ACTIVITY_LIMIT.as_secs()
+            );
+            eprintln!("live: started again with the model, effort and mode it had: no");
+            return;
+        }
+        let settled = |live: &Live| {
+            live.has_reply_to(QUIET_MESSAGE)
+                || matches!(
+                    live.phase(),
+                    Some(Phase::NeedsUser | Phase::Ended { .. } | Phase::Resting)
+                )
+        };
+        self.wait_for(TURN_LIMIT, settled);
+        let why = if self.has_reply_to(QUIET_MESSAGE) {
+            None
+        } else {
+            Some(match self.phase() {
+                Some(Phase::NeedsUser) => {
+                    let effects = self.app.stop(key);
+                    self.carry_out(effects);
+                    self.wait_for(TURN_LIMIT, |live| {
+                        !matches!(live.phase(), Some(Phase::NeedsUser | Phase::Working))
+                    });
+                    "it asked the user; the turn is stopped".to_string()
+                }
+                Some(Phase::Ended { clean, .. }) => format!("its program ended, clean: {clean}"),
+                Some(Phase::Resting) => "its program ended cleanly before it answered".into(),
+                _ => format!("no reply within {} s", TURN_LIMIT.as_secs()),
+            })
+        };
+        match &why {
+            None => eprintln!("live: started again, the session answered: yes"),
+            Some(why) => eprintln!("live: started again, the session answered: no ({why})"),
+        }
+        eprintln!(
+            "live: started again with the model, effort and mode it had: {}",
+            yes(why.is_none() && shown(self) == before)
+        );
+    }
+
+    /// Whether the test's session idles with a finished reply after its latest message that
+    /// contains `message`.
+    fn has_reply_to(&self, message: &str) -> bool {
+        self.phase() == Some(Phase::Idle) && {
+            let items = self.items();
+            let asked = items.iter().rposition(
+                |body| matches!(body, ItemBody::User { text, .. } if text.contains(message)),
+            );
+            asked.is_some_and(|at| !finished_replies(&items[at..]).is_empty())
+        }
+    }
+
+    /// Prints how many counts of background tasks came from the test's programs in both runs,
+    /// and how many tasks the last one counted. A count comes with each of the program's
+    /// records, and once from the adapter's own guard for a tool call run in the background
+    /// ([`Live::background_task`] says which came).
+    fn report_background(&self) {
+        eprintln!(
+            "live: background task records that arrived: {}",
+            self.background.len()
+        );
+        if let Some(last) = self.background.last() {
+            eprintln!("live: the last one counted {last} task(s)");
         }
     }
 
@@ -1531,6 +1959,9 @@ impl Live {
     /// Takes every message waiting from the backend into the `App`, as the window's `poll`
     /// does, and carries out what comes back. Notes what the test reports on as it passes.
     fn take_in(&mut self) {
+        // As the window's poll does: the clock first, so what is taken in is stamped with it.
+        let effects = self.app.tick(unix_now());
+        self.carry_out(effects);
         while let Some(message) = self.backend.try_recv() {
             // The App would load it over the session's live conversation.
             if let FromBackend::History {
@@ -1545,6 +1976,14 @@ impl Live {
                 self.stored = Some(result.as_ref().ok().map(|history| history.items.clone()));
                 self.stored_pictures = pictures.first().cloned().unwrap_or_default();
                 self.stored_read = 0;
+                continue;
+            }
+            // The App would drop it: no picture is open large.
+            if let FromBackend::Image { picture, result } = &message
+                && Some(*picture) == self.image_asked
+            {
+                self.image_asked = None;
+                self.image_read = Some(result.clone().map_err(|error| error.to_string()));
                 continue;
             }
             // Only an image whose bytes the reader gave is answered with a picture.
@@ -1573,6 +2012,16 @@ impl Live {
 
     /// Notes what `message` says that the test reports on, before the `App` takes it.
     fn note(&mut self, message: &FromBackend) {
+        if let FromBackend::Event { open, event } = message {
+            match event {
+                SessionEvent::BackgroundTasks { running } => self.background.push(*running),
+                SessionEvent::Exited { clean, .. } => self.exits.push((*open, *clean)),
+                _ => {}
+            }
+            if self.tasks.watching && Some(*open) == self.attached_open() {
+                self.tasks.see(event);
+            }
+        }
         if let FromBackend::Event { open, event } = message
             && let Some(key) = self.key_of(*open)
             && let Some(said) = RemoteSaid::from_event(event)
@@ -1792,7 +2241,12 @@ impl Live {
                     }
                     ToBackend::Open { open, spec }
                 }
-                Effect::Send { open, command } => ToBackend::Send { open, command },
+                Effect::Send { open, command } => {
+                    if matches!(command, SessionCommand::Close) {
+                        self.closes.push(open);
+                    }
+                    ToBackend::Send { open, command }
+                }
                 Effect::ListSessions { since_unix } => {
                     let asked = match since_unix {
                         Some(_) => &mut self.recent_asked,
@@ -1805,9 +2259,21 @@ impl Live {
                     self.reading.insert(key, Instant::now());
                     ToBackend::ReadHistory { key, id, max_items }
                 }
+                Effect::DropHistory { key } => ToBackend::DropHistory { key },
                 Effect::CheckActivity { key, id } => ToBackend::CheckActivity { key, id },
                 Effect::ReadBranch { folder } => ToBackend::ReadBranch { folder },
                 Effect::Prepare { chip, source } => ToBackend::Prepare { chip, source },
+                Effect::ReadImage {
+                    picture,
+                    id,
+                    message,
+                    index,
+                } => ToBackend::ReadImage {
+                    picture,
+                    id,
+                    message,
+                    index,
+                },
                 Effect::Look { folder } => {
                     if folder != self.folder {
                         eprintln!(
@@ -1860,6 +2326,9 @@ impl Live {
             Screen::Checking | Screen::Main => {}
         }
         for key in self.ours() {
+            if self.quiet && Some(key) == self.key {
+                continue;
+            }
             match self.phase_of(key) {
                 Some(Phase::Ended { clean, detail }) => panic!(
                     "a session ended before the reply (clean: {clean}): {detail}; \
@@ -1897,7 +2366,9 @@ impl Live {
     }
 
     /// Closes the app as the window does, and waits until each of the test's sessions has ended
-    /// cleanly: with a message in it, it then rests. Returns what the app would save.
+    /// cleanly: with a message in it, it then rests. Past the idle stop (`quiet`) the test's own
+    /// session counts once its program has ended, cleanly or not. Returns what the app would
+    /// save.
     fn close_app(&mut self) -> Saved {
         self.closed = true;
         let effects = self.app.close(unix_now());
@@ -1912,16 +2383,24 @@ impl Live {
         let deadline = Instant::now() + CLOSE_LIMIT;
         loop {
             self.take_in();
-            let phases: Vec<Option<Phase>> = self
+            let reported = |live: &Live, key: SessionKey| live.quiet && Some(key) == live.key;
+            let phases: Vec<(SessionKey, Option<Phase>)> = self
                 .ours()
                 .into_iter()
-                .map(|key| self.phase_of(key))
+                .map(|key| (key, self.phase_of(key)))
                 .collect();
-            if phases.iter().all(|phase| *phase == Some(Phase::Resting)) {
+            let done = phases.iter().all(|(key, phase)| match phase {
+                Some(Phase::Resting) => true,
+                Some(Phase::Ended { .. }) => reported(self, *key),
+                _ => false,
+            });
+            if done {
                 return saved;
             }
-            for phase in &phases {
-                if let Some(Phase::Ended { clean, detail }) = phase {
+            for (key, phase) in &phases {
+                if let Some(Phase::Ended { clean, detail }) = phase
+                    && !reported(self, *key)
+                {
                     panic!("a session did not rest after closing (clean: {clean}): {detail}")
                 }
             }
@@ -2049,6 +2528,48 @@ fn listing_word(answer: &Option<Answered>, asked: Option<Instant>) -> String {
         (Some(Answered { count: None, .. }), _) => "failed".into(),
         (None, Some(_)) => "no answer".into(),
         (None, None) => "not asked".into(),
+    }
+}
+
+/// Whether `command` is the one the test allows: with the blanks round it taken off, `sleep `
+/// and a whole number of seconds, and nothing else. So nothing can ride along with it: no
+/// second command, no option, no substitution, no second line.
+fn allowed_command(command: &str) -> bool {
+    command
+        .trim()
+        .strip_prefix(ALLOWED_COMMAND)
+        .is_some_and(|seconds| !seconds.is_empty() && seconds.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Runs in the ordinary suite: it starts nothing.
+#[test]
+fn only_a_sleep_of_some_seconds_is_allowed() {
+    for allowed in ["sleep 20", "sleep 5", " sleep 20 ", "sleep 20\n"] {
+        assert!(allowed_command(allowed), "{allowed:?}");
+    }
+    for refused in [
+        "sleep 20 && touch x",
+        "sleep 20; touch x",
+        "sleep 20 | touch x",
+        "sleep 20 & touch x",
+        "sleep $(touch x)",
+        "sleep `touch x`",
+        "sleep 20\ntouch x",
+        "sleep 20 30",
+        "sleep -h",
+        "sleep --help",
+        "sleep 20s",
+        "sleep 2.5",
+        "sleep  20",
+        "sleep\t20",
+        "sleep ",
+        "sleep",
+        "sleeper 20",
+        "/bin/sleep 20",
+        "touch x",
+        "",
+    ] {
+        assert!(!allowed_command(refused), "{refused:?}");
     }
 }
 

@@ -56,11 +56,12 @@ done
 install -D -m 644 "$repo/assets/icon/$name.svg" "$icons/scalable/apps/$name.svg"
 
 # An Exec line quotes the path, with a backslash before " ` $ and \, and writes % twice.
+# What follows the program's name in the entry's Exec lines stays: `Exec="/path" --quit`.
 exec_path=$(printf '%s' "$binary" | sed -e 's/[\\"`$]/\\&/g' -e 's/%/%%/g')
 mkdir -p "$data/applications"
 while IFS= read -r line; do
     case $line in
-        Exec=*) printf 'Exec="%s"\n' "$exec_path" ;;
+        "Exec=$name"*) printf 'Exec="%s"%s\n' "$exec_path" "${line#"Exec=$name"}" ;;
         *) printf '%s\n' "$line" ;;
     esac
 done <"$repo/assets/linux/$name.desktop" >"$entry"

@@ -27,6 +27,10 @@ pub enum Incoming {
     TitleChanged {
         title: String,
     },
+    /// `tasks` as the record gives it, `Null` when it has none.
+    BackgroundTasks {
+        tasks: Value,
+    },
     Stream {
         parent: Option<String>,
         event: StreamEvent,
@@ -212,6 +216,9 @@ fn parse_system(v: &Value) -> Option<Incoming> {
         }),
         "session_title_changed" => Some(Incoming::TitleChanged {
             title: string_at(v, "title")?,
+        }),
+        "background_tasks_changed" => Some(Incoming::BackgroundTasks {
+            tasks: v.get("tasks").cloned().unwrap_or(Value::Null),
         }),
         "status" => Some(Incoming::ModeChanged {
             permission_mode: string_at(v, "permissionMode")?,
@@ -547,6 +554,7 @@ mod tests {
                     Incoming::Init { .. } => "Init",
                     Incoming::BridgeState { .. } => "BridgeState",
                     Incoming::TitleChanged { .. } => "TitleChanged",
+                    Incoming::BackgroundTasks { .. } => "BackgroundTasks",
                     Incoming::Stream { .. } => "Stream",
                     Incoming::Assistant { .. } => "Assistant",
                     Incoming::ToolResults { .. } => "ToolResults",
@@ -567,6 +575,7 @@ mod tests {
         assert!(lines > 500, "the fixtures are present");
         let all = [
             "Assistant",
+            "BackgroundTasks",
             "BridgeState",
             "ControlCancel",
             "ControlRequest",

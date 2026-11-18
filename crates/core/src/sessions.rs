@@ -39,10 +39,15 @@ pub struct Entry {
     pub session: Session,
     /// The number of its current open; `None` while no program runs for it.
     pub open: Option<u64>,
+    /// The number of its last open that ended. A failed send of that open still finds its session.
+    pub past_open: Option<u64>,
     /// When the user last sent a message in it, or what the store said: Unix seconds.
     pub last_active_unix: i64,
     /// When its own program last reported anything, in this run: Unix seconds.
     pub last_own_unix: Option<i64>,
+    /// When its own program last reported anything but an answer to the app's own asks for the
+    /// usage limits: what the idle stop counts from. Unix seconds.
+    pub idle_from_unix: Option<i64>,
     /// A turn ended in it while it was not the focused session, also when it was in a tile, and
     /// it has not been focused since.
     pub unseen: bool,
@@ -52,11 +57,16 @@ pub struct Entry {
     pub checking: bool,
     /// The question waiting for the user about it.
     pub prompt: Option<Prompt>,
+    /// The open that is being stopped for idleness, until it has ended.
+    pub stopping: Option<u64>,
+    /// When it left its last tile: Unix seconds. `None` while it is in a tile, and for one that
+    /// was never in a tile.
+    pub hidden_unix: Option<i64>,
 }
 
 impl Entry {
     /// `NeedsYou` while a request or a question waits, `Working` while a turn runs or a message
-    /// waits for the program to start, `Finished` while it is `unseen`.
+    /// (queued or undelivered) waits for the program to start, `Finished` while it is `unseen`.
     pub fn mark(&self) -> Mark {
         if self.prompt.is_some() {
             return Mark::NeedsYou;
@@ -64,7 +74,11 @@ impl Entry {
         match self.session.phase {
             Phase::NeedsUser => Mark::NeedsYou,
             Phase::Working => Mark::Working,
-            Phase::Opening if self.session.queued.is_some() => Mark::Working,
+            Phase::Opening
+                if self.session.queued.is_some() || !self.session.undelivered.is_empty() =>
+            {
+                Mark::Working
+            }
             _ if self.unseen => Mark::Finished,
             _ => Mark::None,
         }
@@ -97,12 +111,16 @@ impl Sessions {
             key,
             session,
             open: None,
+            past_open: None,
             last_active_unix,
             last_own_unix: None,
+            idle_from_unix: None,
             unseen: false,
             touched: false,
             checking: false,
             prompt: None,
+            stopping: None,
+            hidden_unix: None,
         };
         self.entries.insert(key, entry);
         key
@@ -198,6 +216,15 @@ impl Sessions {
         self.entries
             .values_mut()
             .find(|entry| entry.open == Some(open))
+            .map(|entry| EntryMut::new(entry, version))
+    }
+
+    /// The entry whose last open that ended is number `open`.
+    pub fn by_past_open(&mut self, open: u64) -> Option<EntryMut<'_>> {
+        let version = &self.version;
+        self.entries
+            .values_mut()
+            .find(|entry| entry.past_open == Some(open))
             .map(|entry| EntryMut::new(entry, version))
     }
 
