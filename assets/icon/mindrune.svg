@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
   <title>MindRune</title>
-  <rect width="512" height="512" rx="122" fill="#2c3140"/>
-  <g transform="translate(256 256) scale(3.2)">
+  <rect x="35" y="35" width="442" height="442" rx="104" fill="#3a4154" stroke="#ffffff" stroke-width="14"/>
+  <g transform="translate(256 256) scale(2.9)">
     <g fill="#f3922e">
       <rect x="-3.5" y="-62" width="7" height="16" rx="3.5"/>
       <rect x="-3.5" y="-62" width="7" height="16" rx="3.5" transform="rotate(60)"/>
