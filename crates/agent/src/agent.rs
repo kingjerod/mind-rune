@@ -22,6 +22,9 @@ pub trait Agent: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     /// Whether and how the user is signed in. May block for seconds.
     fn account(&self) -> Account;
+    /// The stored sessions, those at least as new as `modified_since_unix` or all of them.
+    /// A store that could not be found or read is an error, never an empty list: the caller
+    /// takes a complete listing for everything there is.
     fn list_sessions(
         &self,
         modified_since_unix: Option<i64>,
@@ -43,6 +46,19 @@ pub trait Agent: Send + Sync {
         let _ = (id, message, index);
         Err(AgentError::Protocol(
             "this agent cannot read an image again".into(),
+        ))
+    }
+    /// Removes a stored session for good, unless it changed after `unless_after_unix`.
+    /// `Missing` only when the store was looked through and does not hold it: a store that
+    /// could not be found is an error. May block while files are removed.
+    fn remove_session(
+        &self,
+        id: &SessionId,
+        unless_after_unix: i64,
+    ) -> Result<Removal, AgentError> {
+        let _ = (id, unless_after_unix);
+        Err(AgentError::Protocol(
+            "this agent cannot remove a session".into(),
         ))
     }
     /// Starts a session. May block for seconds. `Started` comes at most once
@@ -153,6 +169,14 @@ pub enum HistoryItem {
     },
     /// The agent summarised everything above this point to save room.
     Compacted,
+}
+
+/// What became of a stored session that was to be removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    Removed,
+    Missing,
+    Changed,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

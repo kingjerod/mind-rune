@@ -11,7 +11,7 @@
 //! Escape (`view::on_key`) and `glue::tidy_sidebar` end those. Each ends it with nothing left
 //! behind: no chip, no line, no outline, and no press swallowed later.
 
-use mr_core::{GroupId, Laid, Part, Place, SessionKey, Spot, TileLevel, part_at};
+use mr_core::{GroupId, Laid, Part, Place, SessionKey, SidebarView, Spot, TileLevel, part_at};
 use rune::{
     Drag, El, Phase, Picked, PointerPress, Spring, Transition, Tx, el, row as row_el, text,
 };
@@ -221,7 +221,8 @@ fn answer(ui: &mut Ui, key: SessionKey, at: [f32; 2], path: Option<&str>) {
 }
 
 /// The group of the sidebar line whose element path is `path`, when it is a header, a row
-/// or a "Show older" line of a listed group.
+/// or a "Show older" line of a listed group. None while the Deleted view shows: nothing is
+/// dropped there.
 ///
 /// The lines are the children of the list, keyed as `sidebar::list` keys them; a point inside
 /// one gives the path of what is drawn there, under the line.
@@ -231,6 +232,9 @@ pub fn group_of_path(ui: &Ui, path: &str) -> Option<GroupId> {
     // Unkeyed elements between (`#n`) are not lines, as Rune's own key paths skip them.
     let line = segments.find(|segment| !segment.starts_with('#'))?;
     let model = &ui.app.sidebar;
+    if model.view == SidebarView::Deleted {
+        return None;
+    }
     let listed = |id: GroupId| model.sections.iter().any(|s| s.id == id).then_some(id);
     if let Some(number) = line.strip_prefix("mr-row-") {
         let entry = ui.app.sessions.get(SessionKey(number.parse().ok()?))?;
@@ -990,8 +994,8 @@ mod tests {
         testkit::emit_to(&mut rt, b, SessionEvent::TurnStarted);
         testkit::emit_to(&mut rt, b, SessionEvent::NeedsUser(request));
         let kit = theme::kit(true);
-        let amber = sidebar::mark_color(mr_core::Mark::NeedsYou, kit);
-        assert_eq!(tiles::outline(&rt.state, b, kit), amber);
+        let orange = sidebar::mark_color(mr_core::Mark::NeedsYou, kit);
+        assert_eq!(tiles::outline(&rt.state, b, kit), orange);
         let to = ((edge_x(&rt, 1) + edge_x(&rt, 2)) / 2.0, mid_y(&rt));
         testkit::hold_row(&mut rt, c, to);
         assert_eq!(over(&rt), Some(DropTarget::Tile(b)));
@@ -1004,7 +1008,11 @@ mod tests {
         });
         testkit::step(&mut rt);
         nothing_left(&rt);
-        assert_eq!(tiles::outline(&rt.state, b, kit), amber, "amber comes back");
+        assert_eq!(
+            tiles::outline(&rt.state, b, kit),
+            orange,
+            "orange comes back"
+        );
         testkit::release(&mut rt);
     }
 
@@ -1182,7 +1190,9 @@ mod tests {
             assert_eq!(over(&rt), Some(target));
             let to = (x + w - 40.0, mid_y(&rt) + 100.0);
             testkit::move_held(&mut rt, to);
-            testkit::move_held(&mut rt, (100.0, 200.0));
+            // Over its own row in the sidebar, where no group is marked.
+            let own = testkit::find(&rt, &testkit::row_key(c)).unwrap();
+            testkit::move_held(&mut rt, own);
             assert!(rt.state.drag.is_some());
             assert_eq!(conversation::all_row_builds(), rows, "no conversation row");
             assert_eq!(sidebar::line_builds(), lines, "no sidebar line");
@@ -2330,12 +2340,12 @@ mod tests {
     }
 
     #[test]
-    fn a_tile_that_needs_the_user_keeps_its_amber_while_a_half_of_it_is_the_target() {
+    fn a_tile_that_needs_the_user_keeps_its_orange_while_a_half_of_it_is_the_target() {
         let (mut rt, a, b, c) = three(SIZE);
         ask_permission(&mut rt, b);
         let kit = theme::kit(true);
-        let amber = sidebar::mark_color(mr_core::Mark::NeedsYou, kit);
-        assert!(amber.is_some());
+        let orange = sidebar::mark_color(mr_core::Mark::NeedsYou, kit);
+        assert!(orange.is_some());
         for (fy, target) in [(0.75, DropTarget::Below(b)), (0.25, DropTarget::Above(b))] {
             let to = in_tile(&rt, b, 0.5, fy);
             testkit::hold_row(&mut rt, c, to);
@@ -2343,8 +2353,8 @@ mod tests {
             assert!(testkit::drawn(&rt, HALF), "the half is outlined");
             assert_eq!(
                 tiles::outline(&rt.state, b, kit),
-                amber,
-                "{fy}: amber stays"
+                orange,
+                "{fy}: orange stays"
             );
             assert!(outlined(&rt, b), "{fy}: b's outline is drawn");
             assert_eq!(tiles::outline(&rt.state, a, kit), None);

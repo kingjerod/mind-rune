@@ -28,6 +28,9 @@ On an ultrawide monitor a single narrow conversation column leaves most of the s
 - A panel for the focused session: its context, its file changes and a Remote Control switch.
 - Attachments: images pasted, picked or dropped, and files by path. A press on a picture opens it large.
 - The app keeps running when its window is closed, with a tray icon, so sessions carry on in the background.
+- Deleting a session or a group: it waits a week in a Deleted view, where it can be recovered, and is then removed for good: its transcript and its own folders are removed from Claude Code's folder too, so it is gone from `claude --resume`. The prompts typed in a terminal stay in Claude Code's own prompt history, which MindRune never changes.
+- Colours: a session that is ready turns its tile's title bar and its row green, and one that needs you turns them orange, until you act on it.
+- On Linux, a desktop notification when a session is ready or needs you while you are in another app, and a green or orange dot on the tray icon.
 
 Screenshots will follow.
 

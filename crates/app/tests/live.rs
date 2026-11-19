@@ -64,29 +64,47 @@
 //! background task records the test's programs sent in both runs, and how many tasks the last
 //! one counted.
 //!
+//! At the very end the test removes from the store the three sessions it made, by their ids,
+//! through the adapter's `remove_session`, as the app removes a deleted session after its
+//! week, and prints how many it removed. It removes a session only once it has seen that
+//! session's program end, waiting up to a limit for it; one whose program still runs is kept,
+//! with a line that says so. It removes nothing else: no session it did not make and none whose
+//! id it does not know. Then it looks through Claude Code's folder for any path whose name
+//! still holds the id of a session that is gone, by names alone and never opening a file, at
+//! most [`WALK_DEPTH`] levels deep and [`WALK_NAMES`] names, and prints how many it found and
+//! the first-level folders they sit under, never a deeper name and never an id. A first-level
+//! folder that is a link is not looked into, and the test prints how many there are. None of
+//! that fails the test.
+//!
 //! Every way out of the test, a failed assertion included, closes its sessions, so no `claude`
-//! is left running, and every wait has a deadline that says what it waited for. Of the user's
+//! is left running, and removes from the store those of its sessions whose programs it has
+//! seen end ([`Tidy`]): a failed run leaves no test session behind but one whose program may
+//! still run. Every wait has a deadline that says what it waited for. Of the user's
 //! other stored sessions it prints only counts and times: never a title, a folder, a message
 //! or an id. It writes one file, into its own temporary folder; only `claude` itself stores the
-//! test's three sessions. What it prints of the session sent attachments holds no path, no
-//! id and no image's bytes.
+//! test's three sessions, and only the removal at the end changes the store. What it prints of
+//! the session sent attachments holds no path, no id and no image's bytes.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mr_agent::{
-    Account, Agent, Answer, Attachment, CommandKind, ContextBreakdown, ContextKind, HistoryItem,
-    ImageData, PermissionMode, RemoteAccess, RemoteFailure, RequestId, SessionCommand,
-    SessionEvent, SessionId, ToolDetail, UserRequestKind,
+    Account, Agent, AgentError, Answer, Attachment, CommandKind, ContextBreakdown, ContextKind,
+    HistoryItem, ImageData, PermissionMode, RemoteAccess, RemoteFailure, Removal, RequestId,
+    SessionCommand, SessionEvent, SessionId, ToolDetail, UserRequestKind,
 };
-use mr_claude::ClaudeAgent;
+use mr_claude::{ClaudeAgent, root_from};
 use mr_core::{
     App, Backend, ChipState, DEFAULT_WIDTH, Effect, FromBackend, HISTORY_ITEMS, HistoryState,
-    IDLE_SECONDS, ItemBody, Launch, Leaving, MAX_BYTES, MAX_SIDE, Phase, Place, Prompt,
-    PromptChoice, RequestState, Saved, Screen, Session, SessionKey, Source, ToBackend, Width,
-    mode_label,
+    IDLE_SECONDS, ItemBody, Launch, Leaving, MAX_BYTES, MAX_SIDE, OWN_EXIT_SLACK_SECONDS, Phase,
+    Place, Prompt, PromptChoice, RequestState, Saved, Screen, Session, SessionKey, Source,
+    ToBackend, Width, mode_label,
 };
 
 /// The whole run, from the account check to the reply; also a resumed session's reply.
@@ -204,6 +222,13 @@ const RECORD_LIMIT: Duration = Duration::from_secs(5);
 /// answer is for the test alone.
 const READ_PICTURE: u64 = u64::MAX;
 
+/// How many levels under Claude Code's folder the look for leftover paths goes: a file in a
+/// session's own folder in a project folder is at the fourth.
+const WALK_DEPTH: usize = 4;
+
+/// How many names the look for leftover paths reads at most.
+const WALK_NAMES: usize = 200_000;
+
 #[test]
 #[ignore = "starts the real claude; run with MINDRUNE_LIVE=1 and --ignored"]
 fn a_real_turn_the_store_the_look_and_the_session_resumed() {
@@ -214,6 +239,14 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     let dir = tempfile::tempdir().expect("a temporary folder");
     let folder = dir.path().to_path_buf();
     let agent: Arc<dyn Agent> = Arc::new(ClaudeAgent::from_environment());
+    // Before the runs, so that it is dropped after them: on every way out it removes the
+    // test's sessions whose programs were seen to end.
+    let made = Rc::new(RefCell::new(Made::default()));
+    let mut tidy = Tidy {
+        agent: agent.clone(),
+        made: made.clone(),
+        done: false,
+    };
 
     // The first run: the window opened with no folder, and a new session in the test's folder.
     let launch = Launch {
@@ -222,7 +255,7 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
         home: folder.clone(),
         ..Launch::default()
     };
-    let mut live = Live::start(agent.clone(), launch, &folder, None);
+    let mut live = Live::start(agent.clone(), launch, &folder, None, made.clone());
     let stand_in = live.first_turn();
     live.report_title_model_and_auto_mode(stand_in);
     live.report_listings();
@@ -250,7 +283,7 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
         home: folder.clone(),
         saved,
     };
-    let mut again = Live::start(agent, launch, &folder, Some(account));
+    let mut again = Live::start(agent.clone(), launch, &folder, Some(account), made);
     again.background = background;
     again.read_back(&id);
     again.restored(&id, &side_id);
@@ -259,6 +292,450 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     again.attachments();
     again.report_background();
     again.close_app();
+    // A session of the test's is removed only once the test has seen its program end: no
+    // program runs for it any more, or the app holds it no more. `close_app` waited for the
+    // first two; the session for attachments was waited for only up to a limit, so the test
+    // waits again here, up to `CLOSE_LIMIT`, and leaves any session whose program still runs.
+    // The time given to the removal is the moment that wait ended plus the app's own slack for
+    // a program's last writes, as the app gives it for a session it deleted. It guards little
+    // here, since the removal follows at once: what keeps a running program's files is the wait.
+    let ids = [Some(id), Some(side_id), again.attached_id()];
+    let running = again.wait_until_ended(&ids);
+    let ended_unix = unix_now();
+    drop(again);
+    // From here the removal is this one: the guard has nothing left to do.
+    tidy.done = true;
+    remove_own_sessions(
+        agent.as_ref(),
+        &ids,
+        &running,
+        ended_unix.saturating_add(OWN_EXIT_SLACK_SECONDS),
+    );
+}
+
+/// The sessions the test made in the real store, by the agent's id, each with when its program
+/// was last seen to end (Unix seconds), or `None` while a program runs for it or may. Both runs
+/// write here ([`Live::track`]); [`Tidy`] reads it.
+#[derive(Debug, Default)]
+struct Made {
+    sessions: Vec<(SessionId, Option<i64>)>,
+}
+
+impl Made {
+    /// Takes in that a program runs for `id` at `now_unix`, or that none does. A session is
+    /// only known here once a program was seen running for it, so that an id the test merely
+    /// read somewhere is never taken for its own; and a program that runs again (a resume)
+    /// takes back what was said of the one before.
+    fn see(&mut self, id: &SessionId, runs: bool, now_unix: i64) {
+        match self.sessions.iter_mut().find(|(known, _)| known == id) {
+            Some((_, ended)) if runs => *ended = None,
+            Some((_, ended)) => {
+                ended.get_or_insert(now_unix);
+            }
+            None if runs => self.sessions.push((id.clone(), None)),
+            None => {}
+        }
+    }
+
+    /// The sessions whose program was seen to end and has not run since, with when.
+    fn ended(&self) -> Vec<(SessionId, i64)> {
+        self.sessions
+            .iter()
+            .filter_map(|(id, ended)| Some((id.clone(), (*ended)?)))
+            .collect()
+    }
+}
+
+/// Removes the test's sessions from the store when the test leaves before its end (a failed
+/// assertion, a deadline): a failed run is when strays pile up in the user's real store. It is
+/// declared before the runs, so it is dropped after them, when each has closed its sessions and
+/// waited for them ([`Live`]'s own drop); it waits for nothing itself.
+///
+/// It removes only a session whose program the test saw end, and nothing else, for these
+/// reasons. A program that still runs, or may, could write its files again after they were
+/// removed, and what it then leaves is a partial session nobody made, in the user's own list:
+/// worse than a whole test session left behind. A session whose id the test never learned
+/// cannot be named. And nothing the test did not make is ever its to remove.
+struct Tidy {
+    agent: Arc<dyn Agent>,
+    made: Rc<RefCell<Made>>,
+    /// The test reached its own removal at its end.
+    done: bool,
+}
+
+impl Tidy {
+    /// Removes each session whose program was seen to end, unless its transcript changed later
+    /// than that exit, with the app's own slack for a program's last writes, as at the test's
+    /// end. Gives how many were removed, of how many, and how many were kept because a program
+    /// may still run. None while the record is being written. Waits for nothing.
+    fn remove_ended(&self) -> Option<(usize, usize, usize)> {
+        let made = self.made.try_borrow().ok()?;
+        let ended = made.ended();
+        let kept = made.sessions.len() - ended.len();
+        let removed = ended
+            .iter()
+            .filter(|(id, ended_unix)| {
+                let unless_after = ended_unix.saturating_add(OWN_EXIT_SLACK_SECONDS);
+                matches!(
+                    self.agent.remove_session(id, unless_after),
+                    Ok(Removal::Removed)
+                )
+            })
+            .count();
+        Some((removed, ended.len(), kept))
+    }
+}
+
+impl Drop for Tidy {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // This runs while the test's own panic unwinds, where a second panic that got out
+        // would abort the process and lose the first one's words: what the adapter might do is
+        // caught, and the line is written without `eprintln!`, which panics when stderr is
+        // gone.
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            if let Some((removed, of, kept)) = self.remove_ended() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "live: the test left early; its sessions removed from the store: {removed} \
+                     of {of}, kept because a program may still run: {kept}"
+                );
+            }
+        }));
+    }
+}
+
+/// Removes for good, through the adapter's `remove_session`, the stored sessions the test made
+/// in this run, `ids` (`None` for one whose id it does not know, which is left alone), but not
+/// those in `running`, whose programs had not ended, and not one whose transcript changed later
+/// than `unless_after_unix`. Prints how many were removed, then how many paths anywhere in
+/// Claude Code's folder are still named by the id of a session that is gone ([`leftovers`]).
+/// Fails on nothing.
+fn remove_own_sessions(
+    agent: &dyn Agent,
+    ids: &[Option<SessionId>],
+    running: &[SessionId],
+    unless_after_unix: i64,
+) {
+    let mut known: Vec<&SessionId> = Vec::new();
+    for id in ids.iter().flatten() {
+        if !known.contains(&id) {
+            known.push(id);
+        }
+    }
+    let unknown = ids.iter().filter(|id| id.is_none()).count();
+    if unknown > 0 {
+        eprintln!("live: sessions of the test's whose id is not known, not removed: {unknown}");
+    }
+    let mut removed = 0;
+    // The sessions the store no longer has: removed, or not there under their id.
+    let mut gone: Vec<&SessionId> = Vec::new();
+    for id in &known {
+        if running.contains(id) {
+            eprintln!("live: a test session was still running; kept");
+            continue;
+        }
+        match agent.remove_session(id, unless_after_unix) {
+            Ok(Removal::Removed) => {
+                removed += 1;
+                gone.push(id);
+            }
+            Ok(Removal::Missing) => {
+                eprintln!("live: a session of the test's was not in the store");
+                gone.push(id);
+            }
+            Ok(Removal::Changed) => {
+                eprintln!("live: a session of the test's changed after the test closed it; kept");
+            }
+            // The error's words may name a path: only its kind is printed.
+            Err(error) => eprintln!(
+                "live: a session of the test's could not be removed ({})",
+                error_kind(&error)
+            ),
+        }
+    }
+    eprintln!(
+        "live: the test's own sessions removed from the store: {removed} of {}",
+        known.len()
+    );
+    const LINE: &str = "live: paths still named by a removed session's id:";
+    let Some(root) = root_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        std::env::home_dir().as_deref(),
+    ) else {
+        eprintln!("{LINE} not looked at (no store)");
+        return;
+    };
+    if gone.is_empty() {
+        eprintln!("{LINE} not looked at (no session was removed)");
+        return;
+    }
+    let Some(left) = leftovers(&root, &gone, WALK_DEPTH, WALK_NAMES) else {
+        eprintln!("{LINE} not looked at (the folder could not be listed)");
+        return;
+    };
+    eprintln!("{LINE} {}", left.count);
+    if !left.under.is_empty() {
+        let under: Vec<&str> = left.under.iter().map(String::as_str).collect();
+        eprintln!("live: they sit under: {}", under.join(", "));
+    }
+    if left.cut {
+        eprintln!(
+            "live: the look stopped after {WALK_NAMES} names; not all of the folder was seen"
+        );
+    }
+    if left.unlisted > 0 {
+        eprintln!(
+            "live: folders that could not be listed, and so not looked into: {}",
+            left.unlisted
+        );
+    }
+    if left.links > 0 {
+        eprintln!("live: folders not looked into, being links: {}", left.links);
+    }
+}
+
+/// What a look through Claude Code's folder found of sessions that are gone.
+#[derive(Debug, Default, PartialEq)]
+struct Leftovers {
+    /// How many paths have a name that holds the id of one of them.
+    count: usize,
+    /// The first-level folders those paths sit under (`projects`, `file-history` and so on).
+    /// Never a deeper name and never an id: a first-level name that itself holds an id is
+    /// given as [`AT_THE_TOP`].
+    under: BTreeSet<String>,
+    /// The look stopped at its limit of names, so not all was seen.
+    cut: bool,
+    /// How many folders below the first could not be listed.
+    unlisted: usize,
+    /// How many first-level folders are links, and so were not looked into: with `projects`
+    /// linked elsewhere, a count of 0 would say nothing of what is there.
+    links: usize,
+}
+
+/// What stands for a first-level name that holds an id.
+const AT_THE_TOP: &str = "(the top of the folder)";
+
+/// Looks through `root`, Claude Code's folder, for every path whose name holds one of `ids`:
+/// at most `depth` levels down and `names` names in all. Only names are read, with what kind
+/// of thing each is: no file is opened, no link is followed, and a path found is counted and
+/// not looked into. This finds a kind of path nobody knew a session leaves; it cannot see an
+/// id written inside a file. None when `root` itself cannot be listed.
+fn leftovers(root: &Path, ids: &[&SessionId], depth: usize, names: usize) -> Option<Leftovers> {
+    // An id too short to be one would be found in every name.
+    let ids: Vec<&str> = ids
+        .iter()
+        .map(|id| id.0.as_str())
+        .filter(|id| id.len() >= 8)
+        .collect();
+    let holds_id = |name: &str| ids.iter().any(|id| name.contains(id));
+    let mut found = Leftovers::default();
+    let mut seen = 0;
+    // Each folder still to list: its path, its level, and the first-level name it is under.
+    let mut todo: Vec<(PathBuf, usize, Option<String>)> = vec![(root.to_path_buf(), 1, None)];
+    while let Some((folder, level, first)) = todo.pop() {
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(_) if level == 1 => return None,
+            Err(_) => {
+                found.unlisted += 1;
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            if seen == names {
+                found.cut = true;
+                return Some(found);
+            }
+            seen += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let first = first.clone().unwrap_or_else(|| name.clone());
+            if holds_id(&name) {
+                found.count += 1;
+                let under = if holds_id(&first) {
+                    AT_THE_TOP.to_string()
+                } else {
+                    first
+                };
+                found.under.insert(under);
+                continue;
+            }
+            // `file_type` does not follow a link: a linked folder is not looked into. At the
+            // first level it is counted, so that the test can say it did not look there; only
+            // what kind of thing the link points to is asked, nothing is opened.
+            let kind = entry.file_type();
+            if level == 1 && kind.as_ref().is_ok_and(|kind| kind.is_symlink()) {
+                found.links += usize::from(entry.path().is_dir());
+            }
+            if level < depth && kind.is_ok_and(|kind| kind.is_dir()) {
+                todo.push((entry.path(), level + 1, Some(first)));
+            }
+        }
+    }
+    Some(found)
+}
+
+/// Runs in the ordinary suite: it looks through a folder the test makes.
+#[test]
+fn leftovers_are_found_by_name_anywhere_and_named_by_their_first_folder() {
+    let store = tempfile::tempdir().expect("a temporary folder");
+    let root = store.path();
+    let gone = SessionId("0b5e1a52-8c3f-4d2a-9e61-7f0c2d4b8a19".into());
+    let other = "1c6f2b63-9d40-4e3b-af72-801d3e5c9b2a";
+    let id = gone.0.as_str();
+    let make = |path: String| std::fs::create_dir_all(root.join(path)).expect("a folder");
+    let write = |path: String| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a folder");
+        std::fs::write(path, "x").expect("a file");
+    };
+    // Nothing of it is left: another session's paths do not count.
+    write(format!("projects/-home-alex-project/{other}.jsonl"));
+    make(format!("file-history/{other}"));
+    write("history.jsonl".into());
+    let ids = [&gone];
+    assert_eq!(
+        leftovers(root, &ids, WALK_DEPTH, WALK_NAMES),
+        Some(Leftovers::default())
+    );
+
+    // The kinds removing knows, and kinds nobody knew of, at every level looked at.
+    write(format!("projects/-home-alex-project/{id}.jsonl"));
+    write(format!(
+        "projects/-home-alex-project/{id}/subagents/agent-a1.jsonl"
+    ));
+    make(format!("session-env/{id}"));
+    write(format!("todos/{id}-agent-{id}.json"));
+    write(format!("tasks/by-day/2026/{id}.lock"));
+    write(format!("{id}.json"));
+    let found = leftovers(root, &ids, WALK_DEPTH, WALK_NAMES).expect("listed");
+    assert_eq!(found.count, 6, "each path once, and none inside one found");
+    let under: Vec<&str> = found.under.iter().map(String::as_str).collect();
+    assert_eq!(
+        under,
+        [AT_THE_TOP, "projects", "session-env", "tasks", "todos"]
+    );
+    assert!(!found.cut && found.unlisted == 0 && found.links == 0);
+    // What is printed holds no id and no project folder's name.
+    let printed = under.join(", ");
+    assert!(!printed.contains(id) && !printed.contains("-home-alex-project"));
+
+    // Not deeper than asked: the lock is at the fourth level.
+    let shallow = leftovers(root, &ids, 3, WALK_NAMES).expect("listed");
+    assert_eq!(shallow.count, 5);
+    assert!(!shallow.under.contains("tasks"));
+    // Not more names than asked, and it says that it stopped.
+    let few = leftovers(root, &ids, WALK_DEPTH, 3).expect("listed");
+    assert!(few.cut && few.count <= 3);
+    // An id that is none finds nothing, and a folder that is not there is not looked at.
+    let empty = SessionId(String::new());
+    assert_eq!(
+        leftovers(root, &[&empty], WALK_DEPTH, WALK_NAMES),
+        Some(Leftovers::default())
+    );
+    assert_eq!(
+        leftovers(&root.join("not-there"), &ids, WALK_DEPTH, WALK_NAMES),
+        None
+    );
+}
+
+/// Runs in the ordinary suite: no link is followed out of the folder.
+#[cfg(unix)]
+#[test]
+fn the_look_for_leftovers_follows_no_link() {
+    let store = tempfile::tempdir().expect("a temporary folder");
+    let elsewhere = tempfile::tempdir().expect("a temporary folder");
+    let gone = SessionId("0b5e1a52-8c3f-4d2a-9e61-7f0c2d4b8a19".into());
+    std::fs::create_dir_all(elsewhere.path().join(&gone.0)).expect("a folder");
+    std::fs::write(elsewhere.path().join("a-file"), "x").expect("a file");
+    let link = |to: PathBuf, at: &str| std::os::unix::fs::symlink(to, store.path().join(at));
+    link(elsewhere.path().to_path_buf(), "linked").expect("a link");
+    // A linked file and a link to nowhere are no folders: only the linked folder is counted.
+    link(elsewhere.path().join("a-file"), "file").expect("a link");
+    link(elsewhere.path().join("not-there"), "gone").expect("a link");
+    // A link below the first level is not looked into either, and not counted.
+    std::fs::create_dir_all(store.path().join("projects")).expect("a folder");
+    link(elsewhere.path().to_path_buf(), "projects/linked").expect("a link");
+    assert_eq!(
+        leftovers(store.path(), &[&gone], WALK_DEPTH, WALK_NAMES),
+        Some(Leftovers {
+            links: 1,
+            ..Leftovers::default()
+        }),
+        "nothing found there, and it says that it did not look"
+    );
+}
+
+/// Runs in the ordinary suite, against the fake: nothing real is removed.
+#[test]
+fn a_test_that_leaves_early_removes_only_what_it_saw_end() {
+    let id = |text: &str| SessionId(text.into());
+    let mut made = Made::default();
+    // Never seen running: not known to be the test's.
+    made.see(&id("read-somewhere"), false, 100);
+    assert!(made.sessions.is_empty());
+    made.see(&id("first"), true, 100);
+    made.see(&id("side"), true, 101);
+    made.see(&id("attached"), true, 102);
+    assert_eq!(made.ended(), vec![], "all three run");
+    made.see(&id("first"), false, 110);
+    made.see(&id("first"), false, 120);
+    made.see(&id("side"), false, 111);
+    assert_eq!(
+        made.ended(),
+        vec![(id("first"), 110), (id("side"), 111)],
+        "when each was first seen ended"
+    );
+    // Resumed: its program runs again, so it is not one to remove until that one ends too.
+    made.see(&id("first"), true, 130);
+    assert_eq!(made.ended(), vec![(id("side"), 111)]);
+    made.see(&id("first"), false, 140);
+    assert_eq!(made.ended(), vec![(id("first"), 140), (id("side"), 111)]);
+
+    let stored = |text: &str| mr_agent::StoredSession {
+        id: id(text),
+        folder: "/home/alex/project".into(),
+        title: text.into(),
+        last_active_unix: 100,
+    };
+    let fake = Arc::new(mr_agent::FakeAgent::new());
+    fake.set_sessions(vec![stored("first"), stored("side"), stored("attached")]);
+    let made = Rc::new(RefCell::new(made));
+    // The test reached its own removal: the guard does nothing when it is dropped.
+    let tidy = Tidy {
+        agent: fake.clone(),
+        made: made.clone(),
+        done: true,
+    };
+    drop(tidy);
+    assert_eq!(fake.removed(), vec![]);
+    // It left early: the two seen to end go, the one that may still run stays. (The guard's
+    // drop does this and prints a line; here it is marked done, to keep the output clean.)
+    let mut tidy = Tidy {
+        agent: fake.clone(),
+        made: made.clone(),
+        done: false,
+    };
+    assert_eq!(tidy.remove_ended(), Some((2, 2, 1)));
+    assert_eq!(fake.removed(), vec![id("first"), id("side")]);
+    // A record that is being written is left alone, without a panic.
+    let writing = made.borrow_mut();
+    assert_eq!(tidy.remove_ended(), None);
+    drop(writing);
+    assert_eq!(fake.removed().len(), 2);
+    tidy.done = true;
+}
+
+/// The kind of `error`, without its words, which may name a path.
+fn error_kind(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::NotInstalled => "not installed",
+        AgentError::Closed => "closed",
+        AgentError::Io(_) => "an error reading or removing",
+        AgentError::Protocol(_) => "a protocol error",
+    }
 }
 
 /// When something was asked of the store and what came back.
@@ -270,10 +747,12 @@ struct Answered {
 
 /// One run of the `App` and the `Backend` over the real agent, the way the window holds them.
 /// Dropping it before the test's session closed cleanly (a failed assertion, a timeout) closes
-/// the session.
+/// the session, and writes down which of the test's sessions were seen to end.
 struct Live {
     app: App,
     backend: Backend,
+    /// The sessions the test made, with whether a program runs for each ([`Live::track`]).
+    made: Rc<RefCell<Made>>,
     /// The test's own folder: the only place its sessions and its look start in.
     folder: PathBuf,
     /// The test's session in this run, once there is one.
@@ -438,6 +917,7 @@ impl Live {
         launch: Launch,
         folder: &Path,
         account: Option<Account>,
+        made: Rc<RefCell<Made>>,
     ) -> Live {
         let (app, mut effects) = App::new(
             agent.capabilities(),
@@ -449,6 +929,7 @@ impl Live {
         let mut live = Live {
             app,
             backend,
+            made,
             folder: folder.to_path_buf(),
             key: None,
             side: None,
@@ -1108,6 +1589,25 @@ impl Live {
         eprintln!("live: restored 2 tiles, the focus on the first");
     }
 
+    /// Writes down, for each of the test's sessions that has the agent's id, whether a program
+    /// runs for it now: the app holds an open for it from the start of its program to the
+    /// program's exit. Called after everything that can start or end one, so [`Tidy`] knows
+    /// which sessions it may remove if the test leaves early. Never panics: it also runs while
+    /// a panic unwinds.
+    fn track(&self) {
+        let Ok(mut made) = self.made.try_borrow_mut() else {
+            return;
+        };
+        let now_unix = unix_now();
+        for key in self.ours().into_iter().chain(self.attached) {
+            if let Some(entry) = self.app.sessions.get(key)
+                && let Some(id) = &entry.session.id
+            {
+                made.see(id, entry.open.is_some(), now_unix);
+            }
+        }
+    }
+
     /// The sessions in the tiles, left to right.
     fn tile_keys(&self) -> Vec<SessionKey> {
         self.app.tiles.keys()
@@ -1116,6 +1616,40 @@ impl Live {
     /// The test's sessions in this run: its own, and the one to the side once there is one.
     fn ours(&self) -> Vec<SessionKey> {
         self.key.into_iter().chain(self.side).collect()
+    }
+
+    /// Waits up to [`CLOSE_LIMIT`] until no program runs for any of the sessions `ids` names
+    /// (the app holds it no more, or its open has gone), and gives the ids of those whose
+    /// program still runs then. Only takes in what comes; fails on nothing.
+    fn wait_until_ended(&mut self, ids: &[Option<SessionId>]) -> Vec<SessionId> {
+        let running = |live: &Live| -> Vec<SessionId> {
+            ids.iter()
+                .flatten()
+                .filter(|id| {
+                    live.app
+                        .sessions
+                        .iter()
+                        .any(|entry| entry.session.id.as_ref() == Some(*id) && entry.open.is_some())
+                })
+                .cloned()
+                .collect()
+        };
+        let deadline = Instant::now() + CLOSE_LIMIT;
+        loop {
+            self.take_in();
+            let still = running(self);
+            if still.is_empty() || Instant::now() >= deadline {
+                return still;
+            }
+            std::thread::sleep(TICK);
+        }
+    }
+
+    /// The id of the session sent attachments, once it has one.
+    fn attached_id(&self) -> Option<SessionId> {
+        self.attached
+            .and_then(|key| self.app.sessions.get(key))
+            .and_then(|entry| entry.session.id.clone())
     }
 
     fn side_id(&self) -> Option<SessionId> {
@@ -2274,6 +2808,15 @@ impl Live {
                     message,
                     index,
                 },
+                Effect::RemoveStored {
+                    id,
+                    unless_after_unix,
+                } => ToBackend::RemoveStored {
+                    id,
+                    unless_after_unix,
+                },
+                // Task 9 passes these on to the desktop; the test asks for none.
+                Effect::Notify { .. } | Effect::Unnotify { .. } | Effect::UnnotifyAll => continue,
                 Effect::Look { folder } => {
                     if folder != self.folder {
                         eprintln!(
@@ -2289,6 +2832,7 @@ impl Live {
             };
             self.backend.send(message);
         }
+        self.track();
     }
 
     fn phase(&self) -> Option<Phase> {
@@ -2419,6 +2963,7 @@ impl Drop for Live {
     /// to end, so a failure never leaves a `claude` running. Dropping the `Backend` afterwards
     /// also passes `Close` to every session its threads still hold, the look's included.
     fn drop(&mut self) {
+        self.track();
         if self.closed {
             return;
         }
@@ -2430,6 +2975,8 @@ impl Drop for Live {
                 let now = self.now();
                 let _ = self.app.receive(message, now);
             }
+            // So that a session seen to end here can be removed ([`Tidy`]).
+            self.track();
             let ended = self.ours().into_iter().chain(self.attached).all(|key| {
                 matches!(
                     self.phase_of(key),

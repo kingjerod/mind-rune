@@ -34,7 +34,7 @@ fn open_with(
     edit: impl FnOnce(&mut StartSpec),
     extra_env: &[(&str, &str)],
 ) -> (Box<dyn SessionHandle>, Receiver<SessionEvent>) {
-    let projects = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
     let folder = tempfile::tempdir().unwrap();
     let mut parent_env = vec![("PATH".to_string(), std::env::var("PATH").unwrap())];
     parent_env.extend(
@@ -42,7 +42,7 @@ fn open_with(
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string())),
     );
-    let agent = ClaudeAgent::with_paths(stub_program(), projects.path().to_path_buf(), parent_env);
+    let agent = ClaudeAgent::with_paths(stub_program(), root.path().to_path_buf(), parent_env);
     let mut spec = StartSpec::new(folder.path());
     edit(&mut spec);
     let (tx, rx) = channel();
@@ -56,7 +56,7 @@ fn open_with(
         .expect("the stub starts");
     let handle = WithDirs {
         session: handle,
-        _dirs: [projects, folder],
+        _dirs: [root, folder],
     };
     (Box::new(handle), rx)
 }

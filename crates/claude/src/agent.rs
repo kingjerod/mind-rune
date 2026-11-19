@@ -15,8 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mr_agent::{
-    Account, Agent, AgentError, Capabilities, EventSink, ImageData, SessionCommand, SessionEvent,
-    SessionHandle, SessionId, StartSpec, StoredHistory, StoredSession,
+    Account, Agent, AgentError, Capabilities, EventSink, ImageData, Removal, SessionCommand,
+    SessionEvent, SessionHandle, SessionId, StartSpec, StoredHistory, StoredSession,
 };
 use serde_json::Value;
 
@@ -31,6 +31,7 @@ use crate::env::child_env;
 use crate::history::{DescriptionTable, find_session, modified_unix, read_image, stored_sessions};
 use crate::history_tail::{TAIL_BYTES, read_tail};
 use crate::process::{ClaudeProcess, ExitInfo, SpawnConfig};
+use crate::remove::{no_store, remove, root_from};
 use crate::translate::{SessionStart, Tracked, Translator};
 use crate::wire::{Incoming, parse_line};
 
@@ -42,7 +43,10 @@ const CLOSE_POLL: Duration = Duration::from_millis(10);
 /// Runs `claude` sessions.
 pub struct ClaudeAgent {
     program: PathBuf,
-    projects_dir: PathBuf,
+    /// Claude Code's folder, where sessions are listed, read and removed; none when it is
+    /// not known, and then listing and removing answer that the store could not be found.
+    root: Option<PathBuf>,
+    projects_dir: Option<PathBuf>,
     parent_env: Vec<(String, String)>,
     /// Whether the last sign-in check found a saved full login.
     full_login: Mutex<Option<bool>>,
@@ -51,33 +55,43 @@ pub struct ClaudeAgent {
 }
 
 impl ClaudeAgent {
-    /// The `claude` found on the `PATH`, the stored sessions in
-    /// `~/.claude/projects` and this process's environment.
+    /// The `claude` found on the `PATH`, the stored sessions in Claude Code's own folder
+    /// (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and this process's environment. Without an
+    /// absolute folder there it has no store: listing and removing are errors.
     pub fn from_environment() -> Self {
-        let projects_dir = std::env::home_dir()
-            .unwrap_or_default()
-            .join(".claude")
-            .join("projects");
-        Self::with_paths(
-            PathBuf::from("claude"),
-            projects_dir,
-            std::env::vars().collect(),
-        )
+        let root = root_from(
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+            std::env::home_dir().as_deref(),
+        );
+        Self::with_store(PathBuf::from("claude"), root, std::env::vars().collect())
     }
 
-    /// A bare `program` name is looked up on the `PATH` in `parent_env`.
-    pub fn with_paths(
+    /// `root` is Claude Code's folder; the stored sessions are in its `projects`. A root that
+    /// is not absolute is no store. A bare `program` name is looked up on the `PATH` in
+    /// `parent_env`.
+    pub fn with_paths(program: PathBuf, root: PathBuf, parent_env: Vec<(String, String)>) -> Self {
+        Self::with_store(program, Some(root), parent_env)
+    }
+
+    fn with_store(
         program: PathBuf,
-        projects_dir: PathBuf,
+        root: Option<PathBuf>,
         parent_env: Vec<(String, String)>,
     ) -> Self {
+        let root = root.filter(|root| root.is_absolute());
         Self {
             program: resolve_program(program, &parent_env),
-            projects_dir,
+            projects_dir: root.as_ref().map(|root| root.join("projects")),
+            root,
             parent_env,
             full_login: Mutex::new(None),
             descriptions: Mutex::new(DescriptionTable::default()),
         }
+    }
+
+    /// The file of stored session `id`, when there is a store and it holds one.
+    fn find_session(&self, id: &SessionId) -> Option<PathBuf> {
+        find_session(self.projects_dir.as_deref()?, id)
     }
 
     fn has_full_login(&self) -> bool {
@@ -119,15 +133,20 @@ impl Agent for ClaudeAgent {
         &self,
         modified_since_unix: Option<i64>,
     ) -> Result<Vec<StoredSession>, AgentError> {
+        // Not an empty list: that would say every stored session is gone.
+        let Some(projects_dir) = &self.projects_dir else {
+            return Err(no_store());
+        };
         stored_sessions(
-            &self.projects_dir,
+            projects_dir,
             modified_since_unix,
             &mut lock(&self.descriptions),
         )
     }
 
     fn read_session(&self, id: &SessionId, max_items: usize) -> Result<StoredHistory, AgentError> {
-        let path = find_session(&self.projects_dir, id)
+        let path = self
+            .find_session(id)
             .ok_or_else(|| AgentError::Protocol(format!("no stored session {}", id.0)))?;
         read_tail(&path, max_items, TAIL_BYTES)
     }
@@ -138,14 +157,29 @@ impl Agent for ClaudeAgent {
         message: &str,
         index: usize,
     ) -> Result<ImageData, AgentError> {
-        read_image(&self.projects_dir, id, message, index)
+        let Some(projects_dir) = &self.projects_dir else {
+            return Err(AgentError::Io("the session is not in the store".into()));
+        };
+        read_image(projects_dir, id, message, index)
     }
 
     fn last_active(&self, id: &SessionId) -> Result<Option<i64>, AgentError> {
-        match find_session(&self.projects_dir, id) {
+        match self.find_session(id) {
             // A file that vanished since it was found is as good as none.
             Some(path) => modified_unix(&path),
             None => Ok(None),
+        }
+    }
+
+    fn remove_session(
+        &self,
+        id: &SessionId,
+        unless_after_unix: i64,
+    ) -> Result<Removal, AgentError> {
+        match &self.root {
+            Some(root) => remove(root, id, unless_after_unix),
+            // Not `Missing`: the session is not known to be gone, so it stays deleted.
+            None => Err(no_store()),
         }
     }
 
@@ -490,19 +524,100 @@ mod tests {
 
     #[test]
     fn a_stored_session_knows_when_it_was_last_active() {
-        let projects = tempfile::tempdir().unwrap();
-        let folder = projects.path().join("-home-alex-proj");
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("projects/-home-alex-proj");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(
             folder.join("s1.jsonl"),
             r#"{"type":"user","uuid":"u1","parentUuid":null,"message":{"content":"hello"}}"#,
         )
         .unwrap();
-        let agent = ClaudeAgent::with_paths("claude".into(), projects.path().to_path_buf(), vec![]);
+        let agent = ClaudeAgent::with_paths("claude".into(), root.path().to_path_buf(), vec![]);
         assert!(matches!(
             agent.last_active(&SessionId("s1".into())),
             Ok(Some(unix)) if unix > 0
         ));
         assert_eq!(agent.last_active(&SessionId("s2".into())), Ok(None));
+    }
+
+    #[test]
+    fn the_agent_removes_from_the_store_it_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let id = SessionId("0b5f3c2e-6a1d-4c8e-9f20-7d3b1a2c4e5f".into());
+        let folder = root.path().join("projects/-home-alex-proj");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(format!("{}.jsonl", id.0)), "{}\n").unwrap();
+        let agent = ClaudeAgent::with_paths("claude".into(), root.path().to_path_buf(), vec![]);
+        assert!(matches!(agent.last_active(&id), Ok(Some(_))));
+        assert_eq!(agent.remove_session(&id, i64::MAX), Ok(Removal::Removed));
+        assert_eq!(agent.last_active(&id), Ok(None));
+        assert!(folder.is_dir());
+    }
+
+    #[test]
+    fn without_a_home_there_is_no_store() {
+        let agent = ClaudeAgent::with_store("claude".into(), root_from(None, None), vec![]);
+        let id = SessionId("0b5f3c2e-6a1d-4c8e-9f20-7d3b1a2c4e5f".into());
+        // An error, not an empty list: an empty list would say every session is gone.
+        assert_eq!(agent.list_sessions(None), Err(no_store()));
+        assert_eq!(agent.list_sessions(Some(0)), Err(no_store()));
+        assert_eq!(agent.last_active(&id), Ok(None));
+        assert!(agent.read_session(&id, 10).is_err());
+        assert!(agent.read_image(&id, "m1", 0).is_err());
+        assert_eq!(
+            agent.remove_session(&id, i64::MAX),
+            Err(AgentError::Io("the store could not be found".into()))
+        );
+        assert!(agent.root.is_none());
+    }
+
+    #[test]
+    fn a_relative_root_given_to_the_agent_is_no_store() {
+        let agent = ClaudeAgent::with_paths("claude".into(), "relative-store".into(), vec![]);
+        let id = SessionId("0b5f3c2e-6a1d-4c8e-9f20-7d3b1a2c4e5f".into());
+        assert!(agent.root.is_none());
+        assert_eq!(agent.list_sessions(None), Err(no_store()));
+        assert_eq!(
+            agent.remove_session(&id, i64::MAX),
+            Err(AgentError::Io("the store could not be found".into()))
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_not_there_lists_as_an_error() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("not-made-yet");
+        let agent = ClaudeAgent::with_paths("claude".into(), root.clone(), vec![]);
+        let id = SessionId("0b5f3c2e-6a1d-4c8e-9f20-7d3b1a2c4e5f".into());
+        let no_store = AgentError::Io("the store could not be found".into());
+        assert_eq!(agent.list_sessions(None), Err(no_store.clone()));
+        assert_eq!(agent.list_sessions(Some(0)), Err(no_store.clone()));
+        assert_eq!(agent.remove_session(&id, i64::MAX), Err(no_store));
+        assert!(!root.exists(), "nothing is made there");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projects_linked_to_nowhere_lists_as_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(root.path().join("elsewhere"), root.path().join("projects"))
+            .unwrap();
+        let agent = ClaudeAgent::with_paths("claude".into(), root.path().to_path_buf(), vec![]);
+        let id = SessionId("0b5f3c2e-6a1d-4c8e-9f20-7d3b1a2c4e5f".into());
+        let no_store = AgentError::Io("the store could not be found".into());
+        assert_eq!(agent.list_sessions(None), Err(no_store.clone()));
+        assert_eq!(agent.remove_session(&id, i64::MAX), Err(no_store));
+    }
+
+    #[test]
+    fn a_store_with_no_projects_yet_lists_as_empty() {
+        // A fresh install: Claude Code's folder is there and nothing was stored in it yet.
+        let root = tempfile::tempdir().unwrap();
+        let agent = ClaudeAgent::with_paths("claude".into(), root.path().to_path_buf(), vec![]);
+        assert_eq!(agent.list_sessions(None), Ok(Vec::new()));
+        assert_eq!(agent.list_sessions(Some(0)), Ok(Vec::new()));
+        // Removing is another matter: where nothing is stored, no session is known to be gone.
+        let id = SessionId("0b5f3c2e-6a1d-4c8e-9f20-7d3b1a2c4e5f".into());
+        assert_eq!(agent.remove_session(&id, i64::MAX), Err(no_store()));
     }
 }

@@ -23,6 +23,27 @@ pub enum Mark {
     Finished,
 }
 
+/// What a notification about a session says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alert {
+    /// It is ready: a turn ended in it ([`Mark::Finished`]).
+    Ready,
+    /// A request or a question waits in it ([`Mark::NeedsYou`]).
+    NeedsInput,
+}
+
+impl Alert {
+    /// What a notification about a session with `mark` says; `None` when there is nothing to
+    /// say.
+    pub(crate) fn of(mark: Mark) -> Option<Alert> {
+        match mark {
+            Mark::Finished => Some(Alert::Ready),
+            Mark::NeedsYou => Some(Alert::NeedsInput),
+            Mark::None | Mark::Working => None,
+        }
+    }
+}
+
 /// A question the app waits on the user for, about one session. Each session has at most one.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Prompt {
@@ -30,6 +51,22 @@ pub enum Prompt {
     /// `text` is the message the user sent it, held until they choose; its chips are back on the
     /// session meanwhile.
     OpenElsewhere { text: String },
+}
+
+/// A session in the Deleted view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deleted {
+    /// When it was deleted.
+    pub at_unix: i64,
+    /// The latest change of its stored file that is the app's own doing. A later one means
+    /// it was used again elsewhere.
+    pub seen_unix: i64,
+    /// When its removal last failed.
+    pub failed_unix: Option<i64>,
+    /// Its removal was asked for and has not answered yet. Not saved. While it is set the
+    /// session is not asked about again and cannot be recovered; a removal whose answer never
+    /// comes is so not tried again until a restart.
+    pub removing: bool,
 }
 
 /// One session the app knows.
@@ -48,8 +85,9 @@ pub struct Entry {
     /// When its own program last reported anything but an answer to the app's own asks for the
     /// usage limits: what the idle stop counts from. Unix seconds.
     pub idle_from_unix: Option<i64>,
-    /// A turn ended in it while it was not the focused session, also when it was in a tile, and
-    /// it has not been focused since.
+    /// Ready: a turn ended in it while the user was not looking at it (another tile had the
+    /// focus, no window showed, or another app had the keyboard), and the user has not acted on
+    /// it since (`App::attend`).
     pub unseen: bool,
     /// It was in a tile or started in this run.
     pub touched: bool,
@@ -57,17 +95,26 @@ pub struct Entry {
     pub checking: bool,
     /// The question waiting for the user about it.
     pub prompt: Option<Prompt>,
-    /// The open that is being stopped for idleness, until it has ended.
+    /// The open the app sent `Close` to, for idleness or because the session was deleted,
+    /// until it has ended.
     pub stopping: Option<u64>,
     /// When it left its last tile: Unix seconds. `None` while it is in a tile, and for one that
     /// was never in a tile.
     pub hidden_unix: Option<i64>,
+    /// It is in the Deleted view. It is never started, shown, counted or marked there.
+    pub deleted: Option<Deleted>,
+    /// A notification about it is out.
+    pub alerted: Option<Alert>,
 }
 
 impl Entry {
     /// `NeedsYou` while a request or a question waits, `Working` while a turn runs or a message
     /// (queued or undelivered) waits for the program to start, `Finished` while it is `unseen`.
+    /// A deleted session has none.
     pub fn mark(&self) -> Mark {
+        if self.deleted.is_some() {
+            return Mark::None;
+        }
         if self.prompt.is_some() {
             return Mark::NeedsYou;
         }
@@ -99,6 +146,9 @@ pub struct Sessions {
     /// See [`Sessions::version`]. A cell, so that every entry [`Sessions::iter_mut`] lends out
     /// can put it up.
     version: Cell<u64>,
+    /// The keys of entries removed while a notification about them was out, until
+    /// [`Sessions::take_unalerted`] takes them.
+    unalerted: Vec<SessionKey>,
 }
 
 impl Sessions {
@@ -121,15 +171,18 @@ impl Sessions {
             prompt: None,
             stopping: None,
             hidden_unix: None,
+            deleted: None,
+            alerted: None,
         };
         self.entries.insert(key, entry);
         key
     }
 
-    /// Adds what is new, refreshes the title and time of resting entries, and, when `complete`,
-    /// removes resting entries that were never touched and are no longer in the store. A title
-    /// the user gave is not replaced (see [`Session::take_listed_title`]). A new entry whose id
-    /// has a name among `names` takes that name, and the name leaves `names`.
+    /// Adds what is new, refreshes the title and time of resting entries and of deleted ones
+    /// whose program has ended, and, when `complete`, removes resting entries that were never
+    /// touched and are no longer in the store. A title the user gave is not replaced (see
+    /// [`Session::take_listed_title`]). A new entry whose id has a name among `names` takes that
+    /// name, and the name leaves `names`.
     pub fn merge_listing(
         &mut self,
         listed: Vec<StoredSession>,
@@ -146,7 +199,8 @@ impl Sessions {
             match known.get(&stored.id).copied() {
                 Some(key) => {
                     if let Some(mut entry) = self.get_mut(key)
-                        && entry.session.phase == Phase::Resting
+                        && (entry.session.phase == Phase::Resting
+                            || entry.deleted.is_some() && entry.session.at_rest())
                     {
                         entry.session.take_listed_title(&stored.title);
                         entry.last_active_unix = stored.last_active_unix;
@@ -193,8 +247,11 @@ impl Sessions {
 
     pub fn remove(&mut self, key: SessionKey) -> Option<Entry> {
         let removed = self.entries.remove(&key);
-        if removed.is_some() {
+        if let Some(entry) = &removed {
             self.bump();
+            if entry.alerted.is_some() {
+                self.unalerted.push(key);
+            }
         }
         removed
     }
@@ -264,6 +321,12 @@ impl Sessions {
         self.entries.is_empty()
     }
 
+    /// The keys of the entries removed, since the last call, while a notification about them
+    /// was out.
+    pub(crate) fn take_unalerted(&mut self) -> Vec<SessionKey> {
+        std::mem::take(&mut self.unalerted)
+    }
+
     fn bump(&self) {
         self.version.set(self.version.get() + 1);
     }
@@ -271,7 +334,14 @@ impl Sessions {
     /// Keeps the entries `keep` says to keep.
     fn retain(&mut self, mut keep: impl FnMut(&Entry) -> bool) {
         let before = self.entries.len();
-        self.entries.retain(|_, entry| keep(entry));
+        let unalerted = &mut self.unalerted;
+        self.entries.retain(|_, entry| {
+            let kept = keep(entry);
+            if !kept && entry.alerted.is_some() {
+                unalerted.push(entry.key);
+            }
+            kept
+        });
         if self.entries.len() != before {
             self.bump();
         }
@@ -280,7 +350,7 @@ impl Sessions {
 
 /// An entry lent out to change. When it is given back, its [`Sessions::version`] goes up if
 /// anything the sidebar shows of it changed: its mark, whether it is live or touched, when it
-/// was last active, its title, its id or its folder.
+/// was last active, whether and since when it is deleted, its title, its id or its folder.
 pub struct EntryMut<'a> {
     entry: &'a mut Entry,
     version: &'a Cell<u64>,
@@ -324,10 +394,12 @@ impl Drop for EntryMut<'_> {
 /// strings are kept as one hash so that lending an entry out allocates nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SidebarFacts {
+    /// Also what tells `App::settle` that a notification may be due.
     mark: Mark,
     live: bool,
     touched: bool,
     last_active_unix: i64,
+    deleted: Option<Deleted>,
     /// The title, the id and the folder.
     names: u64,
 }
@@ -346,6 +418,11 @@ impl SidebarFacts {
             live: entry.live(),
             touched: entry.touched,
             last_active_unix: entry.last_active_unix,
+            // A removal under way shows nowhere.
+            deleted: entry.deleted.map(|deleted| Deleted {
+                removing: false,
+                ..deleted
+            }),
             names: names.finish(),
         }
     }
@@ -414,6 +491,17 @@ mod tests {
             text: "carry on".into(),
         });
         assert_eq!(asked.mark(), Mark::NeedsYou, "a question waits");
+        asked.deleted = Some(Deleted {
+            at_unix: 10,
+            seen_unix: 5,
+            failed_unix: None,
+            removing: false,
+        });
+        assert_eq!(
+            asked.mark(),
+            Mark::None,
+            "a deleted session is never marked"
+        );
     }
 
     #[test]
@@ -482,7 +570,7 @@ mod tests {
         assert!(!moved(&sessions), "nothing the sidebar shows");
 
         type Change = (&'static str, fn(&mut Entry));
-        let changes: [Change; 9] = [
+        let changes: [Change; 11] = [
             ("touched", |entry| entry.touched = true),
             ("last active", |entry| entry.last_active_unix = 20),
             ("mark", |entry| entry.unseen = true),
@@ -500,6 +588,15 @@ mod tests {
                 })
             }),
             ("question answered", |entry| entry.prompt = None),
+            ("deleted", |entry| {
+                entry.deleted = Some(Deleted {
+                    at_unix: 10,
+                    seen_unix: 5,
+                    failed_unix: None,
+                    removing: false,
+                })
+            }),
+            ("recovered", |entry| entry.deleted = None),
         ];
         for (what, change) in changes {
             change(&mut sessions.get_mut(key).unwrap());
@@ -541,5 +638,31 @@ mod tests {
         let _ = (sessions.get(key), sessions.by_id(&SessionId("s2".into())));
         assert_eq!(sessions.iter().count(), 1);
         assert!(!moved(&sessions), "reading changes nothing");
+    }
+
+    #[test]
+    fn a_removal_under_way_is_nothing_the_sidebar_shows() {
+        let mut sessions = Sessions::default();
+        let key = sessions.add(Session::opening("/a"), 10);
+        let deleted = Deleted {
+            at_unix: 10,
+            seen_unix: 5,
+            failed_unix: None,
+            removing: false,
+        };
+        sessions.get_mut(key).unwrap().deleted = Some(deleted);
+        let version = sessions.version();
+        let removing = Deleted {
+            removing: true,
+            ..deleted
+        };
+        sessions.get_mut(key).unwrap().deleted = Some(removing);
+        assert_eq!(sessions.version(), version);
+        let failed = Deleted {
+            failed_unix: Some(20),
+            ..deleted
+        };
+        sessions.get_mut(key).unwrap().deleted = Some(failed);
+        assert_eq!(sessions.version(), version + 1, "a failure shows");
     }
 }

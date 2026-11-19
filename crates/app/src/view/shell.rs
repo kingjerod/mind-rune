@@ -2,10 +2,10 @@
 //! footer (the account, Quit and the usage), the main area beside it, and the right panel beside
 //! that.
 
-use mr_core::{UsageLine, account_line, usage_lines};
+use mr_core::{SidebarView, UsageLine, account_line, usage_lines};
 use rune::{El, KeyEvent, Tx, col, el, row, text};
 use rune_kit::shell::{PaneState, Sidebar, SplitView, Toolbar};
-use rune_kit::{Button, ButtonVariant, ControlSize, Kit};
+use rune_kit::{Button, ButtonVariant, ControlSize, Kit, State};
 
 pub use rune_kit::shell::is_sidebar_toggle;
 
@@ -41,30 +41,102 @@ fn panel_pane(ui: &mut Ui) -> &mut PaneState {
     &mut ui.panel
 }
 
-/// The sidebar: "New session", which asks for the new session's folder (`folder::ask`), with
-/// the folder picker's error under it while there is one; the groups and their sessions; and
-/// the usage footer.
+/// The sidebar: the switch between the sessions and the Deleted view; in the sessions' view "New
+/// session", which asks for the new session's folder (`folder::ask`), with the folder picker's
+/// error under it while there is one, and in the Deleted view what becomes of what is there, with
+/// "Delete All"; the groups and their sessions, or those deleted; and the usage footer.
 fn sidebar(ui: &Ui, kit: &'static Kit) -> El {
-    let new_session = Button::new("New session")
-        .icon(&rune_theme_opencode::icons::PLUS)
-        .variant(ButtonVariant::Ghost)
-        .control_size(ControlSize::Large)
-        .on_press_tx(|ui: &mut Ui, tx: &mut Tx| folder::ask(ui, tx, None, false))
-        .build(kit)
-        .key(NEW_SESSION)
-        .w_full();
     let header = col()
         .key("mr-sidebar-header")
         .w_full()
         .gap(4.0)
-        .child(new_session)
-        .children(folder::error(ui, kit));
+        .child(switch(ui, kit));
+    let header = match ui.app.sidebar_view() {
+        SidebarView::Sessions => {
+            let new_session = Button::new("New session")
+                .icon(&rune_theme_opencode::icons::PLUS)
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Large)
+                .on_press_tx(|ui: &mut Ui, tx: &mut Tx| folder::ask(ui, tx, None, false))
+                .build(kit)
+                .key(NEW_SESSION)
+                .w_full();
+            header.child(new_session).children(folder::error(ui, kit))
+        }
+        SidebarView::Deleted => header.child(deleted_header_line(ui, kit)),
+    };
     Sidebar::new()
         .label("Sessions")
         .header(header)
         .child(sidebar::list(ui, kit))
         .footer(footer(ui, kit))
         .build(kit)
+}
+
+/// The two quiet buttons that switch the sidebar between the sessions and the Deleted view, the
+/// latter with how many sessions it holds when there are any. The one showing is drawn pressed
+/// and is told to assistive technology as on; each is a Tab stop of its own.
+fn switch(ui: &Ui, kit: &Kit) -> El {
+    let showing = ui.app.sidebar_view();
+    let deleted = match ui.app.sidebar.deleted {
+        0 => "Deleted".to_string(),
+        n => format!("Deleted ({n})"),
+    };
+    let button = |label: String, key: &'static str, view: SidebarView| {
+        let chosen = showing == view;
+        let button = Button::new(label)
+            .control_size(ControlSize::Regular)
+            .on_press(move |ui: &mut Ui| {
+                let effects = ui.app.set_sidebar_view(view);
+                glue::run(ui, effects);
+            });
+        let button = if chosen {
+            button.variant(ButtonVariant::Ghost).state(State::Pressed)
+        } else {
+            button.variant(ButtonVariant::GhostMuted)
+        };
+        button.build(kit).key(key).checked(chosen).grow(1.0)
+    };
+    row()
+        .key("mr-view-switch")
+        .w_full()
+        .gap(4.0)
+        .child(button(
+            "Sessions".into(),
+            "mr-view-sessions",
+            SidebarView::Sessions,
+        ))
+        .child(button(deleted, "mr-view-deleted", SidebarView::Deleted))
+}
+
+/// The Deleted view's line under the switch: that what is there is removed for good after a
+/// week, and "Delete All", which asks first and cannot be pressed while the view is empty.
+fn deleted_header_line(ui: &Ui, kit: &Kit) -> El {
+    let empty = ui.app.sidebar.sections.is_empty();
+    let delete_all = Button::new("Delete All")
+        .variant(ButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .disabled(empty)
+        .on_press(glue::ask_delete_all)
+        .build(kit)
+        .key("mr-delete-all");
+    row()
+        .key("mr-deleted-line")
+        .w_full()
+        .min_h(28.0)
+        .gap(4.0)
+        .pl(5.0)
+        .items_center()
+        .child(
+            text("Removed for good after 7 days.")
+                .key("mr-deleted-note")
+                .font(kit.ty.small)
+                .color(kit.c.text_muted)
+                .wrap()
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(delete_all)
 }
 
 /// Who is signed in, with the button that quits at the right end of its line, then the two

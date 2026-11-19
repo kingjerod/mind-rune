@@ -14,6 +14,12 @@ rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "2a4415
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Desktop notifications over the session bus (`notify`), as Rune's own tray worker talks to it.
+futures-util = { version = "0.3", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+zbus = { version = "6", default-features = false, features = ["tokio"] }
+
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile.workspace = true

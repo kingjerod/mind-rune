@@ -1,7 +1,7 @@
 //! What is kept between runs: the groups, where sessions were placed, the folders new sessions
 //! started in, the tiles on screen, the sidebar's width, the names given to sessions, whether
-//! new sessions start with Remote Control, and the right panel's width and whether it shows. It
-//! is one value, read once at start and written whole.
+//! new sessions start with Remote Control, the right panel's width and whether it shows, and
+//! the sessions in the Deleted view. It is one value, read once at start and written whole.
 
 use std::path::{Path, PathBuf};
 
@@ -54,6 +54,18 @@ pub struct Saved {
     /// The right panel shows. Anything that is not `true` reads as false.
     #[serde(deserialize_with = "true_or_false")]
     pub panel_open: bool,
+    /// The sessions in the Deleted view, by the agent's id, ordered by id. An entry that
+    /// cannot be read is left out, so the rest is still read.
+    #[serde(deserialize_with = "deleted_that_read")]
+    pub deleted: Vec<SavedDeleted>,
+}
+
+/// A session in the Deleted view as kept between runs (see `Deleted`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedDeleted {
+    pub id: SessionId,
+    pub at_unix: i64,
+    pub seen_unix: i64,
 }
 
 /// One column of tiles as kept between runs: its tile, or the upper of its two, and the lower.
@@ -171,6 +183,50 @@ fn names_that_read<'de, D: serde::Deserializer<'de>>(
     })
 }
 
+/// The entries that are a deleted session's id and times; none when `deleted` is not a list.
+fn deleted_that_read<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<SavedDeleted>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Mark {
+        Mark(SavedDeleted),
+        Other(serde::de::IgnoredAny),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Marks {
+        List(Vec<Mark>),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Marks::deserialize(deserializer)? {
+        Marks::List(marks) => marks
+            .into_iter()
+            .filter_map(|mark| match mark {
+                Mark::Mark(mark) => Some(mark),
+                Mark::Other(_) => None,
+            })
+            .collect(),
+        Marks::Other(_) => Vec::new(),
+    })
+}
+
+/// A whole number of Unix seconds, or none for anything else.
+pub(crate) fn unix_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Unix {
+        Unix(i64),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Unix::deserialize(deserializer)? {
+        Unix::Unix(unix) => Some(unix),
+        Unix::Other(_) => None,
+    })
+}
+
 impl Saved {
     /// What was read, or the default when it is of another version.
     pub fn checked(self) -> Saved {
@@ -200,8 +256,8 @@ mod tests {
 
     /// A saved state with a folder group, a custom group, a placement, two recent folders, two
     /// columns, the first of two tiles, its upper one focused, a name kept for the second
-    /// column's tile, Remote Control wanted for new sessions, and the right panel open at 360
-    /// points.
+    /// column's tile, Remote Control wanted for new sessions, the right panel open at 360
+    /// points, and a deleted session.
     fn sample() -> Saved {
         Saved {
             version: SAVED_VERSION,
@@ -211,12 +267,14 @@ mod tests {
                     name: Some("Side projects".into()),
                     collapsed: false,
                     hidden: false,
+                    deleted_unix: None,
                 },
                 Group {
                     id: GroupId::Folder("/home/alex/project".into()),
                     name: Some("Parser".into()),
                     collapsed: true,
                     hidden: false,
+                    deleted_unix: None,
                 },
             ],
             placed: vec![(SessionId("a1".into()), GroupId::Custom(2))],
@@ -245,11 +303,16 @@ mod tests {
             remote_for_new: true,
             panel_width: Some(360.0),
             panel_open: true,
+            deleted: vec![SavedDeleted {
+                id: SessionId("c1".into()),
+                at_unix: 1_799_900_000,
+                seen_unix: 1_799_800_000,
+            }],
         }
     }
 
     /// How [`sample`] is written, as the window keeps it under its settings key.
-    const SAMPLE_JSON: &str = r#"{"version":1,"groups":[{"id":{"Custom":2},"name":"Side projects","collapsed":false,"hidden":false},{"id":{"Folder":"/home/alex/project"},"name":"Parser","collapsed":true,"hidden":false}],"placed":[["a1",{"Custom":2}]],"next_custom":3,"recent_folders":["/home/alex/project","/home/alex/notes"],"shown":"a1","tiles":[{"id":"a1","share":1.5,"below":{"id":"a2","split":0.25}},{"id":"b1","share":0.5,"below":null}],"sidebar_width":300.0,"sidebar_collapsed":false,"closed_by_app":[["a1",1800000000]],"names":[["b1","Garden"]],"remote_for_new":true,"panel_width":360.0,"panel_open":true}"#;
+    const SAMPLE_JSON: &str = r#"{"version":1,"groups":[{"id":{"Custom":2},"name":"Side projects","collapsed":false,"hidden":false,"deleted_unix":null},{"id":{"Folder":"/home/alex/project"},"name":"Parser","collapsed":true,"hidden":false,"deleted_unix":null}],"placed":[["a1",{"Custom":2}]],"next_custom":3,"recent_folders":["/home/alex/project","/home/alex/notes"],"shown":"a1","tiles":[{"id":"a1","share":1.5,"below":{"id":"a2","split":0.25}},{"id":"b1","share":0.5,"below":null}],"sidebar_width":300.0,"sidebar_collapsed":false,"closed_by_app":[["a1",1800000000]],"names":[["b1","Garden"]],"remote_for_new":true,"panel_width":360.0,"panel_open":true,"deleted":[{"id":"c1","at_unix":1799900000,"seen_unix":1799800000}]}"#;
 
     #[test]
     fn a_saved_state_survives_a_round_trip() {
@@ -449,5 +512,25 @@ mod tests {
         assert_eq!(read.clone().checked(), read);
         let empty: Saved = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.checked(), Saved::default(), "no version is none");
+    }
+
+    #[test]
+    fn a_deleted_entry_that_cannot_be_read_costs_only_itself() {
+        let json = r#"{"version":1,"next_custom":3,"deleted":[{"id":"a1","at_unix":10,"seen_unix":5},{"id":"a2","at_unix":10},{"id":7,"at_unix":10,"seen_unix":5},{"id":"a3","at_unix":"x","seen_unix":5},{"id":"a4","at_unix":1.5,"seen_unix":5},null,"a5",{"id":"b1","at_unix":20,"seen_unix":15}]}"#;
+        let read: Saved = serde_json::from_str(json).unwrap();
+        let mark = |id: &str, at_unix, seen_unix| SavedDeleted {
+            id: SessionId(id.into()),
+            at_unix,
+            seen_unix,
+        };
+        assert_eq!(read.deleted, vec![mark("a1", 10, 5), mark("b1", 20, 15)]);
+        assert_eq!(read.next_custom, 3);
+        for deleted in ["null", r#""x""#, "{}", "7"] {
+            let json = format!(r#"{{"version":1,"next_custom":3,"deleted":{deleted}}}"#);
+            let read: Saved =
+                serde_json::from_str(&json).unwrap_or_else(|error| panic!("{deleted}: {error}"));
+            assert!(read.deleted.is_empty(), "{deleted}");
+            assert_eq!(read.next_custom, 3, "{deleted}");
+        }
     }
 }

@@ -4,10 +4,15 @@
 use std::path::PathBuf;
 
 use mr_agent::{Agent, SessionCommand, SessionEvent, StartSpec};
-use mr_claude::ClaudeAgent;
+use mr_claude::{ClaudeAgent, root_from};
 
-fn dirs_projects() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME is set")).join(".claude/projects")
+/// Claude Code's folder, where the program itself looks.
+fn dirs_root() -> PathBuf {
+    root_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        std::env::home_dir().as_deref(),
+    )
+    .expect("Claude Code's folder is known")
 }
 
 #[test]
@@ -28,7 +33,7 @@ fn one_real_turn_on_the_cheapest_model() {
     let env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| keep.contains(&k.as_str()))
         .collect();
-    let agent = ClaudeAgent::with_paths("claude".into(), dirs_projects(), env);
+    let agent = ClaudeAgent::with_paths("claude".into(), dirs_root(), env);
     let dir = tempfile::tempdir().unwrap();
     let mut spec = StartSpec::new(dir.path());
     spec.model = Some("haiku".into());

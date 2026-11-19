@@ -13,6 +13,7 @@ use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit};
 
 use super::{drag, folder, requests, sidebar};
 use crate::glue::{self, DropTarget, Renaming, Ui};
+use crate::theme;
 
 /// The key of the row.
 pub const ROW: &str = "mr-tiles";
@@ -24,6 +25,9 @@ const TITLE: &str = "mr-tile-title";
 const STATE: &str = "mr-tile-state";
 const CLOSE: &str = "mr-tile-close";
 const REMOTE: &str = "mr-tile-remote";
+/// How strongly "Remote" is drawn in a coloured bar's ink while Remote Control connects or
+/// reconnects.
+const REMOTE_COMING: f32 = 0.7;
 
 /// The key of the field a session's name is edited in, in its tile's header.
 const RENAME: &str = "mr-tile-rename";
@@ -393,9 +397,9 @@ pub(super) fn tile_height(ui: &Ui, key: SessionKey) -> Option<f32> {
 }
 
 /// The colour of `key`'s outline. While a row dragged over the row would take its place, the
-/// accent, also over the amber of a session that needs the user (ruling R9): it is the one
-/// thing that says which session the drop replaces. Else the amber of the sidebar's attention
-/// mark while its session needs the user, whether its tile is focused or not; else the accent
+/// accent, also over the orange of a session that needs the user (ruling R9): it is the one
+/// thing that says which session the drop replaces. Else the orange of a session that needs
+/// input (`theme::needs_input`) while it does, whether its tile is focused or not; else the accent
 /// while its tile is the focused one of two or more, unless a dragged row or header has a
 /// target in the row (ruling R11): the accent then marks only where the drop lands, the line at
 /// an edge, the half of a tile a new one takes or the tile it replaces. None otherwise: one
@@ -407,7 +411,7 @@ pub(super) fn outline(ui: &Ui, key: SessionKey, kit: &Kit) -> Option<Color> {
     }
     let mark = ui.app.sessions.get(key).map_or(Mark::None, Entry::mark);
     if mark == Mark::NeedsYou {
-        return sidebar::mark_color(mark, kit);
+        return Some(theme::needs_input().fill);
     }
     let in_row = over.is_some_and(|over| !matches!(over, DropTarget::Group(_)));
     let focused = ui.app.focused() == Some(key) && ui.app.tiles.len() > 1;
@@ -612,8 +616,14 @@ fn header(ui: &Ui, kit: &'static Kit, key: SessionKey) -> El {
     let c = &kit.c;
     let entry = ui.app.sessions.get(key);
     let mark = entry.map_or(Mark::None, Entry::mark);
+    let pair = theme::pair_of(mark);
+    let ink = pair.map(|pair| pair.ink);
     let title = if ui.renaming == Some(Renaming::Header(key)) {
-        sidebar::name_field(&ui.rename, RENAME, "Session name", kit.ty.ui_medium, kit)
+        let field = sidebar::name_field(&ui.rename, RENAME, "Session name", kit.ty.ui_medium, kit);
+        match ink {
+            Some(ink) => field.color(ink).caret(ink, kit.selection()),
+            None => field,
+        }
     } else {
         let title = entry
             .and_then(|entry| entry.session.title.clone())
@@ -621,7 +631,7 @@ fn header(ui: &Ui, kit: &'static Kit, key: SessionKey) -> El {
         text(title)
             .key(TITLE)
             .font(kit.ty.ui_medium)
-            .color(c.text_base)
+            .color(ink.unwrap_or(c.text_base))
             .truncate()
             .grow(1.0)
             .min_w(0.0)
@@ -632,7 +642,7 @@ fn header(ui: &Ui, kit: &'static Kit, key: SessionKey) -> El {
             })
             .on_drag(drag::header(key))
     };
-    let header = row_el()
+    let mut header = row_el()
         .key(HEADER)
         .w_full()
         .h(HEADER_HEIGHT)
@@ -644,16 +654,20 @@ fn header(ui: &Ui, kit: &'static Kit, key: SessionKey) -> El {
         .on_drag(drag::header(key))
         // After the press handler, which would make it a button.
         .role("group");
+    if let Some(pair) = pair {
+        header = header.fill(pair.fill);
+    }
     requests::unfocusable(header)
-        .children(entry.map(|entry| folder_chip(&entry.session.folder, kit)))
+        .children(entry.map(|entry| folder_chip(&entry.session.folder, ink, kit)))
         .child(title)
         .children(state_word(mark, kit))
-        .children(entry.and_then(|entry| remote_mark(&entry.session.remote, kit)))
-        .child(close_button(key, kit))
+        .children(entry.and_then(|entry| remote_mark(&entry.session.remote, ink, kit)))
+        .child(close_button(key, mark, kit))
 }
 
 /// The chip that names `folder` by its last part, the whole path its label for assistive tools.
-fn folder_chip(folder: &Path, kit: &Kit) -> El {
+/// On a coloured bar it has no fill of its own, and its border and text are in `ink`.
+fn folder_chip(folder: &Path, ink: Option<Color>, kit: &Kit) -> El {
     let c = &kit.c;
     let name = folder.file_name().map_or_else(
         || folder.display().to_string(),
@@ -671,19 +685,24 @@ fn folder_chip(folder: &Path, kit: &Kit) -> El {
         .shrink()
         .center_y()
         .radius(kit.radius.xs)
-        .fill(c.layer_02)
-        .border(0.5, c.border_base)
+        .fill(if ink.is_some() {
+            Color::TRANSPARENT
+        } else {
+            c.layer_02
+        })
+        .border(0.5, ink.unwrap_or(c.border_base))
         .child(
             text(name)
                 .font(kit.ty.small_medium)
-                .color(c.text_muted)
+                .color(ink.unwrap_or(c.text_muted))
                 .truncate()
                 .shrink()
                 .a11y_hidden(),
         )
 }
 
-/// What the session is doing, in the colour its mark has in the sidebar: nothing while it has
+/// What the session is doing: while it works, in the colour of the sidebar's spinner; while it
+/// is ready or needs input, in its pair's ink, on the bar its pair fills. Nothing while it has
 /// no mark.
 fn state_word(mark: Mark, kit: &Kit) -> Option<El> {
     let word = match mark {
@@ -692,18 +711,25 @@ fn state_word(mark: Mark, kit: &Kit) -> Option<El> {
         Mark::NeedsYou => "Needs you",
         Mark::Finished => "Finished",
     };
-    let color = sidebar::mark_color(mark, kit)?;
+    let color = match theme::pair_of(mark) {
+        Some(pair) => pair.ink,
+        None => sidebar::mark_color(mark, kit)?,
+    };
     Some(text(word).key(STATE).font(kit.ty.small_medium).color(color))
 }
 
 /// "Remote" while Remote Control is not off: in the accent's text colour while it is on, muted
 /// while it connects or reconnects. It never shrinks, so it takes its room from the title, and
-/// has no press of its own: a press on it is one on the header.
-fn remote_mark(remote: &Remote, kit: &Kit) -> Option<El> {
-    let color = match remote {
-        Remote::Off => return None,
-        Remote::On { .. } => kit.c.text_accent,
-        Remote::Starting | Remote::Reconnecting => kit.c.text_muted,
+/// has no press of its own: a press on it is one on the header. On a coloured bar it is in
+/// `ink` while it is on and in `ink` at [`REMOTE_COMING`] while it connects or reconnects, so
+/// the two can still be told apart.
+fn remote_mark(remote: &Remote, ink: Option<Color>, kit: &Kit) -> Option<El> {
+    let color = match (remote, ink) {
+        (Remote::Off, _) => return None,
+        (Remote::On { .. }, Some(ink)) => ink,
+        (Remote::Starting | Remote::Reconnecting, Some(ink)) => ink.alpha(REMOTE_COMING),
+        (Remote::On { .. }, None) => kit.c.text_accent,
+        (Remote::Starting | Remote::Reconnecting, None) => kit.c.text_muted,
     };
     Some(
         text("Remote")
@@ -714,8 +740,11 @@ fn remote_mark(remote: &Remote, kit: &Kit) -> Option<El> {
 }
 
 /// The button that closes `key`'s tile. Pressed by a click only: it is no Tab stop, and a click
-/// on it leaves the focused field focused.
-fn close_button(key: SessionKey, kit: &Kit) -> El {
+/// on it leaves the focused field focused. On a bar the pair of `mark` fills its icon is in the
+/// pair's ink: the kit's button takes its icon's colour from the kit, so it is built from the
+/// theme's kit inked for that mark (`theme::inked`).
+fn close_button(key: SessionKey, mark: Mark, kit: &Kit) -> El {
+    let kit = theme::inked(kit.dark, mark).unwrap_or(kit);
     let button = IconButton::new(kit.glyph.close)
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
@@ -1249,13 +1278,13 @@ mod tests {
         testkit::emit_to(&mut rt, b, SessionEvent::TurnStarted);
         assert_eq!(state(&mut rt, b), Some(("Working".into(), c.icon_muted)));
         ask_permission(&mut rt, b);
-        assert_eq!(
-            state(&mut rt, b),
-            Some(("Needs you".into(), c.warning.icon))
-        );
+        // On the bar its colour fills, in that colour's ink.
+        let ink = theme::needs_input().ink;
+        assert_eq!(state(&mut rt, b), Some(("Needs you".into(), ink)));
         testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
         testkit::emit_to(&mut rt, a, turn_finished());
-        assert_eq!(state(&mut rt, a), Some(("Finished".into(), c.bg_accent)));
+        let ink = theme::ready().ink;
+        assert_eq!(state(&mut rt, a), Some(("Finished".into(), ink)));
         rt.update(|ui, _| {
             let effects = ui.app.focus_tile(a);
             glue::run(ui, effects);
@@ -1436,23 +1465,23 @@ mod tests {
     }
 
     #[test]
-    fn a_tile_that_needs_the_user_is_outlined_in_amber() {
-        let amber = theme::kit(true).c.warning.icon;
+    fn a_tile_that_needs_the_user_is_outlined_in_orange() {
+        let orange = theme::needs_input().fill;
         // Alone.
         let mut rt = testkit::window_sized("empty", SIZE);
         let a = testkit::add_session(&mut rt, "/home/alex/a");
         testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
         ask_permission(&mut rt, a);
-        assert_eq!(outlined(&rt, a), Some(amber));
-        // As the one of two that is not focused, and as the focused one: amber wins.
+        assert_eq!(outlined(&rt, a), Some(orange));
+        // As the one of two that is not focused, and as the focused one: orange wins.
         let (mut rt, a, b) = two_tiles();
         testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
         ask_permission(&mut rt, a);
         assert_eq!(testkit::focused(&rt), Some(b));
-        assert_eq!(outlined(&rt, a), Some(amber));
+        assert_eq!(outlined(&rt, a), Some(orange));
         assert_eq!(outlined(&rt, b), Some(theme::kit(true).c.bg_accent));
         focus(&mut rt, a);
-        assert_eq!(outlined(&rt, a), Some(amber));
+        assert_eq!(outlined(&rt, a), Some(orange));
         assert_eq!(outlined(&rt, b), None);
     }
 
@@ -1626,6 +1655,49 @@ mod tests {
     }
 
     #[test]
+    fn a_press_in_another_tile_leaves_the_tile_with_the_keyboard_ready() {
+        let (mut rt, a, b) = two_tiles();
+        focus(&mut rt, a);
+        assert!(box_focused(&rt, a), "the keyboard is in a's box");
+        // a became ready while the user was away, and they have not acted on it since.
+        rt.state.app.sessions.get_mut(a).unwrap().unseen = true;
+        let unseen = |rt: &Runtime<Ui>, key| rt.state.app.sessions.get(key).unwrap().unseen;
+        // A request waits in b; its buttons never take the keyboard.
+        let request = UserRequest {
+            id: RequestId("r1".into()),
+            kind: UserRequestKind::Permission {
+                tool: "Bash".into(),
+                detail: ToolDetail::Command {
+                    command: "ls".into(),
+                },
+                always_allow_label: None,
+            },
+        };
+        testkit::emit_to(&mut rt, b, SessionEvent::NeedsUser(request));
+        rt.settle_all();
+        testkit::step(&mut rt);
+        assert!(unseen(&rt, a), "still ready before the press");
+
+        testkit::click(&mut rt, &tile(b, "mr-allow-r1"));
+        testkit::step(&mut rt);
+        let answered = testkit::sent(&rt)
+            .iter()
+            .any(|command| matches!(command, SessionCommand::Answer { .. }));
+        assert!(answered, "the press answered b's request");
+        assert_eq!(glue::typing_in(&rt.state), Some(a), "a kept the keyboard");
+        assert_eq!(testkit::focused(&rt), Some(a), "and the focus came back");
+        assert!(
+            unseen(&rt, a),
+            "handing the focus back is not the user's act"
+        );
+
+        // The user's own press on a's tile still clears it.
+        rt.update(|ui, _| glue::focus_tile(ui, a, true));
+        testkit::step(&mut rt);
+        assert!(!unseen(&rt, a));
+    }
+
+    #[test]
     fn using_a_control_focuses_its_tile() {
         let (mut rt, a, b) = two_tiles();
         listing(&mut rt, b);
@@ -1688,11 +1760,19 @@ mod tests {
         assert_eq!(testkit::focused(&rt), Some(b));
     }
 
-    /// Whether `key`'s row in the sidebar shows a status mark of any kind.
-    fn marked_in_sidebar(rt: &Runtime<Ui>, key: SessionKey) -> bool {
-        let inside = format!("/mr-row-{}/", key.0);
+    /// Whether `key`'s row in the sidebar shows a mark of any kind: a status mark, or the
+    /// colour of a session that is ready or needs input, which comes in on a spring: the
+    /// window settles first.
+    fn marked_in_sidebar(rt: &mut Runtime<Ui>, key: SessionKey) -> bool {
+        rt.settle_all();
+        testkit::step(rt);
+        let row = testkit::row_key(key);
+        let inside = format!("/{row}/");
+        let fills = [theme::ready().fill, theme::needs_input().fill];
         rt.elements().into_iter().any(|e| {
-            !e.exiting && e.path.contains(&inside) && e.key.as_deref() == Some("status-mark")
+            !e.exiting
+                && (e.path.contains(&inside) && e.key.as_deref() == Some("status-mark")
+                    || e.key.as_deref() == Some(row.as_str()) && fills.contains(&e.fill))
         })
     }
 
@@ -1707,13 +1787,13 @@ mod tests {
             header_text(&rt, b, "mr-tile-state").as_deref(),
             Some("Finished")
         );
-        assert!(marked_in_sidebar(&rt, b));
+        assert!(marked_in_sidebar(&mut rt, b));
         click_text_in(&mut rt, b, "The reply in b");
         assert_eq!(testkit::focused(&rt), Some(b));
         let entry = rt.state.app.sessions.get(b).unwrap();
         assert_eq!(entry.mark(), Mark::None);
         assert_eq!(header_text(&rt, b, "mr-tile-state"), None);
-        assert!(!marked_in_sidebar(&rt, b));
+        assert!(!marked_in_sidebar(&mut rt, b));
     }
 
     /// The commands `key`'s session was sent from `from` on.
@@ -2912,7 +2992,7 @@ mod tests {
         assert_placed(&rt);
         // `outlined` checks that each outline lies over its own tile's drawn rectangle.
         assert_eq!(outlined(&rt, b), Some(theme::kit(true).c.bg_accent));
-        assert_eq!(outlined(&rt, a), Some(theme::kit(true).c.warning.icon));
+        assert_eq!(outlined(&rt, a), Some(theme::needs_input().fill));
         assert_ne!(tile_rect(&rt, a), tile_rect(&rt, b));
     }
 
@@ -4150,5 +4230,267 @@ mod tests {
         for key in [a, b] {
             assert_eq!(glue::view_of(&rt.state, key).draft.text, "");
         }
+    }
+
+    /// The fill of `key`'s title bar, once the window has settled.
+    fn bar(rt: &mut Runtime<Ui>, key: SessionKey) -> Color {
+        rt.settle_all();
+        testkit::step(rt);
+        testkit::element(rt, &tile(key, "mr-tile-header"))
+            .expect("the header")
+            .fill
+    }
+
+    /// The fill of `key`'s row in the sidebar, once the window has settled.
+    fn row_fill(rt: &mut Runtime<Ui>, key: SessionKey) -> Color {
+        rt.settle_all();
+        testkit::step(rt);
+        let row = testkit::row_key(key);
+        rt.elements()
+            .into_iter()
+            .find(|e| !e.exiting && e.key.as_deref() == Some(row.as_str()))
+            .expect("the row")
+            .fill
+    }
+
+    /// The colour of the title in `key`'s row in the sidebar.
+    fn row_ink(rt: &Runtime<Ui>, key: SessionKey) -> Option<Color> {
+        let inside = format!("/{}/", testkit::row_key(key));
+        rt.elements()
+            .into_iter()
+            .find(|e| !e.exiting && e.path.contains(&inside) && e.key.as_deref() == Some("label"))
+            .and_then(|e| e.text_color)
+    }
+
+    /// Ends a turn in `key`'s session, so that it is ready unless the user is looking at it.
+    fn finish_turn(rt: &mut Runtime<Ui>, key: SessionKey) {
+        testkit::emit_to(rt, key, SessionEvent::TurnStarted);
+        reply(rt, key, "Done");
+        testkit::emit_to(rt, key, turn_finished());
+    }
+
+    /// Makes `key`'s session, in the focused tile, ready: its turn ends while the window is in
+    /// the background, and the window then comes back.
+    fn ready_in_the_focused_tile(rt: &mut Runtime<Ui>, key: SessionKey) {
+        assert_eq!(testkit::focused(rt), Some(key));
+        rt.update(|ui, tx| glue::focus_changed(ui, false, tx));
+        finish_turn(rt, key);
+        rt.update(|ui, tx| glue::focus_changed(ui, true, tx));
+        testkit::step(rt);
+        let entry = rt.state.app.sessions.get(key).unwrap();
+        assert_eq!(entry.mark(), Mark::Finished, "ready in the focused tile");
+    }
+
+    /// Whether neither `key`'s title bar nor its row has a colour of the pairs.
+    fn grey(rt: &mut Runtime<Ui>, key: SessionKey) -> bool {
+        let fills = [theme::ready().fill, theme::needs_input().fill];
+        !fills.contains(&bar(rt, key)) && !fills.contains(&row_fill(rt, key))
+    }
+
+    #[test]
+    fn a_ready_tile_has_a_green_title_bar_and_a_green_row() {
+        let (mut rt, a, b) = two_tiles();
+        ask_remote(&mut rt, a);
+        remote_says(&mut rt, a, reachable());
+        focus(&mut rt, b);
+        finish_turn(&mut rt, a);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        let ready = theme::ready();
+        assert_eq!(bar(&mut rt, a), ready.fill);
+        assert_eq!(row_fill(&mut rt, a), ready.fill);
+        assert_eq!(row_ink(&rt, a), Some(ready.ink));
+        let title = header_part(&rt, a, "mr-tile-title").expect("the title");
+        assert_eq!(title.1, ready.ink);
+        let folder = header_part(&rt, a, "mr-tile-folder").expect("the chip");
+        assert_eq!(folder, ("a".into(), ready.ink));
+        let chip = testkit::element(&rt, &tile(a, "mr-tile-folder")).unwrap();
+        assert_eq!(chip.fill, Color::TRANSPARENT, "the chip loses its own fill");
+        let state = header_part(&rt, a, "mr-tile-state");
+        assert_eq!(state, Some(("Finished".into(), ready.ink)));
+        let remote = header_part(&rt, a, "mr-tile-remote");
+        assert_eq!(remote, Some(("Remote".into(), ready.ink)));
+        let close = testkit::element(&rt, &tile(a, "mr-tile-close/icon")).expect("the icon");
+        assert_eq!(close.text_color, Some(ready.ink), "the close icon");
+        // The other tile is as it was.
+        assert_eq!(bar(&mut rt, b), Color::TRANSPARENT);
+        let kit = theme::kit(true);
+        assert_eq!(row_fill(&mut rt, b), kit.c.pressed, "selected");
+        let title = header_part(&rt, b, "mr-tile-title").expect("the title");
+        assert_eq!(title.1, kit.c.text_base);
+    }
+
+    #[test]
+    fn on_a_coloured_bar_remote_still_says_whether_it_is_on() {
+        let (mut rt, a, b) = two_tiles();
+        ask_remote(&mut rt, a);
+        remote_says(&mut rt, a, reachable());
+        focus(&mut rt, b);
+        finish_turn(&mut rt, a);
+        let ready = theme::ready();
+        assert_eq!(bar(&mut rt, a), ready.fill);
+        let on = Some(("Remote".to_owned(), ready.ink));
+        let coming = Some(("Remote".to_owned(), ready.ink.alpha(0.7)));
+        assert_ne!(on, coming);
+        assert_eq!(mark_in(&mut rt, a), on, "on: in the ink");
+        remote_says(&mut rt, a, RemoteAccess::Reconnecting);
+        assert_eq!(bar(&mut rt, a), ready.fill, "still green");
+        assert_eq!(mark_in(&mut rt, a), coming, "while it reconnects");
+        remote_says(&mut rt, a, RemoteAccess::Starting);
+        assert_eq!(mark_in(&mut rt, a), coming, "while it connects");
+        remote_says(&mut rt, a, reachable());
+        assert_eq!(mark_in(&mut rt, a), on);
+        // On the orange bar the same, in its own ink.
+        testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
+        ask_permission(&mut rt, a);
+        let orange = theme::needs_input();
+        assert_eq!(bar(&mut rt, a), orange.fill);
+        assert_eq!(mark_in(&mut rt, a), Some(("Remote".to_owned(), orange.ink)));
+        remote_says(&mut rt, a, RemoteAccess::Reconnecting);
+        assert_eq!(
+            mark_in(&mut rt, a),
+            Some(("Remote".to_owned(), orange.ink.alpha(0.7)))
+        );
+    }
+
+    #[test]
+    fn a_click_into_the_box_of_a_ready_tile_clears_it() {
+        let (mut rt, a, b) = two_tiles();
+        focus(&mut rt, b);
+        assert!(box_focused(&rt, b), "the keyboard is in b's box");
+        finish_turn(&mut rt, a);
+        let ready = theme::ready();
+        assert_eq!(bar(&mut rt, a), ready.fill);
+        assert_eq!(row_fill(&mut rt, a), ready.fill);
+        // The box is the largest thing to click at the bottom of a tile.
+        testkit::click(&mut rt, &tile(a, "mr-input"));
+        testkit::step(&mut rt);
+        assert!(box_focused(&rt, a), "the keyboard came into a's box");
+        assert_eq!(testkit::focused(&rt), Some(a));
+        let entry = rt.state.app.sessions.get(a).unwrap();
+        assert!(!entry.unseen, "the click is the user's act on it");
+        assert!(grey(&mut rt, a), "on its bar and its row");
+    }
+
+    #[test]
+    fn closing_another_tile_does_not_clear_ready() {
+        let (mut rt, a, b) = two_tiles();
+        focus(&mut rt, b);
+        finish_turn(&mut rt, a);
+        assert_eq!(bar(&mut rt, a), theme::ready().fill);
+        // The focus falls on a, and the glue itself puts the keyboard in its box.
+        rt.update(|ui, tx| glue::close_tile(ui, tx, b));
+        testkit::step(&mut rt);
+        testkit::step(&mut rt);
+        assert_eq!(tile_keys(&rt), vec![a]);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        assert!(box_focused(&rt, a), "the keyboard is in a's box");
+        let entry = rt.state.app.sessions.get(a).unwrap();
+        assert!(entry.unseen, "the user did not act on it");
+        assert_eq!(row_fill(&mut rt, a), theme::ready().fill);
+    }
+
+    #[test]
+    fn a_tile_that_needs_input_is_orange_on_both() {
+        let (mut rt, a, b) = two_tiles();
+        testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
+        ask_permission(&mut rt, a);
+        let orange = theme::needs_input();
+        assert_eq!(bar(&mut rt, a), orange.fill);
+        assert_eq!(row_fill(&mut rt, a), orange.fill);
+        assert_eq!(row_ink(&rt, a), Some(orange.ink));
+        let title = header_part(&rt, a, "mr-tile-title").expect("the title");
+        assert_eq!(title.1, orange.ink);
+        let state = header_part(&rt, a, "mr-tile-state");
+        assert_eq!(state, Some(("Needs you".into(), orange.ink)));
+        assert_eq!(outlined(&rt, a), Some(orange.fill), "and its outline");
+        assert_eq!(outlined(&rt, b), Some(theme::kit(true).c.bg_accent));
+    }
+
+    #[test]
+    fn a_working_tile_has_no_colour() {
+        let (mut rt, a, _) = two_tiles();
+        testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
+        let kit = theme::kit(true);
+        assert_eq!(bar(&mut rt, a), Color::TRANSPARENT);
+        assert_eq!(row_fill(&mut rt, a), kit.c.hover, "shown, as before");
+        assert!(busy_in_sidebar(&rt, a), "the spinner stays");
+        let title = header_part(&rt, a, "mr-tile-title").expect("the title");
+        assert_eq!(title.1, kit.c.text_base);
+        let state = header_part(&rt, a, "mr-tile-state");
+        assert_eq!(state, Some(("Working".into(), kit.c.icon_muted)));
+    }
+
+    #[test]
+    fn clicking_the_ready_tile_returns_both_to_grey() {
+        let (mut rt, a, b) = two_tiles();
+        finish_turn(&mut rt, a);
+        assert!(!grey(&mut rt, a));
+        testkit::click(&mut rt, &tile(a, "mr-tile-header"));
+        testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        assert!(grey(&mut rt, a));
+        assert_eq!(row_fill(&mut rt, a), theme::kit(true).c.pressed, "selected");
+        // Ready in the tile that already has the focus: a click there clears it too.
+        ready_in_the_focused_tile(&mut rt, a);
+        assert!(!grey(&mut rt, a));
+        testkit::click(&mut rt, &tile(a, "mr-tile-header"));
+        testkit::step(&mut rt);
+        assert!(grey(&mut rt, a));
+        assert!(grey(&mut rt, b));
+    }
+
+    #[test]
+    fn clicking_the_ready_row_returns_both_to_grey() {
+        let (mut rt, a, b) = two_tiles();
+        finish_turn(&mut rt, a);
+        assert!(!grey(&mut rt, a));
+        testkit::click(&mut rt, &testkit::row_key(a));
+        testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        assert!(grey(&mut rt, a));
+        // Ready in the tile that already has the focus: a click on its row clears it too.
+        ready_in_the_focused_tile(&mut rt, a);
+        assert!(!grey(&mut rt, a));
+        testkit::click(&mut rt, &testkit::row_key(a));
+        testkit::step(&mut rt);
+        assert!(grey(&mut rt, a));
+        assert_eq!(row_fill(&mut rt, a), theme::kit(true).c.pressed, "selected");
+        assert!(grey(&mut rt, b));
+    }
+
+    /// The node of the accessibility tree keyed `key`.
+    fn node<'a>(tree: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+        if tree["key"] == key {
+            return Some(tree);
+        }
+        tree["children"]
+            .as_array()?
+            .iter()
+            .find_map(|child| node(child, key))
+    }
+
+    #[test]
+    fn a_screen_reader_still_hears_the_state() {
+        let (mut rt, a, b) = two_tiles();
+        finish_turn(&mut rt, a);
+        testkit::emit_to(&mut rt, b, SessionEvent::TurnStarted);
+        ask_permission(&mut rt, b);
+        rt.settle_all();
+        testkit::step(&mut rt);
+        let tree = rt.accessibility_json();
+        let said = |key: SessionKey| {
+            let row = node(&tree, &testkit::row_key(key)).expect("the row is in the tree");
+            row["description"].as_str().unwrap_or_default().to_owned()
+        };
+        assert!(said(a).contains("Unread"), "{}", said(a));
+        assert!(said(b).contains("Needs attention"), "{}", said(b));
+        // Each tile's own state word, in its header.
+        let state = |key: SessionKey| {
+            let tile = node(&tree, &tile_key(key)).expect("the tile is in the tree");
+            let word = node(tile, "mr-tile-state").expect("its state word is in the tree");
+            word["name"].as_str().unwrap_or_default().to_owned()
+        };
+        assert_eq!(state(a), "Finished");
+        assert_eq!(state(b), "Needs you");
     }
 }

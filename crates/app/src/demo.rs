@@ -21,8 +21,8 @@ use mr_agent::{
 };
 use mr_core::{
     AttachKind, Branch, Chip, ChipState, Effect, FromBackend, GroupId, HistoryState, ItemBody,
-    Launch, Leaving, Mark, Phase, Place, Prepared, Problem, Remote, Screen, SessionKey, Source,
-    Spot, THUMB_SIDE, ThinkingTime, Thumb,
+    Launch, Leaving, Mark, Phase, Place, Prepared, Problem, Remote, Screen, SessionKey,
+    SidebarView, Source, Spot, THUMB_SIDE, ThinkingTime, Thumb,
 };
 use rune::prefs::Prefs;
 use rune::{PointerPress, TextEdit};
@@ -147,6 +147,11 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("quit-ask", quit_ask),
     ("viewer", viewer),
     ("viewer-failed", viewer_failed),
+    ("colours", colours),
+    ("deleted", deleted),
+    ("deleted-empty", deleted_empty),
+    ("delete-group-ask", delete_group_ask),
+    ("delete-all-ask", delete_all_ask),
 ];
 
 /// Replaces the state with a fresh demo state.
@@ -828,9 +833,15 @@ const STORED: &[(&str, &str, &str, i64)] = &[
 /// session from another folder, which is shown; "sketches", collapsed, with a session working;
 /// "website", with four sessions too old to list until asked; and two older groups.
 fn sessions(ui: &mut Ui) {
+    sessions_with(ui, &[]);
+}
+
+/// The `sessions` scene with `extra` stored too, given as [`STORED`] gives its own.
+fn sessions_with(ui: &mut Ui, extra: &[(&str, &str, &str, i64)]) {
     fresh(ui);
     let stored: Vec<StoredSession> = STORED
         .iter()
+        .chain(extra)
         .map(|&(id, folder, title, days)| StoredSession {
             id: SessionId(id.into()),
             folder: folder.into(),
@@ -940,7 +951,7 @@ fn sessions(ui: &mut Ui) {
 
 /// Where the `group-menu` scene's menu opens: over the row of the session that needs the user,
 /// in a window of 1200 by 800, as a right-click there opens it.
-const GROUP_MENU_AT: PointerPress = PointerPress { x: 150.0, y: 154.0 };
+const GROUP_MENU_AT: PointerPress = PointerPress { x: 150.0, y: 182.0 };
 
 /// The `sessions` scene with the menu of the row "Running the window tests" open on "Move to
 /// group": the other groups, then "New group…".
@@ -1933,6 +1944,176 @@ fn viewer_failed(ui: &mut Ui) {
     });
 }
 
+/// The folder of the `colours` scene's collapsed group.
+const RECIPES: &str = "/home/alex/recipes";
+
+/// Three tiles side by side, for a window of 1,800 by 900, in the colours of their states: a
+/// session whose turn finished while its tile was not the focused one (green), one whose
+/// permission request waits (orange), and one at work, focused. In the sidebar their rows take
+/// the same colours, and "recipes", collapsed, shows the green dot of a session that finished
+/// in no tile. The arrow keys have passed onto the orange row, as they do in the list: it is the
+/// selected one, and its fill is all it shows.
+fn colours(ui: &mut Ui) {
+    empty(ui);
+    pump_until(ui, "the listing", |ui| ui.app.listed_all);
+    // Its turn ends a second from now, after another session took its tile.
+    let sorting = vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(1.0, SessionEvent::TextDelta("Soups first.".into())),
+        FakeStep::at(1.0, SessionEvent::BlockFinished),
+        FakeStep::at(1.0, finished()),
+    ];
+    live(
+        ui,
+        RECIPES,
+        "Sort the soup recipes",
+        "Sorting the soup recipes",
+        sorting,
+    );
+    let sorted = ui.app.focused().expect("the recipes session is shown");
+    let reading = vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(README_TURN, SessionEvent::TextDelta(README_REPLY.into())),
+        FakeStep::at(README_TURN, SessionEvent::BlockFinished),
+        FakeStep::at(README_TURN, finished()),
+    ];
+    live(ui, SKETCHES, README_MESSAGE, README_TITLE, reading);
+    let reads = ui.app.focused().expect("the first tile is focused");
+    live_at(
+        ui,
+        Place::Side,
+        "/home/alex/website",
+        PERMISSION_MESSAGE,
+        PERMISSION_TITLE,
+        asking_turn(),
+    );
+    let asks = ui.app.focused().expect("the second tile is focused");
+    live_at(
+        ui,
+        Place::Side,
+        RUNE_CLAUDE,
+        "Profile the long scene",
+        "Profiling the long scene",
+        thinking_on(),
+    );
+    let working = ui.app.focused().expect("the third tile is focused");
+    focus_tile(ui, working);
+    let effects = ui
+        .app
+        .collapse_group(&GroupId::Folder(RECIPES.into()), true);
+    glue::run(ui, effects);
+    pump(ui, README_TURN);
+    pump_until(ui, "both turns finished out of sight", |ui| {
+        [sorted, reads].iter().all(|key| {
+            ui.app
+                .sessions
+                .get(*key)
+                .is_some_and(|entry| entry.mark() == Mark::Finished)
+        })
+    });
+    // As an arrow key in the list leaves it on the row of a session in another tile.
+    ui.passed_row = Some((asks, ui.app.tiles.placement()));
+}
+
+/// Two stored sessions of the `deleted` scene's, in "website" with the scene's own: the id, the
+/// folder, the title and how many days before the demo's clock each was last active.
+const DELETED_EXTRA: &[(&str, &str, &str, i64)] = &[
+    (
+        "stored-site-banner",
+        "/home/alex/website",
+        "Resizing the banner",
+        1,
+    ),
+    (
+        "stored-site-fonts",
+        "/home/alex/website",
+        "Choosing the fonts",
+        4,
+    ),
+];
+
+/// Why the `deleted` scene's one removal failed, as the fake says it.
+const REMOVE_FAILURE: &str = "permission denied";
+
+/// The `sessions` scene, with the finished session shown in place of the garden's, and the
+/// Deleted view: "website", with a session deleted now (6 days left) and one whose removal
+/// failed ("Not removed"), and "Side projects", deleted as a group two days ago with
+/// the garden's session (4 days left). That one gets there by the app's own path: deleted, then
+/// "Delete All" while the fake refuses to remove. The other two are deleted with the demo's
+/// clock set back and then forward again, as time passes between them.
+fn deleted(ui: &mut Ui) {
+    sessions_with(ui, DELETED_EXTRA);
+    let finished = key_of_title(ui, "Tidying the sidebar keys");
+    let effects = ui
+        .app
+        .show(finished, Place::Focused, Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+
+    let fonts = key_of(ui, "stored-site-fonts");
+    fake(ui).fail_remove(REMOVE_FAILURE);
+    let effects = ui.app.delete_session(fonts);
+    glue::run(ui, effects);
+    let effects = ui.app.delete_all();
+    glue::run(ui, effects);
+    pump_until(ui, "the failed removal", |ui| {
+        ui.app
+            .sessions
+            .get(fonts)
+            .and_then(|entry| entry.deleted)
+            .is_some_and(|deleted| deleted.failed_unix.is_some())
+    });
+    fake(ui).allow_remove();
+
+    let garden = key_of(ui, GARDEN_ID);
+    let side = ui
+        .app
+        .sessions
+        .get(garden)
+        .map(|entry| ui.app.groups.group_of(entry))
+        .expect("the garden's session is listed");
+    ui.app.now_unix = NOW_UNIX - 2 * DAY;
+    let effects = ui.app.delete_group(&side);
+    glue::run(ui, effects);
+    ui.app.now_unix = NOW_UNIX;
+    let banner = key_of(ui, "stored-site-banner");
+    let effects = ui.app.delete_session(banner);
+    glue::run(ui, effects);
+    let effects = ui.app.set_sidebar_view(SidebarView::Deleted);
+    glue::run(ui, effects);
+    pump(ui, 0.0);
+}
+
+/// The `sessions` scene with the Deleted view shown and nothing deleted.
+fn deleted_empty(ui: &mut Ui) {
+    sessions(ui);
+    let effects = ui.app.set_sidebar_view(SidebarView::Deleted);
+    glue::run(ui, effects);
+}
+
+/// The `sessions` scene with the question whether to delete the group "rune_claude" over it:
+/// three sessions go with it, two of them still working. As the window is while the question
+/// shows, no input box has the keyboard.
+fn delete_group_ask(ui: &mut Ui) {
+    sessions(ui);
+    glue::ask_delete_group(ui, GroupId::Folder(RUNE_CLAUDE.into()));
+    unfocus_boxes(ui);
+}
+
+/// The `deleted` scene with the question whether to remove everything there for good.
+fn delete_all_ask(ui: &mut Ui) {
+    deleted(ui);
+    glue::ask_delete_all(ui);
+    unfocus_boxes(ui);
+}
+
+/// As the window is while a question shows: the question has the keyboard, so no tile's input
+/// box is drawn with it.
+fn unfocus_boxes(ui: &mut Ui) {
+    for tiled in ui.app.tiles.keys() {
+        glue::view_mut(ui, tiled).draft.focused = false;
+    }
+}
+
 /// `width` by `height` pixels of coloured blocks, six across and four down, the hue changing
 /// across and the shade down, with thin pale lines between them and round the whole picture:
 /// as RGB, row by row.
@@ -2191,5 +2372,119 @@ mod tests {
         let session = &rt.state.app.sessions.get(viewing.key).unwrap().session;
         assert_eq!(session.phase, Phase::Resting);
         assert!(testkit::has_text(&rt, "The full picture cannot be read."));
+    }
+
+    /// The texts of the sidebar's list that are drawn, top to bottom.
+    fn list_texts(rt: &rune::Runtime<Ui>) -> Vec<String> {
+        rt.elements()
+            .into_iter()
+            .filter(|e| !e.exiting && e.path.contains("/mr-sidebar-rows/"))
+            .filter_map(|e| e.text)
+            .collect()
+    }
+
+    #[test]
+    fn the_colours_scene_has_a_ready_a_waiting_and_a_working_tile() {
+        let rt = testkit::window_sized("colours", (1800.0, 900.0));
+        let tiles = testkit::tile_keys(&rt);
+        let marks: Vec<Mark> = tiles
+            .iter()
+            .map(|key| rt.state.app.sessions.get(*key).unwrap().mark())
+            .collect();
+        assert_eq!(marks, [Mark::Finished, Mark::NeedsYou, Mark::Working]);
+        assert_eq!(testkit::focused(&rt), Some(tiles[2]));
+        let recipes = GroupId::Folder(RECIPES.into());
+        let section = rt
+            .state
+            .app
+            .sidebar
+            .sections
+            .iter()
+            .find(|s| s.id == recipes);
+        assert!(section.is_some_and(|s| s.collapsed));
+        // Its header shows the green dot of the ready session in it.
+        let header = format!("/mr-group-{}/", recipes.key_text());
+        let dot = rt
+            .elements()
+            .into_iter()
+            .find(|e| !e.exiting && e.path.contains(&header) && e.path.contains("/mr-mark/"))
+            .map(|e| e.fill);
+        assert_eq!(dot, Some(crate::theme::ready().fill));
+        let sorted = key_of_title(&rt.state, "Sorting the soup recipes");
+        assert!(!rt.state.app.tiles.contains(sorted));
+        assert_eq!(
+            rt.state.app.sessions.get(sorted).unwrap().mark(),
+            Mark::Finished
+        );
+    }
+
+    #[test]
+    fn the_deleted_scene_lists_two_groups_with_their_days_and_a_failure() {
+        let rt = testkit::window("deleted");
+        assert_eq!(rt.state.app.sidebar_view(), SidebarView::Deleted);
+        assert_eq!(rt.state.app.sidebar.deleted, 3);
+        assert!(testkit::has_text(&rt, "Deleted (3)"));
+        assert!(testkit::has_text(&rt, "Removed for good after 7 days."));
+        assert_eq!(
+            list_texts(&rt),
+            [
+                "website",
+                "Resizing the banner",
+                "6 days left",
+                "Choosing the fonts",
+                "Not removed",
+                "Side projects",
+                "Planning the spring beds",
+                "4 days left",
+            ]
+        );
+        // The failure came by the app's own path: the fake was asked once and refused.
+        let fake = rt.state.fake.as_ref().unwrap();
+        assert_eq!(fake.removed(), [SessionId("stored-site-fonts".into())]);
+        // A tile still shows a session that is not deleted.
+        assert_eq!(testkit::tile_keys(&rt).len(), 1);
+    }
+
+    #[test]
+    fn the_deleted_empty_scene_says_nothing_is_deleted() {
+        let rt = testkit::window("deleted-empty");
+        assert_eq!(rt.state.app.sidebar_view(), SidebarView::Deleted);
+        assert!(testkit::has_text(&rt, "Nothing is deleted."));
+        // "Delete All" is there and cannot be pressed: a disabled button takes no focus.
+        let delete_all = rt
+            .elements()
+            .into_iter()
+            .find(|e| !e.exiting && e.key.as_deref() == Some("mr-delete-all"))
+            .expect("Delete All is drawn");
+        assert!(!delete_all.focusable);
+    }
+
+    #[test]
+    fn the_delete_group_ask_scene_asks_over_the_list() {
+        let rt = testkit::window("delete-group-ask");
+        assert_eq!(rt.state.app.sidebar_view(), SidebarView::Sessions);
+        assert_eq!(
+            rt.state.delete_ask,
+            Some(glue::DeleteAsk::Group(GroupId::Folder(RUNE_CLAUDE.into())))
+        );
+        assert!(testkit::has_text(
+            &rt,
+            "3 sessions go with it. 2 of them are still working and will be stopped. They can be \
+             recovered for 7 days."
+        ));
+        assert!(testkit::find(&rt, "mr-delete-yes").is_some());
+        assert!(glue::typing_in(&rt.state).is_none());
+    }
+
+    #[test]
+    fn the_delete_all_ask_scene_asks_over_the_deleted_view() {
+        let rt = testkit::window("delete-all-ask");
+        assert_eq!(rt.state.app.sidebar_view(), SidebarView::Deleted);
+        assert_eq!(rt.state.delete_ask, Some(glue::DeleteAsk::All));
+        assert!(testkit::has_text(
+            &rt,
+            "3 sessions will be removed from this computer. This cannot be undone."
+        ));
+        assert!(testkit::has_text(&rt, "Delete All"));
     }
 }

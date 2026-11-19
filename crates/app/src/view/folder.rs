@@ -120,11 +120,18 @@ fn pick(ui: &mut Ui, tx: &mut Tx, group: Option<GroupId>, place: Place) {
         move |ui: &mut Ui, result, tx: &mut Tx| match result {
             Ok(Some(folder)) => start_chosen(ui, tx, folder, group.as_ref(), place),
             Ok(None) => {}
-            Err(error) => {
-                ui.folder_error = Some(format!("The folder picker could not be opened: {error}"));
-            }
+            Err(error) => fail(
+                ui,
+                format!("The folder picker could not be opened: {error}"),
+            ),
         },
     );
+}
+
+/// Sets the error line of a try that failed, with its whole time ahead of it.
+fn fail(ui: &mut Ui, error: String) {
+    ui.folder_error = Some(error);
+    ui.folder_error_until = None;
 }
 
 /// [`start`] in a folder the user chose from the menu or in the picker, or a folder group's
@@ -140,10 +147,10 @@ pub(super) fn start_chosen(
 ) {
     ui.folder_error = None;
     if !folder.is_dir() {
-        ui.folder_error = Some(format!(
-            "That folder no longer exists: {}",
-            folder.display()
-        ));
+        fail(
+            ui,
+            format!("That folder no longer exists: {}", folder.display()),
+        );
         return;
     }
     start(ui, tx, folder, group, place);

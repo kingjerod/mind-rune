@@ -15,9 +15,9 @@ mod tools;
 mod usage;
 
 pub use app::{
-    App, Busy, DEFAULT_WIDTH, ELSEWHERE_SECONDS, Effect, HISTORY_ITEMS, IDLE_SECONDS,
-    LET_GO_SECONDS, Launch, Leaving, Listing, MIN_WIDTH, OWN_EXIT_SLACK_SECONDS, PromptChoice,
-    RECENT_DAYS, RELIST_SECONDS, Screen, Standing, USAGE_RETRY_SECONDS, Width,
+    App, Busy, DEFAULT_WIDTH, DELETED_SECONDS, Deleting, ELSEWHERE_SECONDS, Effect, HISTORY_ITEMS,
+    IDLE_SECONDS, LET_GO_SECONDS, Launch, Leaving, Listing, MIN_WIDTH, OWN_EXIT_SLACK_SECONDS,
+    PromptChoice, RECENT_DAYS, RELIST_SECONDS, Screen, Standing, USAGE_RETRY_SECONDS, Width,
 };
 pub use attach::{
     Chip, ChipState, Kind as AttachKind, MAX_BYTES, MAX_PIXELS, MAX_SIDE, Prepared, Problem,
@@ -30,13 +30,15 @@ pub use conversation::{
     thinking_label,
 };
 pub use git::{Branch, branch};
-pub use groups::{Group, GroupId, Groups, Line, Row, Section, SidebarModel, sidebar_model};
-pub use saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile};
+pub use groups::{
+    Group, GroupId, Groups, Line, Row, Section, SidebarModel, SidebarView, sidebar_model,
+};
+pub use saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedDeleted, SavedTile};
 pub use session::{
     FullImage, HistoryState, Outgoing, Phase, Remote, Session, Undelivered, answer_words,
     mode_label, model_option_label,
 };
-pub use sessions::{Entry, EntryMut, Mark, Prompt, SessionKey, Sessions};
+pub use sessions::{Alert, Deleted, Entry, EntryMut, Mark, Prompt, SessionKey, Sessions};
 pub use tiles::{
     Column, Laid, Level as TileLevel, MIN_TILE_HEIGHT, MIN_TILE_WIDTH, Part, Place, RowSize, Spot,
     Tiles, Under, part_at,

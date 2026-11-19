@@ -9,8 +9,8 @@ mod fake;
 mod ids;
 
 pub use agent::{
-    Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, SessionHandle, StartSpec,
-    StoredHistory, StoredSession,
+    Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, Removal, SessionHandle,
+    StartSpec, StoredHistory, StoredSession,
 };
 pub use command::{Answer, Attachment, ImageData, QuestionAnswer, SessionCommand};
 pub use event::{

@@ -5,11 +5,11 @@
 //! Every open has a thread of its own, which makes that open's `Agent::open` call and every
 //! `send` for it, in order; it ends with its session. Every look has a thread of its own too.
 //! One more thread, the library thread, makes the other calls one at a time in the order they
-//! were sent: the account, the listing, a history, an activity time, an image read again. It
-//! also reads the git branch of a folder. The preparing thread reads and checks each
-//! attachment, in the order they were attached, and then makes the picture of each image a
-//! history holds. So a slow call holds up only what was sent after it to the same thread. A
-//! history no longer wanted is not read, answered or drawn.
+//! were sent: the account, the listing, a history, an activity time, an image read again, the
+//! removal of a stored session. It also reads the git branch of a folder. The preparing thread
+//! reads and checks each attachment, in the order they were attached, and then makes the
+//! picture of each image a history holds. So a slow call holds up only what was sent after it
+//! to the same thread. A history no longer wanted is not read, answered or drawn.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,8 +22,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mr_agent::{
-    Account, Agent, AgentError, HistoryItem, ImageData, ModelOption, SessionCommand, SessionEvent,
-    SessionHandle, SessionId, StartSpec, StoredHistory, StoredSession, UsageLimits,
+    Account, Agent, AgentError, HistoryItem, ImageData, ModelOption, Removal, SessionCommand,
+    SessionEvent, SessionHandle, SessionId, StartSpec, StoredHistory, StoredSession, UsageLimits,
 };
 
 use crate::attach::{self, Prepared, Problem, Source, Thumb};
@@ -78,6 +78,11 @@ pub enum ToBackend {
         id: SessionId,
         message: String,
         index: usize,
+    },
+    /// Remove the stored session `id` for good, unless it changed after `unless_after_unix`.
+    RemoveStored {
+        id: SessionId,
+        unless_after_unix: i64,
     },
 }
 
@@ -141,6 +146,11 @@ pub enum FromBackend {
     Image {
         picture: u64,
         result: Result<ImageData, AgentError>,
+    },
+    /// What removing the stored session `id` did.
+    Removed {
+        id: SessionId,
+        result: Result<Removal, AgentError>,
     },
 }
 
@@ -302,6 +312,13 @@ impl Backend {
                 id,
                 message,
                 index,
+            }),
+            ToBackend::RemoveStored {
+                id,
+                unless_after_unix,
+            } => self.ask_library(LibraryJob::Remove {
+                id,
+                unless_after_unix,
             }),
         }
     }
@@ -486,6 +503,10 @@ enum LibraryJob {
         message: String,
         index: usize,
     },
+    Remove {
+        id: SessionId,
+        unless_after_unix: i64,
+    },
     Flush(FlushToken),
 }
 
@@ -539,6 +560,13 @@ impl Library {
                 } => FromBackend::Image {
                     picture,
                     result: self.agent.read_image(&id, &message, index),
+                },
+                LibraryJob::Remove {
+                    id,
+                    unless_after_unix,
+                } => FromBackend::Removed {
+                    result: self.agent.remove_session(&id, unless_after_unix),
+                    id,
                 },
                 LibraryJob::Flush(token) => {
                     // Answered behind the pictures asked for so far, or dropped once the
@@ -2313,5 +2341,50 @@ mod tests {
                 result: Err(AgentError::Io("the disk is gone".into())),
             }
         );
+    }
+
+    #[test]
+    fn a_removal_runs_and_answers_under_its_id() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.set_sessions(vec![StoredSession {
+            id: id.clone(),
+            folder: "/home/alex/project".into(),
+            title: "Fix the parser".into(),
+            last_active_unix: 100,
+        }]);
+        let (backend, _) = start(&fake);
+        backend.send(ToBackend::RemoveStored {
+            id: id.clone(),
+            unless_after_unix: 100,
+        });
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Removed {
+                id: id.clone(),
+                result: Ok(Removal::Removed),
+            }
+        );
+        assert_eq!(fake.removed(), vec![id]);
+    }
+
+    #[test]
+    fn a_failed_removal_comes_back_as_its_error() {
+        let fake = FakeAgent::new();
+        let id = SessionId("stored-1".into());
+        fake.fail_remove("the disk is gone");
+        let (backend, _) = start(&fake);
+        backend.send(ToBackend::RemoveStored {
+            id: id.clone(),
+            unless_after_unix: 100,
+        });
+        assert_eq!(
+            wait(&backend),
+            FromBackend::Removed {
+                id: id.clone(),
+                result: Err(AgentError::Io("the disk is gone".into())),
+            }
+        );
+        assert_eq!(fake.removed(), vec![id]);
     }
 }

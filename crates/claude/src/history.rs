@@ -17,6 +17,7 @@ use mr_agent::{
 use serde_json::Value;
 
 use crate::encode::split_attached;
+use crate::remove::no_store;
 use crate::translate::tool_detail;
 
 /// How much of each end of a file `describe` looks at.
@@ -57,14 +58,22 @@ impl StoredMeta {
 }
 
 /// The `*.jsonl` files directly inside each immediate subdirectory of
-/// `projects_dir`. Reads no file contents. A missing directory gives an empty list; one that
-/// cannot be read, or a project's directory that cannot, is an error, so that a store that
-/// could not be read is never taken for an empty one. A project's directory or a file gone
-/// while it is listed is skipped.
+/// `projects_dir`. Reads no file contents. A directory not made yet, in a folder that is
+/// there, gives an empty list: a fresh install. One whose folder is not there, or that is a
+/// link to nowhere, is the error "the store could not be found"; one that cannot be read, or
+/// a project's directory that cannot, is an error too. So a store that could not be found or
+/// read is never taken for an empty one. A project's directory or a file gone while it is
+/// listed is skipped.
 pub fn list_entries(projects_dir: &Path) -> Result<Vec<StoredEntry>, AgentError> {
     let projects = match std::fs::read_dir(projects_dir) {
         Ok(projects) => projects,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return if not_made_yet(projects_dir) {
+                Ok(Vec::new())
+            } else {
+                Err(no_store())
+            };
+        }
         Err(e) => return Err(unreadable(projects_dir, &e)),
     };
     let mut entries = Vec::new();
@@ -101,6 +110,17 @@ pub fn list_entries(projects_dir: &Path) -> Result<Vec<StoredEntry>, AgentError>
         }
     }
     Ok(entries)
+}
+
+/// Whether a `projects_dir` that was not found is only not made yet: the folder it belongs
+/// in is there, and nothing, not even a link, is in its place.
+fn not_made_yet(projects_dir: &Path) -> bool {
+    let in_a_folder = projects_dir.parent().is_some_and(Path::is_dir);
+    let nothing_there = matches!(
+        std::fs::symlink_metadata(projects_dir),
+        Err(e) if e.kind() == ErrorKind::NotFound
+    );
+    in_a_folder && nothing_there
 }
 
 /// The error for a directory of the store that could not be read.

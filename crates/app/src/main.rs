@@ -3,6 +3,7 @@
 mod demo;
 mod glue;
 mod instance;
+mod notify;
 #[cfg(test)]
 mod testkit;
 mod theme;
@@ -57,6 +58,7 @@ fn main() {
         not_claimed(&launch)
     };
     let stays = stays_without_window(&launch, headless, first.is_some());
+    let notifies = notifies(&launch, headless);
     let _ = LAUNCH.set(launch);
     rune::set_app_id(APP_ID);
     if let Err(message) = rune::set_app_icon(ICON) {
@@ -72,7 +74,9 @@ fn main() {
         poll: Some(glue::poll),
         on_key: Some(view::on_key),
         ..AppSpec::new("MindRune", (1200.0, 800.0), init, view::view)
-    });
+    })
+    // Whether the user is in this app or another, for a turn that ends in the focused tile.
+    .on_focus(glue::focus_changed);
     let app = if stays {
         app.keep_running()
             .on_close(glue::closing)
@@ -81,6 +85,12 @@ fn main() {
     } else {
         app.on_close(glue::quitting)
     };
+    if notifies {
+        let handle = app.handle();
+        if let Some(notifier) = notify::start(handle.clone()) {
+            handle.update(move |ui, _tx| ui.notifier = Some(notifier));
+        }
+    }
     if let Some(listener) = first {
         let handle = app.handle();
         if stays {
@@ -103,6 +113,12 @@ fn stays_without_window(launch: &Launch, headless: bool, first: bool) -> bool {
 
 /// Whether this launch looks for a running copy: not in the demo and not in a headless run.
 fn claims(launch: &Launch, headless: bool) -> bool {
+    !launch.demo && !headless
+}
+
+/// Whether desktop notifications are sent: outside the demo and outside a headless run, also
+/// when the app does not stay without its window.
+fn notifies(launch: &Launch, headless: bool) -> bool {
     !launch.demo && !headless
 }
 
@@ -519,6 +535,18 @@ mod tests {
         assert!(!claims(&app, true));
         assert!(!claims(&demo, false));
         assert!(!claims(&demo, true));
+    }
+
+    #[test]
+    fn the_demo_and_a_headless_run_send_no_notifications() {
+        let app = parse(&[]).unwrap();
+        let demo = parse(&args(&["--demo"])).unwrap();
+        // Also as a copy that does not stay without its window.
+        assert!(!stays_without_window(&app, false, false));
+        assert!(notifies(&app, false));
+        assert!(!notifies(&app, true));
+        assert!(!notifies(&demo, false));
+        assert!(!notifies(&demo, true));
     }
 
     #[test]

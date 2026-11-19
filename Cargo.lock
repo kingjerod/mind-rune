@@ -1513,6 +1513,7 @@ dependencies = [
 name = "mindrune"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "image",
  "mr-agent",
  "mr-claude",
@@ -1523,6 +1524,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "zbus 6.2.1",
 ]
 
 [[package]]

@@ -1,10 +1,12 @@
 //! Colours and sizes. The theme is the kit's neutral one, following the system's light or
-//! dark setting; the only colours named here are the black of the two scrims.
+//! dark setting; the only colours named here are the black of the two scrims and the icon's
+//! green and orange, with what is written on them.
 
 use std::sync::OnceLock;
 
-use mr_core::Level;
+use mr_core::{Level, Mark};
 use rune::Color;
+use rune::color::srgb_decode;
 use rune_kit::Kit;
 
 /// The height of a usage line's bar.
@@ -47,6 +49,78 @@ pub fn level_color(kit: &Kit, level: Level) -> Color {
     }
 }
 
+/// The green of the icon's hexagon, in sRGB: a session that is ready.
+pub const READY_RGB: [u8; 3] = [0x24, 0x6b, 0x43];
+
+/// The orange of the icon's rays, in sRGB: a session that needs input.
+pub const NEEDS_INPUT_RGB: [u8; 3] = [0xf3, 0x92, 0x2e];
+
+/// The near white written on the green.
+const LIGHT_INK_RGB: [u8; 3] = [0xf7, 0xf7, 0xf7];
+
+/// The near black written on the orange.
+const DARK_INK_RGB: [u8; 3] = [0x1f, 0x1f, 0x1f];
+
+/// A fill and the colour of what is written on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pair {
+    pub fill: Color,
+    pub ink: Color,
+}
+
+/// A session that is ready: the green of the icon's hexagon, with light writing.
+pub fn ready() -> Pair {
+    Pair {
+        fill: srgb(READY_RGB),
+        ink: srgb(LIGHT_INK_RGB),
+    }
+}
+
+/// A session that needs input: the orange of the icon's rays, with dark writing.
+pub fn needs_input() -> Pair {
+    Pair {
+        fill: srgb(NEEDS_INPUT_RGB),
+        ink: srgb(DARK_INK_RGB),
+    }
+}
+
+/// The pair of a mark, when it has one. Working and no mark have none.
+pub fn pair_of(mark: Mark) -> Option<Pair> {
+    match mark {
+        Mark::Finished => Some(ready()),
+        Mark::NeedsYou => Some(needs_input()),
+        Mark::Working | Mark::None => None,
+    }
+}
+
+/// The contrast between two colours, as WCAG counts it: from 1 for the same colour to 21 for
+/// black on white. A `Color` holds linear light, so its luminance is WCAG's relative one.
+pub fn contrast(a: Color, b: Color) -> f32 {
+    let (a, b) = (a.luminance() + 0.05, b.luminance() + 0.05);
+    a.max(b) / a.min(b)
+}
+
+/// The kit of this setting with its muted icon colour set to the ink of `mark`'s pair, built
+/// once for each pair and setting; none for a mark that has no pair. The kit's icon buttons
+/// take their icon's colour from the kit, so one on a bar the pair fills, a tile's close button,
+/// is built from this. It is keyed by the mark, so no other pair can be asked for.
+pub fn inked(dark: bool, mark: Mark) -> Option<&'static Kit> {
+    static KITS: [OnceLock<Kit>; 4] = [const { OnceLock::new() }; 4];
+    let pair = pair_of(mark)?;
+    let slot = usize::from(dark) * 2 + usize::from(mark == Mark::NeedsYou);
+    Some(KITS[slot].get_or_init(|| {
+        let mut inked = kit(dark).clone();
+        inked.c.icon_muted = pair.ink;
+        inked
+    }))
+}
+
+/// The opaque colour of sRGB bytes.
+fn srgb(bytes: [u8; 3]) -> Color {
+    let [r, g, b] = bytes.map(|byte| srgb_decode(f32::from(byte) / 255.0));
+    Color { r, g, b, a: 1.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +137,74 @@ mod tests {
         assert!(black(viewer));
         assert!((viewer.a - 0.7).abs() < 1e-6);
         assert!(viewer.a > dark.a && viewer.a > light.a);
+    }
+
+    #[test]
+    fn the_pairs_can_be_read() {
+        for pair in [ready(), needs_input()] {
+            let ratio = contrast(pair.fill, pair.ink);
+            assert!(ratio >= 4.5, "{pair:?} has a contrast of {ratio}");
+            assert_eq!(contrast(pair.ink, pair.fill), ratio, "either way round");
+        }
+        assert!((contrast(Color::BLACK, Color::WHITE) - 21.0).abs() < 1e-3);
+        assert!(ready().ink.luminance() > 0.8, "light writing on the green");
+        assert!(
+            needs_input().ink.luminance() < 0.05,
+            "dark writing on the orange"
+        );
+    }
+
+    #[test]
+    fn the_fills_are_the_icons_colours() {
+        let bytes = |color: Color| {
+            assert_eq!(color.a, 1.0);
+            [color.r, color.g, color.b].map(|c| rune::color::srgb_encode(c) * 255.0)
+        };
+        let icon: [(Color, [u8; 3]); 2] = [
+            (ready().fill, [0x24, 0x6b, 0x43]),
+            (needs_input().fill, [0xf3, 0x92, 0x2e]),
+        ];
+        for (fill, icon) in icon {
+            for (found, want) in bytes(fill).into_iter().zip(icon) {
+                assert!(
+                    (found - f32::from(want)).abs() < 0.5,
+                    "{fill:?} is {icon:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_inked_kits_are_made_once() {
+        let of = |dark, mark| inked(dark, mark).expect("a mark with a pair");
+        for dark in [true, false] {
+            for mark in [Mark::Finished, Mark::NeedsYou] {
+                let pair = pair_of(mark).unwrap();
+                let inked = of(dark, mark);
+                assert!(std::ptr::eq(inked, of(dark, mark)), "made once");
+                assert_eq!(inked.c.icon_muted, pair.ink);
+                assert_eq!(inked.dark, dark);
+                assert_eq!(inked.c.hover, kit(dark).c.hover, "the rest is the theme's");
+            }
+            assert!(!std::ptr::eq(
+                of(dark, Mark::Finished),
+                of(dark, Mark::NeedsYou)
+            ));
+            // A mark with no pair has no kit of its own: nothing can land in another's slot.
+            assert!(inked(dark, Mark::Working).is_none());
+            assert!(inked(dark, Mark::None).is_none());
+        }
+        assert!(!std::ptr::eq(
+            of(true, Mark::Finished),
+            of(false, Mark::Finished)
+        ));
+    }
+
+    #[test]
+    fn only_ready_and_needs_input_have_a_pair() {
+        assert_eq!(pair_of(Mark::Finished), Some(ready()));
+        assert_eq!(pair_of(Mark::NeedsYou), Some(needs_input()));
+        assert_eq!(pair_of(Mark::Working), None);
+        assert_eq!(pair_of(Mark::None), None);
     }
 }

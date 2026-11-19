@@ -10,6 +10,7 @@ mod history;
 mod history_tail;
 mod mode;
 mod process;
+mod remove;
 mod time;
 mod translate;
 mod wire;
@@ -30,5 +31,6 @@ pub use history::{
 pub use history_tail::{TAIL_BYTES, read_tail};
 pub use mode::{mode_from_wire, mode_to_wire};
 pub use process::{ClaudeProcess, ExitInfo, SpawnConfig};
+pub use remove::{paths_of, root_from};
 pub use translate::{SessionStart, Tracked, Translator, always_allow_label, tool_detail};
 pub use wire::{Block, BlockKind, Incoming, StreamEvent, ToolResult, parse_line};

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use mr_agent::SessionId;
 use serde::{Deserialize, Serialize};
 
-use crate::app::RECENT_DAYS;
+use crate::app::{DELETED_SECONDS, RECENT_DAYS};
 use crate::saved::Saved;
 use crate::sessions::{Entry, Mark, SessionKey, Sessions};
 use crate::tiles::Tiles;
@@ -56,6 +56,10 @@ pub struct Group {
     pub name: Option<String>,
     pub collapsed: bool,
     pub hidden: bool,
+    /// When a custom group was deleted: it is in the Deleted view since. A value that cannot
+    /// be read reads as none, so the rest of the state is still read.
+    #[serde(default, deserialize_with = "crate::saved::unix_or_none")]
+    pub deleted_unix: Option<i64>,
 }
 
 impl Group {
@@ -93,7 +97,12 @@ impl Groups {
     pub fn restored(saved: &Saved) -> Groups {
         let mut groups = Groups::default();
         for group in saved.groups.iter().filter(|group| group.worth_keeping()) {
-            groups.records.insert(group.id.clone(), group.clone());
+            let mut group = group.clone();
+            // Only a group the user made can be deleted, whatever the saved state says.
+            if matches!(group.id, GroupId::Folder(_)) {
+                group.deleted_unix = None;
+            }
+            groups.records.insert(group.id.clone(), group);
         }
         groups.placed = saved
             .placed
@@ -189,6 +198,7 @@ impl Groups {
             name: Some(name.to_string()),
             collapsed: false,
             hidden: false,
+            deleted_unix: None,
         };
         self.records.insert(id.clone(), group);
         id
@@ -197,13 +207,64 @@ impl Groups {
     /// A custom group goes, and its sessions return to their folders' groups. A folder group
     /// loses its name, its collapsed and hidden state and the sessions placed in it; its own
     /// sessions stay in it.
-    pub fn delete(&mut self, id: &GroupId) {
+    pub fn ungroup(&mut self, id: &GroupId) {
         self.version += 1;
         self.records.remove(id);
         self.placed.retain(|_, group| group != id);
         self.placed_by_key.retain(|_, group| group != id);
         if matches!(id, GroupId::Custom(_)) {
             self.showing_older.remove(id);
+        }
+    }
+
+    /// Whether a folder group has anything [`Groups::ungroup`] would reset: a record, or a
+    /// session placed in it. A custom group always has.
+    pub fn has_anything(&self, id: &GroupId) -> bool {
+        matches!(id, GroupId::Custom(_))
+            || self.records.contains_key(id)
+            || self.placed.values().any(|group| group == id)
+            || self.placed_by_key.values().any(|group| group == id)
+    }
+
+    /// When the custom group `id` was deleted; none while it is not, and always for a folder's
+    /// group, whatever its record holds: a folder's sessions are never deleted by a group's mark.
+    pub fn deleted_unix(&self, id: &GroupId) -> Option<i64> {
+        match id {
+            GroupId::Custom(_) => self.records.get(id)?.deleted_unix,
+            GroupId::Folder(_) => None,
+        }
+    }
+
+    /// The custom groups that are deleted, by number.
+    pub fn deleted(&self) -> Vec<GroupId> {
+        let mut deleted: Vec<GroupId> = self
+            .records
+            .values()
+            .filter(|group| self.deleted_unix(&group.id).is_some())
+            .map(|group| group.id.clone())
+            .collect();
+        deleted.sort_by(by_id);
+        deleted
+    }
+
+    /// The group the session `id` was placed in, also while the app does not know that session.
+    pub fn placement(&self, id: &SessionId) -> Option<&GroupId> {
+        self.placed.get(id)
+    }
+
+    /// The session `key`, known by `id`, is gone for good: its placement goes too.
+    pub fn forget(&mut self, key: SessionKey, id: &SessionId) {
+        self.version += 1;
+        self.placed.remove(id);
+        self.placed_by_key.remove(&key);
+    }
+
+    /// Marks the custom group `id` deleted since `at_unix`, or not deleted. A folder's group
+    /// takes no mark.
+    pub fn set_deleted(&mut self, id: &GroupId, at_unix: Option<i64>) {
+        self.version += 1;
+        if let (GroupId::Custom(_), Some(group)) = (id, self.records.get_mut(id)) {
+            group.deleted_unix = at_unix;
         }
     }
 
@@ -297,6 +358,7 @@ impl Groups {
                 name: None,
                 collapsed: false,
                 hidden: false,
+                deleted_unix: None,
             }),
         };
         change(group);
@@ -321,6 +383,15 @@ const NEW_GROUP: &str = "New group";
 /// The title of a row whose session has none yet.
 const NEW_SESSION: &str = "New session";
 
+/// The title `entry`'s row shows.
+pub(crate) fn row_title(entry: &Entry) -> String {
+    entry
+        .session
+        .title
+        .clone()
+        .unwrap_or_else(|| NEW_SESSION.to_string())
+}
+
 /// A folder's last component, or the whole path when it has none.
 fn folder_name(path: &Path) -> String {
     path.file_name().map_or_else(
@@ -341,6 +412,10 @@ pub struct Row {
     pub shown: bool,
     /// The session is in the focused tile.
     pub focused: bool,
+    /// In the Deleted view: whole days until it is removed, 0 on its last day.
+    pub days_left: Option<u8>,
+    /// Its removal failed and waits to be tried again.
+    pub stuck: bool,
 }
 
 /// One group as the sidebar lists it.
@@ -353,10 +428,10 @@ pub struct Section {
     pub rows: Vec<Row>,
     /// Rows left out for their age.
     pub older: usize,
-    /// The strongest mark among its rows.
+    /// The strongest mark among its rows. It means nothing in the Deleted view.
     pub mark: Mark,
     /// A custom group, or a folder group with a name of its own or a session from another
-    /// folder.
+    /// folder. It means nothing in the Deleted view.
     pub can_delete: bool,
 }
 
@@ -372,9 +447,18 @@ pub enum Line {
     OlderGroups,
 }
 
+/// Which list the sidebar shows: the sessions, or those deleted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarView {
+    #[default]
+    Sessions,
+    Deleted,
+}
+
 /// What the sidebar shows.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SidebarModel {
+    pub view: SidebarView,
     pub sections: Vec<Section>,
     pub lines: Vec<Line>,
     /// The hidden groups, with their names, in the order they would be listed.
@@ -385,41 +469,66 @@ pub struct SidebarModel {
     pub older_groups_open: bool,
     /// The first listing of stored sessions has not arrived.
     pub loading: bool,
+    /// How many sessions are in the Deleted view, whichever view shows.
+    pub deleted: usize,
+    /// The listing of every stored session is in, so every session of every group is known:
+    /// until then a group cannot be deleted (`App::delete_group`). `App::settle` sets it.
+    pub complete: bool,
 }
 
-/// What the sidebar shows of `sessions` in `groups`, with `tiles` the tiles the window shows
-/// sessions in, at `now_unix`, `loading` while the first listing has not arrived.
+/// What the sidebar shows of `sessions` in `groups` in `view`, with `tiles` the tiles the window
+/// shows sessions in, at `now_unix`, `loading` while the first listing has not arrived.
+///
+/// The sessions are listed without those deleted and without the groups deleted. The Deleted
+/// view lists the deleted sessions of any age under their groups, never collapsed, and the
+/// deleted groups also empty, newest deletion first.
 pub fn sidebar_model(
     sessions: &Sessions,
     groups: &Groups,
     tiles: &Tiles,
     now_unix: i64,
     loading: bool,
+    view: SidebarView,
 ) -> SidebarModel {
+    let deleted_view = view == SidebarView::Deleted;
     let mut building: HashMap<GroupId, Building> = HashMap::new();
     for entry in sessions.iter() {
+        if entry.deleted.is_some() != deleted_view {
+            continue;
+        }
         let id = groups.group_of(entry);
         let section = building
             .entry(id)
-            .or_insert_with_key(|id| Building::new(id, groups));
+            .or_insert_with_key(|id| Building::new(id, groups, view));
         section.add(entry, tiles, now_unix);
     }
     for id in groups.records.keys() {
-        if matches!(id, GroupId::Custom(_)) && !building.contains_key(id) {
-            building.insert(id.clone(), Building::new(id, groups));
+        let deleted = groups.deleted_unix(id).is_some();
+        if matches!(id, GroupId::Custom(_)) && deleted == deleted_view && !building.contains_key(id)
+        {
+            building.insert(id.clone(), Building::new(id, groups, view));
         }
     }
     let mut building: Vec<Building> = building.into_values().collect();
     building.sort_by(Building::order);
 
     let mut model = SidebarModel {
+        view,
         older_groups_open: groups.older_groups_open,
         loading,
+        deleted: sessions
+            .iter()
+            .filter(|entry| entry.deleted.is_some())
+            .count(),
         ..SidebarModel::default()
     };
     let mut older_groups = Vec::new();
     for section in building {
         let section = section.finish(groups);
+        if deleted_view {
+            model.sections.push(section);
+            continue;
+        }
         let record = groups.records.get(&section.id);
         let present = section
             .rows
@@ -461,6 +570,9 @@ fn lines(model: &SidebarModel) -> Vec<Line> {
     if model.loading {
         lines.push(Line::Loading);
     }
+    if model.view == SidebarView::Deleted {
+        return lines;
+    }
     lines.push(Line::NewGroup);
     if !model.hidden.is_empty() {
         lines.push(Line::HiddenGroups);
@@ -474,10 +586,12 @@ fn lines(model: &SidebarModel) -> Vec<Line> {
 /// A section while the entries are walked.
 struct Building {
     id: GroupId,
-    /// Its rows, each with its session's `last_active_unix`.
+    view: SidebarView,
+    /// Its rows, each with its time: its session's `last_active_unix`, or in the Deleted view
+    /// when it was deleted.
     rows: Vec<(i64, Row)>,
     older: usize,
-    /// The newest `last_active_unix` among its entries.
+    /// The newest time among its entries; in the Deleted view, also when the group was deleted.
     newest: Option<i64>,
     /// It holds a session from another folder, as a folder group.
     guests: bool,
@@ -485,21 +599,28 @@ struct Building {
 }
 
 impl Building {
-    fn new(id: &GroupId, groups: &Groups) -> Building {
+    fn new(id: &GroupId, groups: &Groups, view: SidebarView) -> Building {
+        let deleted_view = view == SidebarView::Deleted;
         Building {
             id: id.clone(),
+            view,
             rows: Vec::new(),
             older: 0,
-            newest: None,
+            newest: groups.deleted_unix(id).filter(|_| deleted_view),
             guests: false,
-            showing_older: groups.showing_older.contains(id),
+            showing_older: deleted_view || groups.showing_older.contains(id),
         }
     }
 
     /// Counts `entry` in, with a row when it is live, in a tile, touched in this run, recent,
-    /// or its group lists old sessions too.
+    /// or its group lists old sessions too. In the Deleted view every entry has a row.
     fn add(&mut self, entry: &Entry, tiles: &Tiles, now_unix: i64) {
-        self.newest = self.newest.max(Some(entry.last_active_unix));
+        let deleted_at = entry
+            .deleted
+            .filter(|_| self.view == SidebarView::Deleted)
+            .map(|deleted| deleted.at_unix);
+        let time = deleted_at.unwrap_or(entry.last_active_unix);
+        self.newest = self.newest.max(Some(time));
         let home = match &self.id {
             GroupId::Folder(path) => *path == entry.session.folder,
             GroupId::Custom(_) => false,
@@ -517,17 +638,17 @@ impl Building {
         }
         let row = Row {
             key: entry.key,
-            title: entry
-                .session
-                .title
-                .clone()
-                .unwrap_or_else(|| NEW_SESSION.to_string()),
+            title: row_title(entry),
             folder_label: (!home).then(|| folder_name(&entry.session.folder)),
             mark: entry.mark(),
             shown,
             focused: tiles.focused() == Some(entry.key),
+            days_left: deleted_at.map(|at_unix| days_left(at_unix, now_unix)),
+            stuck: entry
+                .deleted
+                .is_some_and(|deleted| deleted.failed_unix.is_some()),
         };
-        self.rows.push((entry.last_active_unix, row));
+        self.rows.push((time, row));
     }
 
     /// Newest first; a section with no entry before all others, the newest created first.
@@ -560,7 +681,8 @@ impl Building {
         Section {
             name: groups.name(&self.id),
             custom,
-            collapsed: record.is_some_and(|group| group.collapsed),
+            collapsed: self.view == SidebarView::Sessions
+                && record.is_some_and(|group| group.collapsed),
             rows,
             older: self.older,
             mark,
@@ -580,13 +702,31 @@ fn strength(mark: Mark) -> u8 {
     }
 }
 
-/// Active within [`RECENT_DAYS`] of `now_unix`.
-fn recent(last_active_unix: i64, now_unix: i64) -> bool {
-    now_unix <= last_active_unix + RECENT_DAYS * 86_400
+/// Whole days until a session deleted at `at_unix` is removed, at `now_unix`: 6 a moment after
+/// it was deleted, 0 in its last day and after.
+fn days_left(at_unix: i64, now_unix: i64) -> u8 {
+    u8::try_from(whole_days_left(at_unix, now_unix)).unwrap_or(u8::MAX)
 }
 
-/// The clock times over which no entry turns from recent to old or back: every `now_unix` with
-/// `after < now_unix <= until`.
+/// [`days_left`] before it is cut to a `u8`. A time read from the saved state may be any.
+fn whole_days_left(at_unix: i64, now_unix: i64) -> i64 {
+    let left = at_unix
+        .saturating_add(DELETED_SECONDS)
+        .saturating_sub(now_unix);
+    (left.saturating_sub(1) / DAY).max(0)
+}
+
+/// Seconds in a day.
+const DAY: i64 = 86_400;
+
+/// Active within [`RECENT_DAYS`] of `now_unix`.
+fn recent(last_active_unix: i64, now_unix: i64) -> bool {
+    now_unix <= last_active_unix + RECENT_DAYS * DAY
+}
+
+/// The clock times over which the list `view` shows does not change with the clock: every
+/// `now_unix` with `after < now_unix <= until`. For the sessions, no entry turns from recent to
+/// old or back; in the Deleted view, no row's `days_left` changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Recency {
     after: i64,
@@ -594,17 +734,32 @@ pub(crate) struct Recency {
 }
 
 impl Recency {
-    pub(crate) fn of(sessions: &Sessions, now_unix: i64) -> Recency {
+    pub(crate) fn of(sessions: &Sessions, now_unix: i64, view: SidebarView) -> Recency {
         let mut recency = Recency {
             after: i64::MIN,
             until: i64::MAX,
         };
         for entry in sessions.iter() {
-            let turns = entry.last_active_unix + RECENT_DAYS * 86_400;
-            if recent(entry.last_active_unix, now_unix) {
-                recency.until = recency.until.min(turns);
-            } else {
-                recency.after = recency.after.max(turns);
+            match (view, entry.deleted) {
+                (SidebarView::Sessions, None) => {
+                    let turns = entry.last_active_unix + RECENT_DAYS * DAY;
+                    if recent(entry.last_active_unix, now_unix) {
+                        recency.until = recency.until.min(turns);
+                    } else {
+                        recency.after = recency.after.max(turns);
+                    }
+                }
+                (SidebarView::Deleted, Some(deleted)) => {
+                    // `days_left` is d from `end - (d + 1) days` on, and less from `end - d days`.
+                    let end = deleted.at_unix.saturating_add(DELETED_SECONDS);
+                    let days = whole_days_left(deleted.at_unix, now_unix);
+                    let from = |days: i64| end.saturating_sub(days.saturating_mul(DAY));
+                    recency.after = recency.after.max(from(days + 1).saturating_sub(1));
+                    if days > 0 {
+                        recency.until = recency.until.min(from(days).saturating_sub(1));
+                    }
+                }
+                _ => {}
             }
         }
         recency
@@ -621,10 +776,10 @@ mod tests {
 
     use super::*;
     use crate::session::{Phase, Session};
+    use crate::sessions::Deleted;
     use crate::tiles::{Place, RowSize};
 
     const NOW: i64 = 1_800_000_000;
-    const DAY: i64 = 86_400;
     const MINDRUNE: &str = "/home/alex/rune_claude";
     const NOTES: &str = "/home/alex/notes";
 
@@ -649,7 +804,14 @@ mod tests {
     }
 
     fn model(sessions: &Sessions, groups: &Groups) -> SidebarModel {
-        sidebar_model(sessions, groups, &Tiles::default(), NOW, false)
+        sidebar_model(
+            sessions,
+            groups,
+            &Tiles::default(),
+            NOW,
+            false,
+            SidebarView::Sessions,
+        )
     }
 
     /// A row of tiles holding `keys`, left to right, the last one focused.
@@ -681,6 +843,29 @@ mod tests {
         section.rows.iter().find(|row| row.key == key).unwrap()
     }
 
+    /// Marks `key`'s session deleted at `at_unix`.
+    fn delete(sessions: &mut Sessions, key: SessionKey, at_unix: i64) {
+        sessions.get_mut(key).unwrap().deleted = Some(Deleted {
+            at_unix,
+            seen_unix: at_unix,
+            failed_unix: None,
+            removing: false,
+        });
+    }
+
+    /// The Deleted view at `now_unix`.
+    fn deleted_view(sessions: &Sessions, groups: &Groups, now_unix: i64) -> SidebarModel {
+        let tiles = Tiles::default();
+        sidebar_model(
+            sessions,
+            groups,
+            &tiles,
+            now_unix,
+            false,
+            SidebarView::Deleted,
+        )
+    }
+
     #[test]
     fn a_session_is_in_its_folders_group_by_default() {
         let mut sessions = Sessions::default();
@@ -705,6 +890,8 @@ mod tests {
                 mark: Mark::None,
                 shown: false,
                 focused: false,
+                days_left: None,
+                stuck: false,
             }
         );
         assert_eq!(keys(&model.sections[1]), vec![b]);
@@ -786,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_custom_group_sends_its_sessions_home() {
+    fn ungroup_sends_the_sessions_home() {
         let mut sessions = Sessions::default();
         let a = stored(&mut sessions, "a1", MINDRUNE, 60);
         let b = stored(&mut sessions, "b1", NOTES, 120);
@@ -795,7 +982,7 @@ mod tests {
         groups.place(entry(&sessions, a), &side);
         groups.place(entry(&sessions, b), &side);
         assert_eq!(names(&model(&sessions, &groups)), vec!["Side projects"]);
-        groups.delete(&side);
+        groups.ungroup(&side);
         assert_eq!(groups.group_of(entry(&sessions, a)), folder(MINDRUNE));
         assert_eq!(groups.group_of(entry(&sessions, b)), folder(NOTES));
         assert_eq!(
@@ -811,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_folder_group_resets_it() {
+    fn ungrouping_a_folder_group_resets_it() {
         let mut sessions = Sessions::default();
         let a = stored(&mut sessions, "a1", MINDRUNE, 60);
         let b = stored(&mut sessions, "b1", NOTES, 120);
@@ -833,7 +1020,7 @@ mod tests {
             vec![(home.clone(), "MindRune".to_string())]
         );
 
-        groups.delete(&home);
+        groups.ungroup(&home);
         let model_now = model(&sessions, &groups);
         assert!(model_now.hidden.is_empty());
         let after = section(&model_now, &home);
@@ -913,7 +1100,14 @@ mod tests {
         assert_eq!((keys(home), home.older), (vec![young, old], 0));
 
         let groups = Groups::default();
-        let shown = sidebar_model(&sessions, &groups, &tiles(&[old]), NOW, false);
+        let shown = sidebar_model(
+            &sessions,
+            &groups,
+            &tiles(&[old]),
+            NOW,
+            false,
+            SidebarView::Sessions,
+        );
         let home = section(&shown, &folder(MINDRUNE));
         assert_eq!((keys(home), home.older), (vec![young, old], 0), "shown");
         assert!(row(home, old).shown && !row(home, young).shown);
@@ -944,7 +1138,14 @@ mod tests {
         let b = stored(&mut sessions, "b1", NOTES, 120);
         let mut groups = Groups::default();
         groups.set_hidden(&folder(NOTES), true);
-        let model_now = sidebar_model(&sessions, &groups, &tiles(&[old, b]), NOW, false);
+        let model_now = sidebar_model(
+            &sessions,
+            &groups,
+            &tiles(&[old, b]),
+            NOW,
+            false,
+            SidebarView::Sessions,
+        );
         assert_eq!(
             names(&model_now),
             vec!["rune_claude", "notes"],
@@ -1032,7 +1233,14 @@ mod tests {
         assert_eq!(names(&model_now), vec!["rune_claude"]);
         assert_eq!(model_now.hidden.len(), 1);
 
-        let shown = sidebar_model(&sessions, &groups, &tiles(&[b]), NOW, false);
+        let shown = sidebar_model(
+            &sessions,
+            &groups,
+            &tiles(&[b]),
+            NOW,
+            false,
+            SidebarView::Sessions,
+        );
         assert_eq!(names(&shown), vec!["rune_claude", "notes"], "shown");
 
         groups.set_hidden(&folder(NOTES), false);
@@ -1108,7 +1316,14 @@ mod tests {
         );
         assert_eq!(model_now.hidden, vec![(archive, "Archive".to_string())]);
 
-        let loading = sidebar_model(&sessions, &groups, &Tiles::default(), NOW, true);
+        let loading = sidebar_model(
+            &sessions,
+            &groups,
+            &Tiles::default(),
+            NOW,
+            true,
+            SidebarView::Sessions,
+        );
         assert!(loading.loading);
         assert_eq!(
             loading.lines[4..],
@@ -1131,5 +1346,212 @@ mod tests {
             "the same in every run of every build"
         );
         assert_eq!(GroupId::Custom(3).key_text(), "c3");
+    }
+
+    #[test]
+    fn a_group_saved_before_this_plan_still_reads() {
+        let before =
+            r#"{"id":{"Custom":2},"name":"Side projects","collapsed":false,"hidden":true}"#;
+        let read: Group = serde_json::from_str(before).unwrap();
+        assert_eq!(
+            read,
+            Group {
+                id: GroupId::Custom(2),
+                name: Some("Side projects".into()),
+                collapsed: false,
+                hidden: true,
+                deleted_unix: None,
+            }
+        );
+        for value in ["null", r#""x""#, "1.5", "[1]", "{}", "true"] {
+            let json = format!(
+                r#"{{"id":{{"Custom":2}},"name":"Side projects","collapsed":true,"hidden":false,"deleted_unix":{value}}}"#
+            );
+            let read: Group =
+                serde_json::from_str(&json).unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!((read.deleted_unix, read.collapsed), (None, true), "{value}");
+        }
+        let json = r#"{"id":{"Custom":2},"name":null,"collapsed":false,"hidden":false,"deleted_unix":1800000000}"#;
+        let read: Group = serde_json::from_str(json).unwrap();
+        assert_eq!(read.deleted_unix, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn the_normal_list_leaves_deleted_sessions_out() {
+        let mut sessions = Sessions::default();
+        let a1 = stored(&mut sessions, "a1", MINDRUNE, 60);
+        let a2 = stored(&mut sessions, "a2", MINDRUNE, 50);
+        let b1 = stored(&mut sessions, "b1", NOTES, 120);
+        let mut groups = Groups::default();
+        let side = groups.create("Side projects");
+        let archive = groups.create("Archive");
+        groups.set_hidden(&archive, true);
+        delete(&mut sessions, a2, NOW);
+        groups.set_deleted(&side, Some(NOW));
+        groups.set_deleted(&archive, Some(NOW));
+        let model_now = model(&sessions, &groups);
+        assert_eq!(model_now.view, SidebarView::Sessions);
+        assert_eq!(names(&model_now), vec!["rune_claude", "notes"]);
+        assert_eq!(keys(&model_now.sections[0]), vec![a1]);
+        assert_eq!(keys(&model_now.sections[1]), vec![b1]);
+        assert!(model_now.hidden.is_empty(), "a deleted group is not hidden");
+        use Line::*;
+        assert_eq!(
+            model_now.lines,
+            vec![Header(0), Row(0, 0), Header(1), Row(1, 0), NewGroup]
+        );
+        let row = &model_now.sections[0].rows[0];
+        assert_eq!((row.days_left, row.stuck), (None, false));
+    }
+
+    #[test]
+    fn a_folder_group_with_only_deleted_sessions_is_not_listed() {
+        let mut sessions = Sessions::default();
+        let a1 = stored(&mut sessions, "a1", MINDRUNE, 60);
+        let b1 = stored(&mut sessions, "b1", NOTES, 120);
+        let c1 = stored(&mut sessions, "c1", "/home/alex/old", 40 * DAY);
+        delete(&mut sessions, b1, NOW);
+        delete(&mut sessions, c1, NOW);
+        let mut groups = Groups::default();
+        groups.rename(&folder(NOTES), "Notes");
+        let model_now = model(&sessions, &groups);
+        assert_eq!(names(&model_now), vec!["rune_claude"]);
+        assert_eq!(keys(&model_now.sections[0]), vec![a1]);
+        assert_eq!(model_now.older_groups, 0, "nor among the older groups");
+    }
+
+    #[test]
+    fn the_deleted_view_lists_only_deleted_sessions_under_their_groups() {
+        let mut sessions = Sessions::default();
+        let a1 = stored(&mut sessions, "a1", MINDRUNE, 60);
+        let a2 = stored(&mut sessions, "a2", MINDRUNE, 70);
+        let a3 = stored(&mut sessions, "a3", MINDRUNE, 80);
+        let b1 = stored(&mut sessions, "b1", NOTES, 120);
+        let c1 = stored(&mut sessions, "c1", NOTES, 130);
+        let mut groups = Groups::default();
+        let side = groups.create("Side projects");
+        groups.create("Nothing deleted");
+        groups.place(entry(&sessions, c1), &side);
+        groups.set_hidden(&side, true);
+        groups.set_collapsed(&folder(NOTES), true);
+        delete(&mut sessions, a1, NOW - 300);
+        delete(&mut sessions, a2, NOW - 50);
+        delete(&mut sessions, b1, NOW - 100);
+        delete(&mut sessions, c1, NOW - 200);
+        sessions
+            .get_mut(b1)
+            .unwrap()
+            .deleted
+            .as_mut()
+            .unwrap()
+            .failed_unix = Some(NOW - 10);
+
+        let model_now = deleted_view(&sessions, &groups, NOW);
+        assert_eq!(model_now.view, SidebarView::Deleted);
+        assert_eq!(
+            names(&model_now),
+            vec!["rune_claude", "notes", "Side projects"],
+            "newest deletion first, hidden or not"
+        );
+        assert_eq!(
+            keys(&model_now.sections[0]),
+            vec![a2, a1],
+            "newest deletion first"
+        );
+        assert!(!keys(&model_now.sections[0]).contains(&a3));
+        let notes = &model_now.sections[1];
+        assert_eq!((keys(notes), notes.collapsed), (vec![b1], false));
+        let custom = &model_now.sections[2];
+        assert_eq!(keys(custom), vec![c1]);
+        assert_eq!(custom.rows[0].folder_label.as_deref(), Some("notes"));
+        assert!(model_now.hidden.is_empty());
+        let stuck: Vec<bool> = model_now
+            .sections
+            .iter()
+            .flat_map(|section| section.rows.iter().map(|row| row.stuck))
+            .collect();
+        assert_eq!(stuck, vec![false, false, true, false]);
+        use Line::*;
+        assert_eq!(
+            model_now.lines,
+            vec![
+                Header(0),
+                Row(0, 0),
+                Row(0, 1),
+                Header(1),
+                Row(1, 0),
+                Header(2),
+                Row(2, 0)
+            ],
+            "no line to make, show or open groups"
+        );
+    }
+
+    #[test]
+    fn an_old_deleted_session_is_listed_in_the_deleted_view() {
+        let mut sessions = Sessions::default();
+        let a1 = stored(&mut sessions, "a1", MINDRUNE, 40 * DAY);
+        stored(&mut sessions, "a2", MINDRUNE, 50 * DAY);
+        delete(&mut sessions, a1, NOW);
+        let model_now = deleted_view(&sessions, &Groups::default(), NOW);
+        assert_eq!(names(&model_now), vec!["rune_claude"]);
+        let home = &model_now.sections[0];
+        assert_eq!((keys(home), home.older), (vec![a1], 0));
+        assert_eq!(model_now.older_groups, 0);
+        assert_eq!(model_now.lines, vec![Line::Header(0), Line::Row(0, 0)]);
+    }
+
+    #[test]
+    fn a_deleted_empty_group_shows_in_the_deleted_view() {
+        let mut sessions = Sessions::default();
+        stored(&mut sessions, "a1", MINDRUNE, 60);
+        let mut groups = Groups::default();
+        let side = groups.create("Side projects");
+        groups.set_collapsed(&side, true);
+        groups.set_deleted(&side, Some(NOW - 10));
+        let model_now = deleted_view(&sessions, &groups, NOW);
+        assert_eq!(names(&model_now), vec!["Side projects"]);
+        let custom = &model_now.sections[0];
+        assert!(custom.rows.is_empty() && !custom.collapsed);
+        assert_eq!(model_now.lines, vec![Line::Header(0)]);
+        assert_eq!(names(&model(&sessions, &groups)), vec!["rune_claude"]);
+    }
+
+    #[test]
+    fn days_left_counts_down() {
+        let mut sessions = Sessions::default();
+        let a1 = stored(&mut sessions, "a1", MINDRUNE, 60);
+        delete(&mut sessions, a1, NOW);
+        let groups = Groups::default();
+        let days_left =
+            |now_unix| deleted_view(&sessions, &groups, now_unix).sections[0].rows[0].days_left;
+        assert_eq!(days_left(NOW), Some(6), "deleted a moment ago");
+        assert_eq!(days_left(NOW + DAY - 1), Some(6));
+        assert_eq!(days_left(NOW + DAY), Some(5));
+        assert_eq!(days_left(NOW + 6 * DAY + 1), Some(0), "its last day");
+        assert_eq!(days_left(NOW + 7 * DAY), Some(0));
+        assert_eq!(days_left(NOW + 30 * DAY), Some(0), "never under 0");
+        assert_eq!(
+            super::days_left(i64::MAX, NOW),
+            u8::MAX,
+            "a time read as any"
+        );
+        assert_eq!(super::days_left(i64::MIN, NOW), 0);
+    }
+
+    #[test]
+    fn the_count_of_deleted_is_known_in_both_views() {
+        let mut sessions = Sessions::default();
+        let a1 = stored(&mut sessions, "a1", MINDRUNE, 60);
+        stored(&mut sessions, "a2", MINDRUNE, 70);
+        let b1 = stored(&mut sessions, "b1", NOTES, 40 * DAY);
+        let mut groups = Groups::default();
+        let side = groups.create("Side projects");
+        groups.set_deleted(&side, Some(NOW));
+        assert_eq!(model(&sessions, &groups).deleted, 0);
+        delete(&mut sessions, a1, NOW);
+        delete(&mut sessions, b1, NOW);
+        assert_eq!(model(&sessions, &groups).deleted, 2, "sessions, not groups");
+        assert_eq!(deleted_view(&sessions, &groups, NOW).deleted, 2);
     }
 }

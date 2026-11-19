@@ -11,7 +11,9 @@
 
 use std::borrow::Cow;
 
-use mr_core::{Effect, GroupId, Line, Mark, Place, Row, Section, SessionKey, SidebarModel, Spot};
+use mr_core::{
+    Effect, GroupId, Line, Mark, Place, Row, Section, SessionKey, SidebarModel, SidebarView, Spot,
+};
 use rune::{
     Anim, Color, Cx, El, GrowthSpec, Key, KeyEvent, PointerPress, Spring, TextEdit, TextStyle,
     Transition, Tx, col, el, icon, memo, row, text, text_input,
@@ -23,7 +25,8 @@ use rune_kit::{
 use rune_theme_opencode::icons::PLUS;
 
 use crate::glue::{self, DropTarget, MenuTarget, Renaming, SideMenu, Ui};
-use crate::view::{drag, folder};
+use crate::theme::{self, Pair};
+use crate::view::{deleted, drag, folder};
 
 /// Rows and headers sit this far in from the list's sides, as the kit's do.
 const INSET: f32 = 8.0;
@@ -52,7 +55,13 @@ const TARGET_WIDTH: f32 = 2.0;
 /// `Sidebar::virtual_rows`, which takes no version: without one, Rune asks every row's key on
 /// every commit. The stack sits in the kit's list, so the list's focus group (one Tab stop,
 /// Up and Down) holds its rows.
+///
+/// An empty Deleted view says so in one muted line instead.
 pub fn list(ui: &Ui, kit: &'static Kit) -> El {
+    let model = &ui.app.sidebar;
+    if model.view == SidebarView::Deleted && model.lines.is_empty() {
+        return muted_line("Nothing is deleted.", kit).key("mr-deleted-empty");
+    }
     col()
         .key("mr-sidebar-rows")
         .w_full()
@@ -155,6 +164,9 @@ fn build_line(ui: &Ui, line: Line, kit: &Kit) -> El {
     #[cfg(test)]
     LINE_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let model = &ui.app.sidebar;
+    if model.view == SidebarView::Deleted {
+        return deleted_line(model, line, kit);
+    }
     match line {
         Line::Header(s) => header(ui, &model.sections[s], kit),
         Line::Row(s, r) => {
@@ -166,18 +178,22 @@ fn build_line(ui: &Ui, line: Line, kit: &Kit) -> El {
             // another tile's; the other tiles' rows carry the hover fill at rest, so they read
             // as open and not as selected.
             let selected = is_selected(ui, row);
-            let mut built = SidebarRow::new(row.title.clone()).selected(selected);
-            if let Some(folder) = &row.folder_label {
-                built = built.detail(folder.clone());
-            }
-            if let Some(status) = status(row.mark) {
-                built = built.status(status);
-            }
-            let built = built.on_select(select(row.key)).build(kit);
-            let built = if row.shown && !selected {
-                built.fill(kit.c.hover)
+            let built = if let Some(pair) = theme::pair_of(row.mark) {
+                coloured_row(row, selected, pair, kit)
             } else {
-                built
+                let mut built = SidebarRow::new(row.title.clone()).selected(selected);
+                if let Some(folder) = &row.folder_label {
+                    built = built.detail(folder.clone());
+                }
+                if let Some(status) = status(row.mark) {
+                    built = built.status(status);
+                }
+                let built = built.on_select(select(row.key)).build(kit);
+                if row.shown && !selected {
+                    built.fill(kit.c.hover)
+                } else {
+                    built
+                }
             };
             built
                 .on_key(choose(row.key))
@@ -221,6 +237,101 @@ fn build_line(ui: &Ui, line: Line, kit: &Kit) -> El {
                 });
             }),
     }
+}
+
+/// A line of the Deleted view, which holds only group headers and rows, and "Loading" until the
+/// first listing has come.
+fn deleted_line(model: &SidebarModel, line: Line, kit: &Kit) -> El {
+    match line {
+        Line::Header(s) => deleted_header(&model.sections[s], kit),
+        Line::Row(s, r) => deleted_row(&model.sections[s].rows[r], kit),
+        _ => muted_line("Loading sessions…", kit),
+    }
+}
+
+/// A row of the Deleted view: the session's title and, as its detail, how long it has left, or
+/// that removing it failed, in words as short as "6 days left" so that the title keeps its
+/// room. No mark, no drag, never selected. A press, Return, Space, a
+/// secondary press and the Menu key open its menu, "Recover", under it.
+fn deleted_row(row: &Row, kit: &Kit) -> El {
+    let detail = if row.stuck {
+        "Not removed".to_string()
+    } else {
+        deleted::days(row.days_left.unwrap_or(0))
+    };
+    let target = MenuTarget::Deleted(row.key);
+    SidebarRow::new(row.title.clone())
+        .detail(detail)
+        .on_select(press_menu(target.clone()))
+        .build(kit)
+        .on_key(key_menu(target.clone()))
+        .on_secondary_press(open_menu(target))
+}
+
+/// A group's header in the Deleted view: its name, never folded, with no "+". Its presses and
+/// keys open its menu, "Recover group", as a row's do ([`deleted_row`]). Unlike a header of the
+/// sessions' list it is a stop for the list's arrow keys: they press what they reach, which here
+/// does nothing.
+fn deleted_header(section: &Section, kit: &Kit) -> El {
+    let target = MenuTarget::DeletedGroup(section.id.clone());
+    let name = text(section.name.clone())
+        .key("mr-group-name")
+        .font(kit.ty.text_xsmall_medium)
+        .color(kit.c.text_muted)
+        .truncate()
+        .shrink()
+        .a11y_hidden();
+    let header = row()
+        .label(section.name.clone())
+        .w_full()
+        .h(ROW_HEIGHT)
+        .pt(4.0)
+        .px(INSET)
+        .center_y()
+        .radius(kit.radius.md)
+        .child(name);
+    kit.interactive(header.on_press_tx(press_menu(target.clone())))
+        .on_key(key_menu(target.clone()))
+        .on_secondary_press(open_menu(target))
+        .role("button")
+        .hover_motion(Anim::INSTANT, Anim::INSTANT)
+}
+
+/// A press on a line of the Deleted view opens `target`'s menu. The list's arrow keys press each
+/// line they reach: that does nothing.
+fn press_menu(target: MenuTarget) -> impl Fn(&mut Ui, &mut Tx) + 'static {
+    move |ui: &mut Ui, tx: &mut Tx| {
+        if !tx.by_keys() {
+            show_menu(ui, target.clone());
+        }
+    }
+}
+
+/// Return or Space on a focused line of the Deleted view opens `target`'s menu, as a press
+/// does. The line's own key handler hears them before the list's focus group would press it.
+fn key_menu(target: MenuTarget) -> impl Fn(&mut Ui, &KeyEvent, &mut Tx) -> bool + 'static {
+    move |ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx| {
+        let m = ev.mods;
+        let plain = !(m.shift || m.cmd || m.ctrl || m.alt || m.logo);
+        let chosen = matches!(&ev.key, Key::Enter) || matches!(&ev.key, Key::Text(t) if t == " ");
+        if !plain || !chosen {
+            return false;
+        }
+        if !tx.key_repeat() {
+            show_menu(ui, target.clone());
+        }
+        true
+    }
+}
+
+/// Opens `target`'s menu with no point: it opens under its line (see [`menu`]).
+fn show_menu(ui: &mut Ui, target: MenuTarget) {
+    ui.drag = None;
+    ui.side_menu = Some(SideMenu {
+        target,
+        at: PointerPress { x: 0.0, y: 0.0 },
+        sub_open: false,
+    });
 }
 
 #[cfg(test)]
@@ -317,20 +428,24 @@ fn open_menu(target: MenuTarget) -> impl Fn(&mut Ui, PointerPress, &mut Tx) + 's
 }
 
 /// A row whose session's name is being edited in it: the field in place of its title, then
-/// its folder and its mark, on the fill it has at rest. Built from the kit's parts as
+/// its folder and its mark, on the fill it has at rest; while it is ready or needs input, on
+/// its pair's fill and in its ink, with no mark ([`coloured_row`]). Built from the kit's parts as
 /// `SidebarRow::build` builds one, since the kit's own field takes a key of the kit's. It is
 /// no stop for the list's arrow keys while the field is there; a secondary press opens its
 /// menu.
 fn renaming_row(ui: &Ui, session: &Row, kit: &Kit) -> El {
     let c = &kit.c;
-    let field = name_field(&ui.rename, ROW_RENAME, "Session name", kit.ty.ui, kit)
+    let pair = theme::pair_of(session.mark);
+    let mut field = name_field(&ui.rename, ROW_RENAME, "Session name", kit.ty.ui, kit)
         .focus_return("sidebar-list");
-    let fill = if session.focused {
-        c.pressed
-    } else if session.shown {
-        c.hover
-    } else {
-        Color::TRANSPARENT
+    if let Some(pair) = pair {
+        field = field.color(pair.ink).caret(pair.ink, kit.selection());
+    }
+    let fill = match pair {
+        Some(pair) => pair.fill,
+        None if session.focused => c.pressed,
+        None if session.shown => c.hover,
+        None => Color::TRANSPARENT,
     };
     row()
         .label(session.title.clone())
@@ -346,23 +461,76 @@ fn renaming_row(ui: &Ui, session: &Row, kit: &Kit) -> El {
             text(folder.clone())
                 .key("mr-row-folder")
                 .font(kit.ty.small)
-                .color(c.text_faint)
+                .color(pair.map_or(c.text_faint, |pair| pair.ink))
                 .a11y_hidden()
         }))
-        .children(mark_slot(session.mark, kit))
+        .children(
+            pair.is_none()
+                .then(|| mark_slot(session.mark, kit))
+                .flatten(),
+        )
         .on_secondary_press(open_menu(MenuTarget::Row(session.key)))
         .focusable(false)
         .role("listitem")
 }
 
-/// The kit's status mark for a session's mark.
+/// The row of a session that is ready or needs input: filled with its pair over the selected
+/// and the shown fills, its title and folder in the pair's ink, and nothing in a status slot,
+/// the fill saying it. Built from the kit's parts as `SidebarRow::build` builds one, which
+/// draws its title in an ink of its own; unlike the kit's row it has no hover, so the colour
+/// stays as it is under the pointer. Its description says the state as the kit's does.
+///
+/// The fill is all of it: the selected one looks as the others do, with no ring or border of
+/// its own, the tile's coloured bar saying which session it is. The one that holds the
+/// keyboard's focus in the list shows the focus ring every row shows.
+fn coloured_row(session: &Row, selected: bool, pair: Pair, kit: &Kit) -> El {
+    let state = match session.mark {
+        Mark::NeedsYou => "Needs attention",
+        _ => "Unread",
+    };
+    let said: Vec<&str> = [session.folder_label.as_deref(), Some(state)]
+        .into_iter()
+        .flatten()
+        .collect();
+    row()
+        .label(session.title.clone())
+        .description(said.join(", "))
+        .w_full()
+        .h(ROW_HEIGHT)
+        .px(INSET)
+        .gap(6.0)
+        .center_y()
+        .radius(kit.radius.md)
+        .motion(kit.motion.control)
+        .focusable(true)
+        .focus_selected(selected)
+        .fill(pair.fill)
+        .child(
+            text(session.title.clone())
+                .key("label")
+                .font(kit.ty.ui)
+                .color(pair.ink)
+                .truncate()
+                .grow(1.0)
+                .shrink()
+                .a11y_hidden(),
+        )
+        .children(session.folder_label.as_ref().map(|folder| {
+            text(folder.clone())
+                .key("detail")
+                .font(kit.ty.small)
+                .color(pair.ink)
+                .a11y_hidden()
+        }))
+        .on_press_tx(select(session.key))
+        // After the press handler, which would make it a button.
+        .role("listitem")
+}
+
+/// The kit's status mark for a session's mark: its spinner while the session works. A session
+/// that is ready or needs input has a coloured row instead ([`coloured_row`]).
 fn status(mark: Mark) -> Option<RowStatus> {
-    match mark {
-        Mark::None => None,
-        Mark::Working => Some(RowStatus::Busy),
-        Mark::NeedsYou => Some(RowStatus::Attention),
-        Mark::Finished => Some(RowStatus::Unread),
-    }
+    (mark == Mark::Working).then_some(RowStatus::Busy)
 }
 
 /// A group's header: a chevron, its name (or, while it is being renamed, the field), while it
@@ -528,18 +696,17 @@ fn new_session(ui: &mut Ui, tx: &mut Tx, id: &GroupId, side: bool) {
     }
 }
 
-/// The colour of a session's mark, as a row's status slot draws it; none for no mark.
+/// The colour of a session's mark: the kit's spinner colour while it works, the fill of its
+/// pair while it is ready or needs input; none for no mark.
 pub(super) fn mark_color(mark: Mark, kit: &Kit) -> Option<Color> {
-    let c = &kit.c;
     match mark {
-        Mark::None => None,
-        Mark::Working => Some(c.icon_muted),
-        Mark::NeedsYou => Some(c.warning.icon),
-        Mark::Finished => Some(c.bg_accent),
+        Mark::Working => Some(kit.c.icon_muted),
+        _ => theme::pair_of(mark).map(|pair| pair.fill),
     }
 }
 
-/// A header's mark, keyed `mr-mark`, drawn as a row's status slot draws it.
+/// A header's mark, keyed `mr-mark`: the kit's spinner while a session works, else a dot in
+/// the fill of the mark's pair.
 fn mark_slot(mark: Mark, kit: &Kit) -> Option<El> {
     let color = mark_color(mark, kit)?;
     let drawn = match mark {
@@ -649,17 +816,21 @@ pub fn rename_watch(ui: &Ui, layer: &mut Vec<El>) {
 
 /// The sidebar's menu, while one is open, into `layer`: one kit `Menu` placed at the point it
 /// was opened at, with no trigger. A press on the "Hidden groups" line gives no point, so that
-/// menu opens under the line.
+/// menu opens under the line; so do the menus of the Deleted view, however they were opened.
 pub fn menu(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, layer: &mut Vec<El>) {
     let Some(open) = &ui.side_menu else {
         return;
     };
     let at = (open.at.x, open.at.y);
-    let (x, y) = match open.target {
-        MenuTarget::HiddenGroups => cx
-            .window_layout_with("mr-hidden-groups", |r| (r[0], r[1] + r[3]))
-            .unwrap_or(at),
-        _ => at,
+    let under = |key: &str| {
+        cx.window_layout_with(key, |r| (r[0], r[1] + r[3]))
+            .unwrap_or(at)
+    };
+    let (x, y) = match &open.target {
+        MenuTarget::HiddenGroups => under("mr-hidden-groups"),
+        MenuTarget::Deleted(key) => under(&format!("mr-row-{}", key.0)),
+        MenuTarget::DeletedGroup(id) => under(&header_key(id)),
+        MenuTarget::Row(_) | MenuTarget::Group(_) => at,
     };
     let menu = Menu::new(MENU)
         .at(x, y)
@@ -669,6 +840,8 @@ pub fn menu(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, layer: &mut Vec<El>) {
         MenuTarget::Row(key) => row_menu(ui, menu, *key, open.sub_open),
         MenuTarget::Group(id) => group_menu(ui, menu, id),
         MenuTarget::HiddenGroups => hidden_menu(ui, menu),
+        MenuTarget::Deleted(key) => recover_menu(menu, *key),
+        MenuTarget::DeletedGroup(id) => recover_group_menu(menu, id),
     };
     // What it hands back is its trigger's empty wrapper: nothing to draw.
     if let Some(menu) = menu {
@@ -680,8 +853,10 @@ pub fn menu(ui: &Ui, cx: &mut Cx<Ui>, kit: &Kit, layer: &mut Vec<El>) {
 /// sidebar's order and the hidden ones after them, then "New group…"; "Open to the side",
 /// which cannot be chosen while there is no room for a tile or the session is in one already;
 /// "Open below", which opens it under the focused tile and cannot be chosen while the session
-/// is in a tile, no tile is focused or the focused tile's column could not take another; and
-/// "Rename", which edits the session's name in its row.
+/// is in a tile, no tile is focused or the focused tile's column could not take another;
+/// "Rename", which edits the session's name in its row; and, after a separator, "Delete", which
+/// moves it to the Deleted view at once, or asks first when that would cut something off
+/// (`glue::ask_delete_session`).
 fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu> {
     let entry = ui.app.sessions.get(key)?;
     let own = ui.app.groups.group_of(entry);
@@ -745,10 +920,29 @@ fn row_menu(ui: &Ui, menu: Menu, key: SessionKey, sub_open: bool) -> Option<Menu
         chosen(ui);
         start_rename(ui, tx, Renaming::Row(key));
     });
-    Some(menu.item(move_to).item(side).item(below).item(rename))
+    let delete =
+        MenuItem::new("Delete")
+            .danger(true)
+            .on_select_tx(move |ui: &mut Ui, tx: &mut Tx| {
+                chosen(ui);
+                glue::ask_delete_session(ui, tx, key);
+            });
+    Some(
+        menu.item(move_to)
+            .item(side)
+            .item(below)
+            .item(rename)
+            .separator()
+            .item(delete),
+    )
 }
 
-/// A header's menu: "New session", "Rename", "Hide group", "Delete group".
+/// A header's menu: "New session", "Rename", "Hide group"; for a group the user made "Ungroup",
+/// which lets the group go and sends its sessions home; and, after a separator, "Delete group",
+/// which asks before the group and every session of it go to the Deleted view
+/// (`glue::ask_delete_group`), for a group the user made or one that holds a session. It is
+/// greyed out until the full list of sessions is in (`SidebarModel::complete`): before that the
+/// question's count would not be the whole truth.
 fn group_menu(ui: &Ui, menu: Menu, id: &GroupId) -> Option<Menu> {
     let section = ui.app.sidebar.sections.iter().find(|s| s.id == *id)?;
     let new_session = {
@@ -774,22 +968,56 @@ fn group_menu(ui: &Ui, menu: Menu, id: &GroupId) -> Option<Menu> {
             glue::run(ui, effects);
         })
     };
-    let delete = {
+    let mut menu = menu.item(new_session).item(rename).item(hide);
+    if section.custom {
         let id = id.clone();
-        MenuItem::new("Delete group")
+        menu = menu.item(MenuItem::new("Ungroup").on_select(move |ui: &mut Ui| {
+            // A name typed for the group that goes goes with it.
+            if ui.renaming == Some(Renaming::Group(id.clone())) {
+                glue::end_rename(ui, false);
+            }
+            chosen(ui);
+            let effects = ui.app.ungroup(&id);
+            glue::run(ui, effects);
+        }));
+    }
+    if section.custom || !ui.app.sessions_of(id).is_empty() {
+        let id = id.clone();
+        let delete = MenuItem::new("Delete group")
             .danger(true)
-            .disabled(!section.can_delete)
+            .disabled(!ui.app.sidebar.complete)
             .on_select(move |ui: &mut Ui| {
-                // A name typed for the group deleted goes with it.
-                if ui.renaming == Some(Renaming::Group(id.clone())) {
-                    glue::end_rename(ui, false);
-                }
                 chosen(ui);
-                let effects = ui.app.delete_group(&id);
-                glue::run(ui, effects);
-            })
-    };
-    Some(menu.item(new_session).item(rename).item(hide).item(delete))
+                glue::ask_delete_group(ui, id.clone());
+            });
+        menu = menu.separator().item(delete);
+    }
+    Some(menu)
+}
+
+/// The menu of a row in the Deleted view: "Recover", which puts the session back in the list,
+/// and its group with it when that was deleted. The Deleted view still shows.
+fn recover_menu(menu: Menu, key: SessionKey) -> Option<Menu> {
+    Some(
+        menu.item(MenuItem::new("Recover").on_select(move |ui: &mut Ui| {
+            chosen(ui);
+            let effects = ui.app.recover_session(key);
+            glue::run(ui, effects);
+        })),
+    )
+}
+
+/// The menu of a group's header in the Deleted view: "Recover group", which puts the group back
+/// with every deleted session of it. The Deleted view still shows.
+fn recover_group_menu(menu: Menu, id: &GroupId) -> Option<Menu> {
+    let id = id.clone();
+    Some(menu.item(
+        MenuItem::new("Recover group").on_select(move |ui: &mut Ui| {
+            chosen(ui);
+            let effects = ui.app.recover_group(&id);
+            glue::run(ui, effects);
+        }),
+    ))
 }
 
 /// The "Hidden groups" menu: one item per hidden group, which shows it again.
@@ -817,7 +1045,7 @@ mod tests {
     use mr_core::{FromBackend, GroupId, Line, SessionKey};
 
     use super::line_key;
-    use rune::{Key, Mods, PhysicalInput, Runtime};
+    use rune::{Color, Key, Mods, PhysicalInput, Runtime};
 
     use super::super::conversation;
     use crate::demo::{self, RUNE_CLAUDE, SKETCHES};
@@ -856,31 +1084,45 @@ mod tests {
             .collect()
     }
 
-    /// The mark the line keyed `key` shows: "working" (the kit's spinner), "needs you" (a dot in
-    /// the warning colour) or "finished" (a dot in the accent colour), in the kit's status slot
-    /// of a row or the app's `mr-mark` of a header. A dot's colour comes in on a spring: settle
-    /// the window first.
+    /// The mark the line keyed `key` shows: "working" (the kit's spinner in a row's status slot
+    /// or the app's `mr-mark` of a header), "needs you" (orange) or "finished" (green), a row by
+    /// its fill and a header by its mark's dot. A fill comes in on a spring: settle the window
+    /// first.
     fn mark(rt: &Runtime<Ui>, key: &str) -> Option<&'static str> {
-        let kit = theme::kit(true);
         let inside = format!("/{key}/");
         let parts: Vec<_> = rt
             .elements()
             .into_iter()
-            .filter(|e| !e.exiting && e.path.contains(&inside))
-            .filter(|e| e.path.contains("/status-mark/") || e.path.contains("/mr-mark/"))
+            .filter(|e| !e.exiting)
+            .filter(|e| {
+                e.key.as_deref() == Some(key)
+                    || e.path.contains(&inside)
+                        && (e.path.contains("/status-mark/") || e.path.contains("/mr-mark/"))
+            })
             .collect();
         if parts.iter().any(|e| e.role == "progressbar") {
             return Some("working");
         }
         parts.iter().find_map(|e| {
-            if e.fill == kit.c.warning.icon {
+            if e.fill == theme::needs_input().fill {
                 Some("needs you")
-            } else if e.fill == kit.c.bg_accent {
+            } else if e.fill == theme::ready().fill {
                 Some("finished")
             } else {
                 None
             }
         })
+    }
+
+    /// The fill of the line keyed `key`, once the window has settled.
+    fn fill(rt: &mut Runtime<Ui>, key: &str) -> Color {
+        rt.settle_all();
+        testkit::step(rt);
+        rt.elements()
+            .into_iter()
+            .find(|e| !e.exiting && e.key.as_deref() == Some(key))
+            .expect("the line")
+            .fill
     }
 
     fn selected(rt: &Runtime<Ui>, key: &str) -> bool {
@@ -1387,6 +1629,15 @@ mod tests {
     const MENU: &str = "mr-side-menu-menu";
     const SUBMENU: &str = "mr-side-menu-item0-sub-menu";
 
+    /// A row's menu, as it reads.
+    const ROW_MENU: [&str; 5] = [
+        "Move to group",
+        "Open to the side",
+        "Open below",
+        "Rename",
+        "Delete",
+    ];
+
     /// Right-clicks the middle of the element keyed `key`, then steps. Rows that moved are
     /// landed first, so the click hits where `key` is laid out.
     fn right_click(rt: &mut Runtime<Ui>, key: &str) {
@@ -1454,10 +1705,7 @@ mod tests {
             rt.state.side_menu.as_ref().map(|m| m.target.clone()),
             Some(MenuTarget::Row(working))
         );
-        assert_eq!(
-            texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Open below", "Rename"]
-        );
+        assert_eq!(texts_in(&rt, MENU), ROW_MENU);
         let focused = focused_key(&rt).unwrap_or_default();
         assert!(
             focused.starts_with("mr-side-menu"),
@@ -1716,22 +1964,21 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_custom_group_sends_its_sessions_home() {
+    fn ungroup_sends_a_custom_groups_sessions_home() {
         let mut rt = testkit::window("sessions");
         let garden = titled(&rt, GARDEN);
         let side = group_named(&rt, "Side projects");
         right_click(&mut rt, &header_of(&side));
         assert_eq!(
             texts_in(&rt, MENU),
-            ["New session", "Rename", "Hide group", "Delete group"]
+            [
+                "New session",
+                "Rename",
+                "Hide group",
+                "Ungroup",
+                "Delete group"
+            ]
         );
-        let kit = theme::kit(true);
-        let danger = rt
-            .elements()
-            .into_iter()
-            .find(|e| e.path.contains("/mr-side-menu-item3/") && e.text.is_some())
-            .and_then(|e| e.text_color);
-        assert_eq!(danger, Some(kit.c.danger.fg), "in the danger colour");
         testkit::click(&mut rt, "mr-side-menu-item3");
         testkit::step(&mut rt);
         assert!(rt.state.side_menu.is_none());
@@ -1748,37 +1995,6 @@ mod tests {
             [GARDEN],
             "home: no folder label"
         );
-    }
-
-    #[test]
-    fn a_folder_group_with_nothing_to_reset_cannot_be_deleted() {
-        let mut rt = testkit::window("sessions");
-        let header = group(RUNE_CLAUDE);
-        rt.state.prefs.remove(glue::STATE_KEY).unwrap();
-        right_click(&mut rt, &header);
-        let item = |rt: &Runtime<Ui>| {
-            rt.elements()
-                .into_iter()
-                .find(|e| !e.exiting && e.key.as_deref() == Some("mr-side-menu-item3"))
-                .unwrap()
-        };
-        assert!(!item(&rt).focusable, "disabled");
-        testkit::click(&mut rt, "mr-side-menu-item3");
-        testkit::step(&mut rt);
-        assert!(list_texts(&rt).contains(&"rune_claude".to_string()));
-        assert!(!saved(&rt));
-        testkit::press(&mut rt, Key::Escape);
-        testkit::step(&mut rt);
-        // Once it has a name of its own, deleting gives it its folder's name back.
-        header_item(&mut rt, &header, 1);
-        testkit::type_text(&mut rt, "MindRune");
-        testkit::press(&mut rt, Key::Enter);
-        testkit::step(&mut rt);
-        right_click(&mut rt, &header);
-        assert!(item(&rt).focusable, "something to reset");
-        testkit::click(&mut rt, "mr-side-menu-item3");
-        testkit::step(&mut rt);
-        assert_eq!(texts_in(&rt, &header), ["rune_claude"]);
     }
 
     #[test]
@@ -1829,6 +2045,36 @@ mod tests {
         assert_eq!(testkit::focused(&rt), shown);
         assert_eq!(rt.state.app.sessions.len(), count);
         assert_eq!(rt.state.folder_error.as_deref(), Some(gone.as_str()));
+    }
+
+    #[test]
+    fn the_folder_error_goes_by_itself() {
+        let mut rt = testkit::window("sessions");
+        let id = GroupId::Folder(RUNE_CLAUDE.into());
+        let gone = format!("That folder no longer exists: {RUNE_CLAUDE}");
+        let add = format!("mr-group-add-{}", id.key_text());
+        testkit::click(&mut rt, &add);
+        testkit::step(&mut rt);
+        assert!(testkit::has_text(&rt, &gone));
+        // It stays long enough to be read.
+        for _ in 0..6 {
+            rt.frame(1.0);
+        }
+        assert!(testkit::has_text(&rt, &gone), "six seconds on");
+        // A try that fails again starts its time again.
+        testkit::click(&mut rt, &add);
+        for _ in 0..6 {
+            rt.frame(1.0);
+        }
+        assert!(
+            testkit::has_text(&rt, &gone),
+            "six seconds after the second"
+        );
+        for _ in 0..3 {
+            rt.frame(1.0);
+        }
+        assert_eq!(rt.state.folder_error, None, "nothing was done, and it went");
+        assert!(!testkit::has_text(&rt, &gone));
     }
 
     #[test]
@@ -2077,10 +2323,7 @@ mod tests {
     #[test]
     fn the_group_menu_scene_shows_a_rows_submenu_inside_the_window() {
         let rt = testkit::window("group-menu");
-        assert_eq!(
-            texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Open below", "Rename"]
-        );
+        assert_eq!(texts_in(&rt, MENU), ROW_MENU);
         assert_eq!(
             texts_in(&rt, SUBMENU),
             ["sketches", "Side projects", "website", "New group…"]
@@ -2205,10 +2448,7 @@ mod tests {
         let garden = titled(&rt, GARDEN);
         let finished = titled(&rt, FINISHED);
         right_click(&mut rt, &row(finished));
-        assert_eq!(
-            texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Open below", "Rename"]
-        );
+        assert_eq!(texts_in(&rt, MENU), ROW_MENU);
         assert!(enabled(&rt, SIDE_ITEM));
         testkit::click(&mut rt, SIDE_ITEM);
         testkit::step(&mut rt);
@@ -2227,10 +2467,7 @@ mod tests {
         assert!(!rt.state.app.room_for_tile());
         let finished = titled(&rt, FINISHED);
         right_click(&mut rt, &row(finished));
-        assert_eq!(
-            texts_in(&rt, MENU),
-            ["Move to group", "Open to the side", "Open below", "Rename"]
-        );
+        assert_eq!(texts_in(&rt, MENU), ROW_MENU);
         assert!(!enabled(&rt, SIDE_ITEM), "no room");
         testkit::press(&mut rt, Key::Escape);
         testkit::step(&mut rt);
@@ -2297,10 +2534,7 @@ mod tests {
     /// left open.
     fn below_enabled(rt: &mut Runtime<Ui>, key: SessionKey) -> bool {
         right_click(rt, &row(key));
-        assert_eq!(
-            texts_in(rt, MENU),
-            ["Move to group", "Open to the side", "Open below", "Rename"]
-        );
+        assert_eq!(texts_in(rt, MENU), ROW_MENU);
         enabled(rt, BELOW_ITEM)
     }
 
@@ -2491,5 +2725,186 @@ mod tests {
         testkit::step(&mut rt);
         let title = &rt.state.app.sessions.get(resting).unwrap().session.title;
         assert_eq!(title.as_deref(), Some(RESTING), "dropped");
+    }
+
+    #[test]
+    fn orange_wins_on_a_selected_row() {
+        let mut rt = testkit::window("sessions");
+        let asking = row(titled(&rt, NEEDS_YOU));
+        testkit::click(&mut rt, &asking);
+        testkit::step(&mut rt);
+        assert!(selected(&rt, &asking));
+        assert_eq!(fill(&mut rt, &asking), theme::needs_input().fill);
+        // The row it passed back to is selected and grey again.
+        let garden = row(titled(&rt, GARDEN));
+        testkit::click(&mut rt, &garden);
+        testkit::step(&mut rt);
+        assert_eq!(fill(&mut rt, &garden), theme::kit(true).c.pressed);
+        assert_eq!(fill(&mut rt, &asking), theme::needs_input().fill);
+        // Under the pointer it keeps its colour, while a grey row takes the hover.
+        let hovered = |rt: &mut Runtime<Ui>, key: &str| {
+            let (x, y) = testkit::find(rt, key).unwrap();
+            rt.pointer_move(x, y);
+            testkit::step(rt);
+            rt.settle_all();
+            let line = rt
+                .elements()
+                .into_iter()
+                .find(|e| !e.exiting && e.key.as_deref() == Some(key))
+                .unwrap();
+            (line.hover, line.fill)
+        };
+        let grey = row(titled(&rt, WORKING));
+        assert!(
+            hovered(&mut rt, &grey).0 > 0.0,
+            "a grey row takes the hover"
+        );
+        let (hover, colour) = hovered(&mut rt, &asking);
+        assert_eq!(hover, 0.0, "no hover over the colour");
+        assert_eq!(colour, theme::needs_input().fill);
+    }
+
+    /// What is drawn inside the row keyed `key`: the keys of its parts.
+    fn parts(rt: &mut Runtime<Ui>, key: &str) -> Vec<Option<String>> {
+        rt.settle_all();
+        testkit::step(rt);
+        let inside = format!("/{key}/");
+        rt.elements()
+            .into_iter()
+            .filter(|e| !e.exiting && e.path.contains(&inside))
+            .map(|e| e.key)
+            .collect()
+    }
+
+    #[test]
+    fn a_selected_coloured_row_is_its_fill_and_nothing_more() {
+        let mut rt = testkit::window("sessions");
+        let asking = row(titled(&rt, NEEDS_YOU));
+        let resting = parts(&mut rt, &asking);
+        assert!(!resting.is_empty(), "its title is in it");
+
+        // Selected by a press: orange still, with nothing added inside the row.
+        testkit::click(&mut rt, &asking);
+        testkit::step(&mut rt);
+        assert!(selected(&rt, &asking));
+        assert_eq!(fill(&mut rt, &asking), theme::needs_input().fill);
+        assert_eq!(parts(&mut rt, &asking), resting, "no ring, no border");
+
+        // The arrow keys come onto it and select it: the same.
+        let garden = row(titled(&rt, GARDEN));
+        testkit::click(&mut rt, &garden);
+        testkit::step(&mut rt);
+        rt.update(|_, tx| tx.focus(garden.clone(), true));
+        testkit::step(&mut rt);
+        testkit::press(&mut rt, Key::Up);
+        testkit::step(&mut rt);
+        testkit::press(&mut rt, Key::Up);
+        testkit::step(&mut rt);
+        assert_eq!(focused_key(&rt), Some(asking.clone()), "the arrow is on it");
+        assert_eq!(fill(&mut rt, &asking), theme::needs_input().fill);
+        assert_eq!(parts(&mut rt, &asking), resting);
+    }
+
+    #[test]
+    fn delete_group_waits_for_the_full_list() {
+        let mut rt = testkit::window("sessions");
+        let header = group(RUNE_CLAUDE);
+        // A folder group's "Delete group": after "New session", "Rename", "Hide group" and the
+        // separator.
+        let item = |rt: &Runtime<Ui>| {
+            rt.elements()
+                .into_iter()
+                .find(|e| !e.exiting && e.key.as_deref() == Some("mr-side-menu-item4"))
+                .expect("the entry")
+        };
+        // Only the recent sessions are listed yet.
+        let ui = &mut rt.state;
+        ui.app.listed_all = false;
+        glue::run(ui, Vec::new());
+        assert!(!ui.app.sidebar.complete);
+        rt.invalidate();
+        right_click(&mut rt, &header);
+        assert_eq!(
+            texts_in(&rt, MENU),
+            ["New session", "Rename", "Hide group", "Delete group"]
+        );
+        assert!(
+            !item(&rt).focusable,
+            "greyed out until every session is known"
+        );
+        testkit::click(&mut rt, "mr-side-menu-item4");
+        testkit::step(&mut rt);
+        assert_eq!(rt.state.delete_ask, None, "a press asks nothing");
+        // Nor does the question come another way.
+        rt.update(|ui, _| glue::ask_delete_group(ui, GroupId::Folder(RUNE_CLAUDE.into())));
+        assert_eq!(rt.state.delete_ask, None);
+        testkit::press(&mut rt, Key::Escape);
+        testkit::step(&mut rt);
+
+        // The full list is in.
+        let ui = &mut rt.state;
+        ui.side_menu = None;
+        ui.app.listed_all = true;
+        glue::run(ui, Vec::new());
+        assert!(ui.app.sidebar.complete);
+        rt.invalidate();
+        right_click(&mut rt, &header);
+        assert!(item(&rt).focusable);
+        testkit::click(&mut rt, "mr-side-menu-item4");
+        testkit::step(&mut rt);
+        assert_eq!(
+            rt.state.delete_ask,
+            Some(glue::DeleteAsk::Group(GroupId::Folder(RUNE_CLAUDE.into())))
+        );
+    }
+
+    #[test]
+    fn a_collapsed_group_shows_the_strongest_colour() {
+        let mut rt = testkit::window("sessions");
+        let dot = |rt: &mut Runtime<Ui>, header: &str| {
+            rt.settle_all();
+            testkit::step(rt);
+            let inside = format!("/{header}/");
+            rt.elements()
+                .into_iter()
+                .find(|e| !e.exiting && e.path.contains(&inside) && e.path.contains("/mr-mark/"))
+                .map(|e| e.fill)
+        };
+        let header = group(RUNE_CLAUDE);
+        testkit::click(&mut rt, &header);
+        testkit::step(&mut rt);
+        assert_eq!(dot(&mut rt, &header), Some(theme::needs_input().fill));
+        assert_eq!(mark(&rt, &group(SKETCHES)), Some("working"));
+        // A group whose strongest is a ready session shows the green.
+        let resting = titled(&rt, "Fixing the contact form");
+        let ui = &mut rt.state;
+        ui.app.sessions.get_mut(resting).unwrap().unseen = true;
+        glue::run(ui, Vec::new());
+        let website = group(WEBSITE);
+        testkit::click(&mut rt, &website);
+        testkit::step(&mut rt);
+        assert_eq!(dot(&mut rt, &website), Some(theme::ready().fill));
+    }
+
+    #[test]
+    fn the_row_being_renamed_keeps_its_colour() {
+        let mut rt = testkit::window("sessions");
+        for (title, pair) in [
+            (NEEDS_YOU, theme::needs_input()),
+            (FINISHED, theme::ready()),
+        ] {
+            let key = titled(&rt, title);
+            assert_eq!(fill(&mut rt, &row(key)), pair.fill);
+            rename_row(&mut rt, key);
+            assert_eq!(fill(&mut rt, &row(key)), pair.fill, "{title}");
+            let field = rt
+                .elements()
+                .into_iter()
+                .find(|e| !e.exiting && e.key.as_deref() == Some("mr-row-rename"))
+                .expect("the field");
+            assert_eq!(field.text_color, Some(pair.ink));
+            testkit::press(&mut rt, Key::Escape);
+            testkit::step(&mut rt);
+        }
     }
 }

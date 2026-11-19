@@ -13,13 +13,15 @@
 //! `SuggestTitle` the next answer queued with `title_reply`, and a `Rename` is
 //! answered with `TitleChanged`, as the real program answers it. A `SetModel`
 //! or a `SetEffort` is recorded and not answered: a test answers it with `emit`.
+//! `remove_session` records the id and takes the session out of the list given
+//! to `set_sessions`, as the real adapter takes it out of the store.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::agent::{
-    Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, SessionHandle, StartSpec,
-    StoredHistory, StoredSession,
+    Account, Agent, AgentError, Capabilities, EventSink, HistoryItem, Removal, SessionHandle,
+    StartSpec, StoredHistory, StoredSession,
 };
 use crate::command::{ImageData, SessionCommand};
 use crate::event::{
@@ -80,6 +82,10 @@ struct Inner {
     history_reads: usize,
     /// The detail every `read_image` fails with, once a test asked for that.
     image_failure: Option<String>,
+    /// Every id `remove_session` was asked to remove, in order.
+    removed: Vec<SessionId>,
+    /// The detail every `remove_session` fails with, until a test allows removals again.
+    remove_failure: Option<String>,
 }
 
 impl Inner {
@@ -156,6 +162,8 @@ impl FakeAgent {
                 reads_paused: false,
                 history_reads: 0,
                 image_failure: None,
+                removed: Vec::new(),
+                remove_failure: None,
             })),
             resumed: Arc::new(Condvar::new()),
         }
@@ -274,6 +282,23 @@ impl FakeAgent {
     pub fn history_reads(&self) -> usize {
         self.lock().history_reads
     }
+
+    /// Every id `remove_session` was asked to remove, in the order asked, also those it did
+    /// not remove.
+    pub fn removed(&self) -> Vec<SessionId> {
+        self.lock().removed.clone()
+    }
+
+    /// Make every later `remove_session` fail with `AgentError::Io(detail)` and remove
+    /// nothing, until `allow_remove`.
+    pub fn fail_remove(&self, detail: &str) {
+        self.lock().remove_failure = Some(detail.to_string());
+    }
+
+    /// Lets removals work again after `fail_remove`.
+    pub fn allow_remove(&self) {
+        self.lock().remove_failure = None;
+    }
 }
 
 impl Agent for FakeAgent {
@@ -367,6 +392,35 @@ impl Agent for FakeAgent {
             .iter()
             .find(|session| &session.id == id)
             .map(|session| session.last_active_unix))
+    }
+
+    /// Removes the session from the list given to `set_sessions`, and its time set with
+    /// `set_last_active`, unless the time `last_active` gives is later than `unless_after_unix`.
+    /// A session not in the list is `Missing`, and its time set with `set_last_active` goes too.
+    fn remove_session(
+        &self,
+        id: &SessionId,
+        unless_after_unix: i64,
+    ) -> Result<Removal, AgentError> {
+        let mut inner = self.lock();
+        inner.removed.push(id.clone());
+        if let Some(detail) = &inner.remove_failure {
+            return Err(AgentError::Io(detail.clone()));
+        }
+        let Some(at) = inner.sessions.iter().position(|session| &session.id == id) else {
+            inner.last_active.remove(id);
+            return Ok(Removal::Missing);
+        };
+        let last_active = match inner.last_active.get(id) {
+            Some(unix) => *unix,
+            None => Some(inner.sessions[at].last_active_unix),
+        };
+        if last_active.is_some_and(|unix| unix > unless_after_unix) {
+            return Ok(Removal::Changed);
+        }
+        inner.sessions.remove(at);
+        inner.last_active.remove(id);
+        Ok(Removal::Removed)
     }
 
     fn open(&self, spec: StartSpec, sink: EventSink) -> Result<Box<dyn SessionHandle>, AgentError> {
@@ -797,6 +851,96 @@ mod tests {
         fake.set_last_active(&id, Some(900));
         assert_eq!(fake.last_active(&id), Ok(Some(900)));
         assert_eq!(fake.last_active(&SessionId("nope".into())), Ok(None));
+    }
+
+    fn listed(id: &str, last_active_unix: i64) -> StoredSession {
+        StoredSession {
+            id: SessionId(id.into()),
+            folder: "/home/alex/p".into(),
+            title: "T".into(),
+            last_active_unix,
+        }
+    }
+
+    fn listed_ids(fake: &FakeAgent) -> Vec<SessionId> {
+        let sessions = fake.list_sessions(None).unwrap();
+        sessions.into_iter().map(|session| session.id).collect()
+    }
+
+    #[test]
+    fn the_fake_removes_what_it_lists() {
+        let fake = FakeAgent::new();
+        let (s1, s2, nope) = (
+            SessionId("s1".into()),
+            SessionId("s2".into()),
+            SessionId("nope".into()),
+        );
+        fake.set_sessions(vec![listed("s1", 500), listed("s2", 600)]);
+        assert_eq!(fake.remove_session(&s1, 500), Ok(Removal::Removed));
+        assert_eq!(listed_ids(&fake), vec![s2.clone()]);
+        assert_eq!(fake.remove_session(&s1, 500), Ok(Removal::Missing));
+        assert_eq!(fake.remove_session(&nope, 500), Ok(Removal::Missing));
+        assert_eq!(fake.removed(), vec![s1.clone(), s1, nope]);
+    }
+
+    #[test]
+    fn the_fake_leaves_a_session_that_changed() {
+        let fake = FakeAgent::new();
+        let s1 = SessionId("s1".into());
+        fake.set_sessions(vec![listed("s1", 500)]);
+        assert_eq!(fake.remove_session(&s1, 499), Ok(Removal::Changed));
+        assert_eq!(listed_ids(&fake), vec![s1.clone()]);
+        assert_eq!(fake.removed(), vec![s1]);
+    }
+
+    #[test]
+    fn a_failed_removal_removes_nothing() {
+        let fake = FakeAgent::new();
+        let s1 = SessionId("s1".into());
+        fake.set_sessions(vec![listed("s1", 500)]);
+        fake.fail_remove("the disk is full");
+        assert_eq!(
+            fake.remove_session(&s1, 500),
+            Err(AgentError::Io("the disk is full".into()))
+        );
+        assert_eq!(
+            fake.remove_session(&s1, 500),
+            Err(AgentError::Io("the disk is full".into()))
+        );
+        assert_eq!(listed_ids(&fake), vec![s1.clone()]);
+        fake.allow_remove();
+        assert_eq!(fake.remove_session(&s1, 500), Ok(Removal::Removed));
+        assert_eq!(fake.removed(), vec![s1.clone(), s1.clone(), s1]);
+    }
+
+    #[test]
+    fn the_fake_decides_on_the_time_it_says_a_session_was_last_active() {
+        let fake = FakeAgent::new();
+        let s1 = SessionId("s1".into());
+        fake.set_sessions(vec![listed("s1", 500)]);
+        fake.set_last_active(&s1, Some(900));
+        assert_eq!(fake.remove_session(&s1, 500), Ok(Removal::Changed));
+        assert_eq!(listed_ids(&fake), vec![s1.clone()]);
+        assert_eq!(fake.remove_session(&s1, 900), Ok(Removal::Removed));
+    }
+
+    #[test]
+    fn a_removed_session_is_no_longer_last_active() {
+        let fake = FakeAgent::new();
+        let s1 = SessionId("s1".into());
+        fake.set_sessions(vec![listed("s1", 500)]);
+        fake.set_last_active(&s1, Some(400));
+        assert_eq!(fake.remove_session(&s1, 500), Ok(Removal::Removed));
+        assert_eq!(fake.last_active(&s1), Ok(None));
+    }
+
+    #[test]
+    fn a_missing_session_is_no_longer_last_active() {
+        let fake = FakeAgent::new();
+        let s1 = SessionId("s1".into());
+        fake.set_last_active(&s1, Some(400));
+        assert_eq!(fake.remove_session(&s1, 500), Ok(Removal::Missing));
+        assert_eq!(fake.last_active(&s1), Ok(None));
     }
 
     fn started(seen: &Mutex<Vec<SessionEvent>>) -> SessionInfo {

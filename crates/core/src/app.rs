@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use mr_agent::{
     Account, AgentError, Answer, Capabilities, CommandKind, ImageData, LimitWindow, ModelOption,
-    PermissionMode, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec, StoredSession,
-    UsageLimits,
+    PermissionMode, Removal, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec,
+    StoredSession, UsageLimits,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,10 +16,14 @@ use crate::attach::{Chip, ChipState, Prepared, Problem, Source, name_of};
 use crate::backend::FromBackend;
 use crate::conversation::NoticeKind;
 use crate::git::Branch;
-use crate::groups::{GroupId, Groups, Recency, SidebarModel, sidebar_model};
-use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedTile, remember_folder};
+use crate::groups::{
+    GroupId, Groups, Recency, SidebarModel, SidebarView, row_title, sidebar_model,
+};
+use crate::saved::{
+    RECENT_FOLDERS, SAVED_VERSION, Saved, SavedBelow, SavedDeleted, SavedTile, remember_folder,
+};
 use crate::session::{FullImage, HistoryState, Phase, Remote, Session, Undelivered};
-use crate::sessions::{Entry, Mark, Prompt, SessionKey, Sessions};
+use crate::sessions::{Alert, Deleted, Entry, Mark, Prompt, SessionKey, Sessions};
 use crate::tiles::{Column, Place, Put, RowSize, Spot, Tiles, Under};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +78,13 @@ pub const USAGE_RETRY_SECONDS: i64 = 300;
 /// [`Session::stoppable`]): seconds.
 pub const IDLE_SECONDS: i64 = 30 * 60;
 
+/// How long a session stays in the Deleted view before it is removed for good: seconds.
+pub const DELETED_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// How often the tick removes what has been deleted long enough: seconds.
+pub const PURGE_SECONDS: i64 = 60;
+/// How long after a removal failed it is tried again: seconds.
+pub const PURGE_RETRY_SECONDS: i64 = 60 * 60;
+
 /// How long a resting session is out of every tile before it gives its conversation back to
 /// the store (see [`App::let_go`]): seconds.
 pub const LET_GO_SECONDS: i64 = 10 * 60;
@@ -96,6 +107,23 @@ pub enum Leaving {
     ForgetIfEmpty,
     /// It stays, empty or not: the window has text typed in its input box.
     Keep,
+}
+
+/// What deleting a session would do to it ([`App::deleting`]): what the question asked first
+/// has to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Deleting {
+    /// The store has it and nothing would be cut off: it goes to the Deleted view.
+    Kept,
+    /// Its program would be stopped at work: a turn runs, a request waits, a background task
+    /// runs, or Remote Control is on or coming.
+    Stops,
+    /// The store has it and nothing would be stopped, but a message in it that was not sent
+    /// yet would be dropped: one queued, never delivered, or held by a question.
+    DropsMessage,
+    /// The store has nothing of it, so it would be forgotten for good. `holds`: chips or a
+    /// message not sent yet are in it. A draft typed in its box is the window's to know.
+    Forgotten { holds: bool },
 }
 
 /// How the user answered [`Prompt::OpenElsewhere`].
@@ -156,8 +184,27 @@ pub enum Effect {
         message: String,
         index: usize,
     },
+    /// Remove the stored session `id` for good, unless its stored file changed after
+    /// `unless_after_unix`.
+    RemoveStored {
+        id: SessionId,
+        unless_after_unix: i64,
+    },
     /// Write what is kept between runs.
     SaveState(Box<Saved>),
+    /// Tell the desktop that `key`'s session, titled `title`, is ready or needs input; a
+    /// notification about it that is out already is replaced.
+    Notify {
+        key: SessionKey,
+        title: String,
+        alert: Alert,
+    },
+    /// Take back the notification about `key`'s session.
+    Unnotify {
+        key: SessionKey,
+    },
+    /// Take back every notification.
+    UnnotifyAll,
 }
 
 /// What the app was started with.
@@ -189,6 +236,9 @@ pub struct App {
     pub listing: Listing,
     /// The listing of every stored session, not only the recent ones, has been merged.
     pub listed_all: bool,
+    /// A listing of every stored session that held at least one has been merged: only from
+    /// then on is what the store no longer has forgotten (see [`App::listed`]).
+    store_seen: bool,
     /// The newest list of models any program or look gave.
     pub known_models: Vec<ModelOption>,
     pub groups: Groups,
@@ -196,6 +246,8 @@ pub struct App {
     pub sidebar: SidebarModel,
     /// Goes up by one each time [`App::settle`] rebuilds `sidebar`.
     pub sidebar_version: u64,
+    /// The list the sidebar shows. Not saved: a run starts with the sessions.
+    sidebar_view: SidebarView,
     /// The folders new sessions started in, the latest first: at most [`RECENT_FOLDERS`], each
     /// once.
     pub recent_folders: Vec<PathBuf>,
@@ -206,6 +258,8 @@ pub struct App {
     open: u64,
     /// When the recent listing was last asked for; `None` before signing in.
     listed_unix: Option<i64>,
+    /// When the tick last removed what was deleted long enough; `None` before it first did.
+    purged_unix: Option<i64>,
     /// The listing of every stored session was asked for and has not failed.
     all_asked: bool,
     /// The look after the first listing was asked for.
@@ -230,6 +284,9 @@ pub struct App {
     /// From the last run: the names kept for sessions no listing has given yet (see
     /// [`Saved::names`]).
     names: Vec<(SessionId, String)>,
+    /// From the last run: the marks of deleted sessions no listing has given yet (see
+    /// [`Saved::deleted`]).
+    deleted_marks: Vec<SavedDeleted>,
     /// The branch last read for each folder; a folder whose answer was none is not here.
     branches: HashMap<PathBuf, Branch>,
     /// The id of the latest chip. Each chip gets the next, so an id is never reused.
@@ -240,6 +297,13 @@ pub struct App {
     idle_after: i64,
     /// A window shows ([`App::set_window`]).
     window: bool,
+    /// The window has the keyboard ([`App::set_active`]).
+    active: bool,
+    /// Each session's mark as the last [`App::settle`] saw it.
+    marks: HashMap<SessionKey, Mark>,
+    /// The sessions' version and whether the user looked, as the last [`App::settle`] saw
+    /// them: while both hold, no mark changed.
+    alerts_seen: Option<(u64, bool)>,
 }
 
 /// The tiles of the last run, as [`Saved`] had them.
@@ -271,6 +335,8 @@ struct Settled {
     groups: u64,
     placement: u64,
     loading: bool,
+    complete: bool,
+    view: SidebarView,
     recency: Recency,
 }
 
@@ -307,16 +373,19 @@ impl App {
             now_unix,
             listing: Listing::NotAsked,
             listed_all: false,
+            store_seen: false,
             known_models: Vec::new(),
             // Before any `settle`, so no version it has seen is used again.
             groups: Groups::restored(&saved),
             sidebar: SidebarModel::default(),
             sidebar_version: 0,
+            sidebar_view: SidebarView::Sessions,
             recent_folders,
             remote_for_new: saved.remote_for_new,
             launch,
             open: 0,
             listed_unix: None,
+            purged_unix: None,
             all_asked: false,
             looked: false,
             usage_asked_unix: None,
@@ -327,11 +396,15 @@ impl App {
             restored: None,
             closed_by_app: saved.closed_by_app,
             names: saved.names,
+            deleted_marks: saved.deleted,
             branches: HashMap::new(),
             chip: 0,
             closing: false,
             idle_after: IDLE_SECONDS,
             window: true,
+            active: true,
+            marks: HashMap::new(),
+            alerts_seen: None,
         };
         (app, vec![Effect::CheckAccount])
     }
@@ -372,24 +445,50 @@ impl App {
         self.branches.get(&self.sessions.get(key)?.session.folder)
     }
 
-    /// Whether a window shows. While none does, a turn that ends leaves its session unseen also
+    /// Whether a window shows. While none does, a turn that ends leaves its session ready also
     /// in the focused tile, and no look is made for the usage limits; when one shows again the
-    /// focused session counts as seen, and the limits are asked for when that is due (see
-    /// [`App::usage_after_reset`]).
+    /// limits are asked for when that is due (see [`App::usage_after_reset`]). A session ready
+    /// stays so until the user acts on it ([`App::attend`]).
     pub fn set_window(&mut self, shown: bool) -> Vec<Effect> {
         self.window = shown;
-        if !shown {
-            return Vec::new();
-        }
-        if let Some(key) = self.focused()
-            && let Some(mut entry) = self.sessions.get_mut(key)
-        {
-            entry.unseen = false;
-        }
-        if self.screen != Screen::Main {
+        if !shown || self.screen != Screen::Main {
             return Vec::new();
         }
         self.usage_after_reset()
+    }
+
+    /// Whether the window has the keyboard. While it has not, a turn that ends leaves its
+    /// session ready also in the focused tile.
+    pub fn set_active(&mut self, active: bool) -> Vec<Effect> {
+        self.active = active;
+        Vec::new()
+    }
+
+    /// The user is looking at MindRune: a window shows and has the keyboard. Notifications are
+    /// given only while they are not, and taken back when they are ([`App::alerts`]).
+    pub fn looking(&self) -> bool {
+        self.window && self.active
+    }
+
+    /// The user acted on this session: it is no longer ready. A press on its tile or row, the
+    /// keyboard coming to its tile, a message sent or a question answered in it, and the like
+    /// come here ([`App::focus_tile`], [`App::show`], [`App::move_tile`], the session intents),
+    /// and so does typing in its input box. Nothing for a deleted session.
+    pub fn attend(&mut self, key: SessionKey) -> Vec<Effect> {
+        if let Some(mut entry) = self.sessions.get_mut(key)
+            && entry.deleted.is_none()
+        {
+            entry.unseen = false;
+        }
+        Vec::new()
+    }
+
+    /// The user pressed the notification of this session. As a press on its row
+    /// ([`App::show`]): its tile takes the focus, it shows in the focused tile when it is in
+    /// none, the session leaving that tile leaves as `leaving` says, and the user acted on it
+    /// ([`App::attend`]). Nothing for a session that is gone or deleted.
+    pub fn alert_pressed(&mut self, key: SessionKey, leaving: Leaving) -> Vec<Effect> {
+        self.show(key, Place::Focused, leaving)
     }
 
     /// Another idle length for this run; anything under 60 is taken as 60.
@@ -484,7 +583,8 @@ impl App {
     /// program had ended is kept to go again (see [`Session::keep_undelivered`]), also when the
     /// open has ended already: a session that rests is then started again at once. Any other
     /// failure counts only for a session's current open. A refused ask for the usage limits is
-    /// the app's own business: it does not count for the idle stop.
+    /// the app's own business: it does not count for the idle stop. Nothing is kept for a
+    /// deleted session, whatever was refused.
     pub fn send_failed(
         &mut self,
         open: u64,
@@ -503,7 +603,11 @@ impl App {
             let Some(message) = undelivered else {
                 return Vec::new();
             };
-            let Some(mut entry) = self.sessions.by_past_open(open) else {
+            let Some(mut entry) = self
+                .sessions
+                .by_past_open(open)
+                .filter(|entry| entry.deleted.is_none())
+            else {
                 return Vec::new();
             };
             let key = entry.key;
@@ -513,6 +617,9 @@ impl App {
             effects.extend(self.start_undelivered(key));
             return effects;
         };
+        if entry.deleted.is_some() {
+            return Vec::new();
+        }
         entry.last_own_unix = Some(now_unix);
         if !matches!(command, SessionCommand::RefreshUsage) {
             entry.idle_from_unix = Some(now_unix);
@@ -541,20 +648,23 @@ impl App {
         Vec::new()
     }
 
-    /// Applies `event` to the session whose current open is `open`, stamped `now`. A turn that
-    /// ends in a session other than the focused one leaves it unseen, also when it is in a
-    /// tile, and so does one in the focused session while no window shows; one that ends in the
-    /// focused session asks for the branch of its folder. A program that is gone lets go of its
-    /// open; one stopped for idleness ([`App::stop_idle`]) is taken as gone cleanly whatever it
-    /// says, so its session rests with no notice and no mark. When the session then rests with
-    /// a message a program never got, it is started again, unless that program ended before it
-    /// started; and one stopped for idleness whose session wants Remote Control by then is
-    /// started again too. Its conversation stays: only the tick lets one go ([`App::let_go`]).
-    /// What answers the app's own ask for the usage limits does not count for the idle stop. A
-    /// save is asked for when the name kept for the session changed: its id became known, or
-    /// its program confirmed or refused it.
+    /// Applies `event` to the session whose current open is `open`, stamped `now`. A turn that ends
+    /// leaves its session ready (unseen) unless the user is looking ([`App::looking`]) and it is
+    /// the focused one; one that ends in the focused session asks for the branch of its folder. A
+    /// program that is gone lets go of its open; one stopped for idleness ([`App::stop_idle`]) is
+    /// taken as gone cleanly whatever it says, so its session rests with no notice and no mark.
+    /// When the session then rests with a message a program never got, it is started again, unless
+    /// that program ended before it started; and one stopped for idleness whose session wants
+    /// Remote Control by then is started again too. Its conversation stays: only the tick lets one
+    /// go ([`App::let_go`]). A deleted session's program was sent `Close`
+    /// ([`App::delete_session`]): its exit is a clean one too, a change of the store up to
+    /// [`OWN_EXIT_SLACK_SECONDS`] later is this app's own, nothing is started, its conversation
+    /// goes, and the purge rule runs at once ([`App::purge`]), so one whose week is over is
+    /// removed at its exit. What answers the app's own ask for the usage limits does not count
+    /// for the idle stop. A save is asked for when the name kept for the session changed: its id
+    /// became known, or its program confirmed or refused it.
     pub fn event(&mut self, open: u64, event: SessionEvent, now: f64) -> Vec<Effect> {
-        let (now_unix, focused, window) = (self.now_unix, self.focused(), self.window);
+        let (now_unix, focused, looking) = (self.now_unix, self.focused(), self.looking());
         let Some(mut entry) = self.sessions.by_open(open) else {
             return Vec::new();
         };
@@ -620,7 +730,7 @@ impl App {
             .map(|command| Effect::Send { open, command })
             .collect();
         let names_changed = kept.is_some_and(|kept| entry.session.kept_name() != kept);
-        if ends_turn && (focused != Some(entry.key) || !window) {
+        if ends_turn && entry.deleted.is_none() && (focused != Some(entry.key) || !looking) {
             entry.unseen = true;
         }
         if ends_turn && focused == Some(entry.key) {
@@ -634,6 +744,17 @@ impl App {
             entry.stopping = None;
         }
         let key = entry.key;
+        let deleted_gone = gone && entry.deleted.is_some();
+        // A deleted session's program wrote its last as it ended, and its conversation goes.
+        if gone && let Some(deleted) = entry.deleted {
+            entry.deleted = Some(Deleted {
+                seen_unix: deleted.seen_unix.max(now_unix + OWN_EXIT_SLACK_SECONDS),
+                ..deleted
+            });
+            if entry.session.let_go() {
+                effects.push(Effect::DropHistory { key });
+            }
+        }
         let id = if started {
             entry.session.id.clone()
         } else {
@@ -665,6 +786,10 @@ impl App {
         }
         if stopped {
             effects.extend(self.start_for_remote(key));
+        }
+        // Nothing holds its removal back now: after "Delete All" it goes at this exit.
+        if deleted_gone {
+            effects.extend(self.purge());
         }
         effects
     }
@@ -723,14 +848,17 @@ impl App {
             FromBackend::Picture { .. } => Vec::new(),
             // The full image read again is the window's to show; the app keeps nothing of it.
             FromBackend::Image { .. } => Vec::new(),
+            FromBackend::Removed { id, result } => self.removed(&id, result),
         }
     }
 
     /// Merges a listing since `since_unix`: a listing of every stored session is complete. The
     /// first recent listing merged asks for all of them, the tiles open when the last run ended
     /// may open again (see [`App::restore_tiles`]), and the first answer of any kind asks for a
-    /// look when the app looks. A listed session takes the name kept for it from the last run;
-    /// a save is asked for when that changed the names kept.
+    /// look when the app looks. A complete listing that holds no session at all forgets nothing
+    /// of what was kept: no deleted mark, kept name or group place. A listed session takes the name kept for it from the last run,
+    /// and its mark when it was deleted then (see [`App::take_marks`]); a save is asked for
+    /// when that changed the names or the marks kept.
     fn listed(
         &mut self,
         since_unix: Option<i64>,
@@ -741,12 +869,22 @@ impl App {
         match result {
             Ok(listed) => {
                 let names = self.saved_names();
-                self.sessions
-                    .merge_listing(listed, complete, &mut self.names);
-                if complete {
+                let marks = self.saved_deleted();
+                // A complete listing says what the store no longer has, and that is forgotten:
+                // deleted marks, kept names, group places. One that holds no session at all
+                // is not believed for that. A deleted session's file stays in the store for
+                // its week, so with marks waiting an empty store was not really looked at: a
+                // folder that exists with no `projects` in it, as an empty mount point does,
+                // lists as empty. And where the store truly is empty, nothing is lost by
+                // keeping what would have been forgotten until a listing holds a session.
+                let whole = complete && !listed.is_empty();
+                self.sessions.merge_listing(listed, whole, &mut self.names);
+                if whole {
                     // The store has none of the sessions these were kept for.
                     self.names.clear();
+                    self.store_seen = true;
                 }
+                self.take_marks(whole);
                 self.listing = Listing::Done;
                 if complete {
                     self.listed_all = true;
@@ -755,7 +893,7 @@ impl App {
                     effects.push(Effect::ListSessions { since_unix: None });
                 }
                 effects.extend(self.restore_tiles(complete));
-                if self.saved_names() != names {
+                if self.saved_names() != names || self.saved_deleted() != marks {
                     effects.push(self.save_state());
                 }
             }
@@ -773,13 +911,81 @@ impl App {
         effects
     }
 
+    /// Puts each mark kept from the last run on its session once a listing gives it, unless a
+    /// program runs for it here; after the complete listing, a mark whose session the store no
+    /// longer has is dropped. A resting session no tile or start has touched, placed in a deleted
+    /// group, was not known when the group was deleted: it is deleted with it, seen as listed,
+    /// and its own week starts now.
+    /// Then every deleted session whose stored file changed after its [`Deleted::seen_unix`] was
+    /// used again elsewhere: it is recovered, unless its removal is under way, whose own answer
+    /// then says that it changed ([`App::removed`]).
+    fn take_marks(&mut self, complete: bool) {
+        for mark in std::mem::take(&mut self.deleted_marks) {
+            match self.sessions.by_id(&mark.id) {
+                Some(key) => {
+                    if let Some(mut entry) = self.sessions.get_mut(key)
+                        && !entry.live()
+                    {
+                        entry.deleted = Some(Deleted {
+                            at_unix: mark.at_unix,
+                            seen_unix: mark.seen_unix,
+                            failed_unix: None,
+                            removing: false,
+                        });
+                    }
+                }
+                None if !complete => self.deleted_marks.push(mark),
+                None => {}
+            }
+        }
+        let in_deleted_groups: Vec<SessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.deleted.is_none()
+                    && entry.session.phase == Phase::Resting
+                    && !entry.touched
+                    && self
+                        .groups
+                        .deleted_unix(&self.groups.group_of(entry))
+                        .is_some()
+            })
+            .map(|entry| entry.key)
+            .collect();
+        let now_unix = self.now_unix;
+        for key in in_deleted_groups {
+            if let Some(mut entry) = self.sessions.get_mut(key) {
+                entry.deleted = Some(Deleted {
+                    at_unix: now_unix,
+                    seen_unix: entry.last_active_unix,
+                    failed_unix: None,
+                    removing: false,
+                });
+            }
+        }
+        let used_again: Vec<SessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.deleted.is_some_and(|deleted| {
+                    !deleted.removing && entry.last_active_unix > deleted.seen_unix
+                })
+            })
+            .map(|entry| entry.key)
+            .collect();
+        for key in used_again {
+            self.recover(key);
+        }
+    }
+
     /// Opens the tiles that were open when the last run ended, when there is no tile, without
     /// starting a program: once every one's session is known, the lower tiles' too, or once the
     /// complete listing has come, the known ones in their columns with their shares and splits;
-    /// a column of two with one session not known shows the other alone. Each is marked as
-    /// [`App::show`] marks a session. The focus goes to the one focused then when it is among
-    /// them, else to the first column's upper tile, and the branch of its folder is asked for.
-    /// Once it ran, or once anything is in a tile, it is not tried again.
+    /// a column of two with one session not known or deleted shows the other alone. Each is
+    /// marked as [`App::show`] marks a session, but none is attended to: one ready stays so.
+    /// The focus goes to the one focused then when it is among them, else to the first column's
+    /// upper tile, and the branch of its folder is asked for. Once it ran, or once anything is
+    /// in a tile, it is not tried again.
     fn restore_tiles(&mut self, complete: bool) -> Vec<Effect> {
         let Some(waiting) = self.restore.take() else {
             return Vec::new();
@@ -795,17 +1001,22 @@ impl App {
             self.restore = Some(waiting);
             return Vec::new();
         }
+        // A deleted session is shown in no tile.
+        let by_id = |id: &SessionId| {
+            let key = self.sessions.by_id(id)?;
+            self.sessions.get(key)?.deleted.is_none().then_some(key)
+        };
         let known: Vec<Column> = saved
             .iter()
             .filter_map(|tile| {
                 let under = tile.below.as_ref().and_then(|below| {
                     Some(Under {
-                        key: self.sessions.by_id(&below.id)?,
+                        key: by_id(&below.id)?,
                         split: below.split,
                     })
                 });
                 // Of two, one not known leaves the other alone.
-                let (top, under) = match (self.sessions.by_id(&tile.id), under) {
+                let (top, under) = match (by_id(&tile.id), under) {
                     (Some(top), under) => (top, under),
                     (None, Some(under)) => (under.key, None),
                     (None, None) => return None,
@@ -820,7 +1031,7 @@ impl App {
         if known.is_empty() {
             return Vec::new();
         }
-        let focused = waiting.shown.and_then(|id| self.sessions.by_id(&id));
+        let focused = waiting.shown.and_then(|id| by_id(&id));
         self.tiles.restore(known, focused);
         self.restored = self.focused();
         let mut effects: Vec<Effect> = self
@@ -919,16 +1130,24 @@ impl App {
         &self.launch.home
     }
 
-    /// Shows `key`'s session at `place` (see [`Tiles`]): a session already in a tile only has
-    /// its tile focused. The session counts as seen and is offered the models known, and a
-    /// stored history not read yet is asked for, then the branch of its folder. The session
-    /// taken out of its tile, if any, is closed and forgotten when it is empty, unless `leaving`
-    /// says to keep it; one kept keeps its conversation for now (see [`App::let_go`]). Asks to
-    /// save when a tile opened beside the focused one, at a place, or over or under a tile. A
-    /// session shown in the focused tile, the first tile included, is saved with the next change
-    /// that asks.
+    /// Shows `key`'s session at `place` (see [`Tiles`]): a session already in a tile only has its
+    /// tile focused. The user acted on the session ([`App::attend`]), also when it is the focused
+    /// one already; it is offered the models known, and a stored history not read yet is asked for,
+    /// then the branch of its folder. The session taken out of its tile, if any, is closed and
+    /// forgotten when it is empty, unless `leaving` says to keep it; one kept keeps its
+    /// conversation for now (see [`App::let_go`]). Asks to save when a tile opened beside the
+    /// focused one, at a place, or over or under a tile. A session shown in the focused tile, the
+    /// first tile included, is saved with the next change that asks. A deleted session is never
+    /// shown: nothing happens.
     pub fn show(&mut self, key: SessionKey, place: Place, leaving: Leaving) -> Vec<Effect> {
-        if self.focused() == Some(key) || self.sessions.get(key).is_none() {
+        if self.focused() == Some(key) {
+            return self.attend(key);
+        }
+        if self
+            .sessions
+            .get(key)
+            .is_none_or(|entry| entry.deleted.is_some())
+        {
             return Vec::new();
         }
         let put = self.tiles.put(key, place, self.row_size());
@@ -938,10 +1157,11 @@ impl App {
         // Something is in a tile: the last run's tiles no longer open.
         self.restore = None;
         let read = self.mark_shown(key);
-        let mut effects = match (put, leaving) {
+        let mut effects = self.attend(key);
+        effects.extend(match (put, leaving) {
             (Put::Replaced(left), Leaving::ForgetIfEmpty) => self.forget_if_empty(left),
             _ => Vec::new(),
-        };
+        });
         if let Put::Replaced(left) = put {
             self.left_tiles(left);
         }
@@ -953,11 +1173,22 @@ impl App {
         effects
     }
 
-    /// Moves the focus to `key`'s tile, counts its session as seen and asks for the branch of
-    /// its folder. Nothing happens when it is in no tile or its tile has the focus already. Asks
-    /// for no save.
+    /// Moves the focus to `key`'s tile and asks for the branch of its folder; the user acted on
+    /// its session ([`App::attend`]), also when its tile has the focus already. The focus stays
+    /// when it is in no tile. Asks for no save.
     pub fn focus_tile(&mut self, key: SessionKey) -> Vec<Effect> {
-        self.focus(key).into_iter().collect()
+        self.focus(key)
+    }
+
+    /// Moves the focus back to `key`'s tile, as [`App::focus_tile`] does, without counting as
+    /// the user's act: its session stays ready if it is. For the window, which keeps the focus
+    /// on the tile whose text field holds the keyboard after an intent moved it elsewhere.
+    pub fn return_focus(&mut self, key: SessionKey) -> Vec<Effect> {
+        if self.tiles.focus(key) {
+            self.read_branch().into_iter().collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Takes `key`'s tile out of the row; its session leaves as `leaving` says, and one kept keeps
@@ -979,18 +1210,16 @@ impl App {
         effects
     }
 
-    /// Moves `key`'s tile to `spot` (see `Tiles::move_to`); it takes the focus and its session
-    /// counts as seen. Asks for the branch of its folder when the focus came to it, and to save.
-    /// Nothing, and no effect, when nothing moved.
+    /// Moves `key`'s tile to `spot` (see `Tiles::move_to`); it takes the focus and the user
+    /// acted on its session ([`App::attend`]). Asks for the branch of its folder when the focus
+    /// came to it, and to save. Nothing, and no effect, when nothing moved.
     pub fn move_tile(&mut self, key: SessionKey, spot: Spot) -> Vec<Effect> {
         let focused = self.focused();
         if !self.tiles.move_to(key, spot, self.row_size()) {
             return Vec::new();
         }
-        if let Some(mut entry) = self.sessions.get_mut(key) {
-            entry.unseen = false;
-        }
-        let mut effects: Vec<Effect> = self.branch_if_moved(focused).into_iter().collect();
+        let mut effects = self.attend(key);
+        effects.extend(self.branch_if_moved(focused));
         effects.push(self.save_state());
         effects
     }
@@ -1076,10 +1305,23 @@ impl App {
     /// The app is going away, at `now_unix` by the wall clock: its state saved first, then
     /// `Close` for every session whose program has not ended and is not being stopped already
     /// (it was sent one). The state keeps, for every
-    /// session whose program this run ran, that this app closed it then.
+    /// session whose program this run ran, that this app closed it then, and for a deleted
+    /// session whose program has not ended, that a change up to [`OWN_EXIT_SLACK_SECONDS`]
+    /// from now is this app's own.
     pub fn close(&mut self, now_unix: i64) -> Vec<Effect> {
         self.now_unix = now_unix;
         self.closing = true;
+        // A deleted session's program still running may write as it exits.
+        for mut entry in self.sessions.iter_mut() {
+            if entry.live()
+                && let Some(deleted) = entry.deleted
+            {
+                entry.deleted = Some(Deleted {
+                    seen_unix: deleted.seen_unix.max(now_unix + OWN_EXIT_SLACK_SECONDS),
+                    ..deleted
+                });
+            }
+        }
         let mut saved = self.saved();
         let ran = self
             .sessions
@@ -1107,15 +1349,15 @@ impl App {
     /// What is kept between runs, as of now. The widths of the sidebar and the right panel and
     /// whether each shows are the window's: they are left at their defaults.
     ///
-    /// Once the complete listing has been merged, a placement whose session the app does not
-    /// know is left out. Every tile whose session the store has is kept, column by column, one
+    /// Once a complete listing that held a session has been merged, a placement whose session
+    /// the app does not know is left out. Every tile whose session the store has is kept, column by column, one
     /// of two whose mate is not kept as a column of one; and the focused session by its id, or
     /// the first kept column's upper tile when the focused one is not kept;
     /// while the last run's tiles may still open again, they are kept as they were read. Of
     /// the sessions the last run closed, only those it closed recently enough that a change it
     /// made could still look new to the activity check are kept ([`App::close`] adds this
     /// run's). The names no program has confirmed are always
-    /// those the app holds now.
+    /// those the app holds now, and so are the marks of deleted sessions.
     pub fn saved(&self) -> Saved {
         let recent = ELSEWHERE_SECONDS + OWN_EXIT_SLACK_SECONDS;
         let (tiles, shown) = match &self.restore {
@@ -1170,10 +1412,11 @@ impl App {
                 .collect(),
             names: self.saved_names(),
             remote_for_new: self.remote_for_new,
+            deleted: self.saved_deleted(),
             ..Saved::default()
         };
         self.groups.save_into(&mut saved);
-        if self.listed_all {
+        if self.store_seen {
             let known: HashSet<&SessionId> = self
                 .sessions
                 .iter()
@@ -1208,13 +1451,33 @@ impl App {
         names
     }
 
+    /// The marks to keep between runs, by id: every deleted session's that has an id, and those
+    /// kept from the last run for sessions not listed yet.
+    fn saved_deleted(&self) -> Vec<SavedDeleted> {
+        let mut marks: Vec<SavedDeleted> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                let deleted = entry.deleted?;
+                Some(SavedDeleted {
+                    id: entry.session.id.clone()?,
+                    at_unix: deleted.at_unix,
+                    seen_unix: deleted.seen_unix,
+                })
+            })
+            .collect();
+        marks.extend(self.deleted_marks.iter().cloned());
+        marks.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        marks
+    }
+
     /// What a quit would cut off now. A session is working while a turn runs, while a message
     /// waits for a program (queued, undelivered, or held by the question whether to continue a
     /// session open elsewhere), whatever its phase, and while its program runs a background
-    /// task.
+    /// task. A deleted session counts for nothing.
     pub fn busy(&self) -> Busy {
         let mut busy = Busy::default();
-        for entry in self.sessions.iter() {
+        for entry in self.sessions.iter().filter(|entry| entry.deleted.is_none()) {
             let session = &entry.session;
             let working = matches!(session.phase, Phase::Working | Phase::NeedsUser)
                 || session.queued.is_some()
@@ -1227,10 +1490,10 @@ impl App {
         busy
     }
 
-    /// The sessions by their mark (`Entry::mark`).
+    /// The sessions by their mark (`Entry::mark`). A deleted session counts for nothing.
     pub fn standing(&self) -> Standing {
         let mut standing = Standing::default();
-        for entry in self.sessions.iter() {
+        for entry in self.sessions.iter().filter(|entry| entry.deleted.is_none()) {
             match entry.mark() {
                 Mark::Working => standing.working += 1,
                 Mark::NeedsYou => standing.needs_you += 1,
@@ -1248,10 +1511,10 @@ impl App {
 
     /// Starts an ended session's program again: a message its program never got goes to the new
     /// one when it has started. A resting one is woken by a message instead. This and the
-    /// session intents below first focus the session's tile, when it is in one without it, and
-    /// then ask for the branch of its folder.
+    /// session intents below are the user's acts on the session ([`App::attend`]): they first
+    /// focus its tile, when it is in one without it, and then ask for the branch of its folder.
     pub fn restart(&mut self, key: SessionKey) -> Vec<Effect> {
-        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
+        let mut effects = self.focus(key);
         let Some(mut entry) = self.sessions.get_mut(key) else {
             return effects;
         };
@@ -1269,7 +1532,7 @@ impl App {
     /// run, the store is first asked whether another app may have it open. The session's chips
     /// go with the text. Nothing is taken unless [`App::can_send`] holds.
     pub fn submit(&mut self, key: SessionKey, text: &str) -> Vec<Effect> {
-        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
+        let mut effects = self.focus(key);
         if !self.can_send(key, text) {
             return effects;
         }
@@ -1301,16 +1564,21 @@ impl App {
 
     /// Whether `key`'s session takes a message now. An ended one does not, until it is
     /// restarted. Nor does one with a question waiting or whose check in the store runs: the
-    /// message then stays where it was typed. Other sessions are not held up by either.
+    /// message then stays where it was typed. Other sessions are not held up by either. A
+    /// deleted session takes nothing.
     pub fn takes_message(&self, key: SessionKey) -> bool {
         self.sessions.get(key).is_some_and(|entry| {
-            entry.session.takes_messages() && entry.prompt.is_none() && !entry.checking
+            entry.deleted.is_none()
+                && entry.session.takes_messages()
+                && entry.prompt.is_none()
+                && !entry.checking
         })
     }
 
     /// Adds a chip for each source to `key`'s session and asks for each to be read. A session
     /// that does not take a message now takes no chip, and a path it already has a chip for, in
-    /// its input box or in its queued message, is left out.
+    /// its input box or in its queued message, is left out. When a chip was added the user
+    /// acted on the session: it is no longer ready ([`App::attend`]).
     pub fn attach(&mut self, key: SessionKey, sources: Vec<Source>) -> Vec<Effect> {
         if !self.takes_message(key) {
             return Vec::new();
@@ -1342,7 +1610,26 @@ impl App {
                 source,
             });
         }
+        // The user acted on the session only when it took something.
+        if !effects.is_empty() {
+            entry.unseen = false;
+        }
         effects
+    }
+
+    /// Takes the queued message of `key`'s session back for its input box: its text, and its
+    /// chips back on the session ([`Session::take_queued`]). The user acted on the session
+    /// ([`App::attend`]) when there was one. None for a session with nothing queued.
+    pub fn edit_queued(&mut self, key: SessionKey) -> (Vec<Effect>, Option<String>) {
+        let taken = self
+            .sessions
+            .get_mut(key)
+            .and_then(|mut entry| entry.session.take_queued());
+        let effects = match taken {
+            Some(_) => self.attend(key),
+            None => Vec::new(),
+        };
+        (effects, taken)
     }
 
     /// Takes chip `chip` off `key`'s session.
@@ -1394,7 +1681,7 @@ impl App {
     }
 
     pub fn stop(&mut self, key: SessionKey) -> Vec<Effect> {
-        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
+        let mut effects = self.focus(key);
         let command = self
             .sessions
             .get(key)
@@ -1404,7 +1691,7 @@ impl App {
     }
 
     pub fn answer(&mut self, key: SessionKey, id: &RequestId, answer: Answer) -> Vec<Effect> {
-        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
+        let mut effects = self.focus(key);
         let command = self
             .sessions
             .get_mut(key)
@@ -1414,7 +1701,7 @@ impl App {
     }
 
     pub fn choose_model(&mut self, key: SessionKey, option_id: &str) -> Vec<Effect> {
-        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
+        let mut effects = self.focus(key);
         let command = self
             .sessions
             .get_mut(key)
@@ -1435,8 +1722,12 @@ impl App {
     /// Turns Remote Control on or off for `key`'s session (see [`Session::set_remote`]). Turned
     /// on for a resting session whose program this app ran in this run, as one stopped for
     /// idleness, the session is started for it (see [`App::start_for_remote`]); any other
-    /// resting session waits for its next start. The focus does not move.
+    /// resting session waits for its next start. The focus does not move. Nothing for a deleted
+    /// session.
     pub fn set_remote(&mut self, key: SessionKey, on: bool) -> Vec<Effect> {
+        if self.is_deleted(key) {
+            return Vec::new();
+        }
         let command = self
             .sessions
             .get_mut(key)
@@ -1456,7 +1747,7 @@ impl App {
     }
 
     pub fn choose_mode(&mut self, key: SessionKey, mode: PermissionMode) -> Vec<Effect> {
-        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
+        let mut effects = self.focus(key);
         let command = self
             .sessions
             .get_mut(key)
@@ -1469,8 +1760,11 @@ impl App {
     ///
     /// Its program is told when it runs and has started, else the next one is when it starts.
     /// Once the session has an id the name is kept between runs until a program confirms it,
-    /// and a save is asked for. The focus does not move.
+    /// and a save is asked for. The focus does not move. Nothing for a deleted session.
     pub fn rename(&mut self, key: SessionKey, name: &str) -> Vec<Effect> {
+        if self.is_deleted(key) {
+            return Vec::new();
+        }
         let Some(mut entry) = self.sessions.get_mut(key) else {
             return Vec::new();
         };
@@ -1487,8 +1781,10 @@ impl App {
 
     /// Brings the clock up to date and returns what is due: a new listing, a usage refresh, the
     /// history of each session long enough in no tile that may let it go (see [`App::let_go`]:
-    /// nothing else lets one go), and the `Close` of each program idle too long (see
-    /// [`App::stop_idle`]).
+    /// nothing else lets one go), the `Close` of each program idle too long (see
+    /// [`App::stop_idle`]), and once a minute the removal of what was deleted a week ago (see
+    /// [`App::purge`], which also runs when a removal answers and when a deleted session's
+    /// program has gone).
     pub fn tick(&mut self, now_unix: i64) -> Vec<Effect> {
         self.now_unix = now_unix;
         if self.screen != Screen::Main {
@@ -1515,9 +1811,132 @@ impl App {
         {
             effects.push(self.list_recent());
         }
+        if self
+            .purged_unix
+            .is_none_or(|purged| now_unix - purged >= PURGE_SECONDS)
+        {
+            self.purged_unix = Some(now_unix);
+            effects.extend(self.purge());
+        }
         effects.extend(self.usage_after_reset());
         effects.extend(self.stop_idle());
         effects
+    }
+
+    /// Asks to remove for good each deleted session whose week is over, whose program has
+    /// ended, whose removal is not under way and did not fail in the last
+    /// [`PURGE_RETRY_SECONDS`]: unless its stored file changed after [`Deleted::seen_unix`]. A
+    /// deleted group the user made whose week is over loses its record once no session is in
+    /// it any more, after a complete listing that held a session (before it, one not listed
+    /// yet may be), and a save is asked for.
+    fn purge(&mut self) -> Vec<Effect> {
+        let now_unix = self.now_unix;
+        let over = |at_unix: i64| at_unix.saturating_add(DELETED_SECONDS) <= now_unix;
+        let due: Vec<SessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.open.is_none()
+                    && !entry.live()
+                    && entry.deleted.is_some_and(|deleted| {
+                        over(deleted.at_unix)
+                            && !deleted.removing
+                            && deleted
+                                .failed_unix
+                                .is_none_or(|failed| now_unix - failed >= PURGE_RETRY_SECONDS)
+                    })
+            })
+            .map(|entry| entry.key)
+            .collect();
+        let mut effects = Vec::new();
+        for key in due {
+            let Some(mut entry) = self.sessions.get_mut(key) else {
+                continue;
+            };
+            let (Some(deleted), Some(id)) = (entry.deleted, entry.session.id.clone()) else {
+                continue;
+            };
+            entry.deleted = Some(Deleted {
+                removing: true,
+                ..deleted
+            });
+            effects.push(Effect::RemoveStored {
+                id,
+                unless_after_unix: deleted.seen_unix,
+            });
+        }
+        let emptied: Vec<GroupId> = self
+            .groups
+            .deleted()
+            .into_iter()
+            .filter(|group| {
+                self.store_seen
+                    && self.groups.deleted_unix(group).is_some_and(over)
+                    && !self
+                        .sessions
+                        .iter()
+                        .any(|entry| self.groups.group_of(entry) == *group)
+            })
+            .collect();
+        if !emptied.is_empty() {
+            for group in &emptied {
+                self.groups.ungroup(group);
+            }
+            effects.push(self.save_state());
+        }
+        effects
+    }
+
+    /// Takes the answer to the removal of the stored session `id`. Removed, or not in the store
+    /// any more, it is forgotten with its mark, its placement and its kept name, and a save is
+    /// asked for. Changed since it was deleted, it was used again elsewhere: it is recovered.
+    /// A removal that failed leaves it deleted, to be tried again ([`PURGE_RETRY_SECONDS`]).
+    /// An answer for a session whose removal is not under way, or that is no longer known, is
+    /// dropped. Once a session is forgotten the purge rule runs at once ([`App::purge`]), so a
+    /// deleted group it leaves empty goes with it and not a minute later.
+    fn removed(&mut self, id: &SessionId, result: Result<Removal, AgentError>) -> Vec<Effect> {
+        let now_unix = self.now_unix;
+        let Some(key) = self.sessions.by_id(id) else {
+            return Vec::new();
+        };
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return Vec::new();
+        };
+        // Only an answer that is waited for is taken. The user can neither recover nor delete
+        // again a session being removed, so this drops nothing today. It stands for a session
+        // recovered meanwhile, and for one recovered and deleted again, whose answer is that
+        // of the removal before: either may show although its file is gone, since no recent
+        // listing takes it away; the next run's complete listing does (see
+        // `Sessions::merge_listing`).
+        let Some(deleted) = entry.deleted.filter(|deleted| deleted.removing) else {
+            return Vec::new();
+        };
+        match result {
+            Ok(Removal::Removed | Removal::Missing) => {
+                drop(entry);
+                self.sessions.remove(key);
+                self.groups.forget(key, id);
+                self.names.retain(|(named, _)| named != id);
+                self.deleted_marks.retain(|mark| mark.id != *id);
+                let mut effects = self.purge();
+                drop_saves(&mut effects);
+                effects.push(self.save_state());
+                effects
+            }
+            Ok(Removal::Changed) => {
+                drop(entry);
+                self.recover(key);
+                vec![self.save_state()]
+            }
+            Err(_) => {
+                entry.deleted = Some(Deleted {
+                    failed_unix: Some(now_unix),
+                    removing: false,
+                    ..deleted
+                });
+                Vec::new()
+            }
+        }
     }
 
     /// Stops, once, each program that has done nothing for the idle length when the user would
@@ -1568,7 +1987,7 @@ impl App {
         key: SessionKey,
         choice: PromptChoice,
     ) -> (Vec<Effect>, Option<String>) {
-        let mut effects: Vec<Effect> = self.focus(key).into_iter().collect();
+        let mut effects = self.focus(key);
         let now_unix = self.now_unix;
         let Some(mut entry) = self.sessions.get_mut(key) else {
             return (effects, None);
@@ -1638,10 +2057,14 @@ impl App {
     }
 
     /// Takes out every tile whose session is gone, then rebuilds `sidebar` when sessions, groups
-    /// or the tiles' placement (not their widths) changed since the last call. So does the end
-    /// of the first listing, and a clock that moved an entry across the [`RECENT_DAYS`] line.
-    /// Each rebuild puts `sidebar_version` up by one.
-    pub fn settle(&mut self) {
+    /// or the tiles' placement (not their widths) changed since the last call. So do the end of
+    /// the first listing, the complete listing coming in, a change of the view, a clock that
+    /// moved an entry across the [`RECENT_DAYS`] line, and in the Deleted view one that took a
+    /// day off a row's days left.
+    /// Each rebuild puts `sidebar_version` up by one. Gives the notifications due and those to
+    /// take back ([`App::alerts`]): a notification dropped here is never given again.
+    #[must_use]
+    pub fn settle(&mut self) -> Vec<Effect> {
         let gone: Vec<SessionKey> = self
             .tiles
             .keys()
@@ -1651,15 +2074,18 @@ impl App {
         for key in gone {
             self.remove_tile(key);
         }
+        let alerts = self.alerts();
         let loading = self.listing == Listing::Loading;
         if self.settled.is_some_and(|settled| {
             settled.sessions == self.sessions.version()
                 && settled.groups == self.groups.version()
                 && settled.placement == self.tiles.placement()
                 && settled.loading == loading
+                && settled.complete == self.listed_all
+                && settled.view == self.sidebar_view
                 && settled.recency.holds_at(self.now_unix)
         }) {
-            return;
+            return alerts;
         }
         self.sidebar = sidebar_model(
             &self.sessions,
@@ -1667,19 +2093,96 @@ impl App {
             &self.tiles,
             self.now_unix,
             loading,
+            self.sidebar_view,
         );
+        self.sidebar.complete = self.listed_all;
         self.sidebar_version += 1;
         self.settled = Some(Settled {
             sessions: self.sessions.version(),
             groups: self.groups.version(),
             placement: self.tiles.placement(),
             loading,
-            recency: Recency::of(&self.sessions, self.now_unix),
+            complete: self.listed_all,
+            view: self.sidebar_view,
+            recency: Recency::of(&self.sessions, self.now_unix, self.sidebar_view),
         });
+        alerts
+    }
+
+    /// The notifications due and those to take back, from how each session's mark changed
+    /// since the last call. Every change of a mark, whatever made it, is seen here: a mark is
+    /// read from its entry alone, an entry whose mark changed puts the sessions' version up
+    /// (see [`crate::EntryMut`]), and [`App::settle`] follows every change. While the user looks
+    /// ([`App::looking`]) none is due, and those out are all taken back. Otherwise one is due
+    /// for a session whose mark became [`Mark::Finished`] or [`Mark::NeedsYou`], unless one
+    /// saying that is out already, and one is taken back when its session's mark is no longer
+    /// the one it said, or the session is gone. A deleted session has no mark, so it is never
+    /// the subject of one.
+    fn alerts(&mut self) -> Vec<Effect> {
+        let looking = self.looking();
+        let seen = (self.sessions.version(), looking);
+        if self.alerts_seen == Some(seen) {
+            return Vec::new();
+        }
+        self.alerts_seen = Some(seen);
+        let gone = self.sessions.take_unalerted();
+        let sessions = &self.sessions;
+        self.marks.retain(|key, _| sessions.get(*key).is_some());
+        let mut changed = Vec::new();
+        for entry in self.sessions.iter() {
+            let mark = entry.mark();
+            let before = self.marks.insert(entry.key, mark).unwrap_or(Mark::None);
+            let alert = Alert::of(mark);
+            let alerted = if looking {
+                None
+            } else if mark != before && alert.is_some() {
+                alert
+            } else {
+                entry.alerted.filter(|&alerted| Some(alerted) == alert)
+            };
+            if alerted != entry.alerted {
+                changed.push((entry.key, alerted));
+            }
+        }
+        let mut effects = Vec::new();
+        if looking {
+            if !gone.is_empty() || !changed.is_empty() {
+                effects.push(Effect::UnnotifyAll);
+            }
+        } else {
+            effects.extend(gone.into_iter().map(|key| Effect::Unnotify { key }));
+        }
+        for (key, alerted) in changed {
+            let Some(mut entry) = self.sessions.get_mut(key) else {
+                continue;
+            };
+            entry.alerted = alerted;
+            match alerted {
+                Some(alert) => effects.push(Effect::Notify {
+                    key,
+                    title: row_title(&entry),
+                    alert,
+                }),
+                None if !looking => effects.push(Effect::Unnotify { key }),
+                None => {}
+            }
+        }
+        effects
+    }
+
+    /// The list the sidebar shows.
+    pub fn sidebar_view(&self) -> SidebarView {
+        self.sidebar_view
+    }
+
+    /// Shows the sessions, or those deleted. Nothing is saved.
+    pub fn set_sidebar_view(&mut self, view: SidebarView) -> Vec<Effect> {
+        self.sidebar_view = view;
+        Vec::new()
     }
 
     /// [`App::new_session`] in `folder`, and the session focused then placed in `group`. Asks
-    /// once to save, after the placement.
+    /// once to save, after the placement. Nothing in a deleted group.
     pub fn new_session_in(
         &mut self,
         folder: PathBuf,
@@ -1687,6 +2190,9 @@ impl App {
         place: Place,
         leaving: Leaving,
     ) -> Vec<Effect> {
+        if self.groups.deleted_unix(group).is_some() {
+            return Vec::new();
+        }
         let mut effects = self.new_session(folder, place, leaving);
         drop_saves(&mut effects);
         if self.screen == Screen::Main
@@ -1699,8 +2205,11 @@ impl App {
     }
 
     /// Puts `key`'s session in `group`. This and the group intents below that change what is
-    /// kept between runs ask to save.
+    /// kept between runs ask to save. Nothing for a deleted session, or into a deleted group.
     pub fn move_session(&mut self, key: SessionKey, group: &GroupId) -> Vec<Effect> {
+        if self.is_deleted(key) || self.groups.deleted_unix(group).is_some() {
+            return Vec::new();
+        }
         if let Some(entry) = self.sessions.get(key) {
             self.groups.place(entry, group);
         }
@@ -1717,8 +2226,233 @@ impl App {
         (id, vec![self.save_state()])
     }
 
+    /// Deletes every session of the group `id` that is not deleted yet, of any age (see
+    /// [`App::delete_session`]). A group the user made is marked deleted and keeps its record
+    /// and the places of its sessions; a folder's group takes no mark. Asks once to save.
+    ///
+    /// Nothing before the complete listing is in ([`SidebarModel::complete`]): until then the
+    /// app does not know every session of the group, so the count the user was asked about
+    /// would not be the whole truth, and a session of a folder's group listed afterwards would
+    /// stay behind.
     pub fn delete_group(&mut self, id: &GroupId) -> Vec<Effect> {
-        self.groups.delete(id);
+        if !self.listed_all {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        for key in self.sessions_of(id) {
+            effects.extend(self.delete_session(key));
+        }
+        drop_saves(&mut effects);
+        self.groups.set_deleted(id, Some(self.now_unix));
+        effects.push(self.save_state());
+        effects
+    }
+
+    /// A group the user made goes and its sessions go home; a folder's group is reset (see
+    /// [`Groups::ungroup`]). Nothing for a folder's group that has nothing to reset.
+    pub fn ungroup(&mut self, id: &GroupId) -> Vec<Effect> {
+        if !self.groups.has_anything(id) {
+            return Vec::new();
+        }
+        self.groups.ungroup(id);
+        vec![self.save_state()]
+    }
+
+    /// What deleting would cut off: sessions with a turn running, a request waiting, a
+    /// background task running, Remote Control on or coming, or a message queued, undelivered
+    /// or held by a question.
+    pub fn in_flight(&self, keys: &[SessionKey]) -> usize {
+        keys.iter()
+            .filter_map(|key| self.sessions.get(*key))
+            .filter(|entry| stops(entry) || unsent(entry))
+            .count()
+    }
+
+    /// What deleting `key`'s session would do to it now, as [`App::delete_session`] does it.
+    /// None for a session that is deleted or not known.
+    pub fn deleting(&self, key: SessionKey) -> Option<Deleting> {
+        let entry = self.sessions.get(key).filter(|e| e.deleted.is_none())?;
+        Some(if forgotten_by_delete(entry) {
+            Deleting::Forgotten {
+                holds: unsent(entry) || !entry.session.chips.is_empty(),
+            }
+        } else if stops(entry) {
+            Deleting::Stops
+        } else if unsent(entry) {
+            Deleting::DropsMessage
+        } else {
+            Deleting::Kept
+        })
+    }
+
+    /// The title the row of `key`'s session shows.
+    pub fn title_of(&self, key: SessionKey) -> Option<String> {
+        self.sessions.get(key).map(row_title)
+    }
+
+    /// Every session of the group `group` that is not deleted, also those listed only on
+    /// request for their age.
+    pub fn sessions_of(&self, group: &GroupId) -> Vec<SessionKey> {
+        self.sessions
+            .iter()
+            .filter(|entry| entry.deleted.is_none() && self.groups.group_of(entry) == *group)
+            .map(|entry| entry.key)
+            .collect()
+    }
+
+    /// Moves `key`'s session to the Deleted view, and asks to save. Its tile closes. A session
+    /// the store has nothing of is forgotten instead, as an empty one is, its program closed if
+    /// it runs. Otherwise its queued and undelivered messages go with their chips, its program
+    /// is sent `Close` once, one that ended rests, its question, check and mark are cleared, it
+    /// no longer wants Remote Control, and its conversation is given back to the store as
+    /// [`App::let_go`] gives it, or when its program has ended. Nothing for a deleted session.
+    pub fn delete_session(&mut self, key: SessionKey) -> Vec<Effect> {
+        if self
+            .sessions
+            .get(key)
+            .is_none_or(|entry| entry.deleted.is_some())
+        {
+            return Vec::new();
+        }
+        let focused = self.focused();
+        self.remove_tile(key);
+        let mut effects: Vec<Effect> = self.branch_if_moved(focused).into_iter().collect();
+        let now_unix = self.now_unix;
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return effects;
+        };
+        if forgotten_by_delete(&entry) {
+            drop(entry);
+            if let Some(entry) = self.sessions.remove(key)
+                && entry.live()
+                && let Some(open) = entry.open
+            {
+                effects.push(Effect::Send {
+                    open,
+                    command: SessionCommand::Close,
+                });
+            }
+            effects.push(self.save_state());
+            return effects;
+        }
+        entry.session.queued = None;
+        entry.session.undelivered.clear();
+        // Woken while the store was asked about it, so no program was opened yet, or ended: a
+        // deleted session rests, and so lets its conversation go.
+        if entry.open.is_none()
+            && matches!(entry.session.phase, Phase::Opening | Phase::Ended { .. })
+        {
+            entry.session.phase = Phase::Resting;
+        }
+        let runs = entry.live();
+        if let Some(open) = entry.open
+            && runs
+            && entry.stopping != Some(open)
+        {
+            entry.stopping = Some(open);
+            effects.push(Effect::Send {
+                open,
+                command: SessionCommand::Close,
+            });
+        }
+        entry.unseen = false;
+        entry.prompt = None;
+        entry.checking = false;
+        entry.session.remote_wanted = false;
+        // What its own program wrote, also as it ended, is this app's own doing.
+        let own_exit = entry
+            .last_own_unix
+            .map_or(i64::MIN, |unix| unix + OWN_EXIT_SLACK_SECONDS);
+        let closed = if runs { now_unix } else { i64::MIN };
+        let seen_unix = entry.last_active_unix.max(own_exit).max(closed);
+        entry.deleted = Some(Deleted {
+            at_unix: now_unix,
+            seen_unix,
+            failed_unix: None,
+            removing: false,
+        });
+        if entry.session.let_go() {
+            effects.push(Effect::DropHistory { key });
+        }
+        drop(entry);
+        effects.push(self.save_state());
+        effects
+    }
+
+    /// Removes everything in the Deleted view for good, whatever its age.
+    ///
+    /// The week of every deleted session and of every deleted group the user made ends now, a
+    /// removal that failed is tried again, and what is due goes at once, without waiting for
+    /// the tick (see [`App::purge`]); a session whose program has not ended yet goes when it
+    /// has ([`App::event`]). It does not reach the marks still waiting for sessions no listing
+    /// has given yet: such a session keeps the week it had. Asks once to save; nothing when
+    /// nothing is deleted.
+    pub fn delete_all(&mut self) -> Vec<Effect> {
+        let ended = self.now_unix.saturating_sub(DELETED_SECONDS);
+        let keys: Vec<SessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.deleted.is_some())
+            .map(|entry| entry.key)
+            .collect();
+        let groups = self.groups.deleted();
+        if keys.is_empty() && groups.is_empty() {
+            return Vec::new();
+        }
+        for key in keys {
+            if let Some(mut entry) = self.sessions.get_mut(key)
+                && let Some(deleted) = entry.deleted
+            {
+                entry.deleted = Some(Deleted {
+                    at_unix: ended,
+                    failed_unix: None,
+                    ..deleted
+                });
+            }
+        }
+        for group in &groups {
+            self.groups.set_deleted(group, Some(ended));
+        }
+        let mut effects = self.purge();
+        drop_saves(&mut effects);
+        effects.push(self.save_state());
+        effects
+    }
+
+    /// Takes `key`'s session out of the Deleted view, and its group too when that is deleted.
+    /// Asks to save; nothing when it is not deleted, and nothing while its removal is under way
+    /// ([`Deleted::removing`]): its file may be going, also under a program started for it.
+    pub fn recover_session(&mut self, key: SessionKey) -> Vec<Effect> {
+        if self.being_removed(key) {
+            return Vec::new();
+        }
+        if self.recover(key) {
+            vec![self.save_state()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Takes the group `id` out of the Deleted view, with every deleted session in it, also
+    /// those placed in it that no listing has given yet: their marks go. A session whose
+    /// removal is under way stays deleted (see [`App::recover_session`]). Asks to save.
+    pub fn recover_group(&mut self, id: &GroupId) -> Vec<Effect> {
+        self.groups.set_deleted(id, None);
+        let groups = &self.groups;
+        self.deleted_marks
+            .retain(|mark| groups.placement(&mark.id) != Some(id));
+        let deleted: Vec<SessionKey> = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry.deleted.is_some_and(|deleted| !deleted.removing)
+                    && self.groups.group_of(entry) == *id
+            })
+            .map(|entry| entry.key)
+            .collect();
+        for key in deleted {
+            self.recover(key);
+        }
         vec![self.save_state()]
     }
 
@@ -1756,20 +2490,62 @@ impl App {
         vec![Effect::SaveWidth(width)]
     }
 
+    /// [`App::recover_session`] with no save. True when it was deleted. It comes back with no
+    /// mark. Also for a session being removed: the removal's own answer that it changed comes
+    /// here ([`App::removed`]), so the user's intents and the listing refuse such a session
+    /// themselves.
+    fn recover(&mut self, key: SessionKey) -> bool {
+        let Some(mut entry) = self.sessions.get_mut(key) else {
+            return false;
+        };
+        if entry.deleted.take().is_none() {
+            return false;
+        }
+        entry.unseen = false;
+        drop(entry);
+        if let Some(entry) = self.sessions.get(key) {
+            let group = self.groups.group_of(entry);
+            if self.groups.deleted_unix(&group).is_some() {
+                self.groups.set_deleted(&group, None);
+            }
+        }
+        true
+    }
+
+    fn is_deleted(&self, key: SessionKey) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|entry| entry.deleted.is_some())
+    }
+
+    /// The removal of `key`'s session was asked for and has not answered.
+    fn being_removed(&self, key: SessionKey) -> bool {
+        self.sessions
+            .get(key)
+            .and_then(|entry| entry.deleted)
+            .is_some_and(|deleted| deleted.removing)
+    }
+
     /// Asks to write what is kept between runs, as it is now.
     fn save_state(&self) -> Effect {
         Effect::SaveState(Box::new(self.saved()))
     }
 
-    /// Starts a program for `key`'s session, under the next open's number.
+    /// Starts a program for `key`'s session, under the next open's number. Every start but a
+    /// copy's comes here. A deleted session is never started: one its caller made ready to start
+    /// rests again.
     fn start(&mut self, key: SessionKey) -> Vec<Effect> {
-        let Some(spec) = self
-            .sessions
-            .get(key)
-            .map(|entry| entry.session.start_spec())
-        else {
+        let Some(mut entry) = self.sessions.get_mut(key) else {
             return Vec::new();
         };
+        if entry.deleted.is_some() {
+            if entry.open.is_none() && entry.session.phase == Phase::Opening {
+                entry.session.phase = Phase::Resting;
+            }
+            return Vec::new();
+        }
+        let spec = entry.session.start_spec();
+        drop(entry);
         self.start_with(key, spec)
     }
 
@@ -1779,7 +2555,7 @@ impl App {
     /// notice, marked as a program that died out of sight is, and [`App::restart`] delivers the
     /// message.
     fn start_undelivered(&mut self, key: SessionKey) -> Vec<Effect> {
-        let (focused, window) = (self.focused(), self.window);
+        let (focused, looking) = (self.focused(), self.looking());
         let Some(mut entry) = self.sessions.get_mut(key) else {
             return Vec::new();
         };
@@ -1790,7 +2566,7 @@ impl App {
             return Vec::new();
         }
         if !entry.session.reopen_for_undelivered() {
-            if focused != Some(key) || !window {
+            if entry.deleted.is_none() && (focused != Some(key) || !looking) {
                 entry.unseen = true;
             }
             return Vec::new();
@@ -1828,6 +2604,9 @@ impl App {
         let Some(mut entry) = self.sessions.get_mut(key) else {
             return Vec::new();
         };
+        // Every caller starts a session whose last program has ended: a second open while one
+        // runs would take its events for stale ones.
+        debug_assert!(entry.open.is_none(), "a program already runs for it");
         self.open += 1;
         entry.open = Some(self.open);
         entry.touched = true;
@@ -1927,12 +2706,11 @@ impl App {
         self.known_models = models;
     }
 
-    /// Marks `key`'s session as one put in a tile: it counts as seen, is no longer out of every
-    /// tile, and is offered the models known. Its stored history, when not read yet, is asked
-    /// for.
+    /// Marks `key`'s session as one put in a tile: it is no longer out of every tile, and is
+    /// offered the models known. Its stored history, when not read yet, is asked for. Whether
+    /// it is ready is left as it is: the user's own act clears that ([`App::attend`]).
     fn mark_shown(&mut self, key: SessionKey) -> Option<Effect> {
         let mut entry = self.sessions.get_mut(key)?;
-        entry.unseen = false;
         entry.touched = true;
         entry.hidden_unix = None;
         if !self.known_models.is_empty() {
@@ -1941,16 +2719,14 @@ impl App {
         read_history(&mut entry)
     }
 
-    /// Moves the focus to `key`'s tile, when it is in one without it, and counts its session as
-    /// seen. Asks for the branch of its folder when the focus moved.
-    fn focus(&mut self, key: SessionKey) -> Option<Effect> {
-        if !self.tiles.focus(key) {
-            return None;
+    /// The user acted on `key`'s session ([`App::attend`]); the focus moves to its tile, when
+    /// it is in one without it, and the branch of its folder is asked for when the focus moved.
+    fn focus(&mut self, key: SessionKey) -> Vec<Effect> {
+        let mut effects = self.attend(key);
+        if self.tiles.focus(key) {
+            effects.extend(self.read_branch());
         }
-        if let Some(mut entry) = self.sessions.get_mut(key) {
-            entry.unseen = false;
-        }
-        self.read_branch()
+        effects
     }
 
     /// Asks for the branch of the focused session's folder.
@@ -1966,18 +2742,13 @@ impl App {
             .flatten()
     }
 
-    /// Takes `key`'s tile out of the row and counts the session whose tile takes the focus as
-    /// seen. True when there was such a tile.
+    /// Takes `key`'s tile out of the row. The session whose tile takes the focus stays ready if
+    /// it is: the user did not act on it. True when there was such a tile.
     fn remove_tile(&mut self, key: SessionKey) -> bool {
         if !self.tiles.remove(key) {
             return false;
         }
         self.left_tiles(key);
-        if let Some(focused) = self.focused()
-            && let Some(mut entry) = self.sessions.get_mut(focused)
-        {
-            entry.unseen = false;
-        }
         true
     }
 
@@ -2039,13 +2810,18 @@ impl App {
         Some(Effect::DropHistory { key })
     }
 
-    /// The commands for `key`'s session, sent to its current open.
+    /// The commands for `key`'s session, sent to its current open. None to a deleted session.
     fn send(
         &self,
         key: SessionKey,
         commands: impl IntoIterator<Item = SessionCommand>,
     ) -> Vec<Effect> {
-        let Some(open) = self.sessions.get(key).and_then(|entry| entry.open) else {
+        let Some(open) = self
+            .sessions
+            .get(key)
+            .filter(|entry| entry.deleted.is_none())
+            .and_then(|entry| entry.open)
+        else {
             return Vec::new();
         };
         commands
@@ -2076,9 +2852,9 @@ fn drop_saves(effects: &mut Vec<Effect>) -> bool {
     effects.len() != before
 }
 
-/// `entry`'s stored history, asked for when it has not been read yet.
+/// `entry`'s stored history, asked for when it has not been read yet. Never a deleted one's.
 fn read_history(entry: &mut Entry) -> Option<Effect> {
-    if entry.session.history != HistoryState::NotLoaded {
+    if entry.deleted.is_some() || entry.session.history != HistoryState::NotLoaded {
         return None;
     }
     let id = entry.session.id.clone()?;
@@ -2089,6 +2865,28 @@ fn read_history(entry: &mut Entry) -> Option<Effect> {
         id,
         max_items: HISTORY_ITEMS,
     })
+}
+
+/// Deleting stops `entry`'s program at work: a turn runs, a request waits, a background task
+/// runs, or Remote Control is on or coming.
+fn stops(entry: &Entry) -> bool {
+    let session = &entry.session;
+    matches!(session.phase, Phase::Working | Phase::NeedsUser)
+        || session.background > 0
+        || session.remote != Remote::Off
+}
+
+/// `entry` holds a message that was not sent yet: queued, never delivered, or held by a
+/// question.
+fn unsent(entry: &Entry) -> bool {
+    entry.session.queued.is_some()
+        || !entry.session.undelivered.is_empty()
+        || entry.prompt.is_some()
+}
+
+/// The store has nothing of `entry`'s session, so deleting it forgets it.
+fn forgotten_by_delete(entry: &Entry) -> bool {
+    entry.session.id.is_none() || !entry.session.is_stored()
 }
 
 /// Nothing was handed over in it, nothing waits to be and nothing is attached: the agent stores
@@ -2111,7 +2909,7 @@ mod tests {
     use crate::attach::Kind as AttachKind;
     use crate::conversation::ItemBody;
     use crate::groups::Group;
-    use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, SavedBelow, SavedTile};
+    use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, SavedBelow, SavedDeleted, SavedTile};
     use crate::session::testing::info;
     use crate::sessions::Mark;
 
@@ -3518,7 +4316,7 @@ mod tests {
     #[test]
     fn switching_remote_control_sends_to_that_session_only() {
         let (mut app, a, b) = two_tiles();
-        app.settle();
+        let _ = app.settle();
         let (before, sidebar) = (session(&app, a).clone(), app.sidebar_version);
         assert_eq!(
             app.set_remote(b, true),
@@ -3540,7 +4338,7 @@ mod tests {
             SessionEvent::RemoteAccess(RemoteAccess::Starting),
             0.0,
         );
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, sidebar, "no sidebar row shows it");
         assert_eq!(app.set_remote(SessionKey(99), true), vec![]);
     }
@@ -3631,7 +4429,7 @@ mod tests {
         assert_eq!(effects, vec![save(&app)], "no Close");
         assert_eq!((tile_keys(&app), app.focused()), (vec![a], Some(a)));
         assert_eq!(session(&app, b).phase, Phase::Working);
-        app.settle();
+        let _ = app.settle();
         assert!(!row_of(&app, b).shown && row_of(&app, a).shown);
         assert_eq!(app.close_tile(b, Leaving::ForgetIfEmpty), vec![], "no tile");
     }
@@ -3682,7 +4480,7 @@ mod tests {
         app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
         assert_eq!(tile_keys(&app).len(), 2);
         app.open_failed(2, AgentError::NotInstalled);
-        app.settle();
+        let _ = app.settle();
         assert_eq!((tile_keys(&app), app.focused()), (vec![a], Some(a)));
     }
 
@@ -3716,12 +4514,12 @@ mod tests {
     fn a_session_gone_from_the_store_leaves_its_tile() {
         let (mut app, a, b) = two_tiles();
         app.sessions.remove(b);
-        app.settle();
+        let _ = app.settle();
         assert_eq!((tile_keys(&app), app.focused()), (vec![a], Some(a)));
 
         let (mut app, a, b) = two_tiles();
         app.sessions.remove(a);
-        app.settle();
+        let _ = app.settle();
         assert_eq!((tile_keys(&app), app.focused()), (vec![b], Some(b)));
     }
 
@@ -3747,16 +4545,16 @@ mod tests {
     #[test]
     fn the_sidebar_is_rebuilt_when_the_focus_moves() {
         let (mut app, a, b) = two_tiles();
-        app.settle();
+        let _ = app.settle();
         let version = app.sidebar_version;
         assert!(row_of(&app, a).focused && !row_of(&app, b).focused);
         app.focus_tile(b);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 1);
         assert!(!row_of(&app, a).focused && row_of(&app, b).focused);
         assert!(row_of(&app, a).shown && row_of(&app, b).shown);
         app.focus_tile(b);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 1, "it had the focus");
     }
 
@@ -3909,15 +4707,15 @@ mod tests {
     fn resizing_a_tile_does_not_rebuild_the_sidebar() {
         let (mut app, a, b) = two_tiles();
         app.set_row_width(1500.0);
-        app.settle();
+        let _ = app.settle();
         let version = app.sidebar_version;
         app.resize_tile(a, 900.0);
-        app.settle();
+        let _ = app.settle();
         app.even_tiles();
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version);
         app.focus_tile(b);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 1);
     }
 
@@ -4135,7 +4933,7 @@ mod tests {
             (tile_columns(&app), app.focused()),
             (vec![vec![a], vec![b]], Some(a))
         );
-        assert_ne!(mark(&app, a), Mark::Finished, "it counts as seen");
+        assert_eq!(mark(&app, a), Mark::Finished, "the user did not act on it");
     }
 
     #[test]
@@ -4347,7 +5145,10 @@ mod tests {
         let (untouched, touched) = (by_id(&app, "a1"), by_id(&app, "a2"));
         app.show(touched, Place::Focused, Leaving::ForgetIfEmpty);
         let live = busy(&mut app, "/a");
-        listing(&mut app, None, vec![]);
+        // The store still has another session: a complete listing with none at all is not
+        // believed (see `an_empty_full_listing_forgets_no_deletion`).
+        let other = store("z9", "Sort the notes", "/home/alex/notes", NOW - 30);
+        listing(&mut app, None, vec![other]);
         assert!(app.sessions.get(untouched).is_none());
         assert!(app.sessions.get(touched).is_some());
         assert!(app.sessions.get(live).is_some());
@@ -4625,7 +5426,7 @@ mod tests {
         app.show(other, Place::Focused, Leaving::ForgetIfEmpty);
         let project = GroupId::Folder("/home/alex/project".into());
         app.collapse_group(&project, true);
-        app.settle();
+        let _ = app.settle();
         let version = app.sidebar_version;
         app.receive(
             FromBackend::Activity {
@@ -4635,7 +5436,7 @@ mod tests {
             0.0,
         );
         assert_eq!(mark(&app, key), Mark::NeedsYou);
-        app.settle();
+        let _ = app.settle();
         assert!(app.sidebar_version > version, "the sidebar is rebuilt");
         let section = app
             .sidebar
@@ -4649,7 +5450,7 @@ mod tests {
             "the collapsed header shows it"
         );
         app.hide_group(&project, true);
-        app.settle();
+        let _ = app.settle();
         assert!(
             app.sidebar
                 .sections
@@ -4659,7 +5460,7 @@ mod tests {
         );
         app.answer_prompt(key, PromptChoice::Cancel);
         assert_eq!(mark(&app, key), Mark::None);
-        app.settle();
+        let _ = app.settle();
         assert!(
             !app.sidebar
                 .sections
@@ -5008,45 +5809,45 @@ mod tests {
     fn settle_rebuilds_only_after_a_change() {
         let (mut app, key) = ready();
         app.submit(key, "go");
-        app.settle();
+        let _ = app.settle();
         let (version, model) = (app.sidebar_version, app.sidebar.clone());
         assert_eq!(app.sidebar.sections.len(), 1);
         assert_eq!(app.sidebar.sections[0].mark, Mark::Working);
         assert!(app.sidebar.loading, "the first listing is on its way");
-        app.settle();
+        let _ = app.settle();
         assert_eq!((app.sidebar_version, &app.sidebar), (version, &model));
         app.now_unix += 60;
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version, "no entry crossed the line");
 
         app.event(1, permission("r1"), 0.0);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 1);
         assert_ne!(app.sidebar, model);
         assert_eq!(app.sidebar.sections[0].mark, Mark::NeedsYou);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 1);
 
         let notes = store("b1", "Tidy the notes", "/home/alex/notes", NOW - 29 * DAY);
         listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![notes]);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 2);
         assert!(!app.sidebar.loading);
         assert_eq!(app.sidebar.sections.len(), 2);
 
         app.now_unix = NOW + 2 * DAY;
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 3, "b1 is old now");
         assert_eq!(app.sidebar.sections.len(), 1);
         assert_eq!(app.sidebar.older_groups, 1);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 3);
 
         app.toggle_older_groups();
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 4, "a group changed");
         app.show(by_id(&app, "b1"), Place::Focused, Leaving::ForgetIfEmpty);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 5, "another session is shown");
         let rows = (&app.sidebar.sections[0].rows, &app.sidebar.sections[1].rows);
         assert_eq!((rows.0[0].key, rows.0[0].shown), (key, false));
@@ -5074,7 +5875,7 @@ mod tests {
             ]
         );
         let key = app.focused().unwrap();
-        app.settle();
+        let _ = app.settle();
         let section = &app.sidebar.sections[0];
         assert_eq!(section.id, side);
         assert_eq!(section.rows.len(), 1);
@@ -5118,15 +5919,15 @@ mod tests {
     fn the_group_intents_change_the_sidebar() {
         let (mut app, key) = shows_stored();
         let home = GroupId::Folder("/home/alex/project".into());
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar.sections[0].name, "project");
         assert_eq!(app.rename_group(&home, "Parser"), vec![save(&app)]);
         assert_eq!(app.collapse_group(&home, true), vec![save(&app)]);
-        app.settle();
+        let _ = app.settle();
         let section = &app.sidebar.sections[0];
         assert_eq!((section.name.as_str(), section.collapsed), ("Parser", true));
-        assert_eq!(app.delete_group(&home), vec![save(&app)]);
-        app.settle();
+        assert_eq!(app.ungroup(&home), vec![save(&app)]);
+        let _ = app.settle();
         let section = &app.sidebar.sections[0];
         assert_eq!(
             (section.name.as_str(), section.collapsed),
@@ -5136,7 +5937,7 @@ mod tests {
         let (side, _) = app.new_group("Side projects");
         app.move_session(key, &side);
         assert_eq!(app.hide_group(&side, true), vec![save(&app)]);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(
             app.sidebar.sections[0].id, side,
             "the shown session keeps it listed"
@@ -5146,7 +5947,7 @@ mod tests {
             Place::Focused,
             Leaving::ForgetIfEmpty,
         );
-        app.settle();
+        let _ = app.settle();
         assert_eq!(
             app.sidebar.hidden,
             vec![(side.clone(), "Side projects".to_string())]
@@ -5154,7 +5955,7 @@ mod tests {
         assert_eq!(app.hide_group(&side, false), vec![save(&app)]);
         assert_eq!(app.show_older(&side), vec![]);
         assert_eq!(app.toggle_older_groups(), vec![]);
-        app.settle();
+        let _ = app.settle();
         assert!(app.sidebar.older_groups_open);
         assert!(app.sidebar.hidden.is_empty());
     }
@@ -5163,7 +5964,7 @@ mod tests {
     fn streamed_text_rebuilds_nothing() {
         let (mut app, key) = ready();
         app.submit(key, "go");
-        app.settle();
+        let _ = app.settle();
         let version = app.sidebar_version;
         for event in [
             SessionEvent::TurnStarted,
@@ -5175,7 +5976,7 @@ mod tests {
             SessionEvent::BlockFinished,
         ] {
             app.event(1, event, 0.0);
-            app.settle();
+            let _ = app.settle();
         }
         assert_eq!(
             app.sidebar_version, version,
@@ -5183,7 +5984,7 @@ mod tests {
         );
         assert_eq!(app.sidebar.sections[0].mark, Mark::Working);
         app.event(1, done(), 0.0);
-        app.settle();
+        let _ = app.settle();
         assert_eq!(app.sidebar_version, version + 1);
         assert_eq!(app.sidebar.sections[0].mark, Mark::None);
     }
@@ -5289,10 +6090,10 @@ mod tests {
         app.rename_group(&project(), "Parser");
         let (side, _) = app.new_group("Side projects");
         let (gone, _) = app.new_group("Gone soon");
-        app.delete_group(&gone);
+        app.ungroup(&gone);
         app.move_session(by_id(&app, "a2"), &side);
         app.collapse_group(&notes(), true);
-        app.settle();
+        let _ = app.settle();
         let before = layout(&app);
         assert_eq!(
             before,
@@ -5305,7 +6106,7 @@ mod tests {
 
         let mut again = restored(app.saved());
         list_both(&mut again, three_stored());
-        again.settle();
+        let _ = again.settle();
         assert_eq!(layout(&again), before);
         assert_eq!(again.saved(), app.saved());
         let (newer, _) = again.new_group("Later");
@@ -5338,12 +6139,14 @@ mod tests {
                     name: Some("New group".into()),
                     collapsed: false,
                     hidden: false,
+                    deleted_unix: None,
                 },
                 Group {
                     id: docs,
                     name: None,
                     collapsed: false,
                     hidden: true,
+                    deleted_unix: None,
                 },
             ]
         );
@@ -5361,6 +6164,7 @@ mod tests {
                 name: Some("Side projects".into()),
                 collapsed: false,
                 hidden: false,
+                deleted_unix: None,
             }],
             placed: vec![
                 (id("a1"), side.clone()),
@@ -6126,7 +6930,7 @@ mod tests {
         assert_eq!(app.rename_group(&side, "Parser work"), vec![save(&app)]);
         assert_eq!(app.collapse_group(&side, true), vec![save(&app)]);
         assert_eq!(app.hide_group(&project(), true), vec![save(&app)]);
-        assert_eq!(app.delete_group(&side), vec![save(&app)]);
+        assert_eq!(app.ungroup(&side), vec![save(&app)]);
         let (other, _) = app.new_group("Other");
         let effects = app.new_session_in(
             "/home/alex/project".into(),
@@ -6328,7 +7132,7 @@ mod tests {
         assert_eq!(session(&app, key).title.as_deref(), Some("Garden"));
         assert_eq!(session(&app, key).user_title.as_deref(), Some("Garden"));
         assert_eq!(names(&app), garden("s1"));
-        app.settle();
+        let _ = app.settle();
         assert_eq!(row_of(&app, key).title, "Garden");
     }
 
@@ -7508,19 +8312,176 @@ mod tests {
     }
 
     #[test]
-    fn the_window_coming_back_counts_the_focused_session_as_seen() {
+    fn the_window_coming_back_does_not_clear_ready() {
         let (mut app, key) = ready();
         app.submit(key, "hello");
         app.set_window(false);
+        assert!(!app.looking());
         app.event(1, done(), 0.0);
         assert!(app.sessions.get(key).unwrap().unseen);
         assert!(app.set_window(true).is_empty());
-        assert!(!app.sessions.get(key).unwrap().unseen);
-        assert_eq!(mark(&app, key), Mark::None);
+        assert!(app.looking());
+        assert_eq!(mark(&app, key), Mark::Finished, "until the user acts on it");
         // With the window back, a turn that ends in the focused session is seen there.
         app.submit(key, "again");
         app.event(1, done(), 0.0);
         assert!(!app.sessions.get(key).unwrap().unseen);
+    }
+
+    /// [`ready`] with a turn that ended while another app had the keyboard: its session is
+    /// ready in the focused tile, and the keyboard is back.
+    fn ready_unseen() -> (App, SessionKey) {
+        let (mut app, key) = ready();
+        app.submit(key, "hello");
+        assert!(app.set_active(false).is_empty());
+        app.event(1, done(), 0.0);
+        assert!(app.set_active(true).is_empty());
+        assert_eq!(mark(&app, key), Mark::Finished);
+        (app, key)
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_another_app_has_the_keyboard_is_ready_also_in_the_focused_tile() {
+        let (mut app, key) = ready();
+        app.submit(key, "hello");
+        assert!(app.looking());
+        assert!(app.set_active(false).is_empty());
+        assert!(!app.looking());
+        app.event(1, done(), 0.0);
+        assert_eq!(app.focused(), Some(key));
+        assert!(app.sessions.get(key).unwrap().unseen);
+        assert_eq!(mark(&app, key), Mark::Finished);
+    }
+
+    #[test]
+    fn a_turn_that_ends_in_the_focused_tile_while_looking_is_not_ready() {
+        let (mut app, key) = ready();
+        app.submit(key, "hello");
+        assert!(app.looking());
+        app.event(1, done(), 0.0);
+        assert_eq!(app.focused(), Some(key));
+        assert_eq!(mark(&app, key), Mark::None);
+    }
+
+    #[test]
+    fn a_turn_that_ends_in_another_tile_is_ready() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        assert!(app.tiles.contains(a) && app.focused() != Some(a));
+        assert!(app.looking());
+        app.event(open_of(&app, a), done(), 0.0);
+        assert_eq!(mark(&app, a), Mark::Finished);
+    }
+
+    #[test]
+    fn getting_the_keyboard_back_does_not_clear_ready() {
+        let (app, key) = ready_unseen();
+        assert!(app.looking());
+        assert!(app.sessions.get(key).unwrap().unseen);
+    }
+
+    #[test]
+    fn closing_another_tile_does_not_clear_ready() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        let b = app.focused().unwrap();
+        app.event(open_of(&app, a), done(), 0.0);
+        app.close_tile(b, Leaving::Keep);
+        assert_eq!(app.focused(), Some(a), "the focus falls on it");
+        assert_eq!(mark(&app, a), Mark::Finished);
+    }
+
+    #[test]
+    fn a_press_on_the_focused_tile_clears_ready() {
+        let (mut app, key) = ready_unseen();
+        assert!(app.focus_tile(key).is_empty(), "the focus did not move");
+        assert_eq!(mark(&app, key), Mark::None);
+    }
+
+    #[test]
+    fn handing_the_focus_back_does_not_clear_ready() {
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        let b = app.focused().unwrap();
+        app.event(open_of(&app, a), done(), 0.0);
+        assert_eq!(mark(&app, a), Mark::Finished);
+        assert_eq!(app.return_focus(a), vec![reads_branch("/a")]);
+        assert_eq!(app.focused(), Some(a));
+        assert_eq!(mark(&app, a), Mark::Finished, "not the user's act");
+        assert_eq!(app.return_focus(a), vec![], "it has the focus already");
+        assert_eq!(app.return_focus(SessionKey(999)), vec![]);
+        assert_eq!(app.focused(), Some(a));
+        // The user's own press does clear it.
+        app.focus_tile(b);
+        app.focus_tile(a);
+        assert_eq!(mark(&app, a), Mark::None);
+    }
+
+    #[test]
+    fn a_press_on_the_row_of_the_focused_session_clears_ready() {
+        let (mut app, key) = ready_unseen();
+        assert!(
+            app.show(key, Place::Focused, Leaving::ForgetIfEmpty)
+                .is_empty()
+        );
+        assert_eq!(mark(&app, key), Mark::None);
+    }
+
+    #[test]
+    fn sending_in_it_clears_ready() {
+        let (mut app, key) = ready_unseen();
+        app.submit(key, "again");
+        assert!(!app.sessions.get(key).unwrap().unseen);
+    }
+
+    #[test]
+    fn acting_on_it_in_another_way_clears_ready() {
+        type Act = fn(&mut App, SessionKey) -> Vec<Effect>;
+        let acts: [(&str, Act); 4] = [
+            ("stop", App::stop),
+            ("mode", |app, key| {
+                app.choose_mode(key, PermissionMode::AcceptEdits)
+            }),
+            ("model", |app, key| app.choose_model(key, "default")),
+            ("restart", App::restart),
+        ];
+        for (what, act) in acts {
+            let (mut app, key) = ready_unseen();
+            act(&mut app, key);
+            assert!(!app.sessions.get(key).unwrap().unseen, "{what}");
+        }
+    }
+
+    #[test]
+    fn attending_to_a_deleted_session_does_nothing() {
+        let (mut app, key) = shows_stored();
+        app.delete_session(key);
+        assert!(app.sessions.get(key).unwrap().deleted.is_some());
+        // Set by hand: a deleted session is never marked.
+        app.sessions.get_mut(key).unwrap().unseen = true;
+        assert_eq!(app.attend(key), vec![]);
+        assert!(app.sessions.get(key).unwrap().unseen, "left alone");
+    }
+
+    #[test]
+    fn restored_tiles_keep_no_ready_and_clear_none() {
+        let saved = with_tiles(vec![tile("a1", 0.5), tile("b1", 0.5)], "a1");
+        let mut app = restored(saved);
+        let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 60);
+        let b1 = store("b1", "Tidy the notes", "/home/alex/notes", NOW - 90 * DAY);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![a1.clone()]);
+        assert_eq!(app.focused(), None, "b1 may still come");
+        let a1_key = by_id(&app, "a1");
+        app.sessions.get_mut(a1_key).unwrap().unseen = true;
+        listing(&mut app, None, vec![a1, b1]);
+        let b1_key = by_id(&app, "b1");
+        assert_eq!(tile_keys(&app), vec![a1_key, b1_key]);
+        assert_eq!(app.focused(), Some(a1_key));
+        assert_eq!(mark(&app, a1_key), Mark::Finished, "still ready");
+        assert_eq!(mark(&app, b1_key), Mark::None, "not made ready");
     }
 
     #[test]
@@ -8080,5 +9041,1763 @@ mod tests {
         assert_eq!(drops(&effects), vec![], "not at the exit");
         assert_eq!(drops(&app.tick(NOW + 5599)), vec![]);
         assert_eq!(drops(&app.tick(NOW + 5600)), vec![a]);
+    }
+
+    /// What `key`'s session was marked deleted with.
+    fn deleted(app: &App, key: SessionKey) -> Option<Deleted> {
+        app.sessions.get(key).unwrap().deleted
+    }
+
+    #[test]
+    fn deleting_a_resting_session_marks_it_and_closes_its_tile() {
+        let (mut app, key) = shows_stored();
+        let effects = app.delete_session(key);
+        let mark = deleted(&app, key).expect("deleted");
+        assert_eq!(
+            mark,
+            Deleted {
+                at_unix: NOW,
+                seen_unix: NOW - 3600,
+                failed_unix: None,
+                removing: false,
+            }
+        );
+        assert!(!app.tiles.contains(key));
+        assert_eq!(app.focused(), None);
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        assert_eq!(effects.last(), Some(&save(&app)));
+        assert!(closes(&effects).is_empty(), "no program runs: {effects:?}");
+        assert!(app.delete_session(key).is_empty(), "deleted once");
+    }
+
+    #[test]
+    fn deleting_a_working_session_stops_it_once() {
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        let effects = app.delete_session(key);
+        assert_eq!(closes(&effects), vec![1]);
+        let seen = NOW + OWN_EXIT_SLACK_SECONDS;
+        assert_eq!(
+            deleted(&app, key).unwrap().seen_unix,
+            seen,
+            "its own program"
+        );
+        assert!(app.delete_session(key).is_empty());
+        assert!(closes(&app.close(NOW)).is_empty(), "not again at quit");
+
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.delete_session(key);
+        let effects = app.receive(exit_of(1, false), 0.0);
+        let entry = app.sessions.get(key).unwrap();
+        assert_eq!(entry.session.phase, Phase::Resting);
+        assert_eq!(ended_notices(&entry.session), 0);
+        assert_eq!((entry.mark(), entry.unseen), (Mark::None, false));
+        assert_eq!(
+            entry.deleted.unwrap().seen_unix,
+            NOW + OWN_EXIT_SLACK_SECONDS
+        );
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn a_deleted_session_is_never_started_again() {
+        // A message its program never got, refused before the delete, between the delete and
+        // the exit, or after the exit.
+        for order in [
+            "refused, deleted, exited",
+            "deleted, refused, exited",
+            "deleted, exited, refused",
+        ] {
+            let (mut app, key) = sent_hello();
+            let mut effects = Vec::new();
+            for step in order.split(", ") {
+                effects.extend(match step {
+                    "refused" => app.receive(closed_send(1, "hello", vec![]), 0.0),
+                    "deleted" => app.delete_session(key),
+                    _ => app.receive(exit_of(1, true), 0.0),
+                });
+            }
+            assert!(opened(&effects).is_empty(), "{order}: {effects:?}");
+            let entry = app.sessions.get(key).unwrap();
+            assert!(entry.session.undelivered.is_empty(), "{order}");
+            assert!(entry.session.queued.is_none(), "{order}");
+            assert_eq!(entry.session.phase, Phase::Resting, "{order}");
+            assert!(!entry.unseen, "{order}");
+            assert_eq!(entry.session.history, HistoryState::NotLoaded, "{order}");
+            assert!(opened(&app.restart(key)).is_empty(), "{order}");
+            app.recover_session(key);
+            assert_eq!(app.busy(), Busy::default(), "{order}: nothing waits");
+            assert_eq!(mark(&app, key), Mark::None, "{order}");
+        }
+
+        // Remote Control asked of a session stopped for idling.
+        let (mut app, key) = idle();
+        assert_eq!(closes(&app.tick(NOW + 1800)), vec![1]);
+        app.set_remote(key, true);
+        let effects = app.delete_session(key);
+        assert!(closes(&effects).is_empty(), "it was sent one: {effects:?}");
+        assert!(!session(&app, key).remote_wanted);
+        let effects = app.receive(exit_of(1, true), 0.0);
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert!(app.set_remote(key, true).is_empty());
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+
+        // A queued message, while the store is asked whether another app has it open.
+        let (mut app, key) = shows_stored();
+        app.submit(key, "carry on");
+        app.delete_session(key);
+        let entry = app.sessions.get(key).unwrap();
+        assert_eq!(entry.session.phase, Phase::Resting);
+        assert_eq!(
+            (entry.session.queued.is_none(), entry.checking),
+            (true, false)
+        );
+        let effects = app.receive(
+            FromBackend::Activity {
+                key,
+                result: Ok(Some(NOW - 3600)),
+            },
+            0.0,
+        );
+        assert!(opened(&effects).is_empty(), "{effects:?}");
+        assert!(session(&app, key).queued.is_none());
+    }
+
+    #[test]
+    fn a_deleted_session_cannot_be_shown_or_sent_to() {
+        let (mut app, key) = shows_stored();
+        let (side, _) = app.new_group("Side projects");
+        app.delete_session(key);
+        assert!(app.show(key, Place::Focused, Leaving::Keep).is_empty());
+        assert!(app.show(key, Place::Side, Leaving::Keep).is_empty());
+        assert!(!app.tiles.contains(key));
+        assert!(!app.takes_message(key));
+        assert!(app.submit(key, "carry on").is_empty());
+        let file = Source::Path("/home/alex/notes.txt".into());
+        assert!(app.attach(key, vec![file]).is_empty());
+        assert!(app.rename(key, "Parser").is_empty());
+        assert_eq!(session(&app, key).title.as_deref(), Some("Fix the parser"));
+        assert!(app.move_session(key, &side).is_empty());
+        assert_eq!(group_of(&app, key), project());
+        assert!(app.set_remote(key, true).is_empty());
+        assert!(!session(&app, key).remote_wanted);
+        assert!(session(&app, key).queued.is_none());
+    }
+
+    #[test]
+    fn deleting_lets_its_conversation_go() {
+        let (mut app, key) = shows_stored();
+        assert_eq!(session(&app, key).history, HistoryState::Loaded);
+        let effects = app.delete_session(key);
+        assert_eq!(drops(&effects), vec![key]);
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+        assert!(session(&app, key).conversation.items().is_empty());
+
+        // One whose program runs lets it go when its program has ended.
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        assert_eq!(drops(&app.delete_session(key)), vec![]);
+        let effects = app.receive(exit_of(1, true), 0.0);
+        assert_eq!(drops(&effects), vec![key]);
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+    }
+
+    #[test]
+    fn a_deleted_session_counts_nowhere() {
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        assert_eq!(app.standing().working, 1);
+        assert_eq!(app.busy().working, 1);
+        app.delete_session(key);
+        assert_eq!(session(&app, key).phase, Phase::Working, "until it exits");
+        assert_eq!(app.standing(), Standing::default());
+        assert_eq!(app.busy(), Busy::default());
+        assert_eq!(mark(&app, key), Mark::None);
+    }
+
+    #[test]
+    fn in_flight_counts_what_deleting_would_cut_off() {
+        let mut app = main_screen();
+        let working = busy(&mut app, "/a");
+        let waiting = busy(&mut app, "/b");
+        app.event(open_of(&app, waiting), permission("r1"), 0.0);
+        app.new_session("/c".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let queued = app.focused().unwrap();
+        app.submit(queued, "early");
+        assert!(session(&app, queued).queued.is_some());
+        let resting = app.sessions.add(stored("s9"), NOW - 60);
+        assert_eq!(app.in_flight(&[working, waiting, queued, resting]), 3);
+        assert_eq!(app.in_flight(&[resting]), 0);
+        assert_eq!(app.in_flight(&[]), 0);
+
+        // An idle program that runs a background task, or has Remote Control on or coming:
+        // deleting closes the program, and with it the task or the remote connection.
+        let idle = |app: &mut App, name: &str, change: &dyn Fn(&mut Session)| {
+            let key = app.sessions.add(stored(name), NOW - 60);
+            let mut entry = app.sessions.get_mut(key).unwrap();
+            entry.session.phase = Phase::Idle;
+            change(&mut entry.session);
+            key
+        };
+        let quiet = idle(&mut app, "i0", &|_| {});
+        let task = idle(&mut app, "i1", &|s| s.background = 1);
+        let remote = idle(&mut app, "i2", &|s| s.remote = Remote::On { url: None });
+        let starting = idle(&mut app, "i3", &|s| s.remote = Remote::Starting);
+        let back = idle(&mut app, "i4", &|s| s.remote = Remote::Reconnecting);
+        assert_eq!(app.in_flight(&[quiet]), 0);
+        for (key, what) in [
+            (task, "a background task"),
+            (remote, "Remote Control on"),
+            (starting, "Remote Control starting"),
+            (back, "Remote Control reconnecting"),
+        ] {
+            assert_eq!(app.in_flight(&[key]), 1, "{what}");
+        }
+        assert_eq!(app.in_flight(&[quiet, task, remote, starting, back]), 4);
+    }
+
+    #[test]
+    fn a_session_never_sent_is_forgotten_by_delete() {
+        // Started, with nothing handed over.
+        let (mut app, key) = ready();
+        let effects = app.delete_session(key);
+        assert!(app.sessions.get(key).is_none());
+        assert!(app.tiles.is_empty());
+        assert_eq!(closes(&effects), vec![1]);
+        assert!(app.saved().deleted.is_empty());
+
+        // Not started yet: it has no id.
+        let mut app = main_screen();
+        app.new_session("/q".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let key = app.focused().unwrap();
+        let effects = app.delete_session(key);
+        assert!(app.sessions.get(key).is_none());
+        assert_eq!(closes(&effects), vec![1]);
+    }
+
+    /// [`three_stored`], and `a3`, forty days old, in `/home/alex/project`.
+    fn with_an_older_one() -> Vec<StoredSession> {
+        let mut stored = three_stored();
+        stored.push(store(
+            "a3",
+            "Old work",
+            "/home/alex/project",
+            NOW - 40 * DAY,
+        ));
+        stored
+    }
+
+    #[test]
+    fn deleting_a_group_takes_its_older_sessions_too() {
+        let mut app = main_screen();
+        list_both(&mut app, with_an_older_one());
+        let (a1, a2, a3, b1) = (
+            by_id(&app, "a1"),
+            by_id(&app, "a2"),
+            by_id(&app, "a3"),
+            by_id(&app, "b1"),
+        );
+        assert_eq!(app.sessions_of(&project()), vec![a1, a2, a3]);
+        let effects = app.delete_group(&project());
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        assert_eq!(effects.last(), Some(&save(&app)));
+        for key in [a1, a2, a3] {
+            assert_eq!(deleted(&app, key).map(|d| d.at_unix), Some(NOW));
+        }
+        assert_eq!(deleted(&app, b1), None);
+        assert_eq!(app.sessions_of(&project()), vec![]);
+        assert_eq!(app.sessions_of(&notes()), vec![b1]);
+        assert_eq!(
+            app.groups.deleted_unix(&project()),
+            None,
+            "a folder's group"
+        );
+        assert!(app.saved().groups.is_empty());
+    }
+
+    #[test]
+    fn a_group_you_made_is_marked_and_keeps_its_places() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let (a1, b1) = (by_id(&app, "a1"), by_id(&app, "b1"));
+        app.move_session(a1, &side);
+        app.move_session(b1, &side);
+        app.delete_group(&side);
+        assert_eq!(app.groups.deleted_unix(&side), Some(NOW));
+        assert!(deleted(&app, a1).is_some() && deleted(&app, b1).is_some());
+        assert_eq!(
+            (group_of(&app, a1), group_of(&app, b1)),
+            (side.clone(), side.clone())
+        );
+        let saved = app.saved();
+        assert_eq!(
+            saved.placed,
+            vec![(id("a1"), side.clone()), (id("b1"), side.clone())]
+        );
+        assert_eq!(saved.groups[0].deleted_unix, Some(NOW));
+
+        // A deleted group takes no session.
+        let a2 = by_id(&app, "a2");
+        assert_eq!(app.move_session(a2, &side), vec![]);
+        assert_eq!(group_of(&app, a2), project());
+
+        let mut again = restored(saved);
+        list_both(&mut again, three_stored());
+        let a1 = by_id(&again, "a1");
+        assert_eq!(group_of(&again, a1), side);
+        assert!(deleted(&again, a1).is_some());
+        assert_eq!(again.groups.deleted_unix(&side), Some(NOW));
+        assert_eq!(again.saved(), app.saved());
+    }
+
+    #[test]
+    fn ungroup_sends_the_sessions_home() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let a1 = by_id(&app, "a1");
+        app.move_session(a1, &side);
+        assert_eq!(app.ungroup(&side), vec![save(&app)]);
+        assert_eq!(group_of(&app, a1), project());
+        assert_eq!(deleted(&app, a1), None, "nothing is deleted");
+        assert!(app.saved().groups.is_empty());
+        assert_eq!(app.ungroup(&notes()), vec![], "nothing to reset");
+        app.rename_group(&notes(), "Notes");
+        assert_eq!(app.ungroup(&notes()), vec![save(&app)]);
+        assert!(app.saved().groups.is_empty());
+    }
+
+    #[test]
+    fn recovering_a_session_brings_its_deleted_group_back() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let (a1, b1) = (by_id(&app, "a1"), by_id(&app, "b1"));
+        app.move_session(a1, &side);
+        app.move_session(b1, &side);
+        app.delete_group(&side);
+        assert_eq!(app.recover_session(a1), vec![save(&app)]);
+        assert_eq!(deleted(&app, a1), None);
+        assert!(deleted(&app, b1).is_some(), "the other stays deleted");
+        assert_eq!(app.groups.deleted_unix(&side), None);
+        assert_eq!(group_of(&app, a1), side);
+        assert_eq!(app.recover_session(a1), vec![], "not deleted");
+    }
+
+    #[test]
+    fn recovering_a_group_recovers_its_sessions() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let (a1, b1) = (by_id(&app, "a1"), by_id(&app, "b1"));
+        app.move_session(a1, &side);
+        app.move_session(b1, &side);
+        app.delete_group(&side);
+        assert_eq!(app.recover_group(&side), vec![save(&app)]);
+        assert_eq!((deleted(&app, a1), deleted(&app, b1)), (None, None));
+        assert_eq!(app.groups.deleted_unix(&side), None);
+        assert_eq!(app.sessions_of(&side), vec![a1, b1]);
+        let a2 = by_id(&app, "a2");
+        app.delete_session(a2);
+        app.recover_group(&project());
+        assert_eq!(deleted(&app, a2), None, "a folder's group too");
+    }
+
+    #[test]
+    fn switching_the_view_rebuilds_the_list() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let a1 = by_id(&app, "a1");
+        app.delete_session(a1);
+        let _ = app.settle();
+        assert_eq!(app.sidebar_view(), SidebarView::Sessions);
+        assert_eq!(
+            (app.sidebar.view, app.sidebar.deleted),
+            (SidebarView::Sessions, 1)
+        );
+        let (version, saved) = (app.sidebar_version, app.saved());
+
+        assert_eq!(app.set_sidebar_view(SidebarView::Deleted), vec![]);
+        assert_eq!(app.sidebar_view(), SidebarView::Deleted);
+        let _ = app.settle();
+        assert_eq!(app.sidebar_version, version + 1);
+        assert_eq!(app.sidebar.view, SidebarView::Deleted);
+        assert_eq!(
+            layout(&app),
+            vec![(project(), "project".to_string(), false, vec![id("a1")])]
+        );
+        app.set_sidebar_view(SidebarView::Deleted);
+        let _ = app.settle();
+        assert_eq!(app.sidebar_version, version + 1, "the same view");
+        assert_eq!(app.saved(), saved, "the view is not saved");
+
+        // The last one recovered: the view stays, and is empty.
+        app.recover_session(a1);
+        let _ = app.settle();
+        assert_eq!(app.sidebar_view(), SidebarView::Deleted);
+        assert_eq!(app.sidebar.deleted, 0);
+        assert!(app.sidebar.sections.is_empty() && app.sidebar.lines.is_empty());
+
+        app.set_sidebar_view(SidebarView::Sessions);
+        let _ = app.settle();
+        assert_eq!(app.sidebar_version, version + 3);
+        assert_eq!(app.sidebar.view, SidebarView::Sessions);
+        assert_eq!(app.sidebar.sections.len(), 2);
+        assert_eq!(
+            restored(app.saved()).sidebar_view(),
+            SidebarView::Sessions,
+            "a run starts with the sessions"
+        );
+    }
+
+    /// An app whose last run deleted the group "Side projects" a day before `NOW`, with `c1`
+    /// placed in it but not known then; it has listed the three recent sessions, and then all,
+    /// which hold `c1`, last active forty days ago.
+    fn c1_arrives_in_a_deleted_group() -> (App, GroupId) {
+        let side = GroupId::Custom(1);
+        let saved = Saved {
+            version: SAVED_VERSION,
+            groups: vec![Group {
+                id: side.clone(),
+                name: Some("Side projects".into()),
+                collapsed: false,
+                hidden: false,
+                deleted_unix: Some(NOW - DAY),
+            }],
+            placed: vec![(id("c1"), side.clone())],
+            next_custom: 2,
+            ..Saved::default()
+        };
+        let mut app = restored(saved);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        let mut all = three_stored();
+        all.push(store(
+            "c1",
+            "Old plans",
+            "/home/alex/project",
+            NOW - 40 * DAY,
+        ));
+        listing(&mut app, None, all);
+        let _ = app.settle();
+        (app, side)
+    }
+
+    #[test]
+    fn a_session_that_arrives_in_a_deleted_group_is_deleted_with_it() {
+        let (mut app, side) = c1_arrives_in_a_deleted_group();
+        let c1 = by_id(&app, "c1");
+        // Its own week starts when it arrives, not when its group was deleted.
+        assert_eq!(
+            deleted(&app, c1),
+            Some(Deleted {
+                at_unix: NOW,
+                seen_unix: NOW - 40 * DAY,
+                failed_unix: None,
+                removing: false,
+            })
+        );
+        assert_eq!(group_of(&app, c1), side);
+        assert!(!app.sessions_of(&project()).contains(&c1));
+        assert_eq!(app.sessions_of(&side), vec![]);
+        let listed = |app: &App| {
+            let rows = app
+                .sidebar
+                .sections
+                .iter()
+                .flat_map(|section| &section.rows);
+            rows.map(|row| row.key).collect::<Vec<SessionKey>>()
+        };
+        assert!(!listed(&app).contains(&c1), "not in the normal list");
+        assert_eq!(app.saved().deleted.len(), 1, "its mark is kept");
+
+        app.set_sidebar_view(SidebarView::Deleted);
+        let _ = app.settle();
+        assert_eq!(
+            layout(&app),
+            vec![(side, "Side projects".to_string(), false, vec![id("c1")])]
+        );
+    }
+
+    #[test]
+    fn such_a_session_is_removed_a_week_after_it_arrived() {
+        let (mut app, side) = c1_arrives_in_a_deleted_group();
+        // The group's week ends first: c1 is not removed then, and holds the group's record.
+        let effects = app.tick(NOW + DELETED_SECONDS - DAY);
+        assert_eq!(removals(&effects), vec![]);
+        assert_eq!(app.groups.deleted_unix(&side), Some(NOW - DAY));
+        let effects = app.tick(NOW + DELETED_SECONDS);
+        assert_eq!(removals(&effects), vec![(id("c1"), NOW - 40 * DAY)]);
+    }
+
+    #[test]
+    fn such_a_session_used_again_comes_back_with_its_group() {
+        let (mut app, side) = c1_arrives_in_a_deleted_group();
+        let used = store("c1", "Old plans", "/home/alex/project", NOW - 10);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![used]);
+        let _ = app.settle();
+        let c1 = by_id(&app, "c1");
+        assert_eq!(deleted(&app, c1), None);
+        assert_eq!(app.groups.deleted_unix(&side), None);
+        assert_eq!(app.sessions_of(&side), vec![c1]);
+        assert_eq!(
+            layout(&app)[0],
+            (side, "Side projects".to_string(), false, vec![id("c1")])
+        );
+    }
+
+    #[test]
+    fn a_passing_day_rebuilds_the_deleted_view() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        app.delete_session(by_id(&app, "a1"));
+        let _ = app.settle();
+        let version = app.sidebar_version;
+        app.now_unix = NOW + DAY;
+        let _ = app.settle();
+        assert_eq!(
+            app.sidebar_version, version,
+            "the normal list shows no days"
+        );
+
+        app.set_sidebar_view(SidebarView::Deleted);
+        let _ = app.settle();
+        let days_left = |app: &App| app.sidebar.sections[0].rows[0].days_left;
+        assert_eq!(
+            (app.sidebar_version, days_left(&app)),
+            (version + 1, Some(5))
+        );
+        app.now_unix = NOW + 2 * DAY - 1;
+        let _ = app.settle();
+        assert_eq!(app.sidebar_version, version + 1, "the same day");
+        app.now_unix = NOW + 2 * DAY;
+        let _ = app.settle();
+        assert_eq!(
+            (app.sidebar_version, days_left(&app)),
+            (version + 2, Some(4))
+        );
+        app.now_unix = NOW + 30 * DAY;
+        let _ = app.settle();
+        assert_eq!(
+            (app.sidebar_version, days_left(&app)),
+            (version + 3, Some(0))
+        );
+        app.now_unix = NOW + 31 * DAY;
+        let _ = app.settle();
+        assert_eq!(app.sidebar_version, version + 3, "0 stays 0");
+    }
+
+    #[test]
+    fn a_deleted_session_used_again_elsewhere_comes_back() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let a1 = by_id(&app, "a1");
+        app.delete_session(a1);
+        let since = Some(NOW - RECENT_DAYS * DAY);
+        listing(&mut app, since, three_stored());
+        assert!(deleted(&app, a1).is_some(), "the same time");
+        let mut later = three_stored();
+        later[0].last_active_unix = NOW - 30;
+        let effects = listing(&mut app, since, later);
+        assert_eq!(deleted(&app, a1), None);
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        assert!(app.saved().deleted.is_empty());
+    }
+
+    /// A recent listing that gives `s1` in `/p` at `last_active_unix`.
+    fn lists_s1(app: &mut App, last_active_unix: i64) -> Vec<Effect> {
+        let s1 = store("s1", "Hello", "/p", last_active_unix);
+        listing(app, Some(app.now_unix - RECENT_DAYS * DAY), vec![s1])
+    }
+
+    #[test]
+    fn the_apps_own_exit_does_not_count_as_used_again() {
+        let (mut app, key) = idle();
+        app.delete_session(key);
+        app.receive(exit_of(1, true), 0.0);
+        lists_s1(&mut app, NOW + OWN_EXIT_SLACK_SECONDS);
+        assert!(deleted(&app, key).is_some(), "inside the slack");
+        lists_s1(&mut app, NOW + OWN_EXIT_SLACK_SECONDS + 1);
+        assert_eq!(deleted(&app, key), None);
+
+        // At quit, before its program has ended.
+        let (mut app, key) = idle();
+        app.delete_session(key);
+        let effects = app.close(NOW + 20);
+        let Some(Effect::SaveState(saved)) = effects.first() else {
+            panic!("saved first: {effects:?}");
+        };
+        let seen = NOW + 20 + OWN_EXIT_SLACK_SECONDS;
+        assert_eq!(saved.deleted[0].seen_unix, seen);
+    }
+
+    #[test]
+    fn deleting_just_after_its_own_program_ended_does_not_bring_it_back() {
+        let (mut app, key) = idle();
+        app.receive(exit_of(1, true), 0.0);
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        // The last listing gave an older time.
+        app.sessions.get_mut(key).unwrap().last_active_unix = NOW - 3600;
+        app.now_unix = NOW + 5;
+        let effects = app.delete_session(key);
+        assert!(closes(&effects).is_empty());
+        assert_eq!(
+            deleted(&app, key).unwrap().seen_unix,
+            NOW + OWN_EXIT_SLACK_SECONDS
+        );
+        lists_s1(&mut app, NOW);
+        assert!(deleted(&app, key).is_some(), "what its own program wrote");
+        lists_s1(&mut app, NOW + OWN_EXIT_SLACK_SECONDS + 60);
+        assert_eq!(deleted(&app, key), None);
+    }
+
+    /// [`three_stored`] listed and `a1` deleted.
+    fn a1_deleted() -> App {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        app.delete_session(by_id(&app, "a1"));
+        app
+    }
+
+    fn a1_mark() -> SavedDeleted {
+        SavedDeleted {
+            id: id("a1"),
+            at_unix: NOW,
+            seen_unix: NOW - 60,
+        }
+    }
+
+    #[test]
+    fn the_marks_survive_a_restart_before_their_sessions_are_listed() {
+        let saved = a1_deleted().saved();
+        assert_eq!(saved.deleted, vec![a1_mark()]);
+        let mut again = restored(saved.clone());
+        assert_eq!(again.saved().deleted, saved.deleted);
+        let others = three_stored()[1..].to_vec();
+        listing(&mut again, Some(NOW - RECENT_DAYS * DAY), others);
+        assert_eq!(again.saved().deleted, saved.deleted, "not listed yet");
+    }
+
+    #[test]
+    fn a_mark_is_applied_when_its_session_is_listed() {
+        let mut again = restored(a1_deleted().saved());
+        listing(&mut again, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        let a1 = by_id(&again, "a1");
+        assert_eq!(
+            deleted(&again, a1),
+            Some(Deleted {
+                at_unix: NOW,
+                seen_unix: NOW - 60,
+                failed_unix: None,
+                removing: false,
+            })
+        );
+        assert_eq!(deleted(&again, by_id(&again, "a2")), None);
+        assert_eq!(again.saved().deleted, vec![a1_mark()]);
+    }
+
+    #[test]
+    fn a_mark_for_a_session_the_store_lost_is_dropped_after_the_complete_listing() {
+        let mut again = restored(a1_deleted().saved());
+        let others = three_stored()[1..].to_vec();
+        listing(&mut again, Some(NOW - RECENT_DAYS * DAY), others.clone());
+        assert_eq!(again.saved().deleted, vec![a1_mark()]);
+        let effects = listing(&mut again, None, others);
+        assert!(again.saved().deleted.is_empty());
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+    }
+
+    #[test]
+    fn a_turn_that_ends_after_the_delete_leaves_no_mark_also_after_recovery() {
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.delete_session(key);
+        app.event(1, done(), 0.0);
+        assert!(!app.sessions.get(key).unwrap().unseen, "after the turn");
+        app.receive(exit_of(1, true), 0.0);
+        assert!(!app.sessions.get(key).unwrap().unseen, "after the exit");
+        app.recover_session(key);
+        assert_eq!(mark(&app, key), Mark::None);
+        assert_eq!(app.standing(), Standing::default());
+
+        // Recovering clears what was unseen before the delete, too.
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.delete_session(key);
+        app.sessions.get_mut(key).unwrap().unseen = true;
+        app.recover_session(key);
+        assert!(!app.sessions.get(key).unwrap().unseen);
+    }
+
+    #[test]
+    fn deleting_an_ended_session_lets_its_conversation_go() {
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.receive(exit_of(1, false), 0.0);
+        assert!(matches!(session(&app, key).phase, Phase::Ended { .. }));
+        let effects = app.delete_session(key);
+        assert!(closes(&effects).is_empty(), "{effects:?}");
+        assert_eq!(drops(&effects), vec![key]);
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+        assert_eq!(session(&app, key).history, HistoryState::NotLoaded);
+        assert!(session(&app, key).conversation.items().is_empty());
+    }
+
+    /// The removals `effects` ask for: each id with the time it holds.
+    fn removals(effects: &[Effect]) -> Vec<(SessionId, i64)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::RemoveStored {
+                    id,
+                    unless_after_unix,
+                } => Some((id.clone(), *unless_after_unix)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The answer to the removal of `text`'s session.
+    fn removed(text: &str, result: Result<Removal, AgentError>) -> FromBackend {
+        FromBackend::Removed {
+            id: id(text),
+            result,
+        }
+    }
+
+    #[test]
+    fn a_week_after_deleting_the_session_is_removed() {
+        let mut app = a1_deleted();
+        let a1 = by_id(&app, "a1");
+        let seen = deleted(&app, a1).unwrap().seen_unix;
+        assert_eq!(removals(&app.tick(NOW + DELETED_SECONDS - 1)), vec![]);
+        let next = NOW + DELETED_SECONDS - 1 + PURGE_SECONDS;
+        assert_eq!(removals(&app.tick(next - 1)), vec![], "once a minute");
+        assert_eq!(removals(&app.tick(next)), vec![(id("a1"), seen)]);
+        assert!(deleted(&app, a1).unwrap().removing);
+        assert_eq!(
+            removals(&app.tick(next + PURGE_SECONDS)),
+            vec![],
+            "being removed"
+        );
+
+        // The first tick a week after the delete.
+        let mut app = a1_deleted();
+        let effects = app.tick(NOW + DELETED_SECONDS);
+        assert_eq!(removals(&effects), vec![(id("a1"), seen)]);
+        assert_eq!(saves(&effects), 0, "nothing kept changed: {effects:?}");
+    }
+
+    #[test]
+    fn a_removed_session_is_forgotten() {
+        for removal in [Removal::Removed, Removal::Missing] {
+            // Only the recent listing: every placement is kept.
+            let mut app = main_screen();
+            listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+            let (side, _) = app.new_group("Side projects");
+            let a1 = by_id(&app, "a1");
+            app.move_session(a1, &side);
+            app.rename(a1, "Parser");
+            assert_eq!(app.saved().names, vec![(id("a1"), "Parser".to_string())]);
+            app.delete_session(a1);
+            app.tick(NOW + DELETED_SECONDS);
+            let effects = app.receive(removed("a1", Ok(removal)), 0.0);
+            assert_eq!(app.sessions.by_id(&id("a1")), None, "{removal:?}");
+            assert_eq!(effects, vec![save(&app)], "{removal:?}");
+            let saved = app.saved();
+            assert!(saved.deleted.is_empty(), "{removal:?}");
+            assert!(saved.placed.is_empty(), "{removal:?}");
+            assert!(saved.names.is_empty(), "{removal:?}");
+            assert_eq!(saved.groups.len(), 1, "its group stays");
+            assert!(app.receive(removed("a1", Ok(removal)), 0.0).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_session_that_changed_is_recovered_not_removed() {
+        let mut app = a1_deleted();
+        let a1 = by_id(&app, "a1");
+        app.tick(NOW + DELETED_SECONDS);
+        let effects = app.receive(removed("a1", Ok(Removal::Changed)), 0.0);
+        assert_eq!(deleted(&app, a1), None);
+        assert_eq!(effects, vec![save(&app)]);
+        assert!(app.saved().deleted.is_empty());
+        let later = NOW + DELETED_SECONDS + PURGE_SECONDS;
+        assert_eq!(removals(&app.tick(later)), vec![]);
+    }
+
+    #[test]
+    fn a_failed_removal_is_tried_again_after_an_hour_and_not_before() {
+        let mut app = a1_deleted();
+        let a1 = by_id(&app, "a1");
+        let week = NOW + DELETED_SECONDS;
+        assert_eq!(removals(&app.tick(week)).len(), 1);
+        let failed = Err(AgentError::Io("the disk is gone".into()));
+        let effects = app.receive(removed("a1", failed), 0.0);
+        assert_eq!(effects, vec![]);
+        let mark = deleted(&app, a1).expect("still deleted");
+        assert_eq!((mark.failed_unix, mark.removing), (Some(week), false));
+        assert_eq!(removals(&app.tick(week + PURGE_SECONDS)), vec![]);
+        let hour = week + PURGE_RETRY_SECONDS;
+        assert_eq!(removals(&app.tick(hour - 1)), vec![]);
+        assert_eq!(
+            removals(&app.tick(hour - 1 + PURGE_SECONDS)),
+            vec![(id("a1"), NOW - 60)]
+        );
+    }
+
+    #[test]
+    fn a_session_whose_program_still_runs_is_not_removed_yet() {
+        let (mut app, key) = idle();
+        app.delete_session(key);
+        let week = NOW + DELETED_SECONDS;
+        assert_eq!(removals(&app.tick(week)), vec![]);
+        // Its week is over: it goes when its program has, without waiting for the tick.
+        let effects = app.receive(exit_of(1, true), 0.0);
+        let seen = week + OWN_EXIT_SLACK_SECONDS;
+        assert_eq!(removals(&effects), vec![(id("s1"), seen)]);
+        assert_eq!(
+            removals(&app.tick(week + PURGE_SECONDS)),
+            vec![],
+            "asked once"
+        );
+
+        // Within its week the exit removes nothing.
+        let (mut app, key) = idle();
+        app.delete_session(key);
+        assert_eq!(removals(&app.receive(exit_of(1, true), 0.0)), vec![]);
+        assert_eq!(removals(&app.tick(NOW + PURGE_SECONDS)), vec![]);
+    }
+
+    #[test]
+    fn after_delete_all_a_running_session_goes_at_its_exit() {
+        let (mut app, key) = idle();
+        app.delete_session(key);
+        assert_eq!(removals(&app.delete_all()), vec![], "its program runs");
+        // The tick has just run: the exit does not wait a minute for the next.
+        assert_eq!(removals(&app.tick(NOW)), vec![]);
+        let effects = app.receive(exit_of(1, true), 0.0);
+        let seen = NOW + OWN_EXIT_SLACK_SECONDS;
+        assert_eq!(removals(&effects), vec![(id("s1"), seen)]);
+        assert!(deleted(&app, key).unwrap().removing);
+        assert_eq!(removals(&app.tick(NOW + 1)), vec![], "asked once");
+    }
+
+    #[test]
+    fn delete_all_leaves_no_header_behind() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        app.move_session(by_id(&app, "a1"), &side);
+        app.move_session(by_id(&app, "a2"), &side);
+        app.delete_group(&side);
+        app.set_sidebar_view(SidebarView::Deleted);
+        let _ = app.settle();
+        assert_eq!(layout(&app).len(), 1);
+        // The tick has just run, so nothing here rides on the next one.
+        app.tick(NOW);
+
+        let effects = app.delete_all();
+        assert_eq!(removals(&effects).len(), 2);
+        let effects = app.receive(removed("a1", Ok(Removal::Removed)), 0.0);
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        assert_eq!(
+            app.groups.deleted_unix(&side),
+            Some(NOW - DELETED_SECONDS),
+            "a2 is still in it"
+        );
+        let effects = app.receive(removed("a2", Ok(Removal::Missing)), 0.0);
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        assert_eq!(effects.last(), Some(&save(&app)));
+        assert!(
+            app.saved().groups.is_empty(),
+            "the group went with its last"
+        );
+        let _ = app.settle();
+        assert_eq!(layout(&app), vec![], "no header with no rows");
+        assert_eq!(app.sidebar.deleted, 0);
+    }
+
+    #[test]
+    fn delete_all_removes_everything_in_the_deleted_view_at_once() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (a1, a2, b1) = (by_id(&app, "a1"), by_id(&app, "a2"), by_id(&app, "b1"));
+        let (side, _) = app.new_group("Side projects");
+        app.move_session(b1, &side);
+        app.delete_session(a1);
+        app.tick(NOW + 2 * DAY);
+        app.delete_session(a2);
+        let now = NOW + 5 * DAY;
+        app.tick(now);
+        app.delete_group(&side);
+        // b1's removal failed a minute ago.
+        let mut entry = app.sessions.get_mut(b1).unwrap();
+        let mark = entry.deleted.unwrap();
+        entry.deleted = Some(Deleted {
+            failed_unix: Some(now - 60),
+            ..mark
+        });
+        drop(entry);
+
+        let effects = app.delete_all();
+        assert_eq!(
+            removals(&effects),
+            vec![
+                (id("a1"), NOW - 60),
+                (id("a2"), NOW - 120),
+                (id("b1"), NOW - 180)
+            ]
+        );
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        assert_eq!(effects.last(), Some(&save(&app)));
+        let ended = now - DELETED_SECONDS;
+        for key in [a1, a2, b1] {
+            let mark = deleted(&app, key).unwrap();
+            assert_eq!(
+                (mark.at_unix, mark.failed_unix, mark.removing),
+                (ended, None, true)
+            );
+        }
+        assert_eq!(app.groups.deleted_unix(&side), Some(ended));
+        assert!(app.saved().deleted.iter().all(|mark| mark.at_unix == ended));
+        assert_eq!(removals(&app.delete_all()), vec![], "asked once");
+    }
+
+    #[test]
+    fn an_emptied_deleted_group_loses_its_record() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let (archive, _) = app.new_group("Archive");
+        app.move_session(by_id(&app, "a1"), &side);
+        app.delete_group(&side);
+        app.delete_group(&archive);
+        let week = NOW + DELETED_SECONDS;
+        let effects = app.tick(week - 30);
+        assert_eq!(saves(&effects), 0, "{effects:?}");
+        assert_eq!(app.saved().groups.len(), 2);
+
+        // The empty one goes at its week's end; the other holds a1 until a1 is removed.
+        let effects = app.tick(week + 30);
+        assert_eq!(removals(&effects), vec![(id("a1"), NOW - 60)]);
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        assert_eq!(effects.last(), Some(&save(&app)));
+        let names: Vec<Option<String>> = app.saved().groups.into_iter().map(|g| g.name).collect();
+        assert_eq!(names, vec![Some("Side projects".to_string())]);
+        assert_eq!(app.groups.deleted_unix(&archive), None);
+
+        // With the answer, not at the next tick.
+        let effects = app.receive(removed("a1", Ok(Removal::Removed)), 0.0);
+        assert_eq!(effects, vec![save(&app)]);
+        assert!(app.saved().groups.is_empty());
+        assert_eq!(app.groups.deleted_unix(&side), None);
+        assert_eq!(saves(&app.tick(week + 30 + PURGE_SECONDS)), 0);
+    }
+
+    #[test]
+    fn an_answer_nobody_waits_for_is_dropped() {
+        // A session that is not deleted.
+        let mut app = a1_deleted();
+        let a1 = by_id(&app, "a1");
+        app.recover_session(a1);
+        let effects = app.receive(removed("a1", Ok(Removal::Removed)), 0.0);
+        assert_eq!(effects, vec![]);
+        assert_eq!(deleted(&app, a1), None);
+        assert_eq!(by_id(&app, "a1"), a1);
+
+        // A deleted one whose removal was not asked for.
+        app.delete_session(a1);
+        let effects = app.receive(removed("a1", Ok(Removal::Removed)), 0.0);
+        assert_eq!(effects, vec![]);
+        assert!(deleted(&app, a1).is_some());
+
+        // A session no longer known.
+        let effects = app.receive(removed("z9", Ok(Removal::Removed)), 0.0);
+        assert_eq!(effects, vec![]);
+    }
+
+    #[test]
+    fn recovering_a_group_also_recovers_what_was_not_listed_yet() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        app.move_session(by_id(&app, "a1"), &side);
+        app.delete_group(&side);
+
+        let mut again = restored(app.saved());
+        let others = three_stored()[1..].to_vec();
+        listing(&mut again, Some(NOW - RECENT_DAYS * DAY), others);
+        let effects = again.recover_group(&side);
+        assert_eq!(effects, vec![save(&again)]);
+        assert!(again.saved().deleted.is_empty());
+        listing(&mut again, None, three_stored());
+        let a1 = by_id(&again, "a1");
+        assert_eq!(deleted(&again, a1), None);
+        assert_eq!(group_of(&again, a1), side);
+        assert_eq!(again.sessions_of(&side), vec![a1]);
+    }
+
+    #[test]
+    fn a_new_session_is_not_started_in_a_deleted_group() {
+        let mut app = main_screen();
+        list_both(&mut app, Vec::new());
+        let (side, _) = app.new_group("Side projects");
+        app.delete_group(&side);
+        assert!(app.groups.deleted_unix(&side).is_some());
+        let effects = app.new_session_in(
+            "/home/alex/notes".into(),
+            &side,
+            Place::Focused,
+            Leaving::ForgetIfEmpty,
+        );
+        assert_eq!(effects, vec![]);
+        assert!(app.sessions.is_empty());
+        assert_eq!(app.focused(), None);
+    }
+
+    /// [`ready`] with "Fix the parser" for a title and "hello" sent, the window closed and
+    /// settled: a turn runs while the user is not looking.
+    fn away() -> (App, SessionKey) {
+        let (mut app, key) = ready();
+        app.event(1, SessionEvent::TitleChanged("Fix the parser".into()), 0.0);
+        app.submit(key, "hello");
+        app.set_window(false);
+        assert_eq!(app.settle(), vec![]);
+        (app, key)
+    }
+
+    fn notify(key: SessionKey, title: &str, alert: Alert) -> Effect {
+        Effect::Notify {
+            key,
+            title: title.into(),
+            alert,
+        }
+    }
+
+    fn alerted(app: &App, key: SessionKey) -> Option<Alert> {
+        app.sessions.get(key).unwrap().alerted
+    }
+
+    #[test]
+    fn a_turn_that_ends_while_not_looking_is_notified_once() {
+        let (mut app, key) = away();
+        app.event(1, done(), 0.0);
+        assert_eq!(
+            app.settle(),
+            vec![notify(key, "Fix the parser", Alert::Ready)]
+        );
+        assert_eq!(
+            row_of(&app, key).title,
+            "Fix the parser",
+            "as the sidebar shows it"
+        );
+        assert_eq!(alerted(&app, key), Some(Alert::Ready));
+        app.event(1, done(), 0.0);
+        assert_eq!(app.settle(), vec![], "a second event gives none");
+        assert_eq!(app.settle(), vec![]);
+        assert_eq!(alerted(&app, key), Some(Alert::Ready));
+    }
+
+    #[test]
+    fn a_request_while_not_looking_is_notified() {
+        let (mut app, key) = ready();
+        app.submit(key, "hello");
+        app.set_active(false);
+        assert_eq!(app.settle(), vec![]);
+        app.event(1, permission("r1"), 0.0);
+        let effects = app.settle();
+        assert_eq!(effects, vec![notify(key, "hello", Alert::NeedsInput)]);
+        assert_eq!(row_of(&app, key).title, "hello", "as the sidebar shows it");
+        assert_eq!(alerted(&app, key), Some(Alert::NeedsInput));
+
+        // The store's answer that another app may have it open asks the user too.
+        let (mut app, key) = shows_stored();
+        app.submit(key, "carry on");
+        app.set_window(false);
+        assert_eq!(app.settle(), vec![]);
+        app.receive(
+            FromBackend::Activity {
+                key,
+                result: Ok(Some(NOW - 30)),
+            },
+            0.0,
+        );
+        assert_eq!(mark(&app, key), Mark::NeedsYou);
+        assert_eq!(
+            app.settle(),
+            vec![notify(key, "Fix the parser", Alert::NeedsInput)]
+        );
+    }
+
+    #[test]
+    fn nothing_is_notified_while_looking() {
+        let (mut app, a, b) = two_tiles();
+        assert!(app.looking());
+        let _ = app.settle();
+        app.event(open_of(&app, a), done(), 0.0);
+        app.event(open_of(&app, b), done(), 0.0);
+        assert_eq!(mark(&app, b), Mark::Finished, "ready in another tile");
+        assert_eq!(app.settle(), vec![], "also not for another tile");
+        app.submit(b, "again");
+        app.event(open_of(&app, b), permission("r1"), 0.0);
+        assert_eq!(mark(&app, b), Mark::NeedsYou);
+        assert_eq!(app.settle(), vec![]);
+        // What was ready or needed input before the user left is not notified when they leave.
+        app.set_window(false);
+        assert_eq!(app.settle(), vec![]);
+        app.set_window(true);
+        app.set_active(false);
+        assert_eq!(app.settle(), vec![]);
+        assert_eq!(alerted(&app, b), None);
+    }
+
+    #[test]
+    fn ready_then_needing_input_notifies_again() {
+        let (mut app, key) = away();
+        app.event(1, done(), 0.0);
+        assert_eq!(
+            app.settle(),
+            vec![notify(key, "Fix the parser", Alert::Ready)]
+        );
+        // A turn sent from another device asks for something.
+        app.event(1, SessionEvent::TurnStarted, 0.0);
+        app.event(1, permission("r1"), 0.0);
+        assert_eq!(mark(&app, key), Mark::NeedsYou);
+        assert_eq!(
+            app.settle(),
+            vec![notify(key, "Fix the parser", Alert::NeedsInput)],
+            "it replaces the old one"
+        );
+        assert_eq!(alerted(&app, key), Some(Alert::NeedsInput));
+    }
+
+    #[test]
+    fn answering_takes_the_notification_back() {
+        let (mut app, key) = away();
+        app.event(1, permission("r1"), 0.0);
+        assert_eq!(
+            app.settle(),
+            vec![notify(key, "Fix the parser", Alert::NeedsInput)]
+        );
+        app.answer(
+            key,
+            &RequestId("r1".into()),
+            Answer::Allow { always: false },
+        );
+        assert_eq!(mark(&app, key), Mark::Working);
+        assert_eq!(app.settle(), vec![Effect::Unnotify { key }]);
+        assert_eq!(alerted(&app, key), None);
+        // Attending to a ready one takes it back too.
+        app.event(1, done(), 0.0);
+        assert_eq!(
+            app.settle(),
+            vec![notify(key, "Fix the parser", Alert::Ready)]
+        );
+        app.attend(key);
+        assert_eq!(app.settle(), vec![Effect::Unnotify { key }]);
+        assert_eq!(app.settle(), vec![]);
+    }
+
+    #[test]
+    fn coming_back_takes_them_all_back_and_keeps_the_marks() {
+        let (mut app, a, b) = two_tiles();
+        app.set_window(false);
+        let _ = app.settle();
+        app.event(open_of(&app, a), done(), 0.0);
+        app.event(open_of(&app, b), permission("r1"), 0.0);
+        assert_eq!(app.settle().len(), 2);
+        app.set_active(false);
+        app.set_window(true);
+        assert_eq!(
+            app.settle(),
+            vec![],
+            "a window without the keyboard is not looked at"
+        );
+        app.set_active(true);
+        assert_eq!(app.settle(), vec![Effect::UnnotifyAll]);
+        assert_eq!((alerted(&app, a), alerted(&app, b)), (None, None));
+        assert_eq!(
+            (mark(&app, a), mark(&app, b)),
+            (Mark::Finished, Mark::NeedsYou)
+        );
+        assert_eq!(app.settle(), vec![], "nothing is out");
+        // Leaving again notifies none of them: the user saw them.
+        app.set_active(false);
+        assert_eq!(app.settle(), vec![]);
+        // The window coming back while it has the keyboard takes them back as well.
+        app.answer(b, &RequestId("r1".into()), Answer::Allow { always: false });
+        app.event(open_of(&app, b), done(), 0.0);
+        assert_eq!(app.settle().len(), 1);
+        app.set_window(false);
+        app.set_active(true);
+        assert_eq!(app.settle(), vec![]);
+        app.set_window(true);
+        assert_eq!(app.settle(), vec![Effect::UnnotifyAll]);
+        assert_eq!(mark(&app, b), Mark::Finished);
+    }
+
+    #[test]
+    fn deleting_an_alerted_session_takes_its_notification_back() {
+        let (mut app, key) = away();
+        app.event(1, done(), 0.0);
+        let _ = app.settle();
+        assert_eq!(alerted(&app, key), Some(Alert::Ready));
+        app.delete_session(key);
+        assert!(app.is_deleted(key));
+        assert_eq!(app.settle(), vec![Effect::Unnotify { key }]);
+        assert_eq!(alerted(&app, key), None);
+
+        // One the store has nothing of is forgotten: its notification goes all the same.
+        let (mut app, key) = ready();
+        app.set_window(false);
+        let _ = app.settle();
+        app.event(1, exited(false), 0.0);
+        assert_eq!(app.settle(), vec![notify(key, "New session", Alert::Ready)]);
+        app.delete_session(key);
+        assert!(app.sessions.get(key).is_none());
+        assert_eq!(app.settle(), vec![Effect::Unnotify { key }]);
+        assert_eq!(app.settle(), vec![]);
+    }
+
+    #[test]
+    fn a_deleted_session_is_never_notified() {
+        let (mut app, key) = away();
+        app.delete_session(key);
+        assert_eq!(app.settle(), vec![]);
+        app.event(1, permission("r1"), 0.0);
+        app.event(1, done(), 0.0);
+        app.event(1, exited(false), 0.0);
+        assert_eq!(app.settle(), vec![]);
+        assert_eq!(alerted(&app, key), None);
+        app.set_window(true);
+        assert_eq!(app.settle(), vec![]);
+    }
+
+    #[test]
+    fn ten_sessions_ending_at_once_give_ten_notifications() {
+        let mut app = main_screen();
+        let keys: Vec<SessionKey> = (0..10)
+            .map(|n| busy(&mut app, &format!("/home/alex/s{n}")))
+            .collect();
+        app.set_window(false);
+        assert_eq!(app.settle(), vec![]);
+        let failed = || SessionEvent::TurnFailed {
+            reason: "overloaded".into(),
+        };
+        let mut wanted = Vec::new();
+        for (n, &key) in keys.iter().enumerate() {
+            let (event, alert) = match n % 4 {
+                0 => (done(), Alert::Ready),
+                1 => (failed(), Alert::Ready),
+                2 => (exited(false), Alert::Ready),
+                _ => (permission("r1"), Alert::NeedsInput),
+            };
+            app.event(open_of(&app, key), event, 0.0);
+            wanted.push(notify(key, "go", alert));
+        }
+        assert_eq!(app.settle(), wanted);
+        assert_eq!(app.settle(), vec![]);
+    }
+
+    #[test]
+    fn a_press_on_a_notification_focuses_and_attends_the_session() {
+        // In a tile.
+        let (mut app, a, b) = two_tiles();
+        app.set_window(false);
+        let _ = app.settle();
+        app.event(open_of(&app, b), done(), 0.0);
+        assert_eq!(app.settle(), vec![notify(b, "go", Alert::Ready)]);
+        app.alert_pressed(b, Leaving::ForgetIfEmpty);
+        assert_eq!(app.focused(), Some(b));
+        assert_eq!(tile_keys(&app), vec![a, b]);
+        assert_eq!(mark(&app, b), Mark::None, "attended");
+        assert_eq!(app.settle(), vec![Effect::Unnotify { key: b }]);
+
+        // In none: it shows in the focused tile, as a press on its row shows it.
+        let mut app = main_screen();
+        let c = busy(&mut app, "/c");
+        let d = busy(&mut app, "/d");
+        assert_eq!(tile_keys(&app), vec![d]);
+        app.set_window(false);
+        let _ = app.settle();
+        app.event(open_of(&app, c), done(), 0.0);
+        assert_eq!(app.settle(), vec![notify(c, "go", Alert::Ready)]);
+        let effects = app.alert_pressed(c, Leaving::ForgetIfEmpty);
+        let mut row_press = main_screen();
+        let c2 = busy(&mut row_press, "/c");
+        busy(&mut row_press, "/d");
+        row_press.event(open_of(&row_press, c2), done(), 0.0);
+        assert_eq!(
+            effects,
+            row_press.show(c2, Place::Focused, Leaving::ForgetIfEmpty),
+            "the effects of a press on its row"
+        );
+        assert_eq!(tile_keys(&app), vec![c]);
+        assert_eq!(app.focused(), Some(c));
+        assert_eq!(mark(&app, c), Mark::None, "attended");
+        let effects = app.settle();
+        assert_eq!(
+            effects,
+            vec![Effect::Unnotify { key: c }],
+            "and nothing notified"
+        );
+    }
+
+    #[test]
+    fn a_press_for_a_session_that_is_gone_does_nothing() {
+        let (mut app, a, b) = two_tiles();
+        app.set_window(false);
+        let _ = app.settle();
+        app.event(open_of(&app, b), done(), 0.0);
+        let _ = app.settle();
+        app.delete_session(b);
+        assert_eq!(app.settle(), vec![Effect::Unnotify { key: b }]);
+        let placement = app.tiles.placement();
+        assert_eq!(app.alert_pressed(b, Leaving::ForgetIfEmpty), vec![]);
+        assert_eq!(
+            app.alert_pressed(SessionKey(999), Leaving::ForgetIfEmpty),
+            vec![]
+        );
+        assert_eq!(app.tiles.placement(), placement);
+        assert_eq!(app.focused(), Some(a));
+        assert_eq!(app.settle(), vec![]);
+    }
+
+    /// A listing since `since_unix` that failed because the store could not be found.
+    fn no_store(app: &mut App, since_unix: Option<i64>) -> Vec<Effect> {
+        app.receive(
+            FromBackend::Sessions {
+                since_unix,
+                result: Err(AgentError::Io("the store could not be found".into())),
+            },
+            0.0,
+        )
+    }
+
+    #[test]
+    fn a_failed_listing_forgets_no_deletion() {
+        // The last run deleted a1, named a2 and placed b1 in a group of the user's.
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        app.move_session(by_id(&app, "b1"), &side);
+        app.rename(by_id(&app, "a2"), "Docs");
+        app.delete_session(by_id(&app, "a1"));
+        let saved = app.saved();
+        assert_eq!(saved.deleted, vec![a1_mark()]);
+        assert_eq!(saved.names, vec![(id("a2"), "Docs".to_string())]);
+        assert_eq!(saved.placed, vec![(id("b1"), side)]);
+
+        // This run finds no store: every listing fails, the complete one too.
+        let mut again = restored(saved.clone());
+        let kept = |app: &App| {
+            let now = app.saved();
+            (now.deleted, now.names, now.placed, now.groups)
+        };
+        let before = kept(&again);
+        assert_eq!(
+            before,
+            (
+                saved.deleted.clone(),
+                saved.names.clone(),
+                saved.placed.clone(),
+                saved.groups.clone()
+            )
+        );
+        assert_eq!(
+            saves(&no_store(&mut again, Some(NOW - RECENT_DAYS * DAY))),
+            0
+        );
+        assert_eq!(kept(&again), before, "after the recent listing");
+        assert_eq!(saves(&no_store(&mut again, None)), 0);
+        assert_eq!(kept(&again), before, "after the complete listing");
+        assert!(!again.listed_all);
+        assert!(matches!(again.listing, Listing::Failed(_)));
+        // Nothing is removed or dropped at the ticks either, also a week on.
+        let effects = again.tick(NOW + DELETED_SECONDS + PURGE_SECONDS);
+        assert_eq!(removals(&effects), vec![]);
+        assert_eq!(kept(&again), before, "after a week of ticks");
+
+        // The store is back in a later run: the deletion is still there.
+        let mut later = restored(again.saved());
+        list_both(&mut later, three_stored());
+        assert!(deleted(&later, by_id(&later, "a1")).is_some());
+        assert_eq!(
+            session(&later, by_id(&later, "a2")).user_title.as_deref(),
+            Some("Docs")
+        );
+    }
+
+    #[test]
+    fn an_empty_full_listing_forgets_no_deletion() {
+        // The last run deleted a1, named a2, placed b1 in a group of the user's, and deleted
+        // another group of theirs, with a session placed in it, more than a week ago.
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let (archive, _) = app.new_group("Archive");
+        app.move_session(by_id(&app, "b1"), &side);
+        app.rename(by_id(&app, "a2"), "Docs");
+        app.delete_session(by_id(&app, "a1"));
+        let mut saved = app.saved();
+        saved.placed.push((id("old"), archive.clone()));
+        for group in &mut saved.groups {
+            if group.id == archive {
+                group.deleted_unix = Some(NOW - 2 * DELETED_SECONDS);
+            }
+        }
+        let kept = |app: &App| {
+            let now = app.saved();
+            (now.deleted, now.names, now.placed, now.groups)
+        };
+
+        // This run finds a store that lists as empty: a folder with no `projects` in it, as
+        // an empty mount point is. Every listing succeeds and holds nothing.
+        let mut again = restored(saved.clone());
+        let before = kept(&again);
+        assert_eq!(before.0, vec![a1_mark()]);
+        assert_eq!(before.1, vec![(id("a2"), "Docs".to_string())]);
+        assert_eq!(before.2.len(), 2);
+        assert_eq!(before.3.len(), 2);
+        let effects = listing(&mut again, Some(NOW - RECENT_DAYS * DAY), Vec::new());
+        assert_eq!(saves(&effects), 0, "{effects:?}");
+        let effects = listing(&mut again, None, Vec::new());
+        assert_eq!(saves(&effects), 0, "{effects:?}");
+        assert_eq!(kept(&again), before, "after the complete listing");
+        assert!(again.listed_all, "the listing itself is in");
+        // A row listed before stays as well: with it would go its deleted mark.
+        let mut third = restored(saved.clone());
+        listing(&mut third, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        listing(&mut third, None, Vec::new());
+        assert!(deleted(&third, by_id(&third, "a1")).is_some());
+        assert_eq!(third.sessions.len(), 3);
+        assert_eq!(kept(&third), before);
+        // Nor at the ticks: the deleted group's week is long over, and it keeps its record
+        // and the place in it.
+        let effects = again.tick(NOW + PURGE_SECONDS);
+        assert_eq!(removals(&effects), vec![]);
+        assert_eq!(saves(&effects), 0, "{effects:?}");
+        assert_eq!(kept(&again), before, "after a tick");
+        // A session started meanwhile and listed changes nothing of that.
+        let new = store("n1", "New work", "/home/alex/project", NOW);
+        listing(&mut again, Some(NOW - RECENT_DAYS * DAY), vec![new]);
+        assert_eq!(kept(&again), before, "after a later recent listing");
+
+        // The store is back in a later run: the deletion, the name and the places are there,
+        // and what the store really no longer has is forgotten then.
+        let mut later = restored(again.saved());
+        list_both(&mut later, three_stored());
+        assert!(deleted(&later, by_id(&later, "a1")).is_some());
+        assert_eq!(
+            session(&later, by_id(&later, "a2")).user_title.as_deref(),
+            Some("Docs")
+        );
+        assert_eq!(group_of(&later, by_id(&later, "b1")), side);
+        assert_eq!(
+            later.saved().placed,
+            vec![(id("b1"), side)],
+            "\"old\" is gone"
+        );
+    }
+
+    #[test]
+    fn a_session_being_removed_is_not_recovered_by_the_user() {
+        let mut app = a1_deleted();
+        let a1 = by_id(&app, "a1");
+        assert_eq!(removals(&app.tick(NOW + DELETED_SECONDS)).len(), 1);
+        assert!(deleted(&app, a1).unwrap().removing);
+        assert_eq!(app.recover_session(a1), vec![], "its file may be going");
+        assert!(deleted(&app, a1).unwrap().removing);
+        // The answer is still waited for, and forgets it.
+        let effects = app.receive(removed("a1", Ok(Removal::Removed)), 0.0);
+        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(app.sessions.by_id(&id("a1")), None);
+
+        // "Recover group" brings back the group and its other sessions, not that one.
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let (a1, a2) = (by_id(&app, "a1"), by_id(&app, "a2"));
+        app.move_session(a1, &side);
+        app.move_session(a2, &side);
+        app.delete_group(&side);
+        let mark = deleted(&app, a1).unwrap();
+        app.sessions.get_mut(a1).unwrap().deleted = Some(Deleted {
+            removing: true,
+            ..mark
+        });
+        app.recover_group(&side);
+        assert_eq!(app.groups.deleted_unix(&side), None);
+        assert_eq!(deleted(&app, a2), None);
+        assert!(deleted(&app, a1).is_some_and(|mark| mark.removing));
+
+        // Nor does a listing that shows it used again: the removal's own answer says so.
+        let used = store("a1", "Fix the parser", "/home/alex/project", NOW + 5);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), vec![used]);
+        assert!(deleted(&app, a1).is_some_and(|mark| mark.removing));
+        // Once the removal has failed, the session can be recovered again.
+        let failed = Err(AgentError::Io("the disk is gone".into()));
+        app.receive(removed("a1", failed), 0.0);
+        assert_eq!(app.recover_session(a1), vec![save(&app)]);
+        assert_eq!(deleted(&app, a1), None);
+    }
+
+    #[test]
+    fn a_removal_that_answers_changed_still_recovers() {
+        let mut app = main_screen();
+        list_both(&mut app, three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let a1 = by_id(&app, "a1");
+        app.move_session(a1, &side);
+        app.delete_group(&side);
+        app.tick(NOW + DELETED_SECONDS);
+        assert!(deleted(&app, a1).unwrap().removing);
+        let effects = app.receive(removed("a1", Ok(Removal::Changed)), 0.0);
+        assert_eq!(deleted(&app, a1), None, "used again elsewhere");
+        assert_eq!(
+            app.groups.deleted_unix(&side),
+            None,
+            "and its group with it"
+        );
+        assert_eq!(effects, vec![save(&app)]);
+        assert_eq!(app.sessions_of(&side), vec![a1]);
+    }
+
+    #[test]
+    fn a_folders_group_never_counts_as_deleted() {
+        // A state edited by hand, or damaged: a folder's group with a name and a deleted mark.
+        let saved = Saved {
+            version: SAVED_VERSION,
+            groups: vec![Group {
+                id: project(),
+                name: Some("Work".into()),
+                collapsed: false,
+                hidden: false,
+                deleted_unix: Some(NOW - 30 * DAY),
+            }],
+            ..Saved::default()
+        };
+        let mut app = restored(saved);
+        assert_eq!(app.groups.deleted_unix(&project()), None);
+        assert_eq!(app.groups.deleted(), vec![]);
+        list_both(&mut app, three_stored());
+        for text in ["a1", "a2", "b1"] {
+            assert_eq!(deleted(&app, by_id(&app, text)), None, "{text}");
+        }
+        assert_eq!(removals(&app.tick(NOW + PURGE_SECONDS)), vec![]);
+        let saved = app.saved();
+        assert!(saved.deleted.is_empty());
+        assert_eq!(saved.groups.len(), 1, "its name is kept");
+        assert_eq!(saved.groups[0].deleted_unix, None, "and the mark is not");
+    }
+
+    #[test]
+    fn a_group_is_not_deleted_before_the_full_list_is_in() {
+        let mut app = main_screen();
+        let _ = app.settle();
+        assert!(!app.sidebar.complete);
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let a1 = by_id(&app, "a1");
+        app.move_session(a1, &side);
+        let _ = app.settle();
+        assert!(!app.sidebar.complete, "only the recent sessions are listed");
+
+        // An older session of the folder is still to come: neither kind of group goes yet.
+        for group in [project(), side.clone()] {
+            assert_eq!(app.delete_group(&group), vec![], "{group:?}");
+        }
+        assert_eq!(app.groups.deleted_unix(&side), None);
+        for text in ["a1", "a2", "b1"] {
+            assert_eq!(deleted(&app, by_id(&app, text)), None, "{text}");
+        }
+
+        // A complete listing that fails leaves it so.
+        no_store(&mut app, None);
+        let _ = app.settle();
+        assert!(!app.sidebar.complete);
+        assert_eq!(app.delete_group(&project()), vec![]);
+
+        let version = app.sidebar_version;
+        listing(&mut app, None, with_an_older_one());
+        let _ = app.settle();
+        assert!(app.sidebar.complete);
+        assert!(app.sidebar_version > version);
+        assert_eq!(app.sessions_of(&project()).len(), 2, "a2 and the older a3");
+        assert_eq!(saves(&app.delete_group(&project())), 1);
+        assert!(
+            deleted(&app, by_id(&app, "a3")).is_some(),
+            "the older one too"
+        );
+        assert_eq!(saves(&app.delete_group(&side)), 1);
+        assert!(deleted(&app, a1).is_some());
+    }
+
+    #[test]
+    fn a_kept_name_goes_with_a_session_the_complete_listing_does_not_give() {
+        // The last run named a1, placed it and deleted it; its removal ran, and the app was
+        // closed before the answer came. Nothing of it may stay in the saved state.
+        let mut app = main_screen();
+        listing(&mut app, Some(NOW - RECENT_DAYS * DAY), three_stored());
+        let (side, _) = app.new_group("Side projects");
+        let a1 = by_id(&app, "a1");
+        app.move_session(a1, &side);
+        app.rename(a1, "Parser");
+        app.delete_session(a1);
+        assert_eq!(removals(&app.tick(NOW + DELETED_SECONDS)).len(), 1);
+        let saved = app.saved();
+        assert_eq!(saved.names, vec![(id("a1"), "Parser".to_string())]);
+        assert_eq!((saved.deleted.len(), saved.placed.len()), (1, 1));
+
+        let mut again = restored(saved);
+        let others = three_stored()[1..].to_vec();
+        listing(&mut again, Some(NOW - RECENT_DAYS * DAY), others.clone());
+        assert_eq!(again.saved().names.len(), 1, "it may still be listed");
+        let effects = listing(&mut again, None, others);
+        assert_eq!(saves(&effects), 1, "{effects:?}");
+        let saved = again.saved();
+        assert_eq!(saved.names, vec![]);
+        assert_eq!(saved.deleted, vec![]);
+        assert_eq!(saved.placed, vec![]);
+    }
+
+    #[test]
+    fn attaching_clears_ready_only_when_something_was_taken() {
+        let (mut app, key) = ready_unseen();
+        let effects = app.attach(key, vec![at("/home/alex/notes.txt")]);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(mark(&app, key), Mark::None, "the user acted on it");
+
+        // The same path again adds no chip: nothing was taken, so nothing is cleared.
+        app.sessions.get_mut(key).unwrap().unseen = true;
+        assert_eq!(app.attach(key, vec![at("/home/alex/notes.txt")]), vec![]);
+        assert_eq!(mark(&app, key), Mark::Finished);
+        assert_eq!(app.attach(key, Vec::new()), vec![]);
+        assert_eq!(mark(&app, key), Mark::Finished);
+
+        // A session that takes no message takes no chip.
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.set_active(false);
+        app.receive(exit_of(1, false), 0.0);
+        app.set_active(true);
+        assert_eq!(mark(&app, key), Mark::Finished);
+        assert_eq!(app.attach(key, vec![pasted()]), vec![]);
+        assert_eq!(mark(&app, key), Mark::Finished);
+    }
+
+    #[test]
+    fn taking_the_queued_message_back_clears_ready() {
+        // A turn runs with "later" queued behind it; another tile has the focus.
+        let mut app = main_screen();
+        let a = busy(&mut app, "/a");
+        app.submit(a, "later");
+        assert_eq!(queued_text(session(&app, a)), Some("later"));
+        app.new_session("/b".into(), Place::Side, Leaving::ForgetIfEmpty);
+        app.sessions.get_mut(a).unwrap().unseen = true;
+
+        let (effects, text) = app.edit_queued(a);
+        assert_eq!(text.as_deref(), Some("later"));
+        assert_eq!(effects, vec![]);
+        assert!(session(&app, a).queued.is_none());
+        assert!(!app.sessions.get(a).unwrap().unseen, "the user acted on it");
+
+        // Nothing queued: nothing is taken and nothing cleared.
+        app.sessions.get_mut(a).unwrap().unseen = true;
+        assert_eq!(app.edit_queued(a), (vec![], None));
+        assert!(app.sessions.get(a).unwrap().unseen);
+        assert_eq!(app.edit_queued(SessionKey(999)), (vec![], None));
+    }
+
+    #[test]
+    fn what_deleting_a_session_costs() {
+        // Stored and at rest: nothing.
+        let (mut app, stored) = shows_stored();
+        assert_eq!(app.deleting(stored), Some(Deleting::Kept));
+        // A message held by the "open elsewhere" question, and nothing else.
+        let (asked, key, _) = checked(5);
+        assert!(asked.prompt(key).is_some());
+        assert_eq!(asked.deleting(key), Some(Deleting::DropsMessage));
+        // Queued while the store is asked about it.
+        let (mut queued, key) = shows_stored();
+        queued.submit(key, "carry on");
+        assert_eq!(queued.deleting(key), Some(Deleting::DropsMessage));
+        // Never delivered: its program ended uncleanly before it took the message.
+        let (mut refused, key) = sent_hello();
+        refused.receive(closed_send(1, "hello", vec![]), 0.0);
+        refused.receive(exit_of(1, false), 0.0);
+        assert!(!session(&refused, key).undelivered.is_empty());
+        assert_eq!(refused.deleting(key), Some(Deleting::DropsMessage));
+
+        // A turn runs, a request waits, a background task runs, Remote Control is on.
+        let (mut working, key) = idle();
+        assert_eq!(working.deleting(key), Some(Deleting::Kept), "it idles");
+        working.submit(key, "go");
+        assert_eq!(working.deleting(key), Some(Deleting::Stops));
+        working.event(1, permission("r1"), 0.0);
+        assert_eq!(working.deleting(key), Some(Deleting::Stops));
+        let (mut task, key) = idle();
+        task.sessions.get_mut(key).unwrap().session.background = 1;
+        assert_eq!(task.deleting(key), Some(Deleting::Stops));
+        let (mut remote, key) = idle();
+        remote.sessions.get_mut(key).unwrap().session.remote = Remote::Starting;
+        assert_eq!(remote.deleting(key), Some(Deleting::Stops));
+        // Stopping wins over a message that waits behind the turn.
+        let (mut both, key) = sent_hello();
+        both.submit(key, "later");
+        assert_eq!(both.deleting(key), Some(Deleting::Stops));
+
+        // The store has nothing of it: it would be forgotten, whatever it holds.
+        let (mut fresh, key) = ready();
+        assert_eq!(
+            fresh.deleting(key),
+            Some(Deleting::Forgotten { holds: false })
+        );
+        fresh.attach(key, vec![pasted()]);
+        assert_eq!(
+            fresh.deleting(key),
+            Some(Deleting::Forgotten { holds: true })
+        );
+        let mut early = main_screen();
+        early.new_session("/c".into(), Place::Focused, Leaving::ForgetIfEmpty);
+        let key = early.focused().unwrap();
+        assert_eq!(
+            early.deleting(key),
+            Some(Deleting::Forgotten { holds: false })
+        );
+        early.submit(key, "early");
+        assert!(session(&early, key).queued.is_some());
+        assert_eq!(
+            early.deleting(key),
+            Some(Deleting::Forgotten { holds: true })
+        );
+        // Remote Control on a session never sent is forgotten with it.
+        let (mut fresh, key) = ready();
+        fresh.sessions.get_mut(key).unwrap().session.remote = Remote::On { url: None };
+        assert_eq!(
+            fresh.deleting(key),
+            Some(Deleting::Forgotten { holds: false })
+        );
+
+        // What it says is what `delete_session` does.
+        assert!(fresh.delete_session(key).len() >= 2);
+        assert!(fresh.sessions.get(key).is_none(), "forgotten");
+        app.delete_session(stored);
+        assert!(deleted(&app, stored).is_some(), "kept for a week");
+
+        // Nothing to say of a deleted session or of one that is not known.
+        assert_eq!(app.deleting(stored), None);
+        assert_eq!(app.deleting(SessionKey(999)), None);
+    }
+
+    #[test]
+    fn a_session_is_called_what_its_row_shows() {
+        let (app, key) = shows_stored();
+        assert_eq!(app.title_of(key).as_deref(), Some("Fix the parser"));
+        let (app, key) = ready();
+        assert_eq!(app.title_of(key).as_deref(), Some("New session"));
+        assert_eq!(app.title_of(SessionKey(999)), None);
     }
 }

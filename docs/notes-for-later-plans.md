@@ -2,9 +2,266 @@
 
 **Commit ids in these notes, in the plans and in the rulings files are from before the first push.** On 2026-11-17, at Jerod's word, the history was squashed for that push into one commit for each plan, so the ids named here (`fe0dd63`, `622c6ba` and the rest) are not in the pushed history. On Jerod's machine the old history is kept under the ref `refs/backup/before-squash-2026-11-17` and in the file `.git/backup-before-squash-2026-11-17.bundle`; neither is pushed.
 
-Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column), plan 5 (the effort level, the right panel and Remote Control), plan 6 (attachments) and plan 7 (running in the background, and opening a picture). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column), plan 5 (the effort level, the right panel and Remote Control), plan 6 (attachments), plan 7 (running in the background, and opening a picture) and plan 8 (a Deleted view, status colours and notifications). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
 
-Plan 7's section comes first, then plan 6's, then plan 5's, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+What plan 8 is for comes first, then Jerod's look at plan 8, then plan 7's section, then plan 6's, then plan 5's, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## What plan 8 is for
+
+Asked "What is next to plan?" on 2026-11-17, after plan 7 was merged and pushed, Jerod said: "I see I can't delete conversations or groups, I think that should be included. Along with alerts? I would like to make them more colorful than Claude Code, it only shows a little dot when a session is done. I want the entire name on the left to turn green when it's ready."
+
+What was settled in the talk that followed, in Jerod's words where they chose:
+
+- **Deleting is not permanent at once.** "I think instead of permanent, there should be a menu at the top for Deleted messages/groups, that switches the sidebar to show those deleted ones. That menu has a 'Delete All' option, and every minute or so it permanently deletes those messages if they're older than a week. Groups/sessions from there can be recovered and moved back into the main view. So the main view will 'Delete' and send it into that view where it will be permanently deleted after 1 week. Sort of like deleted text messages on an iphone." What they want gone are test sessions, theirs and those the live test left behind.
+- **After the week the session is really removed**, from Claude Code's own history too. Jerod agreed ("Yes") that this is the first exception to the rule that the app changes nothing in Claude Code's folder, and that a deleted session stays visible in Claude Code's own lists until its week is up.
+- **Colours.** "If I'm in another tile, I want the tile that is ready to have a nice green colored title background. When I click on that tile, the green color goes away back to it's current grey. Same with the entry on the left side." And: "Let's go with orange if a session needs input. That matches the mind rune icon colors."
+- **In another app.** Jerod asked what Claude Code does and was told: little in a terminal, a desktop notification in Claude Desktop. Offered a desktop notification together with a coloured tray icon, they said: "Yes that would work."
+
+The plan is `docs/superpowers/plans/2026-11-17-deleted-view-colours-alerts.md`: eleven tasks and 29 decisions of the planner's that Jerod has not seen. Jerod said "Yes, build it" the same day, and it is built on the branch `plan-8-deleted-colours-alerts`, not yet on `main`: see the next section. Two research reports made for it are on disk and not in git, under `.superpowers/sdd/plan-8-research/`. What they found that shaped the plan: Claude Code has no command that deletes one session, so the adapter removes a session's own files itself; the toolkit cannot change a tray icon in place, so the icon is made anew when its marker changes; GNOME shows a notification also while the app's own window has the keyboard, so the app holds them back then; and the app never knew whether its window has the keyboard, which "ready" now needs.
+
+## Jerod's look at plan 8
+
+**Merged into `main` on 2026-11-19, at Jerod's word ("Merge now"), by the merge commit `fdb2e3b`; the branch is deleted.** The same day, at Jerod's word ("Yeah squash it"), plan 8 was squashed for the push into one commit on top of the pushed history, as the earlier plans were on 2026-11-17: the plan 8 ids named in these notes, in the plan and in its rulings file (`829d085` to `fdb2e3b`) are not in the pushed history. On Jerod's machine they are kept under the ref `refs/backup/before-squash-plan-8-2026-11-19`. Where this section says "on the branch" or "not yet on `main`", that was so until then. Before the merge Jerod had used deleting and the colours in the real window, and two things were changed on their word on 2026-11-18: a selected coloured row has no ring (`8dbcd61`), and the folder error under "New session" goes by itself after eight seconds (`df00d33`). The merged tree gives 1588 passed, 0 failed, 2 ignored, with formatting and lints clean. Not yet reported by Jerod: the live test's output, a press on a notification, the tray's dot, "Delete All" and "Recover".
+
+Plan 8 (`docs/superpowers/plans/2026-11-17-deleted-view-colours-alerts.md`) does three things. A session or a group can be deleted: it moves to a Deleted view, can be recovered from there for a week, and is then removed for good: its transcript and its own folders are removed from Claude Code's folder too, so `claude --resume` no longer lists it; "Delete All" does that at once. A session that is ready turns its tile's title bar and its sidebar row green, and one that needs input turns them orange, until you act on it. And while you are not looking at MindRune, a desktop notification says so, and the tray icon carries a green or orange dot.
+
+It is built on the branch `plan-8-deleted-colours-alerts`, cut from `main` at `817f075`, after Jerod said "Yes, build it" on 2026-11-17: Tasks 1 to 10 in eighteen commits, from `829d085` to `03de435`, eight of them fix rounds after a task's review, then Task 11's three commits (the scenes, the live test's new lines, these notes). Every task had its own review. The whole branch was then reviewed (2026-11-18), and a fix wave of six commits followed, from `97e945f` on, with one correction after its re-review: what it changed is under "The whole-branch review of plan 8", below, and everything in this section describes the branch after it. The branch is not on `main` and nothing is pushed. After the fix wave `cargo test --workspace` gives 1587 passed, 0 failed, 2 ignored (the live tests, not run by any agent), and formatting and lints are clean.
+
+The rulings made while the plan ran are in `docs/superpowers/plans/2026-11-18-plan-8-rulings.md`.
+
+As for the plans before, the live test comes first. Jerod runs, in their own terminal, with the branch checked out:
+
+```bash
+MINDRUNE_LIVE=1 cargo test -p mindrune --test live -- --ignored --nocapture
+```
+
+Then, after quitting any MindRune that runs (see "Before looking"), the window:
+
+```bash
+cargo run --release -p mindrune
+```
+
+Quit it with Ctrl+Q, with "Quit" in the tray's menu, or from another terminal:
+
+```bash
+cargo run --release -p mindrune -- --quit
+```
+
+A notification carries MindRune's name and icon only when the desktop entry is installed. Plan 8 did not change the entry, so one installed for plan 7 serves; if it was never installed, that is Jerod's to run, after a release build:
+
+```bash
+cargo build --release -p mindrune
+scripts/install-desktop-entry.sh
+```
+
+`cargo test --workspace` writes the screenshots of the five new scenes (`colours`, `deleted`, `deleted-empty`, `delete-group-ask` and `delete-all-ask`, dark and light) to `target/snap/final`, beside the others. Neither they nor the folder are in git.
+
+### The live test
+
+It starts the real `claude` as many times as for plan 7 and stores the same three sessions: its first session, the one opened to the side, and the one sent attachments. What is new is its last step. Once it has closed the app for the second time, it removes those three sessions from Claude Code's folder, through the same code that removes a deleted session after its week, and nothing else: no session it did not make, and none whose id it does not know. So a run that reaches its end leaves no test sessions behind. A run that fails before its end tidies up too: on every way out it removes those of its sessions whose programs it has seen end, and prints `live: the test left early; its sessions removed from the store: N of M, kept because a program may still run: K`. It keeps a session whose program may still run, because such a program could write its files again after they were removed and leave a partial session in the list; a session kept that way can be deleted in the window.
+
+It removes a session only once it has seen that session's program end. Closing the app waits for the first two; the session sent attachments was waited for only up to a limit, so the test waits again, up to twenty seconds, and keeps any session whose program still runs then, with a line that says so. A program still running could write its files again after they were removed, and the count of leftover paths would then report them. The removal is also told to keep a session whose transcript changed later than the moment that wait ended, plus ten seconds, as the app does for a session it deleted; since the removal follows at once, that guards little here, and it is the wait that keeps a running program's files.
+
+What it now prints at its end, on stderr, one per line. None of these fails the test, and no line holds an id, a project folder's name or anything a session holds:
+
+- `live: the test's own sessions removed from the store: N of M`. `M` is the number of its sessions whose id the test knows, normally 3. Before it, a line for each one not removed: `live: a test session was still running; kept`, `live: a session of the test's was not in the store`, `live: a session of the test's changed after the test closed it; kept`, or `live: a session of the test's could not be removed (…)` with the kind of error only, since its words may name a path. And, should the test not know an id, `live: sessions of the test's whose id is not known, not removed: N`.
+- `live: paths still named by a removed session's id: N`. After the removal the test looks through the whole of Claude Code's folder, at most four levels deep and at most 200,000 names, for any path whose name holds the id of a session that is gone (removed, or not in the store under its id). It reads names only: it opens no file and follows no link. When `N` is not zero, `live: they sit under: …` names the first-level folders those paths sit under (`projects`, `file-history` and so on), never a deeper name and never an id; a path at the top of the folder whose own name holds an id is given as `(the top of the folder)`. Three more lines may follow: that the look stopped after 200,000 names, how many folders could not be listed, and `live: folders not looked into, being links: N` when a first-level folder is a link (with `projects` linked elsewhere, a count of 0 says nothing of what is there). When Claude Code's folder cannot be found or listed, or no session was removed, the line says `not looked at` with the reason.
+
+What the lines settle:
+
+- `3 of 3` and `0` settle that removing works on a real store, for the transcripts and for the folders beside them, under `file-history` and under `session-env`. This had only been tried on folders the tests made.
+- A path left over means that removing missed it, that a program wrote it again afterwards, or that Claude Code keeps a kind of path for a session that nobody knew of. The look goes by names through the whole folder, so it can show such a kind: a folder named in `they sit under` other than `projects`, `file-history` and `session-env` is one. What it cannot see is an id written inside a shared file, such as a line of Claude Code's prompt history: the test reads no shared file.
+- `not in the store` would mean that the program stored a session under another id than it reported, or not at all.
+
+The earlier lines of the live test are unchanged.
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- **A deleted session is still in Claude Code's own lists for its week.** `claude --resume` and Claude Desktop show it until MindRune removes it.
+- **A deleted session that is used again elsewhere comes back.** If it is continued from a terminal during its week, MindRune puts it back in the normal list and does not remove it.
+- **Deleting a session that is working stops it.** The app asks first, also for a session whose program runs a background task or has Remote Control on, and for one that holds a message not sent yet.
+- **"Removed for good" removes the session's transcript and its own folders**, and nothing else. The prompts you typed in a terminal stay in Claude Code's own prompt history (`history.jsonl`), which MindRune never changes.
+- **A deleted session comes back by itself whenever its transcript changes.** That need not be a use you remember: anything that writes to the file or moves its time counts, and the session is then back in the normal list within a minute or two.
+- **A start with another `CLAUDE_CONFIG_DIR` forgets the deletions and the group places of the first store.** MindRune keeps one saved state, and the complete list of the second store does not hold the first store's sessions.
+- **Claude Code clears out old sessions by itself** (after about thirty days, by its own setting). A session may be gone before its week in the Deleted view is over; MindRune takes that as done.
+- **The tray icon blinks when its dot changes, and it changes calmly.** The toolkit cannot change a tray icon in place, so the icon is taken away and put back. The dot changes only once the state it shows has held for three seconds, so a session that becomes ready and is clicked at once never touches the icon; the first line of the tray's menu follows at once. When it does change, that is usually a blink; at worst the old icon stays up to five seconds and then about ten seconds pass with none. Its place in the bar may change, and a tray menu that is open closes. If the icon could not be put back, MindRune tries again every thirty seconds. If that is too restless, say so.
+- **Notifications need the desktop entry installed.** Without it they show without MindRune's name and icon.
+- **A notification shows only when you are not looking at MindRune**: its window is closed, or another app has the keyboard. With the window in front, the colours do the job.
+- **A notification carries the session's title onto the desktop**, also onto a locked screen where the desktop is set to show notifications there.
+- **MindRune's own file or folder picker counts as another app.** While it is open, a turn that ends turns its tile green and sends a notification.
+- **Notifications are taken back when MindRune quits.**
+- **Notifications are Linux only**, and there is no sound.
+- **The colours stay until you act on the session.** The row and the title bar stay green until you click the tile or the row, or type in it. Coming back to the window does not clear them.
+- **When Claude Code's folder cannot be found** (no home folder, a `CLAUDE_CONFIG_DIR` that is not a full path, a folder that does not exist, or a `projects` in it that is a link to nowhere, as with a volume not mounted), no stored session is listed and nothing is removed. The window does not say why: the list is simply empty, as it was before this plan when the folder could not be read. Deleted sessions stay deleted, and kept names and group places are kept, until a run that finds the folder. "Delete group" stays greyed out in such a run, because the full list never comes in. A folder that exists and holds no `projects` yet is a fresh install and lists as empty; so does an empty mount point, and for that reason a full list with no session in it at all forgets nothing either. MindRune now reads where `CLAUDE_CONFIG_DIR` points when it is set, as Claude Code itself does; before this plan it read only `~/.claude`.
+
+And before the look itself:
+
+- **Quit any MindRune that runs first**, with the command above or Ctrl+Q in its window. A running copy built from `main` would be shown in place of the new build.
+- **Have the desktop entry installed** (the commands above), or notifications come without MindRune's name and icon.
+- **Which sessions to delete.** The things to try below delete test sessions, and only those. Make them for the look: two or three sessions in a throwaway folder, each sent one word. The live test leaves none, because a run that passes removes its own. Make the folder first, then in the window choose "New session", pick that folder, and send one word; do that two or three times.
+
+  ```bash
+  mkdir -p /tmp/mindrune-look
+  ```
+
+  Nothing leaves the disk before its week is over unless "Delete All" is pressed, and "Delete All" removes everything in the Deleted view, from this computer, for good. Two steps below can take more than the test sessions if they are followed without looking: "Delete group" on a folder's group takes every session of that folder, also the older ones behind "Show older", and "Delete All" takes every row of the Deleted view. Each step says what to check first.
+- The demo window (`cargo run -p mindrune -- --demo`) starts no notifier and no tray, as before, and removes nothing.
+
+### What to try in the window
+
+1. Right-click a test session, "Delete": it leaves the list at once. The switch at the top of the sidebar says "Deleted (1)". "Delete" asks first when the session has Remote Control on, with the words "It is still working. Deleting stops it."; where Remote Control is turned on for new sessions, that is every new session whose program still runs, so expect the question there and answer "Delete".
+2. The Deleted view: the line "Removed for good after 7 days." with "Delete All" beside it, and the row says "6 days left". Press it, "Recover": it is back where it was.
+3. "Delete group". Do not use the folder's own group for this unless you have checked it: a folder's group also holds the older sessions behind "Show older". Make a group of your own with "New group", move the test sessions into it, and choose "Delete group" on that. Or, on a folder's group, read the question first: its count must be the number of rows you see. The question is titled with the group's name, `Delete "…"?`, and names the count. Just after a start "Delete group" is greyed out for a second or two, until the full list of sessions is in. The group is in the Deleted view; "Recover group" brings it back; delete it again.
+4. Delete a session while its turn runs: the question is titled `Delete "…"?` with the session's name, its words wrap inside it, with "Cancel" and "Delete"; Return presses "Cancel". Then "Delete": its tile closes and its `claude` process ends. The programs of the running copy are listed by this command, which should no longer show it:
+
+   ```bash
+   pgrep -a -P "$(cat "$XDG_RUNTIME_DIR/mindrune/lock")"
+   ```
+
+5. Start a new session, type a few words in its box without sending, and choose "Delete" on its row: the question says "It was never sent and will not be kept." A new session with nothing in it goes at once, without a question.
+6. Quit and start again with something in the Deleted view: it is still there, with a day count.
+7. The path that works by itself: delete a test session, then continue it from a terminal in its folder, send it a word and leave. Within a minute or two it is back in MindRune's normal list, and no longer in the Deleted view.
+
+   ```bash
+   cd /tmp/mindrune-look && claude --resume
+   ```
+
+8. "Delete All". Look at the Deleted view first: every row must be one you made today. If a row is not, recover it before going on. Then "Delete All": the question says how many sessions will be removed and that it cannot be undone. Afterwards the sessions are gone from `claude --resume` too, and no empty group is left in the Deleted view.
+9. Let a turn end in a tile you are not in: its title bar and its row turn green. Click the tile: both turn grey. The same by clicking the row.
+10. Let a session ask for permission in a tile you are not in: orange on both, and on the tile's outline, until you answer. A coloured row that is the selected one looks as the others do: its fill and no ring.
+11. Switch to another app while a turn runs in the tile you were in: a notification with the session's name and "Finished.", and after three seconds the tray's icon has a green dot. Click the notification: MindRune comes to the front once, with that session focused and the keyboard in its box. Back in MindRune the tile stays green until you click it. If a press on a notification does nothing at all, the first place to look is the check that takes presses only from the notification service itself (see "Rulings made while the plan ran").
+12. The same with the window closed, and with a permission request ("Needs your input.", an orange dot).
+13. The window that comes back without the keyboard: close the window, open it from the tray, and let a turn end in the focused tile. If the tile does not turn green although you clicked nothing in the window, MindRune took the window for looked at; say so.
+14. Watch the tray icon as the dot comes and goes: is the blink acceptable? Let a turn end in another tile and click that tile within three seconds: the icon should not change at all.
+15. Both themes: are the green and the orange pleasant, and is the writing on them easy to read?
+16. Dismiss a notification without pressing it, then let the same session become ready again while you are elsewhere: a new notification appears.
+17. With a notification out, come back and look at its session: the notification goes away. With one out, quit MindRune: it goes away too.
+
+### Every decision of plan 8, with what was built
+
+The twenty-nine decisions are the planner's; Jerod has not seen them.
+
+**Deleting**
+
+1. **"Delete" on a resting session acts at once, without a question**; it can be recovered for a week. Built. It asks first only when something would be lost, and says which. When its program would be stopped (a turn runs, a request waits for you, a background task runs, or Remote Control is on or connecting): "It is still working. Deleting stops it. It can be recovered for 7 days." When it rests and holds a message not sent yet (queued, not yet delivered, or held by the question whether to continue a session open elsewhere): "A message in it has not been sent and will be dropped. It can be recovered for 7 days." The question is titled with the session's name, `Delete "…"?`, with "Cancel" and "Delete" (in the danger colour); Return, Escape, a press outside and its close button cancel. These words replace the plan's, which promised a recovery also where there is none (decision 15).
+2. **"Delete group" always asks, and says how many sessions go with it.** Built: the question is titled with the group's name, `Delete "…"?`, with, for example, "3 sessions go with it. 2 of them are still working and will be stopped. They can be recovered for 7 days.", or "It has no sessions. It can be recovered for 7 days." It takes every session of the group, also the older ones the list does not show. "Delete group" waits for the full list of sessions: it is greyed out until that is in, a second or two after a start, so the count is the whole truth for both kinds of group and no session of the group turns up afterwards.
+3. **A group you made yourself keeps "Ungroup"**, beside "Delete group": the group goes and its sessions return to their folders' groups. Built. A folder's group has only "Delete group"; a folder group you renamed is reset by renaming it to nothing.
+4. **A folder's group can be deleted too.** Built: its sessions go to the Deleted view and the group leaves the list. A new session in that folder brings the group back, without the deleted ones.
+5. **The switch is two words at the top of the sidebar**, "Sessions" and "Deleted (3)", above "New session". Built: the count is of sessions, and "Deleted" stands alone when nothing is deleted. The Deleted view has no "New session"; it has the line "Removed for good after 7 days." with the button "Delete All", which is greyed out, over the line "Nothing is deleted.", when there is nothing. Rows keep their place in the list when you switch, so they slide between the two lists.
+6. **The Deleted view lists the same groups as the normal list**, holding only what was deleted, never folded, newest deletion first. Each row says "6 days left", "1 day left" or "today". Built: a press on a row or a group's name opens its menu under it, "Recover" or "Recover group", and so do a right-click, Return, Space and the Menu key. A group's name is also a stop for the arrow keys there, so an empty deleted group can be recovered from the keyboard.
+7. **Recovering a session whose group was deleted brings the group back with it**; the group's other sessions stay deleted until they are recovered too. Built.
+8. **A deleted session is not shown in a tile.** Built: deleting closes its tile and its open picture, and it cannot be opened until it is recovered.
+9. **"Delete All" asks first.** Built: "Delete everything for good?", "3 sessions will be removed from this computer. This cannot be undone.", with "Cancel" and "Delete All". A session whose program has not ended yet goes when its program has ended, and a group you made that "Delete All" emptied leaves the Deleted view with its last session, not a minute later.
+10. **What is removed for good**: the session's transcript, the folder of the same name beside it, and its folders under `file-history` and `session-env`. Nothing shared is touched. Built, and it is the only code of the app that changes anything in Claude Code's folder. It takes only an id written as a UUID, removes a link as a link and never what it points to, and removes the transcript last, so a session that could not be removed whole is still listed.
+11. **A session whose file changed after it was deleted is not removed**: it comes back to the normal list, as one used again elsewhere. One that is already gone counts as removed. Built, with the file's time read again just before the transcript goes. The app's own program's last writes, up to ten seconds after it ended, do not count as a change.
+12. **A removal that fails is tried again an hour later**, not every minute, and its row says "Not removed". Built; the plan's words were "Could not be removed", which left room for only the start of a title.
+13. **Messages waiting in a deleted session are dropped** when it is deleted: a queued message and one its program never got. Built.
+14. **The app reads Claude Code's folder where Claude Code itself looks**: `CLAUDE_CONFIG_DIR` when it is set, else `~/.claude`. Built, with one addition by ruling: only a full path to a folder that is there counts. Without one (no home folder, a relative `CLAUDE_CONFIG_DIR`, a folder that does not exist, a `projects` linked to nowhere) the listing fails with "the store could not be found", nothing is removed, and deleted sessions stay deleted.
+15. **A session that was never sent a message is simply forgotten** by "Delete". Built, also for one whose first message never reached the store. When such a session holds something (a draft typed in its box, attachments, or a first message not sent yet), "Delete" asks first, and says what is true: "It was never sent and will not be kept."
+
+**Colours**
+
+16. **Green and orange are the icon's own**, the same in both themes: the green with near-white writing, the orange with near-black writing. Built; the contrasts measure 6.0 to 1 and 7.0 to 1.
+17. **The whole title bar and the whole row take the colour.** Built: the title, the folder's chip, the state word, the close button, and a name being edited in the bar are drawn in the pair's writing colour. "Remote" on a coloured bar is in that colour while Remote Control is on, and fainter (at 70%) while it connects or reconnects.
+18. **Orange wins over the selection and over green**; a row that is selected and ready is green. Built. A coloured row shows no hover or press feedback. A coloured row that is the selected one shows its fill and no ring of its own: Jerod saw the ring the run had given it and did not want it (2026-11-18). The arrow keys show the focus ring every row shows.
+19. **The outline of a tile that needs input turns from amber to the same orange.** Built, and the request card inside it takes the orange border too. In the light theme the card's "Needs you" word is a darker amber beside the orange border, because the orange is not readable enough on white. The usage warnings keep their amber.
+20. **A collapsed group shows a green or orange dot** for the strongest state among its sessions. Built; a working session keeps its small moving mark (`colours-*.png` shows the green dot on "recipes").
+21. **"Ready" now also covers the tile you were in when you left for another app.** Built.
+22. **Ready is cleared only by your own act on that session**: a click on its tile or its row (also when it is already the focused one), the keyboard moving into it, typing or pasting text in its box, attaching a picture or a file to it, "Edit" on its queued message, sending, answering, dragging its tile, or a press on its notification. Built. One gap: a click into a box that already holds the keyboard clears nothing until the first keystroke, because the box takes that click for itself. Not cleared any more: the window coming back, another tile closing so that the focus falls on it, or a press on a button in another tile while this tile's box holds the keyboard.
+23. **A failed turn and a program that died count as ready.** Built.
+
+**Notifications and the tray**
+
+24. **A notification is sent when a session becomes ready or starts to need input while you are not looking at MindRune**: its window is closed, or another app has the keyboard. Built. Never while MindRune's window has the keyboard, also not for a session in another tile.
+25. **Its title is the session's name; its text is "Finished." or "Needs your input."** One notification for each session: a new one for the same session replaces the old. Built: the name as the sidebar shows it, the app's name "MindRune" and the hint that ties it to MindRune's desktop entry, and one action, labelled "Open", which a press on the notification itself sets off.
+26. **A press on it brings the window forward and focuses the session**, opening it in the focused tile if it is in none, with the keyboard in its box. Built; the press clears "ready". A press on a notification whose session is gone or deleted only shows the window.
+27. **Notifications are taken back** when the session is dealt with, and all of them when MindRune's window gets the keyboard again, and when MindRune quits. Built. A notification the desktop took more than five seconds to show stays until the app quits; whether the take-back at quit reaches the desktop in time when no program is left to wait for has not been seen.
+28. **The tray's dot**: a filled circle at the icon's lower right, with a thin dark ring, orange while any session needs input, else green while any is ready, else none. Deleted sessions never count. Built; the icon is made anew when the dot changes, and only once the dot wanted has held for three seconds (see "Before looking"). An icon that could not be put up is tried again every thirty seconds.
+29. **Where there is no notification service, or the app runs as the demo or without a window system, nothing is sent** and nothing else changes. Built: without a service, one line on stderr, `mindrune: no desktop notifications: …`, and the app runs on.
+
+### Rulings made while the plan ran
+
+All are in `docs/superpowers/plans/2026-11-18-plan-8-rulings.md`. Those that change what Jerod sees or may meet:
+
+- **Without Claude Code's folder there is no store, and that is an error, not an empty list**: the listing fails, nothing is removed, and a deleted session stays deleted rather than being forgotten (decision 14). This holds for a path that is not full, for a folder that does not exist and for a `projects` linked to nowhere. An id that is not a UUID is never removed and never taken for gone.
+- **A session that turns up after a group you made was deleted is deleted with the group**, and starts its own week when it turns up, so it is never removed before you could see it in the Deleted view. Recovering the group recovers it too. Within a run this can no longer happen, because "Delete group" waits for the full list; the rule stays for a saved state in which a group is deleted and a session placed in it is not marked.
+- **A deleted session that had ended is put to rest at once**, so its conversation is let go.
+- **Typing or pasting text in a ready session's box clears "ready"** (decision 22); the plan's first build cleared it only on sending.
+- **One orange for needs input**: the request card's border and its "Needs you" word use the bar's orange, not the kit's amber, except the word in the light theme, which keeps the darker amber to stay readable.
+- **The tray's dot is drawn from the same two colours as the bars and rows**, defined once.
+- **A press on a notification is taken only from the notification service itself.** Any program of yours on the desktop's message bus could otherwise fake a press that shows the window or a session. The re-review of that change read GNOME Shell's own source: the service answers and sends its signals over one connection, so they carry the same sender there, and the check holds. Read in GNOME's source, not seen working; if presses do nothing at all, this check is the first place to look.
+- **A notification that could not be replaced is sent again as a new one only after the desktop said no**, never after a time-out, so a second notification that could not be taken back never appears.
+- **The live test removes the sessions it made** (see "The live test").
+
+### Things to look at
+
+- The switch at the top of the sidebar, in both views (`sessions-*.png`, `deleted-*.png`): the chosen word sits on a darker or greyer pill.
+- The Deleted view (`deleted-*.png`): "website" with "Resizing the banner", "6 days left", and "Choosing the fonts", "Not removed"; "Side projects" with "Planning the spring beds", "4 days left". Both titles show whole at the sidebar's usual width.
+- The empty Deleted view (`deleted-empty-*.png`): "Deleted" without a count, "Delete All" greyed out, "Nothing is deleted.".
+- The two questions (`delete-group-ask-*.png`, `delete-all-ask-*.png`): the group's is titled `Delete "rune_claude"?`, with its words on two lines inside the dialog, "Delete All"'s on one; "Cancel", and "Delete" or "Delete All" in red.
+- The colours (`colours-*.png`, `sessions-*.png`, `tiles-needs-you-*.png`): green and orange on the bars and the rows, with their writing. The green dot of a collapsed group is small, and in the dark theme it stands out little from the dark sidebar.
+- A row's menu (`group-menu-*.png`) now ends with a separator and a red "Delete".
+- The selected coloured row (`colours-*.png`): the arrow keys have passed onto the orange row, which is a plain orange fill like the green one above it.
+- "Delete All" is a plain text button beside the note, not a red one; its danger shows only in its question.
+- In the dark theme the questions' red "Delete" and "Delete All" are a paler red than in the light theme.
+- A tile stays beside the Deleted view and shows a session that is not deleted, with its input box (`deleted-*.png`).
+- The orange outline of a tile that needs input sits right beside the blue outline of the focused tile next to it (`colours-*.png`): two lines of different colours side by side.
+- In the dark theme a selected row is hard to tell from the sidebar, also the selected working row in `colours-dark.png`.
+
+### What no agent could see
+
+No agent ran Claude Code, removed anything from a real store, or saw the real window or the desktop. What the look or the live test must settle:
+
+| Point | Read where | Seen working | Made sure by |
+| --- | --- | --- | --- |
+| What Claude Code keeps on disk for one session: the transcript, a folder beside it, `file-history/<id>`, `session-env/<id>` | names in Jerod's own store (the research report) | the names, yes; that nothing else refers to a session, no | the live test removes the sessions it made and looks through the whole folder, by names, for anything still named by their ids; an id inside a shared file it cannot see |
+| A notification with the hint `desktop-entry = "mindrune"` shows MindRune's name and icon | GNOME Shell's source | no | Jerod's look, item 11 |
+| A click on a notification sends an activation token and then the action, and the token brings the window to the front | GNOME Shell's source | no | Jerod's look, item 11 |
+| The service's answer to a notification and its signals about it come from the same sender, so a press passes the check | GNOME Shell 50.1's source (the re-review of Task 9) | no | Jerod's look, item 11 |
+| A notification can be taken back and replaced over the connection that sent it | GNOME Shell's source | no | Jerod's look, items 11, 16 and 17 |
+| The window hears when it gains and loses the keyboard on Wayland | Rune's and winit's source | no | Jerod's look, items 9, 11 and 13 |
+| A tray icon made anew with a dot shows without a long gap | Rune's source (it cannot change an icon in place) | no | Jerod's look, item 14 |
+
+### The whole-branch review of plan 8
+
+The whole branch was reviewed on 2026-11-18, after Task 11, and a fix wave followed in six commits: `97e945f` (a store that is not there), `059c8e6` (the core), `8caf6eb` (the window), `6371002` (the live test), `a0cc9e3` (these notes) and one more that rewrapped two comment lines. What it changed, for someone who read this section before:
+
+- **A store that is not there is an error everywhere.** Listing fails with "the store could not be found" when Claude Code's folder is not known, does not exist, or holds a `projects` that is a link to nowhere, and a failed listing keeps every deletion, kept name and group place. Removing answers the same error, and never "the session is gone", when there is no `projects` to look through. An id that is not a UUID is never taken for gone. Before, one start without the folder forgot every deletion.
+- **A session being removed cannot be recovered** until its removal has answered: its file may be going. "Recover" and "Recover group" leave it, and so does a listing that shows it used again; the removal's own answer then brings it back if it changed.
+- **"Delete" asks first for a background task or Remote Control**, which it used to cut off unasked.
+- **What is due goes at once**: a session whose week is over (or after "Delete All") when its program ends, and an emptied group with its last session, not at the next minute's check.
+- **A folder's group can never count as deleted**, whatever the saved state holds, so a damaged or hand-edited state cannot delete a folder's sessions.
+- **"Delete group" waits for the full list**, in the core and in the menu.
+- **Two more acts clear "ready"**: attaching to a session, and "Edit" on its queued message. **One act no longer does**: the focus handed back to the tile that holds the keyboard after a press in another tile.
+- **The tray is calm**: the dot must hold for three seconds before the icon is made anew, the first icon goes up with the right dot, and an icon that could not be put up is tried again every thirty seconds.
+- **Notifications are taken back at quit.**
+- **The questions name what they are about and say what is true** (decisions 1, 2 and 15), and a failed removal's row says "Not removed" (decision 12).
+- **A coloured bar keeps its distinction**: "Remote" fainter while it connects (decision 17). The ring this also gave the selected coloured row was taken out again on 2026-11-18, on Jerod's word (decision 18).
+- **The live test looks for leftovers everywhere, by names**, and tidies up on every way out (see "The live test").
+
+The fix wave was reviewed again, and one correction followed in one commit. A click into the message box of a ready tile clears "ready" again: the wave's change to the focus handed back had stopped that. A full list of sessions that holds none at all forgets no deletion, kept name or group place, because an empty mount point lists that way. The ring of a selected coloured row was drawn two points in from the row's edge, so that it could be seen on a dark sidebar (since removed, see decision 18). And the live test says how many first-level folders it did not look into because they are links.
+
+### What is left
+
+Found while building and reviewing and left as it is:
+
+- **A click into a box that already holds the keyboard** clears "ready" only at the first keystroke (decision 22).
+- **A start with another `CLAUDE_CONFIG_DIR` that names a real store** forgets the deletions, names and group places of the first store (see "Before looking").
+- **A run in which the sessions could not be listed says nothing about it**: the list is empty and "Delete group" stays greyed out, without a word of why.
+- **"Recover" on a session whose removal is under way does nothing**, and the row does not show why, until the removal has answered. That is normally a moment.
+- **A removal whose answer never comes** is not tried again until a restart, and its session cannot be recovered until then.
+- **A session whose id is not a UUID**, if one existed, could be deleted but never removed: its row would say "Not removed" for good, tried again each hour, and "Recover" brings it back.
+- **A project folder that cannot be searched** makes every removal fail, tried again each hour for good. It fails safe: nothing is removed.
+- **A notification can stay on the desktop when MindRune is quit while no program runs.** The take-back at quit has the time the app waits for its programs to end; with none to wait for, the app is gone before the desktop has heard it.
+- A notification shows the title the session had when it was sent; a rename while it is out does not change it.
+- **A window that comes up without the keyboard counts as looked at** until the keyboard first comes or goes. If MindRune is started behind another app and never brought forward, no notification comes (the look's item 13).
+- **The tray's dot shows also while you are looking at MindRune.** Whether it should be held back then is Jerod's to say at the look.
+- Rows keep their keys in both views, so they slide between the two lists when the view is switched.
+- The question about a working session follows the session while it shows: if the turn ends meanwhile, it says only "It can be recovered for 7 days."
+- The notifier was not built for macOS or Windows here, so that it still builds there is not checked.
+- Not in this plan, on purpose: removing one item for good before its week is up, a sound, a setting to turn notifications off (the desktop's own settings do that), notifications on macOS and Windows, deleting with the Delete key, other words for "Working", "Needs you" and "Finished", and a change to Rune so that a tray icon can change in place.
 
 ## Jerod's look at plan 7
 
@@ -1383,7 +1640,7 @@ Folders for new sessions:
 - Ctrl+N while the folder picker is open can open the menu, and both answers then start a session.
 - Tidying the sidebar shuts the folder menu without clearing the folders it offered; they are not read while it is shut.
 - With the sidebar shown and no session shown, the same folder error is drawn twice, under both buttons.
-- The floating error line (sidebar hidden, a session shown) lies over the top left of the conversation until the next try, and no screenshot shows it.
+- The floating error line (sidebar hidden, a session shown) lies over the top left of the conversation until the next try, and no screenshot shows it. Since 2026-11-18 the error line, floating or under "New session", also goes by itself after eight seconds: Jerod found it stuck there after a "+" on a group whose folder was gone.
 
 Tests:
 

@@ -12,9 +12,9 @@ use mr_agent::{Agent, AgentError, FakeAgent, ImageData, RequestId};
 #[cfg(test)]
 use mr_core::EntryMut;
 use mr_core::{
-    App, Backend, Busy, DEFAULT_WIDTH, Effect, FromBackend, GroupId, ItemBody, ItemId, Launch,
-    Leaving, Line, Phase, Place, Prepared, RequestState, SAVED_VERSION, Saved, Screen, Session,
-    SessionKey, Source, Spot, Standing, ToBackend, Width,
+    App, Backend, Busy, DEFAULT_WIDTH, Deleting, Effect, FromBackend, GroupId, ItemBody, ItemId,
+    Launch, Leaving, Line, Phase, Place, Prepared, RequestState, SAVED_VERSION, Saved, Screen,
+    Session, SessionKey, SidebarView, Source, Spot, Standing, ToBackend, Width,
 };
 use rune::prefs::Prefs;
 use rune::runtime::Waker;
@@ -23,6 +23,7 @@ use rune_kit::ImageZoom;
 use rune_kit::shell::PaneState;
 
 use crate::demo;
+use crate::notify::Note;
 use crate::view;
 
 /// The settings key the conversation's width is kept under.
@@ -42,6 +43,10 @@ const TICK: Duration = Duration::from_secs(30);
 
 /// How often the demo window polls, so the fake's scripted replies play on their own.
 const DEMO_TICK: Duration = Duration::from_millis(50);
+
+/// How long the folder error stays under "New session" when no new try takes it away: long
+/// enough to read a line with a path in it.
+pub const FOLDER_ERROR_HOLD: Duration = Duration::from_secs(8);
 
 /// Which of the input box's pickers has its list open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +73,21 @@ pub enum MenuTarget {
     Group(GroupId),
     /// The "Hidden groups" line: one item per hidden group.
     HiddenGroups,
+    /// A session's row in the Deleted view.
+    Deleted(SessionKey),
+    /// A group's header in the Deleted view.
+    DeletedGroup(GroupId),
+}
+
+/// A question about deleting that waits for its answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeleteAsk {
+    /// Deleting a session that would cut something off.
+    Session(SessionKey),
+    /// Deleting a group and every session of it.
+    Group(GroupId),
+    /// Removing everything in the Deleted view for good.
+    All,
 }
 
 /// What the window's one name field edits.
@@ -282,6 +302,11 @@ pub struct Ui {
     /// tiles' placement then (`Tiles::placement`): it is the list's selected row until a row
     /// is pressed or a tile comes, goes or takes the focus (`view::sidebar::selected_row`).
     pub passed_row: Option<(SessionKey, u64)>,
+    /// The tile whose text field held the keyboard at the end of the last [`run`], or that the
+    /// glue itself last gave the keyboard to ([`type_in`]): how [`run`] tells the keyboard
+    /// coming into a tile, which is the user's act, from the focus handed back to the tile
+    /// that had it all along.
+    typed_in: Option<SessionKey>,
     /// The name being edited, and the field it is edited in: one at a time, in the window.
     pub renaming: Option<Renaming>,
     pub rename: TextEdit,
@@ -295,8 +320,11 @@ pub struct Ui {
     /// as it opened (`view::folder::ask`), so it reads the disk once per opening.
     pub folder_offers: Vec<PathBuf>,
     /// Why the folder picker could not be used, or that a folder chosen is gone: shown under the
-    /// button until the next try.
+    /// button until the next try, or until its time is up ([`FOLDER_ERROR_HOLD`]).
     pub folder_error: Option<String>,
+    /// When the folder error goes by itself, on the frames' clock: set by the first poll that
+    /// sees it, and none again once a new one is set (`view::folder`).
+    pub folder_error_until: Option<f64>,
     /// Where the chips' thumbnails and the messages' pictures are made: set by [`setup`], with
     /// the window's waker. Until then, and in a view test that does not set one, none is made.
     pub images: Option<ImageCache>,
@@ -319,6 +347,8 @@ pub struct Ui {
     pub quitting: bool,
     /// The question whether to quit shows (`view::quit`): something would be cut off.
     pub quit_ask: bool,
+    /// The question about deleting that shows (`view::deleted`), if one does.
+    pub delete_ask: Option<DeleteAsk>,
     /// The picture open large over the window, if one is ([`open_picture`]).
     pub viewing: Option<Viewing>,
     /// How far the open picture is zoomed and panned: the kit's viewer keeps it here.
@@ -327,6 +357,9 @@ pub struct Ui {
     pub tray: Option<Sender<Standing>>,
     /// The standing the tray was last told ([`poll`]).
     tray_said: Standing,
+    /// Tells the desktop's notifications what to show and take back; there only where a
+    /// notifier was started.
+    pub notifier: Option<Sender<Note>>,
 }
 
 impl Ui {
@@ -395,12 +428,14 @@ impl Ui {
             file_drop: None,
             swallow_row_press: false,
             passed_row: None,
+            typed_in: None,
             renaming: None,
             rename: TextEdit::new(""),
             folder_menu: None,
             folder_side: false,
             folder_offers: Vec::new(),
             folder_error: None,
+            folder_error_until: None,
             images: None,
             thumbs: HashMap::new(),
             unready: Vec::new(),
@@ -408,10 +443,12 @@ impl Ui {
             reveal_chips: Vec::new(),
             quitting: false,
             quit_ask: false,
+            delete_ask: None,
             viewing: None,
             zoom: ImageZoom::new(),
             tray: None,
             tray_said: Standing::default(),
+            notifier: None,
         };
         run(&mut ui, effects);
         (ui, warning)
@@ -491,8 +528,20 @@ pub fn leaving(ui: &Ui, place: Place) -> Leaving {
 /// keyboard focus, as when the user picked it with a click; without, the focus stays where it
 /// is (on the sidebar's list, say, whose arrow keys move from session to session).
 pub fn show(ui: &mut Ui, tx: &mut Tx, key: SessionKey, place: Place, focus: bool) {
+    let leaving = leaving(ui, place);
+    show_by(ui, tx, key, focus, |app| app.show(key, place, leaving));
+}
+
+/// [`show`] by `intent`, the `App`'s intent that shows `key`'s session.
+fn show_by(
+    ui: &mut Ui,
+    tx: &mut Tx,
+    key: SessionKey,
+    focus: bool,
+    intent: impl FnOnce(&mut App) -> Vec<Effect>,
+) {
     let tiled = ui.app.tiles.contains(key);
-    let effects = ui.app.show(key, place, leaving(ui, place));
+    let effects = intent(&mut ui.app);
     if ui.app.focused() == Some(key) {
         // At once, as a tab shows: the conversation left does not fade out over this one, and
         // the tiles take their new widths in the same frame.
@@ -512,6 +561,13 @@ pub fn show(ui: &mut Ui, tx: &mut Tx, key: SessionKey, place: Place, focus: bool
         }
     }
     run(ui, effects);
+}
+
+/// A notification of this session was pressed: as a press on its row ([`show`]), it shows in
+/// the focused tile, or its tile takes the focus, and its input box takes the keyboard.
+pub fn alert_pressed(ui: &mut Ui, tx: &mut Tx, key: SessionKey) {
+    let leaving = leaving(ui, Place::Focused);
+    show_by(ui, tx, key, true, |app| app.alert_pressed(key, leaving));
 }
 
 /// `key`'s tile takes the focus; with `typing`, its input box takes the keyboard focus.
@@ -589,6 +645,8 @@ pub fn type_in(ui: &mut Ui, key: SessionKey) -> bool {
             .is_some_and(|entry| !ended(&entry.session));
     if typing {
         view_mut(ui, key).draft.focused = true;
+        // The glue's own doing, not the keyboard coming there by the user's act ([`run`]).
+        ui.typed_in = Some(key);
     }
     typing
 }
@@ -770,6 +828,7 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
         now
     };
     changed |= take_in(ui, stamp);
+    changed |= folder_error_times_out(ui, now, tx);
     tell_tray(ui);
     changed |= handles_made(ui);
     changed |= full_made(ui);
@@ -784,6 +843,34 @@ pub fn poll(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Takes the folder error away once it has been there for [`FOLDER_ERROR_HOLD`], and wakes
+/// the window for that. It is about one try, and nothing else the user does takes it away, so
+/// without this it stayed for as long as no new session was asked for. True when it went.
+fn folder_error_times_out(ui: &mut Ui, now: f64, tx: &mut Tx) -> bool {
+    if ui.folder_error.is_none() {
+        ui.folder_error_until = None;
+        return false;
+    }
+    let until = *ui
+        .folder_error_until
+        .get_or_insert(now + FOLDER_ERROR_HOLD.as_secs_f64());
+    if now < until {
+        tx.wake_after(Duration::from_secs_f64(until - now));
+        return false;
+    }
+    ui.folder_error = None;
+    ui.folder_error_until = None;
+    true
+}
+
+/// Tells the notifier what to show or take back. Without one, the note is dropped; so is one
+/// for a notifier that has ended.
+fn tell_notifier(ui: &Ui, note: Note) {
+    if let Some(notifier) = &ui.notifier {
+        let _ = notifier.send(note);
+    }
 }
 
 /// Tells the tray how the sessions stand when that changed since it was last told. Nothing
@@ -806,17 +893,23 @@ fn tell_tray(ui: &mut Ui) {
 /// until `setup` has started it.
 ///
 /// Every change to the `App` (an intent, or a message taken in) is followed by a call to this,
-/// so it ends by bringing the sidebar's model up to date (`App::settle`, which also takes out
-/// the tiles of sessions that are gone) and the sessions' views with it ([`tidy_views`]).
+/// so it brings the sidebar's model up to date (`App::settle`, which also takes out the tiles
+/// of sessions that are gone, and gives the notifications due and to take back: they are
+/// carried out with the rest) and ends by bringing the sessions' views up to date with it
+/// ([`tidy_views`]).
 ///
 /// Last, the rule of ruling R7: while a text field of a tile holds the keyboard focus, that
 /// tile is the focused one. An intent on a session in another tile (a request button, a row's
 /// toggle: controls that take no keyboard focus) focused that other tile; the focus goes back
-/// to the tile the user types in here, in the same change, so no outline or row flashes. A
-/// tile focused on purpose whose box cannot take the keyboard leaves no field holding it
+/// to the tile the user types in here, in the same change, so no outline or row flashes, and
+/// without counting as the user's act on that tile's session (`App::return_focus`). The
+/// keyboard coming into another tile's field since the last run (a click into its box) is
+/// their act: that tile is focused as a press on it focuses it (`App::focus_tile`). A tile
+/// focused on purpose whose box cannot take the keyboard leaves no field holding it
 /// ([`focus_tile`]), so nothing is given back.
 pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
-    for effect in effects {
+    let alerts = ui.app.settle();
+    for effect in effects.into_iter().chain(alerts) {
         let message = match effect {
             Effect::SaveWidth(width) => {
                 if let Err(error) = ui.prefs.set(WIDTH_KEY, &width) {
@@ -863,13 +956,31 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
                 message,
                 index,
             },
+            Effect::RemoveStored {
+                id,
+                unless_after_unix,
+            } => ToBackend::RemoveStored {
+                id,
+                unless_after_unix,
+            },
+            Effect::Notify { key, title, alert } => {
+                tell_notifier(ui, Note::Show { key, title, alert });
+                continue;
+            }
+            Effect::Unnotify { key } => {
+                tell_notifier(ui, Note::Close { key });
+                continue;
+            }
+            Effect::UnnotifyAll => {
+                tell_notifier(ui, Note::CloseAll);
+                continue;
+            }
         };
         match &ui.backend {
             Some(backend) => backend.send(message),
             None => ui.waiting.push(message),
         }
     }
-    ui.app.settle();
     tidy_views(ui);
     tidy_sidebar(ui);
     tidy_handles(ui);
@@ -879,12 +990,25 @@ pub fn run(ui: &mut Ui, effects: Vec<Effect>) {
     {
         ui.file_drop = None;
     }
-    if let Some(typing) = typing_in(ui)
+    // The tile the user types in is the focused one. When the keyboard was in that tile
+    // already, an intent moved the focus away and it is handed back: that is not the user's
+    // act, and a ready session there stays ready. When the keyboard has come into the tile
+    // since the last run (a click into its box, which Rune carries out without the app's
+    // code; `poll` runs this before the view's own watch could), it is their act on that
+    // session.
+    let typing = typing_in(ui);
+    if let Some(typing) = typing
         && ui.app.focused() != Some(typing)
     {
-        let effects = ui.app.focus_tile(typing);
+        let effects = if ui.typed_in == Some(typing) {
+            ui.app.return_focus(typing)
+        } else {
+            ui.app.focus_tile(typing)
+        };
+        ui.typed_in = Some(typing);
         run(ui, effects);
     }
+    ui.typed_in = typing;
 }
 
 /// What a held divider or line keeps for a cancel is forgotten when the tiles' placement
@@ -899,10 +1023,12 @@ fn tidy_handles(ui: &mut Ui) {
     }
 }
 
-/// The sidebar's menu shuts when what it is the menu of is gone, and so does the folder menu of
-/// a group no longer listed. A row's drag ends when its session is gone, a header's when its
-/// tile is, and either while a menu is open: a menu takes the pointer, and the drag's release
-/// never comes.
+/// The sidebar's menu shuts when what it is the menu of is gone (a row's or a group's of the
+/// list, also into or out of the Deleted view), and so does the folder menu of a group no longer
+/// listed. A question about deleting goes when what it asks about is gone or deleted already, or
+/// for "Delete All" when nothing is left in the Deleted view. A row's drag ends when its session
+/// is gone or deleted or the Deleted view shows, a header's when its tile is gone, and either
+/// while a menu is open: a menu takes the pointer, and the drag's release never comes.
 ///
 /// A rename whose field is gone with its place ends: that of a group no longer listed, of a
 /// session that is gone, of a row no longer listed, of a header whose session left its tile.
@@ -912,19 +1038,37 @@ fn tidy_handles(ui: &mut Ui) {
 fn tidy_sidebar(ui: &mut Ui) {
     let model = &ui.app.sidebar;
     let listed = |id: &GroupId| model.sections.iter().any(|section| section.id == *id);
+    let sessions = model.view == SidebarView::Sessions;
+    let deleted = |key: &SessionKey| {
+        ui.app
+            .sessions
+            .get(*key)
+            .map(|entry| entry.deleted.is_some())
+    };
     let gone = match ui.side_menu.as_ref().map(|menu| &menu.target) {
-        Some(MenuTarget::Row(key)) => ui.app.sessions.get(*key).is_none(),
-        Some(MenuTarget::Group(id)) => !listed(id),
+        Some(MenuTarget::Row(key)) => deleted(key) != Some(false),
+        Some(MenuTarget::Group(id)) => !sessions || !listed(id),
         Some(MenuTarget::HiddenGroups) => model.hidden.is_empty(),
+        Some(MenuTarget::Deleted(key)) => deleted(key) != Some(true),
+        Some(MenuTarget::DeletedGroup(id)) => sessions || !listed(id),
         None => false,
     };
     if gone {
         ui.side_menu = None;
     }
+    let gone = match &ui.delete_ask {
+        Some(DeleteAsk::Session(key)) => deleted(key) != Some(false),
+        Some(DeleteAsk::Group(id)) => !sessions || !listed(id),
+        Some(DeleteAsk::All) => sessions || model.sections.is_empty(),
+        None => false,
+    };
+    if gone {
+        ui.delete_ask = None;
+    }
     let menu = ui.side_menu.is_some() || ui.folder_menu.is_some();
     if let Some(drag) = &ui.drag {
         let gone = match drag.from {
-            DragFrom::Row => ui.app.sessions.get(drag.key).is_none(),
+            DragFrom::Row => !sessions || deleted(&drag.key) != Some(false),
             DragFrom::Header => !ui.app.tiles.contains(drag.key),
         };
         if menu || gone {
@@ -972,13 +1116,12 @@ fn tidy_sidebar(ui: &mut Ui) {
 /// - The drawn picture of an id that no session needs any more (`Session::picture_ids`: its
 ///   chips', its queued message's, its conversation's) is dropped, and so is one for an id no
 ///   session ever held.
-/// - The picture open large closes when its session is gone or no longer holds its id.
+/// - The picture open large closes when its session is gone, deleted or no longer holds its id.
 fn tidy_views(ui: &mut Ui) {
     let shown = ui.viewing.as_ref().is_none_or(|viewing| {
-        ui.app
-            .sessions
-            .get(viewing.key)
-            .is_some_and(|entry| entry.session.picture_ids().any(|id| id == viewing.picture))
+        ui.app.sessions.get(viewing.key).is_some_and(|entry| {
+            entry.deleted.is_none() && entry.session.picture_ids().any(|id| id == viewing.picture)
+        })
     });
     if !shown {
         close_picture(ui);
@@ -1074,14 +1217,19 @@ pub fn closing(ui: &mut Ui, _tx: &mut Tx) {
     run(ui, effects);
 }
 
-/// `App::on_quit`, and `App::on_close` where closing the window ends the app: ends every
-/// session, waiting up to [`CLOSE_WAIT`] for them, so no program that runs one is left going
-/// without the app. Only the first call does anything.
+/// `App::on_quit`, and `App::on_close` where closing the window ends the app: takes every
+/// notification back, then ends every session, waiting up to [`CLOSE_WAIT`] for them, so no
+/// program that runs one is left going without the app. Only the first call does anything.
+///
+/// The notifications go first, so that the notifier's thread has the time of that wait to
+/// reach the desktop: a notification left behind by an app that is gone can only be dismissed,
+/// and its press does nothing.
 pub fn quitting(ui: &mut Ui, _tx: &mut Tx) {
     if ui.quitting {
         return;
     }
     ui.quitting = true;
+    tell_notifier(ui, Note::CloseAll);
     if let Some(warning) = close_warning(ui, CLOSE_WAIT) {
         eprintln!("{warning}");
     }
@@ -1104,6 +1252,75 @@ pub fn ask_quit(ui: &mut Ui, tx: &mut Tx) -> bool {
         ui.quit_ask = true;
     }
     true
+}
+
+/// Deletes `key`'s session at once when nothing is lost by it; else asks first
+/// ([`delete_asks`]). Nothing for a session that is deleted or gone.
+pub fn ask_delete_session(ui: &mut Ui, tx: &mut Tx, key: SessionKey) {
+    match delete_asks(ui, key) {
+        Some(true) => ask_delete(ui, DeleteAsk::Session(key)),
+        Some(false) => delete(ui, tx, DeleteAsk::Session(key)),
+        None => {}
+    }
+}
+
+/// Whether deleting `key`'s session asks first; none for a session that is deleted or gone.
+/// The core says what deleting would do (`App::deleting`): it asks when a program would be
+/// stopped at work or a message not sent yet would be dropped. A session the store has nothing
+/// of is forgotten for good, so it asks when anything is in it: the core knows its chips and
+/// its message, the window the draft typed in its box.
+pub fn delete_asks(ui: &Ui, key: SessionKey) -> Option<bool> {
+    Some(match ui.app.deleting(key)? {
+        Deleting::Kept => false,
+        Deleting::Stops | Deleting::DropsMessage => true,
+        Deleting::Forgotten { holds } => holds || !view_of(ui, key).draft.text.is_empty(),
+    })
+}
+
+/// Asks before deleting the group `id` and every session of it. Not before the full list of
+/// sessions is in: the question's count would not be the whole truth (`App::delete_group`).
+pub fn ask_delete_group(ui: &mut Ui, id: GroupId) {
+    if !ui.app.sidebar.complete {
+        return;
+    }
+    ask_delete(ui, DeleteAsk::Group(id));
+}
+
+/// Asks before removing everything in the Deleted view for good.
+pub fn ask_delete_all(ui: &mut Ui) {
+    ask_delete(ui, DeleteAsk::All);
+}
+
+/// Shows the question about `ask`, after putting away what lies over the window: the question
+/// whether to quit among it.
+fn ask_delete(ui: &mut Ui, ask: DeleteAsk) {
+    put_away(ui);
+    ui.delete_ask = Some(ask);
+}
+
+/// Does what `what` asks and puts its question away. A deleted session's tile closes in the
+/// core, and the tiles take their new widths at once; when it was the focused one, the input box
+/// of the tile focused now takes the keyboard focus. Both as [`close_tile`] does. A delete that
+/// closes no tile ("Delete All", a session in no tile) is not at once: the question and the
+/// rows that leave go with their fade.
+pub fn delete(ui: &mut Ui, tx: &mut Tx, what: DeleteAsk) {
+    ui.delete_ask = None;
+    let focused = ui.app.focused();
+    let tiles = ui.app.tiles.keys().len();
+    let effects = match &what {
+        DeleteAsk::Session(key) => ui.app.delete_session(*key),
+        DeleteAsk::Group(id) => ui.app.delete_group(id),
+        DeleteAsk::All => ui.app.delete_all(),
+    };
+    if ui.app.tiles.keys().len() != tiles {
+        tx.instant();
+    }
+    run(ui, effects);
+    if focused.is_some_and(|key| !ui.app.tiles.contains(key))
+        && let Some(now) = ui.app.focused()
+    {
+        type_in(ui, now);
+    }
 }
 
 /// Ends the programs (`quitting`) and the app (`Tx::quit`).
@@ -1133,8 +1350,14 @@ pub fn shown(ui: &mut Ui, shown: bool, _tx: &mut Tx) {
     run(ui, effects);
 }
 
+/// `App::on_focus`: the window got the keyboard or lost it to another app.
+pub fn focus_changed(ui: &mut Ui, focused: bool, _tx: &mut Tx) {
+    let effects = ui.app.set_active(focused);
+    run(ui, effects);
+}
+
 /// Shuts what lies over the window: menus, pickers, a rename, a row's or a header's drag, the
-/// question whether to quit. A draft and its chips stay.
+/// question whether to quit or about deleting. A draft and its chips stay.
 ///
 /// A divider, a line or a width being dragged is left alone here. As the window goes, Rune
 /// cancels the pointer's drag: the handler hears its release as cancelled and puts back what it
@@ -1143,6 +1366,7 @@ pub fn shown(ui: &mut Ui, shown: bool, _tx: &mut Tx) {
 /// save writes the ones put back.
 pub fn put_away(ui: &mut Ui) {
     ui.quit_ask = false;
+    ui.delete_ask = None;
     ui.side_menu = None;
     view::folder::close(ui);
     for view in ui.views.values_mut() {
@@ -1383,7 +1607,7 @@ mod tests {
         PermissionMode, SessionCommand, SessionEvent, SessionHandle, SessionId, SessionInfo,
         StartSpec, StoredHistory, StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary,
     };
-    use mr_core::{HistoryState, ItemBody, Phase, Screen, ThinkingTime, Thumb, Width};
+    use mr_core::{Alert, HistoryState, ItemBody, Phase, Screen, ThinkingTime, Thumb, Width};
     use rune::prefs::Prefs;
     use rune::{Key, Mods, Runtime};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2056,6 +2280,121 @@ mod tests {
         assert!(replied(ui), "the reply came in with no window");
         let entry = ui.app.sessions.get(key).unwrap();
         assert!(entry.unseen, "no one saw it end");
+    }
+
+    #[test]
+    fn losing_the_keyboard_is_told_to_the_core() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        rt.state.fake.clone().unwrap().reply(vec![
+            FakeStep::at(0.0, SessionEvent::TurnStarted),
+            FakeStep::at(
+                1.0,
+                SessionEvent::TurnFinished(TurnSummary {
+                    cost_usd: 0.0,
+                    context_used: None,
+                    duration_ms: 1,
+                    interrupted: false,
+                }),
+            ),
+        ]);
+        let ui = &mut rt.state;
+        assert!(ui.app.looking(), "active from the start");
+        focus_changed(ui, false, &mut Tx::default());
+        assert!(!ui.app.looking());
+        let effects = ui.app.submit(key, "Tidy the notes");
+        run(ui, effects);
+        let mut now = 100.0;
+        while ui.app.sessions.get(key).unwrap().session.phase != Phase::Idle && now < 110.0 {
+            now += 0.25;
+            poll(ui, now, &mut Tx::default());
+        }
+        assert_eq!(ui.app.focused(), Some(key));
+        assert!(
+            ui.app.sessions.get(key).unwrap().unseen,
+            "ready in the focused tile"
+        );
+        focus_changed(ui, true, &mut Tx::default());
+        assert!(ui.app.looking());
+        assert!(
+            ui.app.sessions.get(key).unwrap().unseen,
+            "until the user acts on it"
+        );
+    }
+
+    #[test]
+    fn a_notify_effect_reaches_the_notifier_and_is_dropped_without_one() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        let effects = || {
+            vec![
+                Effect::Notify {
+                    key,
+                    title: "Tidy the notes".into(),
+                    alert: Alert::NeedsInput,
+                },
+                Effect::Unnotify { key },
+                Effect::UnnotifyAll,
+            ]
+        };
+        let sent = testkit::sent(&rt).len();
+        // No notifier: they are dropped, and nothing goes to the programs.
+        run(&mut rt.state, effects());
+        assert_eq!(testkit::sent(&rt).len(), sent);
+        let (notifier, told) = std::sync::mpsc::channel();
+        rt.state.notifier = Some(notifier);
+        run(&mut rt.state, effects());
+        assert_eq!(
+            told.try_iter().collect::<Vec<_>>(),
+            vec![
+                Note::Show {
+                    key,
+                    title: "Tidy the notes".into(),
+                    alert: Alert::NeedsInput,
+                },
+                Note::Close { key },
+                Note::CloseAll,
+            ]
+        );
+        assert_eq!(testkit::sent(&rt).len(), sent);
+    }
+
+    #[test]
+    fn a_pressed_alert_focuses_its_session() {
+        let mut rt = testkit::window("empty");
+        let a = testkit::add_session(&mut rt, "/home/alex/a");
+        let b = testkit::add_session(&mut rt, "/home/alex/b");
+        testkit::show(&mut rt, a);
+        assert_eq!(testkit::focused(&rt), Some(a));
+        rt.update(|ui, tx| alert_pressed(ui, tx, b));
+        testkit::step(&mut rt);
+        assert_eq!(testkit::focused(&rt), Some(b));
+        assert!(testkit::box_focused(&rt, b), "the keyboard is in its box");
+        assert!(!testkit::box_focused(&rt, a));
+    }
+
+    #[test]
+    fn quitting_takes_the_notifications_back_first() {
+        let mut rt = testkit::window("working");
+        let (notifier, told) = std::sync::mpsc::channel();
+        rt.state.notifier = Some(notifier);
+        let before = testkit::sent(&rt).len();
+        let ui = &mut rt.state;
+        quitting(ui, &mut Tx::default());
+        assert_eq!(
+            told.try_iter().collect::<Vec<_>>(),
+            vec![Note::CloseAll],
+            "whatever is out, and whether or not the user looks"
+        );
+        ui.backend.as_ref().unwrap().flush();
+        assert_eq!(
+            testkit::sent(&rt).len(),
+            before + 1,
+            "then the programs end"
+        );
+        // Only the first call does anything.
+        quitting(&mut rt.state, &mut Tx::default());
+        assert_eq!(told.try_iter().count(), 0);
     }
 
     #[test]

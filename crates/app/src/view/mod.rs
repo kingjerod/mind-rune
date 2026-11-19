@@ -10,6 +10,7 @@ use crate::theme;
 
 mod chips;
 mod conversation;
+mod deleted;
 mod drag;
 mod field;
 pub(crate) mod folder;
@@ -55,6 +56,7 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
         Screen::Checking | Screen::SignedOut | Screen::NotInstalled => signin::screen(ui, kit),
     };
     quit::question(ui, kit, &mut layer);
+    deleted::question(ui, kit, &mut layer);
     viewer::layer(ui, cx, kit, &mut layer);
     // The app's own root, under the kit's: what a screenshot's tree is checked for.
     let base = el().key("mr-root").child(base.w_full().h_full());
@@ -108,21 +110,21 @@ fn pane(ui: &Ui, cx: &mut Cx<Ui>, kit: &'static Kit, key: SessionKey, layer: &mu
 
 /// `AppSpec::on_key`, for keys no focused text field took: Ctrl+Q quits, or asks first
 /// ([`glue::ask_quit`]), on every screen and also while the question shows, where it changes
-/// nothing, and while a picture is open large, which it puts away; while either shows no other key
-/// is taken here ([`overlay_open`]). Else the kit's sidebar shortcut shows and hides the sidebar;
-/// on the main screen, Ctrl+Alt+B shows and hides the right panel once per press, Ctrl+N asks for a
-/// new session's folder, and Ctrl+Shift+N for one to the side, F6 and Shift+F6 move to the next and
-/// the previous tile, and Ctrl+W closes the focused one, once per press, the last three unless a
-/// picker's list or a menu is open (a text field leaves all of them alone); Ctrl+Shift+PageUp and
-/// Ctrl+Shift+PageDown move the focused tile one place along the row, and Ctrl+Alt+PageUp and
-/// Ctrl+Alt+PageDown up or down in a column, also held, on the same terms, and are taken on the
-/// main screen even when nothing moves; and Escape shuts the folder menu when it is open, or else
-/// stops the focused tile's running turn (a focused text area catches its own Escape, which never
-/// gets here). With neither, Escape is left alone. An open picker or menu, and the field a name is
-/// edited in, take Escape before this. Ctrl+N and Ctrl+Shift+N keep a name being edited first; F6
-/// keeps it as the field loses the keyboard, and Ctrl+W drops it with the tile whose header it was
-/// edited in. While a sidebar row or a tile's header is dragged, the drag takes them first
-/// ([`drag_key`]).
+/// nothing, and while a question about deleting shows or a picture is open large, which it puts
+/// away; while any of these shows no other key is taken here ([`overlay_open`]). Else the kit's
+/// sidebar shortcut shows and hides the sidebar; on the main screen, Ctrl+Alt+B shows and hides the
+/// right panel once per press, Ctrl+N asks for a new session's folder, and Ctrl+Shift+N for one to
+/// the side, F6 and Shift+F6 move to the next and the previous tile, and Ctrl+W closes the focused
+/// one, once per press, the last three unless a picker's list or a menu is open (a text field
+/// leaves all of them alone); Ctrl+Shift+PageUp and Ctrl+Shift+PageDown move the focused tile one
+/// place along the row, and Ctrl+Alt+PageUp and Ctrl+Alt+PageDown up or down in a column, also
+/// held, on the same terms, and are taken on the main screen even when nothing moves; and Escape
+/// shuts the folder menu when it is open, or else stops the focused tile's running turn (a focused
+/// text area catches its own Escape, which never gets here). With neither, Escape is left alone. An
+/// open picker or menu, and the field a name is edited in, take Escape before this. Ctrl+N and
+/// Ctrl+Shift+N keep a name being edited first; F6 keeps it as the field loses the keyboard, and
+/// Ctrl+W drops it with the tile whose header it was edited in. While a sidebar row or a tile's
+/// header is dragged, the drag takes them first ([`drag_key`]).
 pub fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if quit::is_quit_key(ev) {
         glue::ask_quit(ui, tx);
@@ -222,9 +224,9 @@ fn drag_key(ui: &mut Ui, ev: &KeyEvent) -> bool {
 }
 
 /// Something lies over the whole window that holds every key but Ctrl+Q: the question whether
-/// to quit, or a picture open large. Escape and Return go on to it.
+/// to quit, a question about deleting, or a picture open large. Escape and Return go on to it.
 fn overlay_open(ui: &Ui) -> bool {
-    ui.quit_ask || ui.viewing.is_some()
+    ui.quit_ask || ui.delete_ask.is_some() || ui.viewing.is_some()
 }
 
 /// A picker's list or a menu is open. It holds the keyboard until it shuts: Ctrl+Shift+N, F6 and
@@ -514,6 +516,28 @@ mod tests {
         testkit::show(&mut rt, b);
         assert!(input_focused(&rt), "shown by a click");
         assert!(glue::view_of(&rt.state, b).draft.focused);
+    }
+
+    #[test]
+    fn a_click_on_the_focused_tile_of_a_ready_session_clears_it() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        let ready = |rt: &mut Runtime<Ui>| {
+            rt.state.app.sessions.get_mut(key).unwrap().unseen = true;
+            rt.invalidate();
+            testkit::step(rt);
+            assert_eq!(testkit::focused(rt), Some(key));
+        };
+        let unseen = |rt: &Runtime<Ui>| rt.state.app.sessions.get(key).unwrap().unseen;
+        // On its title bar, and on its conversation.
+        for inner in [
+            "mr-tile-header".to_owned(),
+            conversation::conversation_key(key),
+        ] {
+            ready(&mut rt);
+            testkit::click(&mut rt, &testkit::tile(key, &inner));
+            assert!(!unseen(&rt), "{inner}");
+        }
     }
 
     #[test]

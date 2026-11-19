@@ -11,6 +11,7 @@ use rune::{Color, Cursor, El, TextEdit, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Kit, Markdown, TextInput};
 
 use crate::glue::{self, QuestionDraft, Ui};
+use crate::theme;
 use crate::view::items::{self, call_details, show_all};
 
 /// The width of the border that marks a request waiting for the user.
@@ -31,12 +32,16 @@ const SETTLED_HEIGHT: f32 = 28.0;
 /// The height of a one-line "Always allow" button, as a kit button's (Regular).
 const ALWAYS_MIN_HEIGHT: f32 = 24.0;
 
+/// The least contrast "Needs you", a short bold label, has with its card.
+const NEEDS_YOU_CONTRAST: f32 = 3.0;
+
 /// What a withdrawn request says in place of an answer.
 const NO_LONGER_NEEDED: &str = "No longer needed";
 
-/// A request of `key`'s session as a card. While it waits, a card bordered in the warning colour
-/// under the label "Needs you", with its buttons; once answered or withdrawn, one line: its
-/// title, then what became of it. No button on it ever takes keyboard focus.
+/// A request of `key`'s session as a card. While it waits, a card bordered in the orange of a
+/// tile that needs input, under the label "Needs you", with its buttons; once answered or
+/// withdrawn, one line: its title, then what became of it. No button on it ever takes keyboard
+/// focus.
 pub fn card(ui: &Ui, key: SessionKey, item: &Item, kit: &Kit) -> El {
     let ItemBody::Request { request, state } = &item.body else {
         return col();
@@ -153,7 +158,7 @@ fn settled(id: &RequestId, title: &str, words: &str, answered: bool, kit: &Kit) 
 }
 
 /// A request of `key`'s session waiting for the user: "Needs you", its title, what it is about,
-/// and its buttons, in a card bordered in the warning colour.
+/// and its buttons, in a card bordered in the orange of a tile that needs input.
 fn waiting(
     ui: &Ui,
     key: SessionKey,
@@ -258,7 +263,7 @@ fn waiting(
             text("Needs you")
                 .key(format!("mr-needs-you-{}", id.0))
                 .font(kit.ty.small_medium)
-                .color(kit.c.warning.fg),
+                .color(needs_you_ink(kit)),
         )
         .child(
             text(title.to_owned())
@@ -290,7 +295,7 @@ fn waiting(
         .gap(12.0)
         .radius(kit.radius.lg)
         .fill(kit.c.bg_base)
-        .border(WAITING_BORDER, kit.c.warning.icon)
+        .border(WAITING_BORDER, waiting_border())
         .child(top)
         .children(body)
         .child(
@@ -461,6 +466,24 @@ fn mark(chosen: Option<String>, multi: bool, kit: &Kit) -> El {
     }
 }
 
+/// The border of a card that waits for the user: the orange of the bar of the tile it is in,
+/// which needs input while the card waits.
+pub(super) fn waiting_border() -> Color {
+    theme::needs_input().fill
+}
+
+/// The colour of "Needs you" on a waiting card: the bar's orange where it reads on the card at
+/// least 3 to 1, as on the dark theme's; the kit's warning text where it does not, as on the
+/// light theme's white card, where the orange gives 2.3 to 1.
+fn needs_you_ink(kit: &Kit) -> Color {
+    let orange = theme::needs_input().fill;
+    if theme::contrast(orange, kit.c.bg_base) >= NEEDS_YOU_CONTRAST {
+        orange
+    } else {
+        kit.c.warning.fg
+    }
+}
+
 /// The ring of an option's mark while it is not chosen: the muted icon colour, which stands
 /// out from the card in both themes (the kit's own strong border is faint in the dark one).
 fn unchosen_ring(kit: &Kit) -> Color {
@@ -596,7 +619,10 @@ mod tests {
     use mr_core::Phase;
     use rune::{Key, Runtime, TextEdit};
 
-    use super::{choose, permission_title, question_answers, typed, unchosen_ring};
+    use super::{
+        choose, needs_you_ink, permission_title, question_answers, typed, unchosen_ring,
+        waiting_border,
+    };
     use crate::glue::{self, QuestionDraft, Ui};
     use crate::testkit;
     use crate::theme;
@@ -666,6 +692,31 @@ mod tests {
         assert_eq!(answers(&rt), vec![Answer::Allow { always: true }]);
         assert!(testkit::has_text(&rt, "Always allowed"));
         assert!(rt.find("mr-allow-r1").is_none() && rt.find("mr-deny-r1").is_none());
+    }
+
+    #[test]
+    fn a_waiting_card_is_in_the_bars_orange() {
+        let orange = theme::needs_input().fill;
+        assert_eq!(waiting_border(), orange);
+        // "Needs you" is orange where it reads on the card, and the kit's warning text where
+        // it does not: the orange gives 2.3 to 1 on the light theme's white card.
+        for dark in [true, false] {
+            let kit = theme::kit(dark);
+            let word = needs_you_ink(kit);
+            let ratio = theme::contrast(word, kit.c.bg_base);
+            assert!(ratio >= 3.0, "dark {dark}: {ratio}");
+            let wanted = if dark { orange } else { kit.c.warning.fg };
+            assert_eq!(word, wanted, "dark {dark}");
+        }
+        let mut rt = testkit::window("permission");
+        rt.settle_all();
+        testkit::step(&mut rt);
+        let word = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("mr-needs-you-r1"))
+            .expect("the word");
+        assert_eq!(word.text_color, Some(orange), "the window is dark in tests");
     }
 
     #[test]

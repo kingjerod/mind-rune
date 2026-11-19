@@ -119,7 +119,7 @@ pub fn elsewhere(ui: &Ui, key: SessionKey, kit: &Kit, width: Option<f32>) -> Opt
         .gap(12.0)
         .radius(kit.radius.lg)
         .fill(kit.c.bg_base)
-        .border(CARD_BORDER, kit.c.warning.icon)
+        .border(CARD_BORDER, requests::waiting_border())
         .child(
             col()
                 .w_full()

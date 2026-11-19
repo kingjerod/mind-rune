@@ -295,13 +295,10 @@ fn queued_strip(key: SessionKey, queued: &Outgoing, kit: &Kit) -> El {
 /// Puts the queued message of `key`'s session back at the start of its draft, a line break
 /// between it and what was already typed, and focuses the text area. Its chips go back on the
 /// session (the core puts them there); a message of chips alone leaves the draft as it was.
+/// Taking it back is an act on the session: it is no longer ready (`App::edit_queued`).
 fn edit_queued(ui: &mut Ui, key: SessionKey) {
-    let taken = ui
-        .app
-        .sessions
-        .get_mut(key)
-        .and_then(|mut entry| entry.session.take_queued());
-    glue::run(ui, Vec::new());
+    let (effects, taken) = ui.app.edit_queued(key);
+    glue::run(ui, effects);
     let Some(message) = taken else {
         return;
     };
@@ -320,6 +317,7 @@ fn edit_queued(ui: &mut Ui, key: SessionKey) {
 /// The text area of `key`'s session, showing the draft in `view` and growing to `lines` lines
 /// before it scrolls: Enter submits to that session, Shift+Enter adds a line, Escape stops its
 /// running turn, and a paste of an image or of copied files adds chips to it ([`pasted`]).
+/// Typing in it clears the session's ready mark (`App::attend`).
 ///
 /// Once the session has ended it is disabled and empty, and reads "This session has ended" where
 /// the placeholder goes; the draft is kept for a restart. Those words are a text of their own
@@ -340,6 +338,15 @@ fn text_area(key: SessionKey, view: &SessionView, ended: bool, lines: usize, kit
     }
     let handlers = move |e: El| {
         e.on_edit(move |ui: &mut Ui| &mut glue::view_mut(ui, key).draft)
+            // Rune calls this only for the user's own typing, paste or cut, never for text the
+            // app puts in the box: typing there is an act on the session. It comes with every
+            // key, so it does its work only while there is something to clear.
+            .on_input_change(move |ui: &mut Ui, _tx: &mut Tx| {
+                if ui.app.sessions.get(key).is_some_and(|entry| entry.unseen) {
+                    let effects = ui.app.attend(key);
+                    glue::run(ui, effects);
+                }
+            })
             .on_submit(move |ui: &mut Ui, _tx: &mut Tx| submit(ui, key))
             .on_input_key(move |ui: &mut Ui, ev: &KeyEvent, _tx: &mut Tx| {
                 is_escape(ev) && stop_turn(ui, key)
@@ -816,6 +823,74 @@ mod tests {
         testkit::click(&mut rt, "mr-stop");
         testkit::step(&mut rt);
         assert!(testkit::sent(&rt).contains(&SessionCommand::Stop));
+    }
+
+    #[test]
+    fn typing_in_the_box_of_a_ready_session_clears_it() {
+        let mut rt = testkit::window("empty");
+        let key = testkit::focused(&rt).unwrap();
+        let unseen = |rt: &Runtime<Ui>| rt.state.app.sessions.get(key).unwrap().unseen;
+        testkit::type_text(&mut rt, "go");
+        testkit::press(&mut rt, Key::Enter);
+        // The turn ends while another app has the keyboard: ready in the focused tile.
+        rt.update(|ui, tx| glue::focus_changed(ui, false, tx));
+        testkit::emit(
+            &mut rt,
+            SessionEvent::TurnFinished(TurnSummary {
+                cost_usd: 0.0,
+                context_used: None,
+                duration_ms: 1,
+                interrupted: false,
+            }),
+        );
+        rt.update(|ui, tx| glue::focus_changed(ui, true, tx));
+        testkit::step(&mut rt);
+        assert!(unseen(&rt), "the keyboard back clears nothing");
+        assert!(testkit::box_focused(&rt, key), "the box kept the keyboard");
+        testkit::type_text(&mut rt, "n");
+        assert!(!unseen(&rt), "typed");
+        // A paste counts as typing.
+        rt.state.app.sessions.get_mut(key).unwrap().unseen = true;
+        rt.paste_content(ClipboardContent::new("ext"));
+        testkit::step(&mut rt);
+        assert_eq!(testkit::shown_view(&rt).draft.text, "next");
+        assert!(!unseen(&rt), "pasted");
+    }
+
+    #[test]
+    fn edit_on_the_queued_message_clears_ready() {
+        let mut rt = testkit::window("working");
+        let key = testkit::focused(&rt).unwrap();
+        testkit::type_text(&mut rt, "then run the tests");
+        testkit::press(&mut rt, Key::Enter);
+        testkit::step(&mut rt);
+        rt.state.app.sessions.get_mut(key).unwrap().unseen = true;
+        testkit::click(&mut rt, &testkit::tile(key, "mr-queued-edit"));
+        testkit::step(&mut rt);
+        assert_eq!(
+            testkit::shown_view(&rt).draft.text,
+            "then run the tests",
+            "the queued message is back in the box"
+        );
+        assert!(
+            !rt.state.app.sessions.get(key).unwrap().unseen,
+            "taking it back is the user's act"
+        );
+    }
+
+    #[test]
+    fn text_put_back_by_the_app_does_not_clear_ready() {
+        let mut rt = testkit::window("working");
+        let key = testkit::focused(&rt).unwrap();
+        rt.state.app.sessions.get_mut(key).unwrap().unseen = true;
+        // As the app puts a message back that was not taken: no typing, no paste.
+        rt.update(|ui, _| {
+            glue::view_mut(ui, key).draft.replace_text("carry on");
+            glue::run(ui, Vec::new());
+        });
+        testkit::step(&mut rt);
+        assert_eq!(testkit::shown_view(&rt).draft.text, "carry on");
+        assert!(rt.state.app.sessions.get(key).unwrap().unseen);
     }
 
     #[test]
