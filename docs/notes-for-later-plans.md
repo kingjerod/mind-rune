@@ -2,9 +2,221 @@
 
 **Commit ids in these notes, in the plans and in the rulings files are from before the first push.** On 2026-11-17, at Jerod's word, the history was squashed for that push into one commit for each plan, so the ids named here (`fe0dd63`, `622c6ba` and the rest) are not in the pushed history. On Jerod's machine the old history is kept under the ref `refs/backup/before-squash-2026-11-17` and in the file `.git/backup-before-squash-2026-11-17.bundle`; neither is pushed.
 
-Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column), plan 5 (the effort level, the right panel and Remote Control), plan 6 (attachments), plan 7 (running in the background, and opening a picture) and plan 8 (a Deleted view, status colours and notifications). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
+Carried over from plan 1 (foundations and the Claude adapter), plan 2 (one session in a window), plan 3 (many sessions), plan 4 (tiles), the stacked tiles plan (two tiles in a column), plan 5 (the effort level, the right panel and Remote Control), plan 6 (attachments), plan 7 (running in the background, and opening a picture), plan 8 (a Deleted view, status colours and notifications) and plan 9 (a task checklist and a choice box). Everything here was found while building or reviewing those plans and deliberately left for a later plan. Read it with `docs/protocol-notes.md` before writing the next plan.
 
-What plan 8 is for comes first, then Jerod's look at plan 8, then plan 7's section, then plan 6's, then plan 5's, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+What plan 9 is for comes first, then Jerod's look at plan 9, then what plan 8 is for and Jerod's look at plan 8, then plan 7's section, then plan 6's, then plan 5's, then the stacked tiles plan's, then plan 4's, then plan 3's. "What plan 5 must know", among plan 4's sections, also says what the stacked tiles plan changed. From "Jerod's first look" on, the file is what plan 2 left, kept as it was; where plan 3 settled something there, an added sentence in italics says so.
+
+## What plan 9 is for
+
+Jerod asked on 2026-11-19, with three screenshots of another app's task list, its buttons under a question, and a copy button beside a command: "I want the UI in the chatbox that is formatted. Lists for tasks with checkboxes, the buttons for me to click when deciding things etc."
+
+Asked for a moment when it was missed: "I was running a task to apply for jobs. I like when it shows a list of what it's doing rather than spitting out a bunch of commands that I don't know what they're for. I also like to be able to click a button rather than have to type \"/apply\". I also like being able to just hit that \"copy\" button next to commands you give me." The copy button was there already, on every code block.
+
+What was settled in the talk that followed, in Jerod's words where they chose: a click on a button sends at once ("Send right away"); the list sits above the message box and stays while the conversation scrolls ("No thats right"); and Claude may offer a question with up to three buttons of its own choosing, not only one predicted next message ("Full choice box").
+
+The plan is `docs/superpowers/plans/2026-11-19-tasks-and-choices.md`: nine tasks and eighteen decisions of the planner's that Jerod has not seen. Its wire facts are in `docs/protocol-notes.md` under "The task list and a tool of the app's own", written from two recordings Jerod made that day; the two fixtures made from them are in git, scrubbed. A research report made for it is on disk and not in git, under `.superpowers/sdd/plan-9-research/`.
+
+## Jerod's look at plan 9
+
+Plan 9 does two things. A session's tile shows what Claude is working through as a checklist just above the message box, which ticks off in place as Claude goes. And when Claude's turn ends with a decision for the user, the tile shows one short question with up to three buttons there; a click sends that button's message at once, as if it had been typed. Both come from tool calls: the checklist is Claude Code's own task list, which the app now asks for in every session it starts, and the buttons are the first tool the app gives Claude itself, served by the app over the session's own channel.
+
+It is built on the branch `plan-9-tasks-and-choices`, cut from `main` at `7d88a48`. It was merged into `main` on 2026-11-20 as one commit; the commit ids named here are the branch's, from before that. Before the plan, the branch took the probe's `--choices` (`5f1413d`) and the protocol notes with the two fixtures (`c42952f`), then the plan itself (`cf2da12`). Tasks 1 to 8 are ten commits, from `f70ea32` to `ef204f7`, two of them fix rounds after a task's review (`43d55f6` and `758fa8d`); then Task 9's commit (the scenes, the live test's new lines, these notes). Every task had its own review. Then came the whole-branch review and one final fix wave: five commits from `46f8381` to `ade0c43`, one for these notes, and one correction after its re-review. A last re-review found the correction right, and the rulings file was written. Jerod's word on merging is still to come. Nothing is merged or pushed. `cargo test --workspace` gives 1705 passed, 0 failed, 2 ignored (the live tests, not run by any agent), and formatting and lints are clean.
+
+The rulings made while the plan ran are in `docs/superpowers/plans/2026-11-19-plan-9-rulings.md`, 26 of them, each with what it costs if it was wrong; "Rulings made while the plan ran", below, sums them up.
+
+As for the plans before, the live test comes first. Jerod runs, in their own terminal, with the branch checked out:
+
+```bash
+MINDRUNE_LIVE=1 cargo test -p mindrune --test live -- --ignored --nocapture
+```
+
+Then, after quitting any MindRune that runs (see "Before looking"), the window:
+
+```bash
+cargo run --release -p mindrune
+```
+
+Quit it with Ctrl+Q, with "Quit" in the tray's menu, or from another terminal:
+
+```bash
+cargo run --release -p mindrune -- --quit
+```
+
+`cargo test --workspace` writes the screenshots of the three new scenes (`tasks`, `tasks-folded` and `choices`, dark and light) to `target/snap/final`, beside the others. Neither they nor the folder are in git.
+
+### The live test
+
+It starts the real `claude` as many times as for plan 8 and stores the same three sessions. One step is new in its first run, after the rename and before the app is closed: the test's own session, in the test's own folder, is sent
+
+> Keep a task list with exactly two steps, "one" and "two". Tick off "one" and leave "two" open, without doing anything else. Then offer me two choices with the tool for that: "Yes" and "No". Use no other tool and run nothing.
+
+A request of the program in that turn (a permission, a question) is denied, the turn is stopped and the step ends there; so does a turn still running after two minutes. The line `live: the step's turn was stopped: …` then says which, and the same for the turn the choice starts. If the session's program ends during the step, `live: the program ended during the task step` says so. What it prints, on stderr, one per line. None of these fails the test, and no line holds a step's words, a question, a label, an id or a path:
+
+- `live: task steps added N, changed M, open at the turn's end K`. Expected: 2 added, at least 1 changed ("one" goes to "done", often by "in progress" first), and 1 open ("two"). It settles that the program keeps the list when the app asks for the task tools, that the adapter reads each step's id from the call's result as the recording showed, and that a list with a step still open stays when the turn ends.
+- `live: tool lines of the turn: N (named ToolSearch: M)`. Expected: 0 and 0. N of 0 settles that the calls of the task tools and of the choice tool, and a `ToolSearch` that only loads them, are kept from the tool lines. M counts only a `ToolSearch` that is shown, one that searches by words or loads another tool too. **It does not settle whether `alwaysLoad` works**: a `ToolSearch` that loads only the choice tool is hidden by the adapter and never counted here, whether `alwaysLoad` worked or not. The plan hoped this line would settle it; see "What no agent could see".
+- `live: choices offered: true|false, buttons N, shown after the turn: true|false`. Expected: true, 2, true. It settles that the program reaches the server the app serves and calls its tool without a permission question, and that the box shows once the turn has ended.
+- `live: the choice was sent and answered: true|false`, only when the choices showed. The test presses the first, as a click does: its message must go out as the user's and start a turn that finishes. Expected: true.
+- `live: task steps at the end of the first run: N`, once the step is over (after the choice's turn, or the step's own turn when no choice was sent). Expected: 2 while "two" is still open, 0 when Claude ticked "two" in the choice's turn and the list cleared at its end. It is the number the second run should get back from the store.
+
+And in its second run, from the test's session's stored conversation as the app reads it back:
+
+- `live: stored history gives task steps N, an offer: true|false`. Expected: the same N as `task steps at the end of the first run` (2 when "two" was still open). A smaller N means that steps' ids could not be read from the stored results: the guess about how a stored result names them failed, whichever field it is. The line does not show which field held the id. An offer of true shows that the stored conversation gives back an offer made after your last message there: either the choice was never answered, or Claude offered again in the turn that answered it, and the test cannot tell the two apart. False shows that none was left open.
+- `live: hidden calls among the stored tool items: N`. Expected: 0. It shows only that the stored reader hides what the live one hides, by the calls' names and inputs: the calls of the task tools and of the choice tool, and a `ToolSearch` that only loads them.
+
+The earlier lines of the live test are unchanged.
+
+### Before looking
+
+What this window will not do yet, so it is judged for what it is:
+
+- **The task list and the buttons work only in sessions started by this build.** The app asks for the task tools and serves the choice tool when it starts a session's program. A session whose program was started by an older MindRune, still running in the background, has neither until its program is started again: quit every MindRune first (below).
+- **A session opened in a terminal, or over Remote Control, has no choice box.** In a terminal that resumed the session Claude has no tool either: only MindRune serves it, and Claude asks in words, as before. Over Remote Control Claude still has the tool, because Remote Control runs in this app's own program; that is why Claude is now told to end its reply by naming the decision in words, so the reply makes sense without the buttons. A task list Claude keeps there is shown in MindRune only after that session is read again from the store, and only if a step is still open.
+- **Claude decides whether to keep a list.** It keeps one for most work of three steps or more, and none for a short request. The app only asks for the tools.
+- **Claude decides whether to offer buttons.** The app tells every session when to offer them (decision 16), and that is the one thing in this plan that changes how Claude behaves in MindRune. How often it does so in real work was never seen.
+- **The list and the box are only in the tile**, above the message box. The sidebar's row shows nothing of them.
+- **The box shows only once the turn has ended**, a moment after Claude offered it.
+- **The steps of a sub-agent's own list are not shown**, nor Claude Code's older `TodoWrite`. The stored `AskUserQuestion` and `ExitPlanMode` calls still show as tool lines after a restart, as before this plan.
+- **No button of the list or the box takes the keyboard.** They are pressed with the pointer; Tab never stops on them.
+
+And before the look itself:
+
+- **Quit any MindRune that runs first**, with the command above or Ctrl+Q in its window. A running copy built from `main` would be shown in place of the new build, and its sessions would have neither the list nor the box.
+- **Use a throwaway folder.** The things to try below ask Claude to write small files.
+
+  ```bash
+  mkdir -p /tmp/mindrune-tasks
+  ```
+
+- The demo window (`cargo run -p mindrune -- --demo --scene tasks`, or `tasks-folded` or `choices`) shows the three scenes of the screenshots without a real `claude`.
+
+### What to try in the window
+
+1. In the window choose "New session", pick `/tmp/mindrune-tasks`, and send: `Create three text files a.txt, b.txt and c.txt, one at a time, each with one line of your choice.` A list appears above the message box, as wide as it, with a head line "Tasks" and a count such as "0 of 3". As Claude goes, each step ticks off in place: a done step has a green tick and fainter words, the current one a spinner and its "doing" wording ("Creating b.txt"), the rest an empty circle. The list slides up and fades in when it comes; the marks change at once, with no fade.
+2. In the same turn, look at the conversation: the file writes show as tool lines, and no line names `TaskCreate` or `TaskUpdate`. There is no line for a `ToolSearch` that only loads these tools; a `ToolSearch` that looks for tools by words still shows as a line. Scroll the conversation up: the list stays where it is, above the box.
+3. When that turn ends with every step ticked, the list goes.
+4. Send: `Create eight text files, one.txt to eight.txt, one at a time, each with one line.` The open list shows at most six steps, those around the current one with one step before it, and a last line such as "2 more", indented under the steps' words.
+5. Send a job of several steps and stop it half way with the stop button. The list stays, ticked steps included, and the current step's spinner turns into an empty circle: nothing is happening. Send another job: its steps join the same list.
+6. Click "Tasks" on the head line: the list folds to one line, such as `3 of 5: Create c.txt`, with the current step's mark. Outside a turn it says the step's subject; while a turn runs, its "doing" wording ("Creating c.txt") with the spinner. With no step open it says `5 of 5 done` with a tick. Click the line: the list opens again. Pointing at the head line gives it the hover look of a tool line's toggle.
+7. Make a tile shorter than 480 points: right-click another session's row and choose "Open below", so two tiles share a column; if the tiles are still 480 points high or more, make the window lower. A list in the short tile starts folded to one line; a click opens it, and it stays as you chose while that list lasts. While a choice box shows in such a tile, the list is not drawn at all; once the box goes, the folded list is back.
+8. Stop a turn with steps still open, as in item 5, and quit MindRune (Ctrl+Q). Start it again: the session rests with the same list, read back from Claude Code's stored conversation. In a very long session the oldest steps may be missing, because only the conversation's last part is read.
+9. In the session of item 1, send: `Ask me whether to keep or delete the three text files.` While the turn runs there is no box. Once it ends: a bordered box above the message box with one question and up to three buttons, the first drawn stronger, the recommended one. No permission question came for the tool, and no tool line names it. Claude's reply ends by naming the decision in a few words, so it reads well without the buttons; a little repetition of the question is expected. A long question shows up to three lines in a tall tile and one line in a tile shorter than 480 points, cut at its end with an ellipsis; pointing at it shows it whole.
+10. Point at a button: its help shows the whole message it sends (a message is at most 200 characters).
+11. Type a few words in the message box without sending, then press the first button. Its message is sent as yours and shows in the conversation as your message, and the words you typed stay in the box. The box goes.
+12. Get a box again (item 9), then type and send a message of your own: the box goes, and does not come back.
+13. Get a box again, then attach a picture: while the picture is read the buttons are greyed. Reading is quick, so this may be too fast to see.
+14. Let a turn that ends with a box finish while you are in another tile: its tile turns green, as after any turn, never orange. While you are in another app, the notification says "Finished.", not "Needs your input."
+15. With a box waiting, quit MindRune and start it again: the box is back on the resting session. Press a button: the session wakes and the message goes out.
+16. The "open elsewhere" question. Get a box (item 9) on a session of its own, quit MindRune and start it again, so the box shows on the resting session, and keep that session in a tile. Then, in a terminal, continue that session, send it one word and leave:
+
+    ```bash
+    cd /tmp/mindrune-tasks && claude --resume
+    ```
+
+    Within two minutes, press a button in MindRune: the app asks whether to continue here, since another app had the session. Press "Cancel": the buttons are back, and nothing was put into your message box. Press the button again and choose "Continue as a copy": the copy takes the message, and the original keeps its box.
+17. A folder that is gone. With a box on a resting session (as in item 15, before pressing), rename its folder in a terminal (`mv /tmp/mindrune-tasks /tmp/mindrune-tasks-gone`) and press a button: nothing is sent, the line under the message box says "This session's folder no longer exists: /tmp/mindrune-tasks", and the box stays. Rename it back (`mv /tmp/mindrune-tasks-gone /tmp/mindrune-tasks`) and press again: it sends.
+18. In a terminal, continue a session there and ask it for a decision: Claude asks in words, with no buttons anywhere, since only MindRune serves the tool.
+19. Both themes: are the ticks, the empty circles, the spinner, the box and its buttons easy to read? The plainer buttons have a grey fill of their own in both themes since 2026-11-20, in every part of the window (see "Things to look at").
+20. Use MindRune for real work for a while. How often does Claude keep a list, and how often does it offer buttons? Are its choices sensible, and does it offer a project's own slash commands, such as `/apply`? Watch for: a filler line after each offer, offers after trivial turns, and an offer in plan mode, where a go-ahead competes with Claude's own plan approval.
+21. In a project that has slash commands of its own (the throwaway folder has none), get a box whose button sends one of them (ask Claude for a decision whose answer is one of those commands), press that button, let its turn end, then quit MindRune and start it again: the box must not be back.
+22. Stop a turn while a step is in progress (as in item 5), then ask for something else that makes new steps. The spinner moves to the new work when Claude marks a new step in progress; steps that are only pending do not take it, and neither does a step taken up earlier in the list than the stale one. The old step stays as an empty circle until Claude ticks it, or until the list is cleared by a turn that ends with everything ticked. There is no way yet to clear a stuck list by hand: that is a question for Jerod (see "What is left").
+
+### Every decision of plan 9, with what was built
+
+The eighteen decisions are the planner's; Jerod has not seen them.
+
+**The task list**
+
+1. **The app turns the task list on for every session it starts**, by setting `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` for the program, over whatever the user's shell says. Built. It is the one variable the app sets, after it has filtered out a parent Claude session's own.
+2. **The list shows in the tile, above the message box and as wide as it**, under a line "Tasks" with a count such as "2 of 5". Built: a done step has a green tick and fainter words; the current one, while a turn runs, the tile's spinner and its "doing" wording; the rest an empty circle and muted words. A step's words stay on one line, cut with an ellipsis, and a step's text is cut to 300 characters when it comes in. In the final fix wave a step's text is made one plain line as it comes in: line breaks and tabs become one space, control characters, direction marks and invisible characters (zero-width spaces, line and paragraph separators, a soft hyphen, tag characters; not the joiner inside emoji) are dropped.
+3. **While no turn runs, the current step shows an empty circle**, not a spinner. Built.
+4. **In a tile shorter than 480 points the list starts folded to one line**, and a click on that line opens it; a click on "Tasks" folds an open list. The choice lasts while that list lasts. Built. The folded line's words take the current step's colour; with no open step its mark is the done tick and it says `5 of 5 done`. Outside a turn it says the current step's subject, not its "doing" wording (a ruling: nothing is being done then).
+5. **An open list shows at most six steps**, those around the current step, with a last line such as `4 more`. Built: the six keep one step before the current one where there is one; with no current step, the last six.
+6. **The list goes away when a turn ends with every step ticked.** A list with a step still open stays, ticked steps included, also after the turn was stopped; the next turn's steps join it. Built. The current step is the last one in progress, else the first not started, so new work wins over a step a stopped turn left in progress (final fix wave; it was the first one in progress). A list of 100 steps makes room for a new one by dropping its oldest done step; only a list of 100 open steps takes no more (final fix wave). The list's turn also ends where a message could not be sent, or was kept undelivered, and the session went from working to idle.
+7. **After a restart the list comes back if it had an open step**, rebuilt from Claude Code's stored conversation. Built: a step's id is read from the stored result's `toolUseResult` or `tool_use_result`, else from the result's text (`Task #1 created successfully: …`). A record that carries several results names each step by its own result's text. A user's message in the stored conversation does not drop the calls still waiting for their result; a result that comes after it still adds its step (final fix wave). Only the conversation's last part is read, so in a very long session the oldest steps may be missing. A resting session whose conversation is let go (out of sight for a while, or deleted) lets its list and its box go with it, and takes both from the stored conversation when it is read again, so a session carried on elsewhere shows the store's list, not the one it had (final fix wave).
+8. **The list's own tool calls are not shown as tool lines**, nor is the `ToolSearch` call that only loads them. Built: `TaskCreate`, `TaskUpdate`, `TaskGet`, `TaskList` and the choice tool's calls, and a `ToolSearch` whose query is `select:` and the names of those tools alone. A `ToolSearch` that loads one of them together with another tool still shows. The same holds in a stored conversation. A step's id is taken only when, trimmed, it is not empty and at most 64 characters; a `TaskUpdate`'s id is the first of `taskId`, `id` and `task_id` that holds a usable one.
+
+**The choice box**
+
+9. **One question and one to three buttons in a bordered box above the message box, under the list.** The first button is the recommended one and is drawn stronger. Pointing at a button shows the message it sends. Built: the question wraps to at most three lines in a tall tile and shows one line in a tile shorter than 480 points (the one line the box is counted with), cut at its end with an ellipsis, the whole question showing on pointing at it (final fix wave; it was cut at its top in a short tile). At exactly 280 points with an attached file and a line under the box, the box's top border sits 1.5 points under the title bar while the question stays whole. In any tile the buttons wrap onto a second row when they do not fit. A button's help is its whole message, since a message is at most 200 characters. The box is counted at 86 points high, not the plan's 96 (a ruling: the plan's sum was wrong).
+10. **The box shows only once the turn has ended**, though Claude calls the tool a moment before. Built: the offer counts only once the call's result says it worked, so a call the program refused for its own reasons (a deny rule, a hook) shows nothing, nor does one whose result never came before the turn ended (final fix wave; it counted from the call); it shows while the session takes a message, with no turn running, no message queued or undelivered, and no request waiting.
+11. **A click sends through the same path as a typed message**: files attached in the box go with it, the text typed in the box stays, and while an attachment is still being read the buttons are greyed. Built. A click on a resting session first makes the check a typed message makes: when its folder is gone, nothing is sent and the line under the box says so (a ruling).
+12. **The box goes away** on a click, when any other message is sent or queued, when a new turn starts, and when the turn was stopped or failed. It is not there while a permission request or the "open elsewhere" question waits. Built. It also goes where a message could not be sent or was kept undelivered and the session went from working to idle. A program that ends while the box shows on an idle session leaves it, so a program stopped for idling keeps its box. A click on a resting session followed by "Cancel" at the "open elsewhere" question puts the buttons back and puts nothing into the message box; a message you typed yourself is given back there as before. After "Continue as a copy" the original keeps its box.
+13. **After a restart the box comes back** if nothing was said after it in the stored conversation. Built. A slash command counts as something said there, though it shows no message: a box answered with a command does not come back (final fix wave).
+14. **A box that waits does not turn the tile orange** and sends no "needs your input" notification. Built.
+15. **The tool is allowed without a permission question**, in every permission mode. Built, with `--allowedTools` for the tool alone.
+16. **The words that tell Claude when to offer choices** are added to every session's instructions. Built as the plan had them, then in the final fix wave the last sentence became two, so the reply stands without the buttons (over Remote Control, or where the box does not show). They now read: "This session runs in a desktop app that can show the user buttons. When your work in a turn is done and the next move is the user's decision (a choice between ways forward, a go-ahead, or an obvious next command), call the tool mcp__mindrune__offer_choices once, with one short question and one to three choices, your recommendation first. A choice's message is sent as the user's next message when they click it, and it may be a slash command of this project. Do not call it when nothing is pending. Your reply must still make sense to someone who cannot see the buttons: end it by naming the decision in a few words." The tool's own description no longer gives one project's command as an example, and says that the question is at most 300 characters, a label at most 40 and a message at most 200.
+17. **Limits on what Claude may offer**: a question of at most 300 characters, one to three choices, a label of at most 40, a message of at most 2,000. Built, and in the final fix wave a message is at most 200 characters, so what a button sends can always be seen whole in its help. Plain text only: line breaks and tabs in a question or a label become one space; a question, label or message that still holds a control character, a direction mark or an invisible character (as for a step, decision 2) is refused with "Only plain text can be shown." (a message keeps its line breaks, so one with a line break is refused). Anything else is refused with a sentence Claude can read, such as "One to three choices are needed. Nothing was shown.", and nothing is shown.
+18. **The same session opened in a terminal or over Remote Control has no choice box.** Built. The planner's reason, that the tool exists only where MindRune serves it, holds for a terminal that resumed the session, not for Remote Control: Remote Control runs in this app's own program, so Claude has the tool there and its call shows nothing on the phone. That is why the instruction now asks the reply to name the decision in words (decision 16). The app answers the program's requests to its server at once, on the thread that reads the program, and refuses every other request it does not know, as before.
+
+### Rulings made while the plan ran
+
+All are to go into `docs/superpowers/plans/2026-11-19-plan-9-rulings.md`. Those that change what Jerod sees or may meet:
+
+- **A tool result that comes after its turn has ended adds no step.** It is then a result without its call, and is dropped as such a result always was.
+- **A step's id is trusted no more than its words**: it is taken only when, trimmed, it is not empty and at most 64 characters, and a `TaskUpdate`'s id is the first of `taskId`, `id` and `task_id` that holds a usable one (decision 8).
+- **In a stored conversation, a record of several results names each step by its result's text** (decision 7). And a user's message there does not drop the calls still waiting for their result, since a message Claude Code took in mid-turn, from a terminal or over Remote Control, can sit between a call and its result (final fix wave).
+- **The list's turn also ends, and the box also goes, where a message could not be sent or was kept undelivered** and the session went from working to idle (decisions 6 and 12). An exit of the program while a box shows on an idle session keeps the box.
+- **A cancelled wake puts the box back**, and "Cancel" puts nothing into the message box when the text was a choice's message (decision 12). After "Continue as a copy" the original keeps its box: nothing was said in it.
+- **A click first makes the folder check a typed message makes for a resting session** (decision 11).
+- **The checklist's marks land at once**, with no square ring and no cross-fade. **While a tile's height is not known, no list and no box are drawn in it**: only before the app's first layout, so they first appear in the second frame of the app's life, and slide and fade in as anything new above the message box does. **The folded line says a step's "doing" wording only while a turn runs** (decision 4).
+- **The box is counted at 86 points high**, not 96 (decision 9).
+- **In a tile shorter than 480 points, the list is not drawn while a box shows**: the two do not fit a short tile together, a line cut in half is worse than none, and the box is what waits for you. Built in the final fix wave; once the box goes, the folded list is back. At exactly 280 points, with an attached file and a line under the message box as well, the box's top border sits 1.5 points under the title bar while the question stays whole.
+- **Final fix wave, from the whole-branch review**: the current step is the last one in progress; a full list makes room by its oldest done step; a message is at most 200 characters and only plain text is shown; a slash command answers a box in the stored conversation too; a box counts only once its call's result says it worked; the instruction asks the reply to name the decision; a conversation that is let go takes its list and its box with it; a question shows up to three lines in a tall tile and one in a short one, cut at its end; the folded line's mark keeps one key, so it changes at once. Each is in its decision above.
+
+Look choices of the implementers that Jerod has not seen: the folded line's words take the current step's colour; with no open step the folded mark is the done tick; the head line has the hover look of the tool lines' toggle; "4 more" is indented under the steps' words; the lower tile of the scene `tasks-folded` is an empty session.
+
+### Things to look at
+
+- The open list (`tasks-*.png`): "Tasks 2 of 5" over five steps, two green ticks with fainter words, the spinner beside "Updating the stylesheet" in the strong colour, two empty circles. In the light theme the spinner's dots are pale, as the "Thinking..." spinner's are above it.
+- The head line's triangle (`tasks-*.png`) sits a little left of the marks under it, since the triangle is drawn smaller than its square.
+- The folded list (`tasks-folded-*.png`): the upper of two tiles in a column, "3 of 5: Updating the stylesheet" with its spinner, right under the "Thinking..." line, the message box under it; the lower tile is a new session in another folder. The conversation above is scrolled to its end, so only the bottom edge of the user's message shows under the title bar.
+- The choice box (`choices-*.png`): "Publish the new banner?" over "Publish", "Show me first" and "Not now", "Publish" drawn strong (light on dark, dark on light). **The dark buttons, by name:** in the dark theme the two plainer buttons, "Show me first" and "Not now", had the box's own fill and only a faint edge. Jerod asked for a lighter grey on 2026-11-20; a neutral button now has one in the dark theme, so "Deny", "Not now" and the Stop button changed with them. In the light theme they were white on the white box with a thin edge; at Jerod's word the same day a neutral button is a light grey there too.
+- **"N of M", by name:** the open list's head counts the steps done ("2 of 5"), while the folded line gives the current step's place ("3 of 5: …"). Folding the same list changes the number. The words are the plan's; do they read well?
+- The box's border and corners are those of the message box under it; the gap between them is the list's gap.
+- No row of the sidebar and no title bar shows anything of the list or the box.
+
+### What no agent could see
+
+No agent ran Claude Code or saw the real window. What the look or the live test must settle:
+
+| Point | Read where | Seen working | Made sure by |
+| --- | --- | --- | --- |
+| `alwaysLoad` on the server's entry and on the tool loads the choice tool with the first prompt, so no `ToolSearch` is needed | Claude Code's documentation | no | nothing yet: a `ToolSearch` that loads only the choice tool is hidden, so the live test's line cannot show it. A look at a session's stored transcript for a `ToolSearch` naming `mcp__mindrune__offer_choices` would |
+| A stored transcript keeps a `TaskCreate`'s result as `toolUseResult` | guessed from the live record's `tool_use_result` | no; the result's text, the fallback, was seen live | that the list comes back: the second run's `stored history gives task steps` line, which should equal the first run's `task steps at the end of the first run`. Which field held the id: nothing |
+| `TaskUpdate` beyond a status: `deleted`, a changed `subject` or `activeForm`, the misspelt keys | Claude Code's documentation | no; only `taskId` with `in_progress` and `completed` | nothing: handled from the documentation alone |
+| How Claude uses the choice tool in real work: how often, and whether it offers a project's slash commands | one recording | once | Jerod's look, item 20 |
+| The list after Claude Code compacts a long conversation, after `/clear`, and in a session resumed after days: steps that no longer match Claude Code's own list, or ids that collide | nothing | no | Jerod's look, items 8 and 20 |
+| A copy ("Continue as copy") starts with the original's list; whether the forked program keeps the same list and numbering, or numbers from 1 again | the code | no | nothing yet |
+| The stored conversation knows a turn's end only by a message of the user's, so the box of a turn that failed may come back after a restart, and in the same run after the conversation was let go and read again | the code | no | nothing: live, a failed turn's box goes |
+| How the program stores a slash command sent as a message, and an unknown one. The rule that an answered box does not come back after a restart rests on it: a command stored as no record at all would bring the box back | an older test's guess (`<command-name>`) | no | Jerod's look, item 21 |
+| A list and a box read from the store are dropped when the conversation is let go, and taken again from the store when it is read back | the code | in tests only | nothing in the look: it needs the session in no tile until the idle stop lets its conversation go. "Cancel" at the "open elsewhere" question (item 16) still puts back a box the store may have moved past |
+| The program takes the `alwaysLoad` key in the server's entry. If no session starts at all after this build, that key is the first suspect | Claude Code's documentation | no; the recording's entry had no such key | the live test's first turn. The probe (`cargo run -p mr-probe -- raw --cwd DIR --choices`) shows whether a `ToolSearch` still comes before the tool's call |
+| How the list and the box look in motion: they enter by sliding up and fading in, and the marks change at once | the code and the toolkit's source | no | Jerod's look, item 1 |
+
+### The whole-branch review of plan 9
+
+The whole branch was reviewed on 2026-11-19, after Task 9, on the most capable model. It found nothing critical, five Important things and fourteen Minor, and no fault in the channel to the program, the events or the core. One fix wave followed in six commits (`46f8381` the vocabulary, `0ac1fb8` the adapter, `9a1f003` the core, `fd041ca` the window, `ade0c43` the live test, `d0b0ef0` these notes). What it changed, for someone who read this section before:
+
+- **A button that sent a slash command stays answered after a restart.** The stored conversation keeps a command in a wrapper the reader skipped, so the box came back.
+- **A stale step no longer holds the spinner**, and a list of 100 steps makes room by dropping its oldest ticked step. There is still no way to clear a stuck list by hand.
+- **What a button sends can always be seen.** A message is at most 200 characters, which is what pointing at the button shows, and text with control characters, direction marks or a few invisible characters is refused.
+- **Claude names the decision in its reply.** The instruction's last sentence changed, so the reply makes sense where the box cannot be seen: over Remote Control, in a short tile, after a message queued mid-turn.
+- **The box shows only when the tool's call succeeded**, and it is announced at the call's result.
+- **A conversation that is let go takes its list and its box with it**; both are read again from the store.
+- **In a short tile the box comes first**: no list is drawn while a box shows, and the question is cut at its end, never at its top.
+- **The live test's step leaves one step open**, so its second run can show the list coming back from the store.
+
+The fix wave was reviewed again on the same model. Every item was found addressed, and two sentences of these notes were found untrue. One correction followed in two commits (`ad257e7`, `bcf6e29`): in a short tile the question shows one line, so what is counted for the box is what is drawn; the live test prints how many steps the list held at the end of its first run, which is the number its second run should get back; and a few more invisible characters count as not plain. A last re-review found all of it right.
+
+### What is left
+
+Found while building and reviewing and left for the final fix wave, or as it is:
+
+- **A list can lose its oldest steps after a let-go in a very long session**, as after a restart: it is rebuilt from the part of the stored conversation that is read.
+- **A list with a step Claude never ticks cannot be cleared by hand.** The current step is now the last one in progress, so new work holds the spinner, but the old step stays open in the list, also after a restart, until Claude ticks it. A control to clear the app's list is a question for Jerod.
+- **An answer to the program's request to the app's server is dropped** if the request came before the app had linked the program's process, a matter of microseconds; never seen. Since the final fix wave one line on stderr says so, once per program.
+- **Whether `alwaysLoad` works is not settled by the live test** (see "The live test"): a probe recording with `--choices` settles it, a `ToolSearch` before the tool's call or none.
+- Not in this plan, on purpose: a Run button on a command, Claude Code's predicted next message (`--prompt-suggestions`), a setting that turns the checklist or the choice tool off, the older `TodoWrite`, the steps of a sub-agent's own list, folding a step's commands under it, hiding the stored `AskUserQuestion` and `ExitPlanMode` calls that show as tool lines after a restart, and buttons that take the keyboard.
 
 ## What plan 8 is for
 

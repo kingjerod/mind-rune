@@ -1217,6 +1217,8 @@ mod tests {
             model: Some("fake-model".into()),
             permission_mode: Some(PermissionMode::Ask),
             effort: None,
+            tasks: Vec::new(),
+            choices: None,
         }
     }
 

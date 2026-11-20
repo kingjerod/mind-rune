@@ -13,11 +13,11 @@
 use std::sync::Arc;
 
 use mr_agent::{
-    Account, Attachment, ContextBreakdown, ContextKind, ContextPart, FakeAgent, FakeStep,
-    HistoryItem, ImageData, LimitWindow, ModelOption, PermissionMode, Question, QuestionOption,
-    RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent, SessionId, StoredHistory,
-    StoredSession, ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest,
-    UserRequestKind,
+    Account, Attachment, Choice, Choices, ContextBreakdown, ContextKind, ContextPart, FakeAgent,
+    FakeStep, HistoryItem, ImageData, LimitWindow, ModelOption, PermissionMode, Question,
+    QuestionOption, RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent,
+    SessionId, StoredHistory, StoredSession, TaskChange, TaskStatus, TaskStep, ToolCallId,
+    ToolDetail, ToolOutcome, TurnSummary, UsageLimits, UserRequest, UserRequestKind,
 };
 use mr_core::{
     AttachKind, Branch, Chip, ChipState, Effect, FromBackend, GroupId, HistoryState, ItemBody,
@@ -152,6 +152,9 @@ pub const SCENES: &[(&str, Scene)] = &[
     ("deleted-empty", deleted_empty),
     ("delete-group-ask", delete_group_ask),
     ("delete-all-ask", delete_all_ask),
+    ("tasks", tasks),
+    ("tasks-folded", tasks_folded),
+    ("choices", choices),
 ];
 
 /// Replaces the state with a fresh demo state.
@@ -545,6 +548,164 @@ fn working(ui: &mut Ui) {
                     })
                 )
         })
+    });
+}
+
+/// The user's message in the `tasks` scenes, and the title Claude gives the session.
+const TASKS_MESSAGE: &str = "Make the banner fit a phone screen";
+const TASKS_TITLE: &str = "Resizing the banner";
+
+/// The steps of the `tasks` scenes' list: id, subject and active wording.
+const TASKS: [(&str, &str, &str); 5] = [
+    (
+        "1",
+        "Measure the current banner",
+        "Measuring the current banner",
+    ),
+    ("2", "Resize the image", "Resizing the image"),
+    ("3", "Update the stylesheet", "Updating the stylesheet"),
+    (
+        "4",
+        "Check the page on a phone",
+        "Checking the page on a phone",
+    ),
+    ("5", "Write the change note", "Writing the change note"),
+];
+
+/// A step added to the task list, not started yet.
+fn task_added((id, subject, active): (&str, &str, &str)) -> SessionEvent {
+    SessionEvent::TaskAdded(TaskStep {
+        id: id.into(),
+        subject: subject.into(),
+        active: Some(active.into()),
+        status: TaskStatus::Pending,
+    })
+}
+
+/// Step `id` of the task list now stands at `status`.
+fn task_now(id: &str, status: TaskStatus) -> SessionEvent {
+    SessionEvent::TaskChanged(TaskChange {
+        id: id.into(),
+        status: Some(status),
+        subject: None,
+        active: None,
+    })
+}
+
+/// A turn in flight that works through a list of five steps: two done, the third, "Update the
+/// stylesheet", under way, and a thought still going on. The rest of the turn is scripted a
+/// minute later, as in `working`.
+fn tasks(ui: &mut Ui) {
+    empty(ui);
+    let command = |id: &str, command: &str| {
+        let detail = ToolDetail::Command {
+            command: command.into(),
+        };
+        tool(id, "Bash", detail)
+    };
+    let mut steps = vec![
+        SessionEvent::TurnStarted,
+        SessionEvent::TextDelta("I will work through this in five steps.".into()),
+        SessionEvent::BlockFinished,
+    ];
+    steps.extend(TASKS.map(task_added));
+    steps.extend([
+        task_now("1", TaskStatus::InProgress),
+        command("c1", "identify images/banner.png"),
+        done("c1", "images/banner.png PNG 1600x400"),
+        task_now("1", TaskStatus::Completed),
+        task_now("2", TaskStatus::InProgress),
+        command(
+            "c2",
+            "convert images/banner.png -resize 800x images/banner-800.png",
+        ),
+        done("c2", ""),
+        task_now("2", TaskStatus::Completed),
+        task_now("3", TaskStatus::InProgress),
+        read("r1", "/home/alex/project/styles/banner.css"),
+        done("r1", ".banner {\n    width: 1600px;\n}\n"),
+        SessionEvent::ThinkingStarted,
+    ]);
+    let mut script: Vec<FakeStep> = steps
+        .into_iter()
+        .map(|event| FakeStep::at(0.0, event))
+        .collect();
+    script.extend([
+        FakeStep::at(LATER, SessionEvent::BlockFinished),
+        FakeStep::at(LATER, finished()),
+    ]);
+    fake(ui).reply(script);
+    say(ui, TASKS_MESSAGE, TASKS_TITLE);
+    pump_until(ui, "the third step under way and a thought", |ui| {
+        ui.focused_session().is_some_and(|s| {
+            s.phase == Phase::Working
+                && s.tasks.current() == Some(2)
+                && s.tasks.steps()[2].status == TaskStatus::InProgress
+                && matches!(
+                    s.conversation.items().last().map(|item| &item.body),
+                    Some(ItemBody::Thinking {
+                        time: ThinkingTime::Going,
+                        ..
+                    })
+                )
+        })
+    });
+}
+
+/// The `tasks` scene in the upper tile of a column of two, for a window of 1,200 by 800, where
+/// the tile is short enough that its list starts folded; the lower tile holds a session with
+/// nothing said yet. The upper one is focused.
+fn tasks_folded(ui: &mut Ui) {
+    tasks(ui);
+    let upper = ui.app.focused().expect("a session is shown");
+    let effects = ui
+        .app
+        .new_session(SKETCHES.into(), Place::Below(upper), Leaving::ForgetIfEmpty);
+    glue::run(ui, effects);
+    pump_until(ui, "the lower session started", |ui| {
+        ui.app.focused() != Some(upper)
+            && ui.focused_session().is_some_and(|s| s.phase == Phase::Idle)
+    });
+    focus_tile(ui, upper);
+}
+
+/// Claude's reply in the `choices` scene, and the question its turn ends with.
+const CHOICES_REPLY: &str = "I resized the image to 800 pixels wide and let the stylesheet scale it down. The banner is resized and the page checked on a phone.";
+const CHOICES_QUESTION: &str = "Publish the new banner?";
+
+/// The answers of the `choices` scene: each label, and the message it sends.
+const CHOICES: [(&str, &str); 3] = [
+    ("Publish", "/publish"),
+    (
+        "Show me first",
+        "Show me the page before anything is published.",
+    ),
+    ("Not now", "Leave it unpublished for now."),
+];
+
+/// The session "Resizing the banner" after a finished turn whose reply is followed by an offer
+/// of three answers, the first one Claude's recommendation. The offer comes inside the turn,
+/// as the agent gives it, and shows once the turn has ended.
+fn choices(ui: &mut Ui) {
+    empty(ui);
+    let answers = CHOICES
+        .map(|(label, message)| Choice {
+            label: label.into(),
+            message: message.into(),
+        })
+        .to_vec();
+    let offer = Choices::new(CHOICES_QUESTION, answers).expect("an offer that can be shown");
+    fake(ui).reply(vec![
+        FakeStep::at(0.0, SessionEvent::TurnStarted),
+        FakeStep::at(0.0, SessionEvent::TextDelta(CHOICES_REPLY.into())),
+        FakeStep::at(0.0, SessionEvent::BlockFinished),
+        FakeStep::at(0.0, SessionEvent::ChoicesOffered(offer)),
+        FakeStep::at(0.0, finished()),
+    ]);
+    say(ui, TASKS_MESSAGE, TASKS_TITLE);
+    pump_until(ui, "the finished turn and its offer", |ui| {
+        let key = ui.app.focused().expect("a session is shown");
+        ui.app.choices(key).is_some()
     });
 }
 
@@ -1060,6 +1221,8 @@ pub(crate) fn parser_history() -> StoredHistory {
         model: Some("fake-model-fast".into()),
         permission_mode: Some(PermissionMode::Plan),
         effort: None,
+        tasks: Vec::new(),
+        choices: None,
     }
 }
 
@@ -2474,6 +2637,103 @@ mod tests {
         ));
         assert!(testkit::find(&rt, "mr-delete-yes").is_some());
         assert!(glue::typing_in(&rt.state).is_none());
+    }
+
+    /// Runs frames until a task list or a choice box, drawn from the second frame of the app's
+    /// life, has slid and faded in, as a screenshot of the scene takes it.
+    fn settled(scene: &str) -> rune::Runtime<Ui> {
+        let mut rt = testkit::window(scene);
+        for _ in 0..40 {
+            testkit::step(&mut rt);
+        }
+        rt
+    }
+
+    /// Whether the element keyed `key` in `tile`'s tile is drawn at rest, fully shown.
+    fn at_rest(rt: &rune::Runtime<Ui>, tile: SessionKey, key: &str) -> bool {
+        testkit::element(rt, &testkit::tile(tile, key))
+            .is_some_and(|e| !e.exiting && e.opacity == 1.0)
+    }
+
+    /// The status of each step of `key`'s task list, in order.
+    fn statuses(rt: &rune::Runtime<Ui>, key: SessionKey) -> Vec<TaskStatus> {
+        let tasks = &rt.state.app.sessions.get(key).unwrap().session.tasks;
+        tasks.steps().iter().map(|step| step.status).collect()
+    }
+
+    #[test]
+    fn the_tasks_scene_is_at_its_third_step_of_five_in_a_working_turn() {
+        let rt = settled("tasks");
+        let key = testkit::focused(&rt).expect("a tile is focused");
+        let entry = rt.state.app.sessions.get(key).unwrap();
+        assert_eq!(entry.session.phase, Phase::Working);
+        assert_eq!(entry.mark(), Mark::Working);
+        use TaskStatus::{Completed, InProgress, Pending};
+        assert_eq!(
+            statuses(&rt, key),
+            [Completed, Completed, InProgress, Pending, Pending]
+        );
+        assert_eq!(entry.session.tasks.current(), Some(2));
+        assert!(rt.state.app.choices(key).is_none());
+        // Open in a tile of the whole window: the head, five steps, and no line for more.
+        assert_eq!(glue::view_of(&rt.state, key).tasks_open, None);
+        assert!(at_rest(&rt, key, &format!("mr-tasks-{}", key.0)));
+        for i in 0..5 {
+            assert!(at_rest(&rt, key, &format!("mr-task-{i}")), "step {i}");
+        }
+        assert!(testkit::element(&rt, &testkit::tile(key, "mr-tasks-more")).is_none());
+    }
+
+    #[test]
+    fn the_tasks_folded_scene_folds_the_list_of_its_upper_tile() {
+        let rt = settled("tasks-folded");
+        let columns = testkit::columns(&rt);
+        assert_eq!(columns.len(), 1);
+        let [upper, lower] = columns[0][..] else {
+            panic!("one column of two: {columns:?}");
+        };
+        assert_eq!(testkit::focused(&rt), Some(upper));
+        let entry = |key: SessionKey| rt.state.app.sessions.get(key).unwrap();
+        assert_eq!(entry(upper).session.phase, Phase::Working);
+        assert_eq!(entry(upper).mark(), Mark::Working);
+        assert_eq!(entry(upper).session.tasks.current(), Some(2));
+        assert_eq!(statuses(&rt, upper).len(), 5);
+        assert_eq!(entry(lower).session.phase, Phase::Idle);
+        assert_eq!(entry(lower).mark(), Mark::None);
+        assert!(entry(lower).session.tasks.is_empty());
+        assert!(entry(lower).session.conversation.items().is_empty());
+        // Folded by the tile's height, not by a press: the head line alone, at rest.
+        assert_eq!(glue::view_of(&rt.state, upper).tasks_open, None);
+        assert!(at_rest(&rt, upper, &format!("mr-tasks-{}", upper.0)));
+        assert!(at_rest(&rt, upper, "mr-tasks-head"));
+        assert!(testkit::element(&rt, &testkit::tile(upper, "mr-task-0")).is_none());
+        assert!(testkit::tile_has_text(
+            &rt,
+            upper,
+            "3 of 5: Updating the stylesheet"
+        ));
+        assert!(testkit::element(&rt, &testkit::tile(lower, "mr-tasks-head")).is_none());
+    }
+
+    #[test]
+    fn the_choices_scene_ends_its_turn_with_an_offer_of_three() {
+        let rt = settled("choices");
+        let key = testkit::focused(&rt).expect("a tile is focused");
+        let entry = rt.state.app.sessions.get(key).unwrap();
+        assert_eq!(entry.session.phase, Phase::Idle);
+        // The turn ended in the tile the user looks at: nothing marks it.
+        assert_eq!(entry.mark(), Mark::None);
+        assert!(entry.session.tasks.is_empty());
+        assert_eq!(entry.session.conversation.waiting(), 0);
+        let offer = rt.state.app.choices(key).expect("the offer shows");
+        assert_eq!(offer.question, CHOICES_QUESTION);
+        let labels: Vec<&str> = offer.choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, CHOICES.map(|(label, _)| label));
+        assert!(rt.state.app.can_choose(key));
+        assert!(at_rest(&rt, key, &format!("mr-choices-{}", key.0)));
+        for i in 0..3 {
+            assert!(at_rest(&rt, key, &format!("mr-choice-{i}")), "button {i}");
+        }
     }
 
     #[test]

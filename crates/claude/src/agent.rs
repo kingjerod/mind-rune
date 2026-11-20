@@ -22,12 +22,13 @@ use serde_json::Value;
 
 use crate::account::detect;
 use crate::args::build_args;
+use crate::choices;
 use crate::encode::{
     control_request, generate_session_title, get_usage, initialize, interrupt, permission_reply,
     remote_control, rename_session, set_effort, set_model, set_permission_mode, unsupported_reply,
     user_message,
 };
-use crate::env::child_env;
+use crate::env::{child_env, with_task_tools};
 use crate::history::{DescriptionTable, find_session, modified_unix, read_image, stored_sessions};
 use crate::history_tail::{TAIL_BYTES, read_tail};
 use crate::process::{ClaudeProcess, ExitInfo, SpawnConfig};
@@ -92,6 +93,19 @@ impl ClaudeAgent {
     /// The file of stored session `id`, when there is a store and it holds one.
     fn find_session(&self, id: &SessionId) -> Option<PathBuf> {
         find_session(self.projects_dir.as_deref()?, id)
+    }
+
+    /// How the program is started for `spec` as session `id`: the choice tool served and the
+    /// task tools asked for, whatever kind of session it is.
+    fn spawn_config(&self, spec: StartSpec, id: &SessionId, full_login: bool) -> SpawnConfig {
+        let mut args = build_args(&spec, Some(id));
+        args.extend(choices::args());
+        SpawnConfig {
+            program: self.program.clone(),
+            args,
+            cwd: spec.folder,
+            env: with_task_tools(child_env(self.parent_env.clone(), full_login)),
+        }
     }
 
     fn has_full_login(&self) -> bool {
@@ -198,12 +212,7 @@ impl Agent for ClaudeAgent {
             model: spec.model.clone(),
             permission_mode: spec.permission_mode.clone(),
         };
-        let config = SpawnConfig {
-            program: self.program.clone(),
-            args: build_args(&spec, Some(&id)),
-            cwd: spec.folder,
-            env: child_env(self.parent_env.clone(), full_login),
-        };
+        let config = self.spawn_config(spec, &id, full_login);
 
         let translator = Arc::new(Mutex::new(Translator::for_session(start)));
         let next_request = Arc::new(AtomicU64::new(1));
@@ -220,6 +229,7 @@ impl Agent for ClaudeAgent {
             sink: Arc::clone(&sink),
             process: Arc::clone(&process_link),
             ignored: Mutex::new(HashSet::new()),
+            dropped_reply: AtomicBool::new(false),
         };
         let process = ClaudeProcess::spawn(config, move |line| reader.line(&line), {
             let exited = Arc::clone(&exited);
@@ -252,6 +262,9 @@ struct Reader {
     process: Arc<OnceLock<Weak<ClaudeProcess>>>,
     /// The kinds of unrecognised line already reported on stderr.
     ignored: Mutex<HashSet<String>>,
+    /// Whether an answer was already dropped, and said so on stderr, because the link to the
+    /// process was not yet set.
+    dropped_reply: AtomicBool,
 }
 
 impl Reader {
@@ -259,6 +272,15 @@ impl Reader {
         let message = parse_line(line);
         match &message {
             Incoming::Ignored { kind } => self.note_ignored(kind),
+            // A message for the app's own server is answered here and now, and is nothing more.
+            Incoming::ControlRequest {
+                request_id,
+                subtype,
+                body,
+            } if subtype == "mcp_message" => {
+                self.reply(&choices::reply(request_id, body));
+                return;
+            }
             Incoming::ControlRequest {
                 request_id,
                 subtype,
@@ -313,21 +335,36 @@ impl Reader {
 
     /// Tells `claude` this adapter does not handle a request, so it stops waiting.
     fn refuse(&self, request_id: &str) {
-        let Some(process) = self.process.get().and_then(Weak::upgrade) else {
+        self.reply(&unsupported_reply(request_id));
+    }
+
+    /// Writes `line`, the answer to one of `claude`'s requests, straight to the child.
+    fn reply(&self, line: &str) {
+        let Some(link) = self.process.get() else {
+            if !self.dropped_reply.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "mindrune: dropped an answer to claude, whose process was not yet linked"
+                );
+            }
             return;
         };
-        // A refused line means the child is going away, which the exit reports.
-        let _ = process.write_line(&unsupported_reply(request_id));
+        let Some(process) = link.upgrade() else {
+            return;
+        };
+        // A line that cannot be queued means the child is going away, which the exit reports.
+        let _ = process.write_line(line);
     }
 }
 
 /// Kinds of line `claude` sends that the adapter has no use for and that are known to be
-/// harmless: hooks starting and answering, and a status line that carries no permission mode
-/// (one that carries it is read, so it is never ignored).
-const HARMLESS_KINDS: [&str; 3] = [
+/// harmless: hooks starting and answering, a status line that carries no permission mode
+/// (one that carries it is read, so it is never ignored), and the count of tokens Claude is
+/// thinking with.
+const HARMLESS_KINDS: [&str; 4] = [
     "system/hook_started",
     "system/hook_response",
     "system/status",
+    "system/thinking_tokens",
 ];
 
 /// Whether an ignored line of this kind is worth a note on stderr: it is not known to be harmless.
@@ -499,6 +536,7 @@ mod tests {
             "system/hook_started",
             "system/hook_response",
             "system/status",
+            "system/thinking_tokens",
         ] {
             assert!(!worth_reporting(harmless), "{harmless}");
         }
@@ -520,6 +558,43 @@ mod tests {
                 "{record}"
             );
         }
+    }
+
+    #[test]
+    fn every_start_serves_the_choice_tool_and_asks_for_the_task_tools() {
+        // An agent started from the user's own shell, which turns the task tools off: the
+        // parent-session filter keeps both settings, so only the task setting can drop them.
+        let parent = [
+            ("PATH", "/bin"),
+            ("CLAUDE_CODE_ENABLE_TODO_TOOLS", "0"),
+            ("CLAUDE_CODE_ENABLE_TASKS", "0"),
+        ];
+        let parent = parent
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let root = tempfile::tempdir().unwrap();
+        let agent = ClaudeAgent::with_paths("claude".into(), root.path().to_path_buf(), parent);
+        let id = SessionId("11111111-1111-4111-8111-111111111111".into());
+        let config = agent.spawn_config(StartSpec::new("/work"), &id, false);
+        let own = build_args(&StartSpec::new("/work"), Some(&id));
+        assert_eq!(config.args[..own.len()], own[..]);
+        assert_eq!(config.args[own.len()..], choices::args()[..]);
+        let named: Vec<&(String, String)> = config
+            .env
+            .iter()
+            .filter(|(k, _)| k == "CLAUDE_CODE_ENABLE_TODO_TOOLS")
+            .collect();
+        assert_eq!(
+            named,
+            [&("CLAUDE_CODE_ENABLE_TODO_TOOLS".to_string(), "1".to_string())]
+        );
+        assert!(
+            config
+                .env
+                .iter()
+                .all(|(k, _)| k != "CLAUDE_CODE_ENABLE_TASKS")
+        );
     }
 
     #[test]

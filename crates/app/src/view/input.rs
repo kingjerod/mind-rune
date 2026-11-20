@@ -1,10 +1,11 @@
 //! The input box under the conversation: the queued message, the chips, the text area, the
-//! attach button, the model, effort and permission-mode pickers, and the send or stop button.
+//! attach button, the model, effort and permission-mode pickers, and the send or stop button;
+//! over it, the session's task list and the choices its last turn offered.
 //!
 //! Enter in the text area submits the draft and nothing else: it never reaches a request card,
 //! whose buttons take no focus. While a turn runs a message is queued by the core, not sent.
 
-use mr_agent::{ImageData, PermissionMode};
+use mr_agent::{ImageData, PermissionMode, TaskList};
 use mr_core::{Outgoing, Phase, Session, SessionKey, Source, mode_label, model_option_label};
 use rune::{ClipboardContent, El, FileDialogOptions, Key, KeyEvent, TextEdit, Tx, col, row, text};
 use rune_kit::{
@@ -13,7 +14,7 @@ use rune_kit::{
 use rune_theme_opencode::icons::{ARROW_UP, PLUS, STOP};
 
 use crate::glue::{self, Picker, SessionView, Ui};
-use crate::view::{chips, field, tiles};
+use crate::view::{chips, choices, field, tasks, tiles};
 
 /// The fewest and the most lines the text area shows before it scrolls; a short tile allows
 /// fewer ([`lines_for`]).
@@ -76,11 +77,24 @@ pub fn lines_for(tile_height: Option<f32>, extra: f32) -> usize {
     ((room / field::LINE_HEIGHT).floor() as usize).clamp(LINES.0, LINES.1)
 }
 
-/// What the box of a session holds besides its text and its bottom row, in points: the queued
-/// message and the chips, each with the gap over it, and each line under the box. A line under
-/// the box is counted as one line of its type, though a long one wraps.
-fn extra_height(session: Option<&Session>, view: &SessionView, kit: &Kit) -> f32 {
-    let mut extra = 0.0;
+/// What the input area of a session holds besides the box's text and its bottom row, in
+/// points: its task list `tasks` as drawn in a tile `tile_height` high, with the space under it;
+/// its choice box, `choices` points high with the space under it (`choices::height`); the
+/// queued message and the chips, each with the gap over it; and each line under the box. A line
+/// under the box is counted as one line of its type, though a long one wraps, and so is the
+/// choice box's question.
+fn extra_height(
+    session: Option<&Session>,
+    view: &SessionView,
+    tasks: Option<&TaskList>,
+    choices: f32,
+    tile_height: Option<f32>,
+    kit: &Kit,
+) -> f32 {
+    let mut extra = choices
+        + tasks.map_or(0.0, |list| {
+            tasks::height(list, tasks::is_open(view, tile_height))
+        });
     if session.is_some_and(|s| s.queued.is_some()) {
         extra += QUEUED_HEIGHT + BOX_PAD;
     }
@@ -99,14 +113,16 @@ const ATTACH: &str = "Attach a file";
 const PLACEHOLDER: &str = "Message Claude";
 const PLACEHOLDER_ENDED: &str = "This session has ended";
 
-/// The input box of `key`'s session, keyed `mr-input-area` (the space round it) and
-/// `mr-input-box` (the rounded box): the queued message when there is one, the chips when there
-/// are some, the text area keyed `mr-input`, then the attach button, the pickers and the send or
-/// stop button; under the box, the line that says the session's folder is gone, after a message
-/// could not wake it, and the one that says the file picker could not be used. The text grows
-/// only as far as the tile's height allows ([`lines_for`]). The pickers' lists go into `layer`.
-/// The area is `width` points wide and centred, as the conversation's rows are (the whole width
-/// while the tile's width is not known yet).
+/// The input box of `key`'s session, keyed `mr-input-area` (the space round it) and `mr-input-box`
+/// (the rounded box), with the session's task list over the box, in the area and as wide as the
+/// box, when it has one (`tasks::strip`), and under the list the choices its last turn offered, as
+/// wide, while they can be answered (`choices::boxed`). The box holds the queued message when there
+/// is one, the chips when there are some, the text area keyed `mr-input`, then the attach button,
+/// the pickers and the send or stop button; under the box, the line that says the session's folder
+/// is gone, after a message could not wake it, and the one that says the file picker could not be
+/// used. The text grows only as far as the tile's height allows ([`lines_for`]). The pickers' lists
+/// go into `layer`. The area is `width` points wide and centred, as the conversation's rows are
+/// (the whole width while the tile's width is not known yet).
 pub fn input(ui: &Ui, kit: &Kit, key: SessionKey, layer: &mut Vec<El>, width: Option<f32>) -> El {
     let session = ui.app.sessions.get(key).map(|entry| &entry.session);
     let view = glue::view_of(ui, key);
@@ -151,9 +167,18 @@ pub fn input(ui: &Ui, kit: &Kit, key: SessionKey, layer: &mut Vec<El>, width: Op
     controls = controls
         .child(mode_slot)
         .child(send_or_stop(ui, key, view, phase, kit));
+    let tile_height = tiles::tile_height(ui, key);
+    let tasks = tasks::listed(ui, key);
     let lines = lines_for(
-        tiles::tile_height(ui, key),
-        extra_height(session, view, kit),
+        tile_height,
+        extra_height(
+            session,
+            view,
+            tasks,
+            choices::height(ui, key),
+            tile_height,
+            kit,
+        ),
     );
     frame = frame
         .child(text_area(key, view, ended, lines, kit))
@@ -163,7 +188,12 @@ pub fn input(ui: &Ui, kit: &Kit, key: SessionKey, layer: &mut Vec<El>, width: Op
         Some(width) => area.w(width).self_center(),
         None => area.w_full(),
     };
-    let area = area.px(AREA_PAD_X).pb(AREA_PAD_BOTTOM).child(frame);
+    let area = area
+        .px(AREA_PAD_X)
+        .pb(AREA_PAD_BOTTOM)
+        .children(tasks::strip(ui, kit, key))
+        .children(choices::boxed(ui, kit, key))
+        .child(frame);
     let area = match &view.folder_gone {
         Some(folder) => area.child(folder_gone(folder, kit)),
         None => area,
@@ -436,13 +466,22 @@ pub fn give_back(ui: &mut Ui, key: SessionKey, message: &str) {
 /// says so: the session takes a message now (it has not ended, no question about it waits, its
 /// check in the store does not run), every chip is ready, and there is text or a chip.
 /// Otherwise the draft stays as it is. So does one for a resting session whose folder is no
-/// longer there: no program could start in it, so the line under the box says so instead.
-/// That is checked here, as the user sends, never as the box is drawn.
+/// longer there ([`folder_there`]).
 fn submit(ui: &mut Ui, key: SessionKey) {
     let text = glue::view_of(ui, key).draft.text.clone();
-    if !ui.app.can_send(key, &text) {
+    if !ui.app.can_send(key, &text) || !folder_there(ui, key) {
         return;
     }
+    let effects = ui.app.submit(key, &text);
+    glue::run(ui, effects);
+    glue::view_mut(ui, key).draft.clear();
+}
+
+/// Whether a message can go to `key`'s session as far as its folder goes: not when it rests and
+/// its folder is no longer there, for no program could start in it. Then the line under the box
+/// says so, until a try finds the folder there. Checked as the user sends, by Enter, the send
+/// button or a choice (`choices`), never as the box is drawn.
+pub(super) fn folder_there(ui: &mut Ui, key: SessionKey) -> bool {
     let gone = ui
         .app
         .sessions
@@ -450,14 +489,9 @@ fn submit(ui: &mut Ui, key: SessionKey) {
         .filter(|entry| entry.session.phase == Phase::Resting)
         .map(|entry| entry.session.folder.clone())
         .filter(|folder| !(ui.folder_exists)(folder));
-    let stays = gone.is_some();
+    let there = gone.is_none();
     glue::view_mut(ui, key).folder_gone = gone;
-    if stays {
-        return;
-    }
-    let effects = ui.app.submit(key, &text);
-    glue::run(ui, effects);
-    glue::view_mut(ui, key).draft.clear();
+    there
 }
 
 /// Send while no turn runs (disabled while there is nothing to send), stop while one does.
@@ -765,7 +799,7 @@ mod tests {
     };
     use crate::demo::NOW_UNIX;
     use crate::glue::{self, Picker, Ui};
-    use crate::view::{field, tiles};
+    use crate::view::{choices, field, tasks, tiles};
     use crate::{testkit, theme};
 
     /// The texts of the `Send` commands the fake received, in order.
@@ -2502,6 +2536,16 @@ mod tests {
         let one = tiles::HEADER_HEIGHT + CONVERSATION_MIN + AROUND_TEXT + field::LINE_HEIGHT;
         assert_eq!(lines_for(Some(one - 0.5), 0.0), 1);
         assert_eq!(lines_for(Some(one + field::LINE_HEIGHT), 0.0), 2);
+        // A folded task list takes 30 points; the text still has a line.
+        assert_eq!(lines_for(Some(280.0), 30.0), 4);
+        assert!(lines_for(Some(280.0), 30.0) >= 1);
+        let rt = testkit::window("tasks");
+        let session = rt.state.focused_session().unwrap();
+        assert_eq!(session.tasks.steps().len(), 5);
+        let (view, kit, short) = (testkit::shown_view(&rt), theme::kit(true), Some(280.0));
+        let listed = extra_height(Some(session), view, Some(&session.tasks), 0.0, short, kit);
+        let unlisted = extra_height(Some(session), view, None, 0.0, short, kit);
+        assert_eq!(listed - unlisted, 30.0, "a folded list in a 280-point tile");
     }
 
     /// Two sessions, `a`'s tile over `b`'s in one column, the window then made the smallest;
@@ -2741,12 +2785,150 @@ mod tests {
         settle(&mut rt);
         let session = rt.state.focused_session().unwrap();
         assert!(session.queued.is_some() && !session.chips.is_empty());
-        let extra = extra_height(Some(session), testkit::shown_view(&rt), theme::kit(true));
+        let extra = extra_height(
+            Some(session),
+            testkit::shown_view(&rt),
+            tasks::listed(&rt.state, key),
+            choices::height(&rt.state, key),
+            tiles::tile_height(&rt.state, key),
+            theme::kit(true),
+        );
         let area = rect_in(&rt, key, "mr-input-area");
         assert!(
             (area[3] - (AROUND_TEXT + field::LINE_HEIGHT + extra)).abs() < 0.5,
             "{area:?} holds one line and {extra} points besides"
         );
+    }
+
+    #[test]
+    fn a_short_tile_with_everything_keeps_a_line_to_type_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window("tasks-folded");
+        let (a, b) = match testkit::columns(&rt).as_slice() {
+            [column] => (column[0], column[1]),
+            columns => panic!("one column of two: {columns:?}"),
+        };
+        // The turn ends on an offer with its list not done: both stay.
+        let choice = |label: &str| mr_agent::Choice {
+            label: label.into(),
+            message: format!("{label}, please."),
+        };
+        let offer = mr_agent::Choices::new("Go on?", vec![choice("Yes"), choice("No")]).unwrap();
+        testkit::emit_to(&mut rt, a, SessionEvent::ChoicesOffered(offer));
+        let finished = SessionEvent::TurnFinished(TurnSummary {
+            cost_usd: 0.0,
+            context_used: None,
+            duration_ms: 1,
+            interrupted: false,
+        });
+        testkit::emit_to(&mut rt, a, finished);
+        testkit::paste_files(&mut rt, &[file(dir.path(), "notes.md")]);
+        chips_read(&mut rt);
+        glue::view_mut(&mut rt.state, a).attach_error =
+            Some("The file picker could not be opened: no portal".into());
+        // The upper tile 280 points high.
+        rt.set_viewport((1200.0, 616.0), 1.0);
+        type_lines(&mut rt, 30);
+        settle(&mut rt);
+        let tile_height = tiles::tile_height(&rt.state, a);
+        assert_eq!(tile_height, Some(280.0));
+        let session = rt.state.app.sessions.get(a).map(|entry| &entry.session);
+        assert!(session.is_some_and(|s| !s.chips.is_empty()));
+        assert_eq!(testkit::shown_view(&rt).tasks_open, None, "folded");
+        let extra = extra_height(
+            session,
+            glue::view_of(&rt.state, a),
+            tasks::listed(&rt.state, a),
+            choices::height(&rt.state, a),
+            tile_height,
+            theme::kit(true),
+        );
+        assert!(
+            tasks::listed(&rt.state, a).is_none(),
+            "no list while the box shows"
+        );
+        assert!(extra >= choices::HEIGHT + super::CHIPS_HEIGHT);
+        assert_eq!(list_keys_in(&rt, a), Vec::<String>::new(), "no list drawn");
+        // The question between the header and the input box. With a chip and a line under the
+        // box as well, the box's own top edge is 1.5 points short of the room.
+        let boxed = format!("mr-choices-{}", a.0);
+        assert_under_header(&rt, a, "mr-choices-question");
+        let [_, top, _, high] = rect_in(&rt, a, &boxed);
+        let input = rect_in(&rt, a, "mr-input-box");
+        assert!(top + high <= input[1] + 0.5, "the box over the input box");
+        assert!(
+            testkit::tile_has_text(&rt, a, "no portal"),
+            "the line under the box"
+        );
+        assert_under_header(&rt, a, "mr-input");
+        assert_under_header(&rt, a, "mr-send");
+        assert_kept_in(&rt, a, b);
+        // With the chip alone, the whole box is in the tile under its header.
+        glue::view_mut(&mut rt.state, a).attach_error = None;
+        rt.invalidate();
+        settle(&mut rt);
+        assert_under_header(&rt, a, &boxed);
+        assert_kept_in(&rt, a, b);
+        // Once the box goes, the folded list is back.
+        testkit::emit_to(&mut rt, a, SessionEvent::TurnStarted);
+        settle(&mut rt);
+        assert!(rt.state.app.choices(a).is_none());
+        assert!(list_keys_in(&rt, a).contains(&"mr-tasks-head".to_string()));
+        assert_under_header(&rt, a, "mr-tasks-head");
+    }
+
+    #[test]
+    fn a_long_question_in_a_short_tile_shows_one_whole_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = testkit::window("tasks-folded");
+        let a = testkit::columns(&rt)[0][0];
+        let question: String = "Should the banner be resized again before it goes out? "
+            .repeat(6)
+            .chars()
+            .take(300)
+            .collect();
+        let choice = mr_agent::Choice {
+            label: "Yes".into(),
+            message: "Yes.".into(),
+        };
+        let offer = mr_agent::Choices::new(&question, vec![choice]).unwrap();
+        testkit::emit_to(&mut rt, a, SessionEvent::ChoicesOffered(offer));
+        let finished = SessionEvent::TurnFinished(TurnSummary {
+            cost_usd: 0.0,
+            context_used: None,
+            duration_ms: 1,
+            interrupted: false,
+        });
+        testkit::emit_to(&mut rt, a, finished);
+        testkit::paste_files(&mut rt, &[file(dir.path(), "notes.md")]);
+        chips_read(&mut rt);
+        rt.set_viewport((1200.0, 616.0), 1.0);
+        settle(&mut rt);
+        assert_eq!(tiles::tile_height(&rt.state, a), Some(280.0));
+        assert!(
+            rt.state
+                .app
+                .sessions
+                .get(a)
+                .is_some_and(|e| !e.session.chips.is_empty())
+        );
+        assert_under_header(&rt, a, "mr-choices-question");
+        let shown = rect_in(&rt, a, "mr-choices-question");
+        assert!(
+            shown[3] <= theme::kit(true).ty.ui.line_px() + 0.5,
+            "one line: {shown:?}"
+        );
+    }
+
+    /// The keys of what is drawn of a task list in `key`'s tile, leaving ones aside.
+    fn list_keys_in(rt: &Runtime<Ui>, key: SessionKey) -> Vec<String> {
+        let inside = format!("/{}/", crate::view::tile_key(key));
+        rt.elements()
+            .into_iter()
+            .filter(|e| !e.exiting && e.path.contains(&inside))
+            .filter_map(|e| e.key)
+            .filter(|k| k.starts_with("mr-tasks-"))
+            .collect()
     }
 
     #[test]

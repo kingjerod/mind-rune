@@ -731,6 +731,8 @@ mod tests {
                 model: Some("fake-model-1".into()),
                 permission_mode: Some(PermissionMode::Plan),
                 effort: None,
+                tasks: Vec::new(),
+                choices: None,
             },
         );
 

@@ -4,6 +4,7 @@
 mod account;
 mod agent;
 mod args;
+pub mod choices;
 mod encode;
 mod env;
 mod history;
@@ -11,6 +12,7 @@ mod history_tail;
 mod mode;
 mod process;
 mod remove;
+mod tasks;
 mod time;
 mod translate;
 mod wire;

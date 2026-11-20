@@ -11,7 +11,7 @@ use mr_agent::{AgentError, HistoryItem, StoredHistory};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::history::{add_record, contains, parse_record, stored_images};
+use crate::history::{Walk, add_record, contains, parse_record, stored_images};
 use crate::mode::mode_from_wire;
 
 /// How much of the end of a session file is read for its history.
@@ -52,12 +52,13 @@ pub fn read_tail(
             model: None,
             permission_mode,
             effort: None,
+            tasks: Vec::new(),
+            choices: None,
         });
     };
     let (steps, end) = records.chain_to(leaf);
 
-    let mut items = Vec::new();
-    let mut tool_positions = HashMap::new();
+    let mut walk = Walk::default();
     let mut model = None;
     let mut effort = None;
     // The user's messages that have images, by their place in `items`, with their records:
@@ -65,7 +66,7 @@ pub fn read_tail(
     let mut with_images: VecDeque<(usize, Value)> = VecDeque::new();
     for step in steps.iter().rev() {
         match step {
-            Step::Compaction => items.push(HistoryItem::Compacted),
+            Step::Compaction => walk.items.push(HistoryItem::Compacted),
             Step::Record(index) => {
                 let Some(record) = parse_record(&region[records.nodes[*index].line.clone()]) else {
                     continue;
@@ -76,10 +77,10 @@ pub fn read_tail(
                 if let Some(level) = reply_effort(&record) {
                     effort = Some(level.to_string());
                 }
-                let before = items.len();
-                add_record(&record, &mut items, &mut tool_positions);
-                if items.len() > before
-                    && let Some(HistoryItem::User { image_count, .. }) = items.last()
+                let before = walk.items.len();
+                add_record(&record, &mut walk);
+                if walk.items.len() > before
+                    && let Some(HistoryItem::User { image_count, .. }) = walk.items.last()
                     && *image_count > 0
                 {
                     with_images.push_back((before, record));
@@ -87,7 +88,7 @@ pub fn read_tail(
                 // Items are only ever added: one this far from the end is cut.
                 while with_images
                     .front()
-                    .is_some_and(|(at, _)| items.len() - at > max_items)
+                    .is_some_and(|(at, _)| walk.items.len() - at > max_items)
                 {
                     with_images.pop_front();
                 }
@@ -95,6 +96,8 @@ pub fn read_tail(
         }
     }
 
+    // The list and the offer come of every record read, not only of the items kept.
+    let (mut items, tasks, choices) = walk.end();
     let cut = items.len().saturating_sub(max_items);
     items.drain(..cut);
     for (at, record) in with_images {
@@ -117,6 +120,8 @@ pub fn read_tail(
         model,
         permission_mode,
         effort,
+        tasks,
+        choices,
     })
 }
 
@@ -905,5 +910,422 @@ mod tests {
             items.last(),
             Some(HistoryItem::Tool { outcome: Some(ToolOutcome::Failed { output }), .. }) if output == "no\nway"
         ));
+    }
+
+    /// Records written one after another, each the reply to the one before. Written by
+    /// hand, field names and shapes only.
+    struct Chain {
+        lines: Vec<String>,
+        last: Option<String>,
+    }
+
+    impl Chain {
+        /// A chain whose first record answers `parent`, which need not be in the file.
+        fn after(parent: Option<&str>) -> Self {
+            Chain {
+                lines: Vec::new(),
+                last: parent.map(str::to_string),
+            }
+        }
+
+        fn new() -> Self {
+            Chain::after(None)
+        }
+
+        fn push(&mut self, mut record: serde_json::Value) -> &mut Self {
+            let uuid = format!("c{}", self.lines.len() + 1);
+            record["uuid"] = json!(uuid);
+            record["parentUuid"] = json!(self.last);
+            record["sessionId"] = json!("s1");
+            self.lines.push(record.to_string());
+            self.last = Some(uuid);
+            self
+        }
+
+        fn user(&mut self, text: &str) -> &mut Self {
+            self.push(json!({"type": "user", "message": {"role": "user", "content": text}}))
+        }
+
+        fn reply(&mut self, text: &str) -> &mut Self {
+            self.push(json!({"type": "assistant", "message": {"role": "assistant",
+                "model": "claude-x-1", "content": [{"type": "text", "text": text}]}}))
+        }
+
+        /// A call of the tool `name` with `input`, as the call `id`.
+        fn call(&mut self, id: &str, name: &str, input: serde_json::Value) -> &mut Self {
+            self.push(json!({"type": "assistant", "message": {"role": "assistant",
+                "model": "claude-x-1",
+                "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}}))
+        }
+
+        /// The result `text` of the call `id`, with `top` merged into the record.
+        fn result_with(&mut self, id: &str, text: &str, top: serde_json::Value) -> &mut Self {
+            let mut record = json!({"type": "user", "message": {"role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]}});
+            for (key, value) in top.as_object().into_iter().flatten() {
+                record[key] = value.clone();
+            }
+            self.push(record)
+        }
+
+        fn result(&mut self, id: &str, text: &str) -> &mut Self {
+            self.result_with(id, text, json!({}))
+        }
+
+        /// A `TaskCreate` of `subject` as the call `id`, and its result naming the step `step`.
+        fn create(&mut self, id: &str, step: &str, subject: &str) -> &mut Self {
+            self.call(
+                id,
+                "TaskCreate",
+                json!({"subject": subject, "description": subject,
+                "activeForm": format!("Doing {subject}")}),
+            )
+            .result_with(
+                id,
+                &format!("Task #{step} created successfully: {subject}"),
+                json!({"toolUseResult": {"task": {"id": step, "subject": subject}}}),
+            )
+        }
+
+        /// A `TaskUpdate` of the step `step` to `status`, as the call `id`, and its result.
+        fn update(&mut self, id: &str, step: &str, status: &str) -> &mut Self {
+            self.call(id, "TaskUpdate", json!({"taskId": step, "status": status}))
+                .result_with(
+                    id,
+                    &format!("Updated task #{step} status"),
+                    json!({"toolUseResult": {"success": true, "taskId": step}}),
+                )
+        }
+
+        fn offer(&mut self, id: &str, question: &str, labels: [&str; 2]) -> &mut Self {
+            let choices: Vec<serde_json::Value> = labels
+                .iter()
+                .map(|label| json!({"label": label, "message": format!("{label}, please")}))
+                .collect();
+            self.call(
+                id,
+                "mcp__mindrune__offer_choices",
+                json!({"question": question, "choices": choices}),
+            )
+            .result(id, "The choices are shown to the user.")
+        }
+
+        fn read(&self) -> StoredHistory {
+            let dir = tempfile::tempdir().unwrap();
+            read_all(&write(dir.path(), &self.lines))
+        }
+    }
+
+    fn steps(history: &StoredHistory) -> Vec<(&str, mr_agent::TaskStatus)> {
+        history
+            .tasks
+            .iter()
+            .map(|step| (step.id.as_str(), step.status))
+            .collect()
+    }
+
+    fn tool_names(history: &StoredHistory) -> Vec<&str> {
+        history
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::Tool { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_list_with_an_open_step_comes_back_and_its_calls_are_no_items() {
+        use mr_agent::TaskStatus::{Completed, InProgress};
+        let history = Chain::new()
+            .user("Make three files")
+            .create("toolu_a", "1", "Create a.txt")
+            .call(
+                "toolu_b",
+                "TaskCreate",
+                json!({"subject": "Create b.txt", "activeForm": "Creating b.txt"}),
+            )
+            .result("toolu_b", "Task #2 created successfully: Create b.txt")
+            .update("toolu_c", "1", "in_progress")
+            .update("toolu_d", "1", "completed")
+            .update("toolu_e", "2", "in_progress")
+            .call(
+                "toolu_f",
+                "Write",
+                json!({"file_path": "/home/alex/proj/b.txt", "content": "b"}),
+            )
+            .result("toolu_f", "File created")
+            .read();
+        assert_eq!(steps(&history), [("1", Completed), ("2", InProgress)]);
+        assert_eq!(history.tasks[1].subject, "Create b.txt");
+        assert_eq!(history.tasks[1].active.as_deref(), Some("Creating b.txt"));
+        assert_eq!(tool_names(&history), ["Write"]);
+        assert_eq!(
+            history.items.len(),
+            2,
+            "the message and the Write: {:?}",
+            history.items
+        );
+    }
+
+    #[test]
+    fn a_finished_list_does_not_come_back() {
+        let history = Chain::new()
+            .user("Make two files")
+            .create("toolu_a", "1", "Create a.txt")
+            .create("toolu_b", "2", "Create b.txt")
+            .update("toolu_c", "1", "completed")
+            .update("toolu_d", "2", "completed")
+            .reply("Both are made.")
+            .read();
+        assert!(history.tasks.is_empty(), "{:?}", history.tasks);
+        assert!(tool_names(&history).is_empty());
+    }
+
+    #[test]
+    fn a_new_message_ends_the_turn_for_the_list() {
+        let history = Chain::new()
+            .user("Make two files")
+            .create("toolu_a", "1", "Create a.txt")
+            .create("toolu_b", "2", "Create b.txt")
+            .update("toolu_c", "1", "completed")
+            .update("toolu_d", "2", "completed")
+            .user("And a third")
+            .create("toolu_e", "3", "Create c.txt")
+            .read();
+        assert_eq!(steps(&history), [("3", mr_agent::TaskStatus::Pending)]);
+    }
+
+    #[test]
+    fn the_last_offer_comes_back_unless_something_was_said_after_it() {
+        let mut chain = Chain::new();
+        chain
+            .user("Fix the bug")
+            .reply("Fixed.")
+            .offer("toolu_a", "Commit the fix?", ["Commit", "Not yet"])
+            .reply("Over to you.");
+        let history = chain.read();
+        let offer = history.choices.as_ref().expect("the offer comes back");
+        assert_eq!(offer.question, "Commit the fix?");
+        assert_eq!(
+            offer
+                .choices
+                .iter()
+                .map(|c| (c.label.as_str(), c.message.as_str()))
+                .collect::<Vec<_>>(),
+            [("Commit", "Commit, please"), ("Not yet", "Not yet, please")]
+        );
+        assert!(tool_names(&history).is_empty(), "the offer is no tool line");
+
+        let mut answered = Chain::new();
+        answered
+            .user("Fix the bug")
+            .offer("toolu_a", "Commit the fix?", ["Commit", "Not yet"])
+            .user("Commit, please");
+        assert_eq!(answered.read().choices, None);
+
+        let mut interrupted = Chain::new();
+        interrupted
+            .user("Fix the bug")
+            .offer("toolu_a", "Commit the fix?", ["Commit", "Not yet"])
+            .user("[Request interrupted by user]");
+        assert_eq!(
+            interrupted.read().choices,
+            None,
+            "a stored interruption is said after it"
+        );
+
+        let mut twice = Chain::new();
+        twice
+            .user("Fix the bug")
+            .offer("toolu_a", "Commit the fix?", ["Commit", "Not yet"])
+            .offer("toolu_b", "Push it too?", ["Push", "Wait"]);
+        assert_eq!(
+            twice.read().choices.map(|offer| offer.question),
+            Some("Push it too?".into())
+        );
+
+        let mut refused = Chain::new();
+        refused
+            .user("Fix the bug")
+            .offer("toolu_a", "Commit the fix?", ["Commit", "Not yet"])
+            .call(
+                "toolu_b",
+                "mcp__mindrune__offer_choices",
+                json!({"question": "", "choices": []}),
+            )
+            .result_with(
+                "toolu_b",
+                "A question is needed.",
+                json!({"toolUseResult": "Error: A question is needed."}),
+            );
+        let history = refused.read();
+        assert_eq!(
+            history
+                .choices
+                .as_ref()
+                .map(|offer| offer.question.as_str()),
+            Some("Commit the fix?"),
+            "an offer that cannot be shown changes nothing"
+        );
+        assert!(tool_names(&history).is_empty());
+    }
+
+    #[test]
+    fn the_live_spelling_of_the_result_is_read_too() {
+        let history = Chain::new()
+            .user("Make a file")
+            .call("toolu_a", "TaskCreate", json!({"subject": "Create a.txt"}))
+            .result_with(
+                "toolu_a",
+                "Done.",
+                json!({"tool_use_result": {"task": {"id": "7", "subject": "Create a.txt"}}}),
+            )
+            .read();
+        assert_eq!(steps(&history), [("7", mr_agent::TaskStatus::Pending)]);
+    }
+
+    #[test]
+    fn a_cut_off_conversation_costs_only_what_was_cut() {
+        let history = Chain::after(Some("before-the-file"))
+            .update("toolu_a", "1", "completed")
+            .update("toolu_b", "2", "in_progress")
+            .create("toolu_c", "3", "Create c.txt")
+            .read();
+        assert_eq!(steps(&history), [("3", mr_agent::TaskStatus::Pending)]);
+        assert!(history.items.is_empty(), "{:?}", history.items);
+        assert!(history.earlier_left_out);
+    }
+
+    #[test]
+    fn a_failed_call_and_a_search_for_the_tools_leave_no_trace() {
+        let mut chain = Chain::new();
+        chain
+            .user("Make a file")
+            .call(
+                "toolu_a",
+                "ToolSearch",
+                json!({"query": "select:TaskCreate,TaskUpdate", "max_results": 2}),
+            )
+            .result("toolu_a", "Loaded.")
+            .call("toolu_b", "TaskCreate", json!({"subject": "Create a.txt"}));
+        chain.push(
+            json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_b", "is_error": true,
+             "content": "Task #1 created successfully: Create a.txt"}]},
+            "toolUseResult": {"task": {"id": "1"}}}),
+        );
+        chain
+            .call(
+                "toolu_c",
+                "ToolSearch",
+                json!({"query": "select:TaskCreate,Bash", "max_results": 2}),
+            )
+            .result("toolu_c", "Loaded.");
+        let history = chain.read();
+        assert!(history.tasks.is_empty(), "{:?}", history.tasks);
+        assert_eq!(tool_names(&history), ["ToolSearch"]);
+        assert!(matches!(
+            history.items.last(),
+            Some(HistoryItem::Tool { id, outcome: Some(ToolOutcome::Ok { .. }), .. }) if id.0 == "toolu_c"
+        ));
+    }
+
+    #[test]
+    fn a_record_of_several_results_names_each_step_by_its_text() {
+        let mut chain = Chain::new();
+        chain
+            .user("Make two files")
+            .push(json!({"type": "assistant", "message": {
+            "role": "assistant", "model": "claude-x-1", "content": [
+                {"type": "tool_use", "id": "toolu_a", "name": "TaskCreate",
+                 "input": {"subject": "Create a.txt"}},
+                {"type": "tool_use", "id": "toolu_b", "name": "TaskCreate",
+                 "input": {"subject": "Create b.txt"}}]}}));
+        chain.push(
+            json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_a",
+             "content": "Task #1 created successfully: Create a.txt"},
+            {"type": "tool_result", "tool_use_id": "toolu_b",
+             "content": "Task #2 created successfully: Create b.txt"}]},
+            "toolUseResult": {"task": {"id": "9"}}}),
+        );
+        use mr_agent::TaskStatus::Pending;
+        assert_eq!(steps(&chain.read()), [("1", Pending), ("2", Pending)]);
+    }
+
+    #[test]
+    fn a_result_that_comes_after_the_next_message_is_applied() {
+        let history = Chain::new()
+            .user("Make a file")
+            .call("toolu_a", "TaskCreate", json!({"subject": "Create a.txt"}))
+            .user("Stop")
+            .result("toolu_a", "Task #1 created successfully: Create a.txt")
+            .read();
+        assert_eq!(steps(&history), [("1", mr_agent::TaskStatus::Pending)]);
+    }
+
+    #[test]
+    fn a_slash_command_answers_an_offer_and_ends_the_lists_turn() {
+        let mut chain = Chain::new();
+        chain
+            .user("Fix the bug")
+            .create("toolu_a", "1", "Fix it")
+            .update("toolu_b", "1", "completed")
+            .offer("toolu_c", "Apply the fix?", ["Apply", "Not now"])
+            .user("<command-name>/apply</command-name>\n<command-message>apply</command-message>");
+        chain.push(
+            json!({"type": "user", "isMeta": true, "message": {"role": "user",
+            "content": "Apply the change that was made."}}),
+        );
+        chain.reply("Applied.").create("toolu_d", "2", "Check it");
+        let history = chain.read();
+        assert_eq!(history.choices, None, "the offer was answered");
+        assert_eq!(steps(&history), [("2", mr_agent::TaskStatus::Pending)]);
+        let messages = history
+            .items
+            .iter()
+            .filter(|item| matches!(item, HistoryItem::User { .. }))
+            .count();
+        assert_eq!(
+            messages, 1,
+            "the command is still no item: {:?}",
+            history.items
+        );
+    }
+
+    #[test]
+    fn an_offer_comes_back_only_once_its_result_says_it_was_shown() {
+        let offer = json!({"question": "Go on?", "choices": [{"label": "Yes", "message": "Yes."}]});
+        let mut unanswered = Chain::new();
+        unanswered.user("Fix the bug").call(
+            "toolu_a",
+            "mcp__mindrune__offer_choices",
+            offer.clone(),
+        );
+        assert_eq!(unanswered.read().choices, None, "no result yet");
+
+        let mut failed = Chain::new();
+        failed
+            .user("Fix the bug")
+            .call("toolu_a", "mcp__mindrune__offer_choices", offer.clone());
+        failed.push(
+            json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_a", "is_error": true,
+             "content": "Permission to use the tool was denied."}]}}),
+        );
+        assert_eq!(failed.read().choices, None, "the program refused the call");
+
+        let mut late = Chain::new();
+        late.user("Fix the bug")
+            .call("toolu_a", "mcp__mindrune__offer_choices", offer)
+            .user("Something else")
+            .result("toolu_a", "Shown to the user.");
+        assert_eq!(
+            late.read().choices,
+            None,
+            "something was said before its result"
+        );
     }
 }

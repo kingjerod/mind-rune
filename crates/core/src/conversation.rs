@@ -294,7 +294,11 @@ impl Conversation {
             | SessionEvent::PermissionModeChanged(_)
             | SessionEvent::ContextBreakdown(_)
             | SessionEvent::BackgroundTasks { .. }
-            | SessionEvent::CommandFailed { .. } => {}
+            | SessionEvent::CommandFailed { .. }
+            | SessionEvent::TaskAdded(_)
+            | SessionEvent::TaskChanged(_)
+            | SessionEvent::TaskRemoved { .. }
+            | SessionEvent::ChoicesOffered(_) => {}
         }
     }
 

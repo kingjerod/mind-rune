@@ -1,6 +1,7 @@
 //! `mindrune-probe`: checks the stream-json protocol against a real `claude`
 //! and turns recordings into test fixtures.
 
+mod choices;
 mod events;
 mod repl;
 mod scrub;
@@ -13,7 +14,8 @@ use mr_claude::ClaudeAgent;
 const USAGE: &str = "\
 usage:
   mindrune-probe raw --cwd DIR [--program PATH] [--resume ID] [--fork] [--model M]
-                        [--mode MODE] [--record FILE] [--full-login] [--arg VALUE]...
+                        [--mode MODE] [--record FILE] [--full-login] [--choices]
+                        [--arg VALUE]...
   mindrune-probe events --cwd DIR [--model M]
   mindrune-probe scrub IN OUT";
 
@@ -65,6 +67,7 @@ fn parse_raw(args: &[String]) -> Result<repl::RawOptions, String> {
         record: None,
         full_login: false,
         extra_args: Vec::new(),
+        choices: false,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -84,6 +87,7 @@ fn parse_raw(args: &[String]) -> Result<repl::RawOptions, String> {
             "--arg" => options.extra_args.push(value("--arg")?),
             "--fork" => options.fork = true,
             "--full-login" => options.full_login = true,
+            "--choices" => options.choices = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -177,5 +181,7 @@ mod tests {
             parse_raw(&words("--cwd /p --arg")).err(),
             Some("--arg needs a value".to_string())
         );
+        assert!(!parse_raw(&words("--cwd /p")).unwrap().choices);
+        assert!(parse_raw(&words("--cwd /p --choices")).unwrap().choices);
     }
 }

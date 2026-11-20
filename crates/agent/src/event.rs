@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::choices::Choices;
 use crate::ids::{RequestId, SessionId, ToolCallId};
+use crate::tasks::{TaskChange, TaskStep};
 
 /// What a session tells its caller, through the [`EventSink`](crate::EventSink)
 /// given to [`Agent::open`](crate::Agent::open).
@@ -24,6 +26,8 @@ use crate::ids::{RequestId, SessionId, ToolCallId};
 /// - `UsageLimits`, `RemoteAccess`, `TitleChanged`, `ModelChanged`,
 ///   `EffortChanged`, `PermissionModeChanged`, `ContextBreakdown`,
 ///   `BackgroundTasks` and `CommandFailed` can come between turns or inside one.
+/// - `TaskAdded`, `TaskChanged`, `TaskRemoved` and `ChoicesOffered` come only inside a turn.
+///   A `ChoicesOffered` may be followed by more of that turn.
 /// - `Exited` comes last, exactly once, also after a normal `Close`. It ends any
 ///   open turn and every request still waiting for the user; no separate
 ///   `TurnFailed` or `RequestWithdrawn` is sent for them.
@@ -57,6 +61,16 @@ pub enum SessionEvent {
     TurnFailed {
         reason: String,
     },
+    /// A step was added to the session's task list.
+    TaskAdded(TaskStep),
+    /// A step of the task list changed.
+    TaskChanged(TaskChange),
+    /// A step left the task list.
+    TaskRemoved {
+        id: String,
+    },
+    /// The agent offers the user a question with choices to pick from.
+    ChoicesOffered(Choices),
     UsageLimits(UsageLimits),
     RemoteAccess(RemoteAccess),
     TitleChanged(String),
@@ -366,6 +380,29 @@ mod tests {
                     }],
                 },
             }),
+            SessionEvent::TaskAdded(crate::TaskStep {
+                id: "1".into(),
+                subject: "Create a.txt".into(),
+                active: Some("Creating a.txt".into()),
+                status: crate::TaskStatus::Pending,
+            }),
+            SessionEvent::TaskChanged(crate::TaskChange {
+                id: "1".into(),
+                status: Some(crate::TaskStatus::InProgress),
+                subject: None,
+                active: None,
+            }),
+            SessionEvent::TaskRemoved { id: "1".into() },
+            SessionEvent::ChoicesOffered(
+                crate::Choices::new(
+                    "Apply now?",
+                    vec![crate::Choice {
+                        label: "Apply".into(),
+                        message: "/apply".into(),
+                    }],
+                )
+                .unwrap(),
+            ),
         ];
         let text = serde_json::to_string(&events).unwrap();
         assert_eq!(

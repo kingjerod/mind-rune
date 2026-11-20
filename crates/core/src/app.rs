@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use mr_agent::{
-    Account, AgentError, Answer, Capabilities, CommandKind, ImageData, LimitWindow, ModelOption,
-    PermissionMode, Removal, RequestId, SessionCommand, SessionEvent, SessionId, StartSpec,
-    StoredSession, UsageLimits,
+    Account, AgentError, Answer, Capabilities, Choices, CommandKind, ImageData, LimitWindow,
+    ModelOption, PermissionMode, Removal, RequestId, SessionCommand, SessionEvent, SessionId,
+    StartSpec, StoredSession, UsageLimits,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1649,6 +1649,35 @@ impl App {
                 .is_some_and(|entry| entry.session.can_send(text))
     }
 
+    /// The choices `key`'s session offers ([`Session::choices`]), while it takes a message.
+    pub fn choices(&self, key: SessionKey) -> Option<&Choices> {
+        if !self.takes_message(key) {
+            return None;
+        }
+        self.sessions.get(key)?.session.choices()
+    }
+
+    /// Whether a click on a choice would send it now: there are choices, and the first choice's
+    /// message with `key`'s chips can be sent ([`App::can_send`]).
+    pub fn can_choose(&self, key: SessionKey) -> bool {
+        self.choices(key)
+            .and_then(|offer| offer.choices.first())
+            .is_some_and(|first| self.can_send(key, &first.message))
+    }
+
+    /// Sends the message of `key`'s choice at `index` as [`App::submit`] sends a typed one, the
+    /// chips with it. Nothing without choices or for an index that is not there.
+    pub fn choose(&mut self, key: SessionKey, index: usize) -> Vec<Effect> {
+        let Some(message) = self
+            .choices(key)
+            .and_then(|offer| offer.choices.get(index))
+            .map(|choice| choice.message.clone())
+        else {
+            return Vec::new();
+        };
+        self.submit(key, &message)
+    }
+
     /// Fills the chip with id `chip`, in whatever session it is, with what reading it gave. A
     /// chip taken off is gone: its answer is dropped. A pasted chip lets go of the clipboard's
     /// bytes: what is sent is the prepared image's.
@@ -1981,7 +2010,8 @@ impl App {
     /// queued in it, leaving the original resting. The message's chips are on the session while
     /// the question waits: they go with the message, to the copy when it is one, and stay on
     /// the session on Cancel. The text that goes back into that session's input box, when the
-    /// choice was Cancel or the text and chips left make no message to send.
+    /// choice was Cancel or the text and chips left make no message to send: none when it is
+    /// the message of a choice offered again, whose button says it.
     pub fn answer_prompt(
         &mut self,
         key: SessionKey,
@@ -1998,12 +2028,13 @@ impl App {
         if entry.session.phase != Phase::Resting {
             return (effects, None);
         }
+        let given_back = (!entry.session.is_a_choice(&text)).then(|| text.clone());
         // Its chips may have been taken off meanwhile, leaving nothing to send.
         if !entry.session.can_send(&text) {
-            return (effects, Some(text));
+            return (effects, given_back);
         }
         match choice {
-            PromptChoice::Cancel => (effects, Some(text)),
+            PromptChoice::Cancel => (effects, given_back),
             PromptChoice::ContinueHere => {
                 entry.session.wake(&text);
                 entry.last_active_unix = now_unix;
@@ -2303,9 +2334,10 @@ impl App {
     /// Moves `key`'s session to the Deleted view, and asks to save. Its tile closes. A session
     /// the store has nothing of is forgotten instead, as an empty one is, its program closed if
     /// it runs. Otherwise its queued and undelivered messages go with their chips, its program
-    /// is sent `Close` once, one that ended rests, its question, check and mark are cleared, it
-    /// no longer wants Remote Control, and its conversation is given back to the store as
-    /// [`App::let_go`] gives it, or when its program has ended. Nothing for a deleted session.
+    /// is sent `Close` once, one that ended rests, the offer a wake kept aside is forgotten, its
+    /// question, check and mark are cleared, it no longer wants Remote Control, and its
+    /// conversation is given back to the store as [`App::let_go`] gives it, or when its program
+    /// has ended. Nothing for a deleted session.
     pub fn delete_session(&mut self, key: SessionKey) -> Vec<Effect> {
         if self
             .sessions
@@ -2337,6 +2369,7 @@ impl App {
         }
         entry.session.queued = None;
         entry.session.undelivered.clear();
+        entry.session.forget_choices_aside();
         // Woken while the store was asked about it, so no program was opened yet, or ended: a
         // deleted session rests, and so lets its conversation go.
         if entry.open.is_none()
@@ -2910,7 +2943,7 @@ mod tests {
     use crate::conversation::ItemBody;
     use crate::groups::Group;
     use crate::saved::{RECENT_FOLDERS, SAVED_VERSION, SavedBelow, SavedDeleted, SavedTile};
-    use crate::session::testing::info;
+    use crate::session::testing::{info, offer};
     use crate::sessions::Mark;
 
     /// The wall clock the tests' apps start at.
@@ -2993,6 +3026,11 @@ mod tests {
     /// An app with no launch folder, signed in, that knows the stored session `a1` (in
     /// `/home/alex/project`, an hour old, its history read) and shows it.
     fn shows_stored() -> (App, SessionKey) {
+        shows_stored_with(None)
+    }
+
+    /// [`shows_stored`] with `choices` as the stored conversation's last offer.
+    fn shows_stored_with(choices: Option<Choices>) -> (App, SessionKey) {
         let mut app = main_screen();
         let a1 = store("a1", "Fix the parser", "/home/alex/project", NOW - 3600);
         listing(&mut app, Some(NOW - RECENT_DAYS * 86_400), vec![a1]);
@@ -3009,6 +3047,7 @@ mod tests {
                 },
                 HistoryItem::AssistantText("It reads tokens.".into()),
             ],
+            choices,
             ..StoredHistory::default()
         };
         app.receive(
@@ -10799,5 +10838,219 @@ mod tests {
         let (app, key) = ready();
         assert_eq!(app.title_of(key).as_deref(), Some("New session"));
         assert_eq!(app.title_of(SessionKey(999)), None);
+    }
+
+    /// [`ready`] after a turn that offered [`offer`] has ended: the offer shows.
+    fn offer_shown() -> (App, SessionKey) {
+        let (mut app, key) = ready();
+        app.submit(key, "go");
+        app.event(1, SessionEvent::TurnStarted, 0.0);
+        app.event(1, SessionEvent::ChoicesOffered(offer()), 0.0);
+        app.event(1, done(), 0.0);
+        assert_eq!(app.choices(key), Some(&offer()));
+        (app, key)
+    }
+
+    /// The commands among `effects` that go to open `open`.
+    fn sent_to(effects: &[Effect], open: u64) -> Vec<&SessionCommand> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Send { open: o, command } if *o == open => Some(command),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_click_sends_the_choices_message_as_a_typed_one() {
+        let (mut app, key) = offer_shown();
+        assert!(app.can_choose(key));
+        let effects = app.choose(key, 0);
+        assert_eq!(
+            sent_to(&effects, 1),
+            [&SessionCommand::Send {
+                text: "/publish".into(),
+                attachments: vec![],
+            }]
+        );
+        assert_eq!(app.choices(key), None);
+        assert!(!app.can_choose(key));
+        assert!(
+            app.choose(key, 0)
+                .iter()
+                .all(|e| !matches!(e, Effect::Send { .. })),
+            "a second click sends nothing"
+        );
+    }
+
+    #[test]
+    fn an_index_that_is_not_there_does_nothing() {
+        let (mut app, key) = offer_shown();
+        let before = session(&app, key).clone();
+        assert_eq!(app.choose(key, 5), vec![]);
+        assert_eq!(app.choices(key), Some(&offer()), "the offer stays");
+        assert_eq!(session(&app, key), &before);
+        assert_eq!(app.choose(SessionKey(999), 0), vec![]);
+    }
+
+    #[test]
+    fn a_click_takes_the_attached_files_with_it_and_waits_for_one_still_being_read() {
+        let (mut app, key) = offer_shown();
+        app.attach(key, vec![at("/home/alex/notes.txt")]);
+        assert!(!app.can_choose(key), "a chip is still read");
+        assert!(
+            sent_to(&app.choose(key, 1), 1).is_empty(),
+            "nothing is sent"
+        );
+        assert_eq!(app.choices(key), Some(&offer()), "the offer stays");
+
+        answer(&mut app, 1, Ok(file_ready("/home/alex/notes.txt")));
+        assert!(app.can_choose(key));
+        let effects = app.choose(key, 1);
+        assert_eq!(
+            sent_to(&effects, 1),
+            [&SessionCommand::Send {
+                text: "Leave it for now.".into(),
+                attachments: vec![Attachment::File {
+                    path: "/home/alex/notes.txt".into()
+                }],
+            }]
+        );
+        assert!(session(&app, key).chips.is_empty());
+    }
+
+    #[test]
+    fn a_deleted_session_and_one_with_a_question_waiting_offer_nothing() {
+        let (mut app, key) = offer_shown();
+        app.delete_session(key);
+        assert_eq!(app.choices(key), None);
+        assert!(!app.can_choose(key));
+        assert_eq!(app.choose(key, 0), vec![]);
+
+        let (mut app, key) = shows_stored_with(Some(offer()));
+        assert_eq!(app.choices(key), Some(&offer()));
+        app.sessions.get_mut(key).unwrap().prompt = Some(Prompt::OpenElsewhere {
+            text: "go on".into(),
+        });
+        assert_eq!(app.choices(key), None);
+        assert!(!app.can_choose(key));
+        assert_eq!(app.choose(key, 0), vec![]);
+        assert_eq!(session(&app, key).phase, Phase::Resting);
+    }
+
+    #[test]
+    fn a_deleted_session_keeps_no_offer_aside() {
+        // Woken by a click while the store is asked about it, then deleted. Its history is
+        // marked unread so the delete does not let its conversation go, which would clear
+        // the offers too.
+        let delete_woken = |choices: Option<Choices>, send: fn(&mut App, SessionKey)| {
+            let (mut app, key) = shows_stored_with(choices);
+            send(&mut app, key);
+            assert_eq!(session(&app, key).phase, Phase::Opening);
+            app.sessions.get_mut(key).unwrap().session.history =
+                HistoryState::Failed("unread".into());
+            app.delete_session(key);
+            assert_eq!(session(&app, key).phase, Phase::Resting);
+            session(&app, key).clone()
+        };
+        let clicked = delete_woken(Some(offer()), |app, key| {
+            app.choose(key, 0);
+        });
+        let typed = delete_woken(None, |app, key| {
+            app.submit(key, "/publish");
+        });
+        assert_eq!(clicked, typed, "no offer is kept aside");
+    }
+
+    #[test]
+    fn a_click_on_a_resting_session_wakes_it_as_a_typed_message_does() {
+        let (mut clicked, key) = shows_stored_with(Some(offer()));
+        assert_eq!(clicked.choices(key), Some(&offer()), "a restored offer");
+        assert!(clicked.can_choose(key));
+        let (mut typed, typed_key) = shows_stored_with(Some(offer()));
+        let effects = clicked.choose(key, 0);
+        assert_eq!(effects, typed.submit(typed_key, "/publish"));
+        assert_eq!(effects, vec![Effect::CheckActivity { key, id: id("a1") }]);
+        assert_eq!(session(&clicked, key), session(&typed, typed_key));
+        assert_eq!(clicked.choices(key), None);
+    }
+
+    /// [`shows_stored_with`] [`offer`], given what `send` sends it, and the store's answer that
+    /// another app had it open five seconds ago: the question waits.
+    fn elsewhere_after(
+        send: impl FnOnce(&mut App, SessionKey) -> Vec<Effect>,
+    ) -> (App, SessionKey) {
+        let (mut app, key) = shows_stored_with(Some(offer()));
+        let effects = send(&mut app, key);
+        assert_eq!(effects, vec![Effect::CheckActivity { key, id: id("a1") }]);
+        app.receive(
+            FromBackend::Activity {
+                key,
+                result: Ok(Some(NOW - 5)),
+            },
+            0.0,
+        );
+        assert!(app.prompt(key).is_some(), "the question waits");
+        (app, key)
+    }
+
+    #[test]
+    fn a_click_cancelled_at_the_open_elsewhere_question_puts_the_offer_back() {
+        let (mut app, key) = elsewhere_after(|app, key| {
+            app.attach(key, vec![at("/home/alex/notes.txt")]);
+            answer(app, 1, Ok(file_ready("/home/alex/notes.txt")));
+            app.choose(key, 0)
+        });
+        assert_eq!(app.choices(key), None, "no box while the question waits");
+        let (_, back) = app.answer_prompt(key, PromptChoice::Cancel);
+        assert_eq!(back, None, "nothing goes into the box");
+        assert_eq!(app.choices(key), Some(&offer()));
+        assert_eq!(chips_of(&app, key).len(), 1, "the chip is back");
+
+        let effects = app.choose(key, 1);
+        assert_eq!(effects, vec![Effect::CheckActivity { key, id: id("a1") }]);
+        assert_eq!(
+            queued_text(session(&app, key)),
+            Some("Leave it for now."),
+            "a second click works as the first"
+        );
+    }
+
+    #[test]
+    fn a_typed_message_cancelled_there_is_given_back_and_the_offer_shows_again() {
+        let (mut app, key) = elsewhere_after(|app, key| app.submit(key, "carry on"));
+        let (_, back) = app.answer_prompt(key, PromptChoice::Cancel);
+        assert_eq!(back.as_deref(), Some("carry on"));
+        assert_eq!(app.choices(key), Some(&offer()));
+    }
+
+    #[test]
+    fn continue_here_after_a_click_sends_the_choice_once_and_leaves_no_offer() {
+        let (mut app, key) = elsewhere_after(|app, key| app.choose(key, 0));
+        let (effects, back) = app.answer_prompt(key, PromptChoice::ContinueHere);
+        assert_eq!(back, None);
+        assert_eq!(
+            effects,
+            vec![Effect::Open {
+                open: 1,
+                spec: resume_a1()
+            }]
+        );
+        let effects = app.event(1, SessionEvent::Started(info()), 0.0);
+        let publish = SessionCommand::Send {
+            text: "/publish".into(),
+            attachments: vec![],
+        };
+        assert_eq!(
+            sent_to(&effects, 1)
+                .into_iter()
+                .filter(|command| **command == publish)
+                .count(),
+            1
+        );
+        assert_eq!(app.choices(key), None);
+        app.event(1, done(), 0.0);
+        assert_eq!(app.choices(key), None, "also once idle");
     }
 }

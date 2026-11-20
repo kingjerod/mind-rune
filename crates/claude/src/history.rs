@@ -12,12 +12,14 @@ use std::time::UNIX_EPOCH;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use mr_agent::{
-    AgentError, HistoryItem, ImageData, SessionId, StoredSession, ToolCallId, ToolOutcome,
+    AgentError, Choices, HistoryItem, ImageData, SessionEvent, SessionId, StoredSession, TaskList,
+    TaskStep, ToolCallId, ToolOutcome,
 };
 use serde_json::Value;
 
 use crate::encode::split_attached;
 use crate::remove::no_store;
+use crate::tasks::{self, Hidden};
 use crate::translate::tool_detail;
 
 /// How much of each end of a file `describe` looks at.
@@ -434,15 +436,63 @@ pub fn read_image(
         .ok_or_else(|| said("the message has no such image"))
 }
 
-/// Adds what one record of a conversation shows to `items`. Side chains, meta
-/// records and compaction summaries show nothing. A tool result fills in the
-/// outcome of the tool at its position in `tool_positions`. A user's message comes without
-/// its images' bytes, `None` in each image's place: [`stored_images`] gives them.
-pub(crate) fn add_record(
-    record: &Value,
-    items: &mut Vec<HistoryItem>,
-    tool_positions: &mut HashMap<String, usize>,
-) {
+/// What the records of a conversation give, read one after another by [`add_record`].
+#[derive(Default)]
+pub(crate) struct Walk {
+    pub(crate) items: Vec<HistoryItem>,
+    /// Where each tool call shown is in `items`, by the call's id.
+    tool_positions: HashMap<String, usize>,
+    /// The calls not shown (see [`tasks::hidden`]) of the turn, by id, until their result.
+    hidden_calls: HashMap<String, Hidden>,
+    tasks: TaskList,
+    /// The last offer, while nothing was said after it.
+    choices: Option<Choices>,
+}
+
+impl Walk {
+    /// The items, and the task list and the offer as the conversation leaves them once its
+    /// last turn has ended.
+    pub(crate) fn end(mut self) -> (Vec<HistoryItem>, Vec<TaskStep>, Option<Choices>) {
+        self.tasks.turn_ended();
+        (self.items, self.tasks.steps().to_vec(), self.choices)
+    }
+
+    /// Does to the list or the offer what the result of a hidden call does.
+    fn apply(&mut self, done: Option<SessionEvent>) {
+        match done {
+            Some(SessionEvent::TaskAdded(step)) => {
+                self.tasks.add(step);
+            }
+            Some(SessionEvent::TaskChanged(change)) => {
+                self.tasks.change(&change);
+            }
+            Some(SessionEvent::TaskRemoved { id }) => {
+                self.tasks.remove(&id);
+            }
+            Some(SessionEvent::ChoicesOffered(offer)) => self.choices = Some(offer),
+            // `tasks::finished` gives no other event.
+            _ => {}
+        }
+    }
+
+    /// A message of the user's starts a new turn: the list's turn ends, and the offer is
+    /// forgotten, as at a turn's end live, with the offers not yet answered. The task calls
+    /// not yet answered are kept: the program may have taken the message in mid-turn, and
+    /// their results follow it.
+    fn new_turn(&mut self) {
+        self.tasks.turn_ended();
+        self.choices = None;
+        self.hidden_calls
+            .retain(|_, hidden| !matches!(hidden, Hidden::Offer(_)));
+    }
+}
+
+/// Adds what one record of a conversation shows to `walk`'s items. Side chains, meta records
+/// and compaction summaries show nothing. A tool result fills in the outcome of its tool's
+/// item. A user's message comes without its images' bytes, `None` in each image's place:
+/// [`stored_images`] gives them. A call of a task tool or of the choice tool is no item: its
+/// result changes the walk's task list or offer.
+pub(crate) fn add_record(record: &Value, walk: &mut Walk) {
     let compact_summary = record
         .get("isCompactSummary")
         .and_then(Value::as_bool)
@@ -451,26 +501,50 @@ pub(crate) fn add_record(
         return;
     }
     match record.get("type").and_then(Value::as_str) {
-        Some("user") => add_user(record, items, tool_positions),
-        Some("assistant") => add_assistant(record, items, tool_positions),
+        Some("user") => add_user(record, walk),
+        Some("assistant") => add_assistant(record, walk),
         _ => {}
     }
 }
 
-fn add_user(record: &Value, items: &mut Vec<HistoryItem>, tool_positions: &HashMap<String, usize>) {
+/// The structured value of a record's tool result: its `toolUseResult`, or as the live stream
+/// spells it `tool_use_result`. Null when it has none, or when the record holds several results
+/// and so cannot say whose it is.
+fn structured_result(record: &Value, results: usize) -> &Value {
+    static NONE: Value = Value::Null;
+    record
+        .get("toolUseResult")
+        .or_else(|| record.get("tool_use_result"))
+        .filter(|_| results == 1)
+        .unwrap_or(&NONE)
+}
+
+fn add_user(record: &Value, walk: &mut Walk) {
     let content = UserContent::of(record);
+    let structured = structured_result(record, content.tool_results.len());
     for (tool_use_id, outcome) in content.tool_results {
-        if let Some(&position) = tool_positions.get(&tool_use_id)
-            && let Some(HistoryItem::Tool { outcome: slot, .. }) = items.get_mut(position)
+        if let Some(hidden) = walk.hidden_calls.remove(&tool_use_id) {
+            let (is_error, text) = match &outcome {
+                ToolOutcome::Ok { output } => (false, output),
+                ToolOutcome::Failed { output } => (true, output),
+            };
+            walk.apply(tasks::finished(hidden, is_error, structured, text));
+        } else if let Some(&position) = walk.tool_positions.get(&tool_use_id)
+            && let Some(HistoryItem::Tool { outcome: slot, .. }) = walk.items.get_mut(position)
         {
             *slot = Some(outcome);
         }
     }
     let empty = content.text.is_empty() && content.image_count == 0 && content.files.is_empty();
-    if is_command_wrapper(&content.text) || empty {
+    if empty {
         return;
     }
-    items.push(HistoryItem::User {
+    walk.new_turn();
+    // A slash command answers an offer as a message does, but is no item.
+    if is_command_wrapper(&content.text) {
+        return;
+    }
+    walk.items.push(HistoryItem::User {
         text: content.text,
         image_count: content.image_count,
         files: content.files,
@@ -482,11 +556,8 @@ fn add_user(record: &Value, items: &mut Vec<HistoryItem>, tool_positions: &HashM
     });
 }
 
-fn add_assistant(
-    record: &Value,
-    items: &mut Vec<HistoryItem>,
-    tool_positions: &mut HashMap<String, usize>,
-) {
+fn add_assistant(record: &Value, walk: &mut Walk) {
+    let items = &mut walk.items;
     let Some(content) = record.get("message").and_then(|m| m.get("content")) else {
         return;
     };
@@ -522,7 +593,11 @@ fn add_assistant(
                     continue;
                 };
                 let input = block.get("input").unwrap_or(&Value::Null);
-                tool_positions.insert(id.to_string(), items.len());
+                if let Some(hidden) = tasks::hidden(name, input) {
+                    walk.hidden_calls.insert(id.to_string(), hidden);
+                    continue;
+                }
+                walk.tool_positions.insert(id.to_string(), items.len());
                 items.push(HistoryItem::Tool {
                     id: ToolCallId(id.to_string()),
                     name: name.to_string(),
@@ -1034,13 +1109,9 @@ mod tests {
 
     /// The items `add_record` makes of one record.
     fn read_one(record: &str) -> Vec<HistoryItem> {
-        let mut items = Vec::new();
-        add_record(
-            &serde_json::from_str(record).unwrap(),
-            &mut items,
-            &mut HashMap::new(),
-        );
-        items
+        let mut walk = Walk::default();
+        add_record(&serde_json::from_str(record).unwrap(), &mut walk);
+        walk.items
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::glue::{self, Ui};
 use crate::theme;
 
 mod chips;
+mod choices;
 mod conversation;
 mod deleted;
 mod drag;
@@ -23,6 +24,7 @@ mod resting;
 mod shell;
 mod sidebar;
 mod signin;
+mod tasks;
 mod tiles;
 mod viewer;
 mod width;
@@ -83,10 +85,12 @@ fn paste(ui: &mut Ui, content: &ClipboardContent, tx: &mut Tx) {
 /// Nothing of the area is drawn outside it: not over the tile's header, not over a tile below.
 /// In a tile too short for all of it, the conversation gives up its height first, then:
 /// - Without the card, the box keeps to the bottom of the tile and what does not fit is cut off
-///   at the top of the area: the box's top padding, then the queued message, then the chips,
-///   and its text and bottom row last. The text grows only as far as the tile allows
-///   (`input::lines_for`), so they stay whole, but for a line under the box that wraps: it is
-///   counted as one line, and a long one can push the cut into the text.
+///   at the top of the area: the task list over the box, from its top, then the choice box
+///   under the list, then the box's top padding, then the queued message, then the chips, and
+///   its text and bottom row last. The text grows only as far as the tile allows
+///   (`input::lines_for`), so they stay whole, but for a line under the box, or a question or
+///   a row of choices, that wraps: each is counted as one line, and a long one can push the
+///   cut into the text.
 /// - With the card, the session takes no message, so the box is of no use and the card is what
 ///   the user needs: the area keeps to its top, right under the header, and what does not fit
 ///   is cut off at the bottom, which is the box, from its lines under it upwards. In a tile

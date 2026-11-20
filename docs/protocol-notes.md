@@ -550,3 +550,56 @@ The names were read in one real store, the one of the machine this was built on,
 A test that fails before its end tidies up as well. On every way out it removes those of its sessions whose programs it has seen end, with the same guard on the transcript's time, and prints `live: the test left early; its sessions removed from the store: N of M, kept because a program may still run: K`. It removes nothing else: a session whose program may still run is kept, because that program could write its files again after they were removed and leave a partial session in the store; a session whose id the test never learned cannot be named; and nothing the test did not make is its to remove.
 
 `3 of 3` removed and `0` paths left settle that removing works on a real store for sessions the program wrote, transcripts and side folders alike, and that this version of the program keeps no other path named by a session's id within four levels of its folder. A count that is not zero, with a folder in `they sit under` that is not one of `projects`, `file-history` and `session-env`, shows a kind of path these notes do not name. What the look cannot see is an id written inside a file, such as a line of `history.jsonl`: the test reads no shared file, so whether a shared file refers to a removed session stays unknown. A `not in the store` line means the program stored that session under another id or not at all; the look then shows whether a path is named by the id all the same.
+
+## The task list and a tool of the app's own
+
+Seen live on 2026-11-19 with `claude` 2.1.323 and the model `claude-opus-5-5`, driven by `mindrune-probe raw`. Fixtures: `v12-tasks.jsonl` (two turns that keep a task list; the program was started with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` in its environment and with `--prompt-suggestions`) and `v14-choices.jsonl` (two turns; the probe was started with `--choices`, which serves the choice tool). Both are scrubbed and then trimmed as the earlier ones were: the long lists of a session's start are cut short and thinking signatures replaced. What the probe sent is in no fixture; the lines marked `> ` below are from the raw recordings.
+
+### The task list
+
+Seen:
+
+- **The tools are there only when asked for.** With `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`, `init`'s `tools` holds `TaskCreate`, `TaskGet`, `TaskList` and `TaskUpdate` (line 2 of `v12-tasks.jsonl`). Without it, on this model, it holds none of them (`v14-choices.jsonl`, line 5): the documentation says the newer models keep no written list unless the session opts in.
+- **They are deferred tools.** Before its first use Claude loads them with a `ToolSearch` call whose input is `{"query":"select:TaskCreate,TaskUpdate","max_results":2}` (line 17), an ordinary `tool_use` with an ordinary result.
+- **A step is made with `TaskCreate`**: input `{"subject":"Create a.txt","description":"Write a.txt with one line","activeForm":"Creating a.txt"}` (line 34). Its id is not in the input. It comes with the result, on the `user` record that carries the `tool_result` block (line 38): the block's text is `Task #1 created successfully: Create a.txt`, and the record's top-level `tool_use_result` is `{"task":{"id":"1","subject":"Create a.txt","description":"Write a.txt with one line"}}`.
+- **A step changes with `TaskUpdate`**: input `{"taskId":"1","status":"in_progress"}` (line 69), later `{"taskId":"1","status":"completed"}` (line 92). The result's text is `Updated task #1 status`, and `tool_use_result` is `{"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"pending","to":"in_progress"}}`.
+- **The ids are strings of numbers that count on through the session**: the first turn made 1 to 3, the second 4 to 6, and the finished steps of the first turn were never removed by the program.
+- A `tool_result` block of a call that worked has no `is_error` key at all.
+- With `--prompt-suggestions` the program sends, after a turn's `result`, `{"type":"prompt_suggestion","suggestion":"Now add a third line to each file.",…}` (line 412): one line of text, its guess at the user's next message. The app does not ask for it.
+
+Read in the documentation, not seen: `TaskUpdate` also takes `subject`, `description` and `activeForm`, and the status `deleted`, which removes the step; the model may write `id` or `task_id` for `taskId` and `active_form` for `activeForm`, which the program repairs before it runs the tool but not in the record it sends; with `CLAUDE_CODE_ENABLE_TASKS=0` the program gives the older `TodoWrite` in place of these tools.
+
+Guessed: that a stored transcript keeps the same result under `toolUseResult` on the `user` record. The store was not read for these notes; the adapter looks for both spellings and falls back to the result's text.
+
+### A tool of the app's own
+
+The program is given a server it reaches through the session's own channel: `--mcp-config {"mcpServers":{"mindrune":{"type":"sdk","name":"mindrune"}}}`. `--allowedTools mcp__mindrune__offer_choices` allows its one tool without a request, and `--append-system-prompt` adds the words on when to use it.
+
+Seen, in this order (`v14-choices.jsonl`, with the probe's lines from the raw recording):
+
+```
+> {"type":"control_request","request_id":"probe_1","request":{"subtype":"initialize","hooks":null}}
+{"type":"control_request","request_id":"…","request":{"subtype":"mcp_message","server_name":"mindrune","message":{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"claude-code",…,"version":"2.1.323"}},"jsonrpc":"2.0","id":0}}}
+> {"type":"control_response","response":{"subtype":"success","request_id":"…","response":{"mcp_response":{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"mindrune","version":"0.1.0"}}}}}}
+{"type":"control_response",…}                                   the answer to the probe's own initialize
+{…"subtype":"mcp_message","server_name":"mindrune","message":{"method":"notifications/initialized","jsonrpc":"2.0"}}
+> {…"response":{"mcp_response":{"jsonrpc":"2.0","result":{}}}}
+{…"subtype":"mcp_message","server_name":"mindrune","message":{"method":"tools/list","jsonrpc":"2.0","id":1}}
+> {…"response":{"mcp_response":{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"offer_choices",…}]}}}}
+```
+
+- **The server's handshake comes after the host's `initialize` request and before its answer**, and before any message of the user's. Every `mcp_message` request wants a successful `control_response` whose `response` is `{"mcp_response": <the JSON-RPC answer>}`, a notification too (an empty result).
+- `init` then lists the server as `{"name":"mindrune","status":"connected","source":"sdk"}` and the tool as `mcp__mindrune__offer_choices` (line 5).
+- **The tool is deferred as well**: Claude first calls `ToolSearch` with `{"query":"select:mcp__mindrune__offer_choices","max_results":1}` (line 20).
+- **The call**: an ordinary `tool_use` block named `mcp__mindrune__offer_choices` with the whole input (line 50), then the request to the server (line 53): `{"method":"tools/call","params":{"name":"offer_choices","arguments":{"question":"…","choices":[{"label":"Keep them","message":"Keep the three text files."},{"label":"Delete them","message":"Delete the three text files in this folder."}]},"_meta":{"claudecode/toolUseId":"toolu_…","progressToken":2}},"jsonrpc":"2.0","id":2}`. The server's answer `{"content":[{"type":"text","text":"Shown to the user."}]}` comes back to Claude as the call's `tool_result` (line 55), whose `tool_use_result` is the same list of content.
+- **No `can_use_tool` request came for it**: `--allowedTools` settled it (`tool_result_meta` says `"permission_decision":{"decision":"accept","source":"config","reason_type":"rule"}`).
+- **The turn goes on after the call.** Claude wrote a closing reply after it (line 81) and the `result` came after that (line 85). The buttons are therefore offered before the turn has ended.
+- Claude did not repeat the question in its reply, as the instruction of that recording asked. The app's instruction now asks the reply to make sense without the buttons and to end by naming the decision in a few words.
+- A new kind of record appears while Claude thinks: `{"type":"system","subtype":"thinking_tokens","estimated_tokens":…,"estimated_tokens_delta":…}` (lines 29 and 32). The app has no use for it.
+- **A message sent while a turn runs is taken in at once**, not after the turn: in an earlier recording (not a fixture) a second message, sent while a permission request waited, changed what Claude did in that same turn. The app already holds a message back until the turn has ended.
+
+Read in the documentation, not seen: a server's entry may say `"alwaysLoad": true`, and a tool may carry `"_meta":{"anthropic/alwaysLoad":true}` in the list, either of which loads the tool with the session's first prompt, so that no `ToolSearch` is needed; `alwaysLoad` makes the start wait for the server's tools, up to five seconds.
+
+### What the live test settles
+
+The live test (`crates/app/tests/live.rs`, run only by Jerod) asks its own session for a task list of two steps, "one" ticked off and "two" left open, and for two choices, and prints: `live: task steps added N, changed M, open at the turn's end K` (the list kept with the task tools turned on, and each step's id read from its result; K is expected to be 1), `live: tool lines of the turn: N (named ToolSearch: M)` (the hidden calls kept from the tool lines), `live: choices offered: true|false, buttons N, shown after the turn: true|false` (the app's server reached and its tool called), `live: the choice was sent and answered: true|false`, and, if the program ends during the step, `live: the program ended during the task step`. Once the step is over (after the choice's turn, or the step's own turn when no choice was sent) it prints `live: task steps at the end of the first run: N`: 2 while "two" is still open, 0 when Claude ticked it in the choice's turn and the list cleared. In its second run, from the stored conversation read back, it prints `live: stored history gives task steps N, an offer: true|false` and `live: hidden calls among the stored tool items: N`. N of the first is expected to equal the first run's `task steps at the end of the first run`; a smaller N means that steps' ids could not be read from the stored results, so the guess above about how a stored result names them failed, whichever field it is. The line does not show which field held the id. An offer of true shows that the stored conversation gives back an offer made after the user's last message there: the choice was never answered, or Claude offered again in the turn that answered it, which the test cannot tell apart; it does not by itself mean the store is read wrongly. The count of hidden calls shows only that the stored reader hides, by their names and inputs, what the live one hides. Whether `alwaysLoad` works is not settled by these lines: a `ToolSearch` that loads only the choice tool is hidden, so it is never counted among the tool lines, and `named ToolSearch: 0` with choices offered says only that the user saw no search.

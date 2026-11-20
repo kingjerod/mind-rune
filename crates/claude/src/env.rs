@@ -36,6 +36,22 @@ pub fn child_env(parent: Vec<(String, String)>, has_full_login: bool) -> Vec<(St
         .collect()
 }
 
+/// The setting that gives the program its task tools (`TaskCreate` and the rest).
+const TODO_TOOLS: &str = "CLAUDE_CODE_ENABLE_TODO_TOOLS";
+/// The setting that, set to `0`, gives the older `TodoWrite` in their place.
+const TASKS: &str = "CLAUDE_CODE_ENABLE_TASKS";
+
+/// `env` with the program's task tools asked for: the user's own settings for them are
+/// dropped and `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` is added last. The order of the rest is kept.
+pub fn with_task_tools(env: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = env
+        .into_iter()
+        .filter(|(key, _)| key != TODO_TOOLS && key != TASKS)
+        .collect();
+    env.push((TODO_TOOLS.to_string(), "1".to_string()));
+    env
+}
+
 fn injected_by_claude(key: &str) -> bool {
     INJECTED.contains(&key)
         || key.starts_with("ANTHROPIC_")
@@ -152,5 +168,27 @@ mod tests {
             ("PATH", "/bin"),
         ]);
         assert_eq!(child_env(parent, true), env(&[("PATH", "/bin")]));
+    }
+
+    #[test]
+    fn the_task_tools_are_asked_for_once_whatever_the_shell_says() {
+        let given = env(&[
+            ("PATH", "/bin"),
+            ("CLAUDE_CODE_ENABLE_TODO_TOOLS", "0"),
+            ("HOME", "/home/alex"),
+            ("CLAUDE_CODE_ENABLE_TASKS", "0"),
+        ]);
+        assert_eq!(
+            with_task_tools(given),
+            env(&[
+                ("PATH", "/bin"),
+                ("HOME", "/home/alex"),
+                ("CLAUDE_CODE_ENABLE_TODO_TOOLS", "1")
+            ])
+        );
+        assert_eq!(
+            with_task_tools(Vec::new()),
+            env(&[("CLAUDE_CODE_ENABLE_TODO_TOOLS", "1")])
+        );
     }
 }

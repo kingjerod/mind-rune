@@ -179,11 +179,14 @@ pub struct SessionView {
     /// Why the file picker of the attach button could not be used: said under the input box
     /// until the picker's next answer.
     pub attach_error: Option<String>,
+    /// The user's own choice to show the task list open or folded; none until they make one,
+    /// and none again once the list is empty (`view::tasks::is_open`).
+    pub tasks_open: Option<bool>,
 }
 
 impl SessionView {
     /// A session not shown yet: nothing typed, every row as its kind starts, at the end.
-    fn new(generation: u64) -> SessionView {
+    pub(crate) fn new(generation: u64) -> SessionView {
         SessionView {
             draft: TextEdit::new(""),
             open_picker: None,
@@ -195,6 +198,7 @@ impl SessionView {
             generation,
             folder_gone: None,
             attach_error: None,
+            tasks_open: None,
         }
     }
 
@@ -1176,6 +1180,10 @@ fn tidy_views(ui: &mut Ui) {
         // Its box is drawn disabled from now on, with no field for its draft.
         if ended(session) {
             let_go(&mut view.draft);
+        }
+        // A list that comes later starts open or folded as its tile's height says.
+        if session.tasks.is_empty() {
+            view.tasks_open = None;
         }
         drop_settled_drafts(view, session);
         shut_disabled_picker(view, session);

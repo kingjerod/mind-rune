@@ -30,16 +30,58 @@
 //! message, Remote Control is turned on and off in it too, and what came of that is printed.
 //! Then it is sent one message: each session must hold its own reply and not the other's. The
 //! first session is renamed: its program must confirm the name, and a listing of the store must
-//! then give it. The first run then closes, as the window closes, keeping what it would save:
-//! both tiles, the first focused.
+//! then give it.
+//!
+//! Then the test's session is asked for a task list of two steps, the first ticked off and the
+//! second left open, and for two choices offered with the app's own tool, and to use no other
+//! tool. A request of the program in that turn is denied and the turn stopped, which ends the
+//! step, as does a turn that runs longer than [`TURN_LIMIT`]; a line then says which, and
+//! `live: the program ended during the task step` says that its program ended. It prints these
+//! lines, none of which fails the test, and none of which holds a step's words, a question or a
+//! label:
+//!
+//! - `live: task steps added N, changed M, open at the turn's end K`: whether the program kept
+//!   the list when the app asked for the task tools, and whether the adapter read the steps and
+//!   their ids from the calls and their results as recorded (2 added and at least 1 changed),
+//!   and that a list with a step still open stays at the turn's end (K is expected to be 1).
+//! - `live: task steps at the end of the first run: N`, once the step is over (after the
+//!   choice's turn, or the step's own turn when no choice was sent): how many steps the list
+//!   holds then, 2 while "two" is still open, 0 when Claude ticked it in the choice's turn and
+//!   the list cleared at that turn's end.
+//! - `live: tool lines of the turn: N (named ToolSearch: M)`: whether the calls of the task
+//!   tools and of the choice tool, and a `ToolSearch` that only loads them, are kept from the
+//!   tool lines (N is 0 when Claude did as asked). M counts only a `ToolSearch` the adapter
+//!   shows, one that searches by words or loads another tool too. A `ToolSearch` that loads only
+//!   the choice tool is hidden and never counted here, so an M of 0 with choices offered does
+//!   not by itself show that `alwaysLoad` works: it shows that the choice tool was reached
+//!   without a search the user would see.
+//! - `live: choices offered: true|false, buttons N, shown after the turn: true|false`: whether
+//!   the server the app serves was reached and its tool called (2 buttons), and that the box
+//!   shows once the turn has ended.
+//! - `live: the choice was sent and answered: true|false`, only when choices showed: the test
+//!   presses the first, as a click does, and the message it sends must start a turn that
+//!   finishes.
+//!
+//! The first run then closes, as the window closes, keeping what it would save: both tiles, the
+//! first focused.
 //!
 //! The second run starts with what the first kept, so it shows the test's session again from
 //! the store. Both tiles must come back, the first focused and under its new name. The first
-//! message and its reply must be in the history read back, a second message must wake the
-//! session, resuming the same id, and get its reply; it prints the effort level the app passed
-//! when it resumed the session and the level the program then said. What the first run kept
-//! also says that this app closed the session, so the second run is not expected to ask
-//! whether another app has it open; it prints whether it did.
+//! message and its reply must be in the history read back. From that history it prints
+//! `live: stored history gives task steps N, an offer: true|false`. N is expected to equal the
+//! first run's `task steps at the end of the first run`; a smaller N means that steps' ids could
+//! not be read from the stored results, so the guess about how a stored result names them
+//! failed, whichever field it is. The line does not show which field held the id. An
+//! offer of true shows that the stored conversation gives back an offer made after the user's
+//! last message there: the choice was never answered, or Claude offered again in the turn that
+//! answered it, which this test cannot tell apart; false, that none was left open. Then
+//! `live: hidden calls among the stored tool items: N`: an N of 0 shows only that the stored
+//! reader hides the calls the live one hides, by their names and inputs. Neither fails the
+//! test. A second
+//! message must wake the session, resuming the same id, and get its reply; it prints the effort
+//! level the app passed when it resumed the session and the level the program then said. What
+//! the first run kept also says that this app closed the session, so the second run is not
+//! expected to ask whether another app has it open; it prints whether it did.
 //!
 //! Then the session is left alone, the idle length set to a minute, until the app stops its
 //! program unnoticed, as it stops one idle for half an hour. It prints whether the program
@@ -97,7 +139,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mr_agent::{
     Account, Agent, AgentError, Answer, Attachment, CommandKind, ContextBreakdown, ContextKind,
     HistoryItem, ImageData, PermissionMode, RemoteAccess, RemoteFailure, Removal, RequestId,
-    SessionCommand, SessionEvent, SessionId, ToolDetail, UserRequestKind,
+    SessionCommand, SessionEvent, SessionId, StoredHistory, TaskStatus, ToolDetail,
+    UserRequestKind,
 };
 use mr_claude::{ClaudeAgent, root_from};
 use mr_core::{
@@ -199,6 +242,19 @@ const QUIET_MESSAGE: &str = "Reply with the single word: back";
 /// The idle length the test sets: the shortest the app takes, a minute.
 const QUIET_AFTER: i64 = 60;
 
+/// The line that says the test's session's program ended during the task step.
+const PROGRAM_ENDED: &str = "live: the program ended during the task step";
+
+/// The message that asks the test's session for a task list and then for choices.
+const LIST_MESSAGE: &str = "Keep a task list with exactly two steps, \"one\" and \"two\". Tick \
+                            off \"one\" and leave \"two\" open, without doing anything else. \
+                            Then offer me two choices with the tool for that: \"Yes\" and \
+                            \"No\". Use no other tool and run nothing.";
+
+/// The tools whose calls the adapter does not show as tool lines, but for the choice tool,
+/// whose name the adapter gives ([`mr_claude::choices::tool_name`]).
+const HIDDEN_TOOLS: [&str; 4] = ["TaskCreate", "TaskUpdate", "TaskGet", "TaskList"];
+
 /// How long the test waits for the app to stop the idle program: the idle length, the events
 /// its program may still send after a turn, and a margin.
 const QUIET_LIMIT: Duration = Duration::from_secs(180);
@@ -267,6 +323,7 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     live.report_remote(live.key.expect("the test's session"), "remote control");
     live.side_turn();
     live.rename();
+    live.tasks_and_choices();
     let id = live.id().expect("the session has the agent's id");
     let side_id = live
         .side_id()
@@ -286,6 +343,7 @@ fn a_real_turn_the_store_the_look_and_the_session_resumed() {
     let mut again = Live::start(agent.clone(), launch, &folder, Some(account), made);
     again.background = background;
     again.read_back(&id);
+    again.report_stored_list();
     again.restored(&id, &side_id);
     again.resume(&id);
     again.stop_while_idle();
@@ -828,6 +886,11 @@ struct Live {
     /// What the session for attachments' program said about background tasks while it was
     /// asked to start one ([`Live::background_task`]).
     tasks: Tasks,
+    /// What the test's session's program did in the step that keeps a task list and offers
+    /// choices ([`Live::tasks_and_choices`]).
+    list_turn: ListTurn,
+    /// What each stored history read gave of a task list and an offer, by the entry it is for.
+    listed_back: HashMap<SessionKey, StoredList>,
     /// Every program's exit, by its open number, with whether it was clean.
     exits: Vec<(u64, bool)>,
     /// Every open the app sent `Close`, in order.
@@ -873,6 +936,75 @@ impl Tasks {
             }
             SessionEvent::BackgroundTasks { running } => self.record_counted |= *running >= 1,
             _ => {}
+        }
+    }
+}
+
+/// What the test's session's program sent in the step that keeps a task list and offers
+/// choices, counted while it is watched: the steps, the tool lines and the offer of the step's
+/// own turn, and how many turns have ended since the step began.
+#[derive(Clone, Copy, Debug, Default)]
+struct ListTurn {
+    watching: bool,
+    added: usize,
+    changed: usize,
+    tool_lines: usize,
+    /// How many of the tool lines are calls of `ToolSearch`.
+    searches: usize,
+    offered: bool,
+    /// How many choices the last offer held.
+    buttons: usize,
+    ends: usize,
+    /// The last turn that ended finished; false when it failed.
+    finished: bool,
+}
+
+impl ListTurn {
+    /// Takes in one event of the test's session's program.
+    fn see(&mut self, event: &SessionEvent) {
+        match event {
+            SessionEvent::TurnFinished(_) | SessionEvent::TurnFailed { .. } => {
+                self.ends += 1;
+                self.finished = matches!(event, SessionEvent::TurnFinished(_));
+            }
+            _ if self.ends > 0 => {}
+            SessionEvent::TaskAdded(_) => self.added += 1,
+            SessionEvent::TaskChanged(_) => self.changed += 1,
+            SessionEvent::ToolStarted { name, .. } => {
+                self.tool_lines += 1;
+                self.searches += usize::from(name == "ToolSearch");
+            }
+            SessionEvent::ChoicesOffered(offer) => {
+                self.offered = true;
+                self.buttons = offer.choices.len();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a stored history gave of a task list and an offer: how many steps, whether an offer,
+/// and how many of its tool items are calls the adapter hides ([`hidden_call`]).
+#[derive(Clone, Copy, Debug)]
+struct StoredList {
+    steps: usize,
+    offer: bool,
+    hidden: usize,
+}
+
+impl StoredList {
+    fn of(history: &StoredHistory) -> StoredList {
+        let hidden = history
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(item, HistoryItem::Tool { name, detail, .. } if hidden_call(name, detail))
+            })
+            .count();
+        StoredList {
+            steps: history.tasks.len(),
+            offer: history.choices.is_some(),
+            hidden,
         }
     }
 }
@@ -967,6 +1099,8 @@ impl Live {
             image_read: None,
             background: Vec::new(),
             tasks: Tasks::default(),
+            list_turn: ListTurn::default(),
+            listed_back: HashMap::new(),
             exits: Vec::new(),
             closes: Vec::new(),
             quiet: false,
@@ -1310,6 +1444,171 @@ impl Live {
             "live: the name was confirmed in {} ms; a listing gave it {} ms later",
             took.as_millis(),
             listed_from.elapsed().as_millis()
+        );
+    }
+
+    /// Sends the test's session [`LIST_MESSAGE`]: a task list of two steps, the first ticked off,
+    /// then two choices. Prints how many steps were added and changed and how many were open at the
+    /// turn's end; how many tool lines the turn had, and how many of them were `ToolSearch`
+    /// calls; whether choices were offered, with how many buttons, and whether they showed once
+    /// the turn had ended. When they showed it presses the first, as a click does, and prints
+    /// whether its message was sent and the turn it started finished. A request of the program
+    /// is denied and the turn stopped, which ends the step; so is a turn that runs too long
+    /// ([`Live::until_turns_ended`]). When the program ends meanwhile, a line says so and the
+    /// step ends. Last it prints how many steps the list holds ([`Live::report_steps_left`]).
+    /// Nothing of a step, a question or a label is printed. Fails on nothing.
+    fn tasks_and_choices(&mut self) {
+        const ADDED: &str = "live: task steps added";
+        let key = self.key.expect("the test's session");
+        if self.phase_of(key) != Some(Phase::Idle) {
+            eprintln!("{ADDED}: not tried (the session was not ready for a message)");
+            return;
+        }
+        self.list_turn = ListTurn {
+            watching: true,
+            ..ListTurn::default()
+        };
+        let effects = self.app.submit(key, LIST_MESSAGE);
+        self.carry_out(effects);
+        let stopped = self.until_turns_ended(key, 1);
+        let ended = self.program_ended(key);
+        let seen = self.list_turn;
+        let open = self.session().map_or(0, |session| {
+            let steps = session.tasks.steps();
+            steps
+                .iter()
+                .filter(|step| step.status != TaskStatus::Completed)
+                .count()
+        });
+        if let Some(why) = &stopped {
+            eprintln!("live: the step's turn was stopped: {why}");
+        }
+        eprintln!(
+            "{ADDED} {}, changed {}, open at the turn's end {open}",
+            seen.added, seen.changed
+        );
+        eprintln!(
+            "live: tool lines of the turn: {} (named ToolSearch: {})",
+            seen.tool_lines, seen.searches
+        );
+        let shown = self.app.choices(key).is_some();
+        eprintln!(
+            "live: choices offered: {}, buttons {}, shown after the turn: {shown}",
+            seen.offered, seen.buttons
+        );
+        if ended {
+            eprintln!("{PROGRAM_ENDED}");
+        }
+        if ended || stopped.is_some() || !shown {
+            self.list_turn.watching = false;
+            self.report_steps_left();
+            return;
+        }
+        let effects = self.app.choose(key, 0);
+        let sent = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Send {
+                    command: SessionCommand::Send { .. },
+                    ..
+                }
+            )
+        });
+        self.carry_out(effects);
+        let stopped = if sent {
+            self.until_turns_ended(key, 2)
+        } else {
+            None
+        };
+        let answered = stopped.is_none() && self.list_turn.ends >= 2 && self.list_turn.finished;
+        self.list_turn.watching = false;
+        if let Some(why) = &stopped {
+            eprintln!("live: the choice's turn was stopped: {why}");
+        }
+        if self.program_ended(key) {
+            eprintln!("{PROGRAM_ENDED}");
+        }
+        eprintln!(
+            "live: the choice was sent and answered: {}",
+            sent && answered
+        );
+        self.report_steps_left();
+    }
+
+    /// Prints how many steps the test's session's list holds once the task step is over, the
+    /// number the second run's stored history is expected to give back. A count only.
+    fn report_steps_left(&self) {
+        let steps = self
+            .session()
+            .map_or(0, |session| session.tasks.steps().len());
+        eprintln!("live: task steps at the end of the first run: {steps}");
+    }
+
+    /// Whether the program of the test's session `key` has ended: the session ended or rests.
+    fn program_ended(&self, key: SessionKey) -> bool {
+        matches!(
+            self.phase_of(key),
+            Some(Phase::Ended { .. } | Phase::Resting)
+        )
+    }
+
+    /// Takes messages in until `turns` turns of the test's session `key` have ended since the
+    /// step began ([`ListTurn`]), or no turn runs in it any more. A request of the program
+    /// meanwhile is denied, as a press on "Deny" does, and the turn is stopped; so is a turn
+    /// still running after [`TURN_LIMIT`], which is then given [`CLOSE_LIMIT`] more to end.
+    /// Gives why the turn was stopped, or `None` when it was not. Unlike [`Live::wait_for`], it
+    /// fails on nothing.
+    fn until_turns_ended(&mut self, key: SessionKey, turns: usize) -> Option<String> {
+        let mut deadline = Instant::now() + TURN_LIMIT;
+        let mut stopped: Option<String> = None;
+        loop {
+            self.take_in();
+            if self.list_turn.ends >= turns {
+                return stopped;
+            }
+            let late = Instant::now() >= deadline;
+            let why = match self.phase_of(key) {
+                Some(Phase::NeedsUser) if stopped.is_none() => {
+                    for id in self.waiting_requests(key).into_iter().map(|(id, _)| id) {
+                        let effects = self.app.answer(key, &id, Answer::Deny { message: None });
+                        self.carry_out(effects);
+                    }
+                    "it asked for something, which was denied".to_string()
+                }
+                Some(Phase::Working | Phase::NeedsUser) if late && stopped.is_none() => {
+                    format!("it did not end within {} s", TURN_LIMIT.as_secs())
+                }
+                Some(Phase::Working | Phase::NeedsUser) if late => return stopped,
+                Some(Phase::Working | Phase::NeedsUser) => {
+                    std::thread::sleep(TICK);
+                    continue;
+                }
+                _ => return stopped,
+            };
+            stopped = Some(why);
+            deadline = Instant::now() + CLOSE_LIMIT;
+            let effects = self.app.stop(key);
+            self.carry_out(effects);
+            std::thread::sleep(TICK);
+        }
+    }
+
+    /// Prints what the stored history the second run read back for the test's session gives
+    /// of a task list and an offer, and how many of its tool items are calls the adapter hides.
+    /// Fails on nothing.
+    fn report_stored_list(&self) {
+        let read = self.key.and_then(|key| self.listed_back.get(&key));
+        let Some(read) = read else {
+            eprintln!("live: stored history gives task steps: not read");
+            return;
+        };
+        eprintln!(
+            "live: stored history gives task steps {}, an offer: {}",
+            read.steps, read.offer
+        );
+        eprintln!(
+            "live: hidden calls among the stored tool items: {}",
+            read.hidden
         );
     }
 
@@ -2555,6 +2854,17 @@ impl Live {
             if self.tasks.watching && Some(*open) == self.attached_open() {
                 self.tasks.see(event);
             }
+            if self.list_turn.watching && Some(*open) == self.open() {
+                self.list_turn.see(event);
+            }
+        }
+        if let FromBackend::History {
+            key,
+            result: Ok(history),
+            ..
+        } = message
+        {
+            self.listed_back.insert(*key, StoredList::of(history));
         }
         if let FromBackend::Event { open, event } = message
             && let Some(key) = self.key_of(*open)
@@ -3118,6 +3428,50 @@ fn only_a_sleep_of_some_seconds_is_allowed() {
     ] {
         assert!(!allowed_command(refused), "{refused:?}");
     }
+}
+
+/// Whether a tool call named `name` with `detail` is one the adapter does not show as a tool
+/// line: a task tool, the choice tool, or a `ToolSearch` whose query is `select:` and the names
+/// of those tools alone.
+fn hidden_call(name: &str, detail: &ToolDetail) -> bool {
+    let offer = mr_claude::choices::tool_name();
+    let hidden = |name: &str| HIDDEN_TOOLS.contains(&name) || name == offer;
+    if hidden(name) {
+        return true;
+    }
+    let ToolDetail::Other { input_json } = detail else {
+        return false;
+    };
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(input_json) else {
+        return false;
+    };
+    name == "ToolSearch"
+        && input["query"]
+            .as_str()
+            .and_then(|query| query.strip_prefix("select:"))
+            .is_some_and(|names| names.split(',').map(str::trim).all(hidden))
+}
+
+/// Runs in the ordinary suite: it starts nothing.
+#[test]
+fn a_stored_call_the_adapter_hides_is_told_apart() {
+    let input = |query: &str| ToolDetail::Other {
+        input_json: serde_json::json!({ "query": query, "max_results": 2 }).to_string(),
+    };
+    let none = ToolDetail::Other {
+        input_json: "{}".into(),
+    };
+    assert!(hidden_call("TaskCreate", &none));
+    assert!(hidden_call("TaskList", &none));
+    assert!(hidden_call("mcp__mindrune__offer_choices", &none));
+    assert!(hidden_call(
+        "ToolSearch",
+        &input("select:TaskCreate, TaskUpdate,mcp__mindrune__offer_choices")
+    ));
+    assert!(!hidden_call("ToolSearch", &input("select:TaskCreate,Bash")));
+    assert!(!hidden_call("ToolSearch", &input("task list")));
+    assert!(!hidden_call("ToolSearch", &none));
+    assert!(!hidden_call("Bash", &none));
 }
 
 /// The wall clock in Unix seconds.

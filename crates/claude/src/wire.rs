@@ -121,6 +121,9 @@ pub struct ToolResult {
     pub tool_use_id: String,
     pub is_error: bool,
     pub text: String,
+    /// The record's top-level `tool_use_result`: `Null` when it has none, or when it holds
+    /// several results and so cannot say whose it is.
+    pub structured: Value,
 }
 
 /// Parses one output line. Never panics and never fails: a line that is not a
@@ -310,9 +313,12 @@ fn input_side(usage: &Value) -> Option<u64> {
 fn parse_user(v: &Value) -> Option<Incoming> {
     // String content, and content without tool results, is not a tool result record.
     let content = v.get("message")?.get("content")?.as_array()?;
-    let results: Vec<ToolResult> = content.iter().filter_map(parse_tool_result).collect();
+    let mut results: Vec<ToolResult> = content.iter().filter_map(parse_tool_result).collect();
     if results.is_empty() {
         return None;
+    }
+    if let [result] = results.as_mut_slice() {
+        result.structured = v.get("tool_use_result").cloned().unwrap_or(Value::Null);
     }
     Some(Incoming::ToolResults {
         parent: parent_of(v),
@@ -337,6 +343,7 @@ fn parse_tool_result(b: &Value) -> Option<ToolResult> {
         tool_use_id: string_at(b, "tool_use_id")?,
         is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
         text,
+        structured: Value::Null,
     })
 }
 
@@ -676,16 +683,35 @@ mod tests {
                     ToolResult {
                         tool_use_id: "t1".into(),
                         is_error: false,
-                        text: "file.txt".into()
+                        text: "file.txt".into(),
+                        structured: Value::Null
                     },
                     ToolResult {
                         tool_use_id: "t2".into(),
                         is_error: true,
-                        text: "a\nb".into()
+                        text: "a\nb".into(),
+                        structured: Value::Null
                     }
                 ]
             }
         );
+    }
+
+    #[test]
+    fn a_tool_result_carries_its_records_structured_result() {
+        let structured = |line: &str| match parse_line(line) {
+            Incoming::ToolResults { results, .. } => results
+                .into_iter()
+                .map(|r| r.structured)
+                .collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        let one = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"Task #1 created successfully: S"}]},"tool_use_result":{"task":{"id":"1","subject":"S"}}}"#;
+        assert_eq!(structured(one), [json!({"task":{"id":"1","subject":"S"}})]);
+        let without = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"x"}]}}"#;
+        assert_eq!(structured(without), [Value::Null]);
+        let two = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"x"},{"type":"tool_result","tool_use_id":"t2","content":"y"}]},"tool_use_result":{"task":{"id":"1"}}}"#;
+        assert_eq!(structured(two), [Value::Null, Value::Null]);
     }
 
     #[test]

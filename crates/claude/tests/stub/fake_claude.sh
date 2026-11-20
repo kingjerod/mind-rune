@@ -7,6 +7,10 @@
 #                                 then runs on, ignoring input and its end, until killed
 #   need-permission            -> a turn that asks to run Bash (request req_p); it
 #                                 finishes only when an allow reply for req_p arrives
+#   offer-choices              -> a turn that calls the app's choice tool through its
+#                                 server (request req_m, an mcp_message); the call, its
+#                                 result, a text reply and the result are withheld until
+#                                 a line with "mcp_response" and req_m arrives
 #   "subtype":"set_model"      -> a success reply naming claude-sonnet-5-5
 #   "subtype":"apply_flag_settings"
 #                              -> a success reply with no body; its effortLevel is kept
@@ -53,6 +57,9 @@ PERMISSION_REQUEST='{"type":"control_request","request_id":"req_p","request":{"s
 TOOL_DONE='{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t_p","content":"a.txt"}]}}'
 USAGE='{"subscription_type":"max","rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":37,"resets_at":"2026-11-11T08:19:59.618411+00:00"},"seven_day":{"utilization":10,"resets_at":"2026-11-15T20:59:59.618435+00:00"}}}'
 CONTEXT='{"categories":[{"id":"system_prompt","name":"System prompt","tokens":3000,"color":"promptBorder","kind":"used"},{"id":"messages","name":"Messages","tokens":46000,"color":"purple","kind":"used"},{"id":"mcp_tools_deferred","name":"MCP tools","tokens":1200,"color":"cyan","kind":"deferred"},{"id":"autocompact_buffer","name":"Autocompact buffer","tokens":33000,"color":"inactive","kind":"buffer"},{"id":"free_space","name":"Free space","tokens":918000,"color":"promptBorder","kind":"free"}],"totalTokens":49000,"maxTokens":1000000,"percentage":5}'
+CHOICE_REQUEST='{"type":"control_request","request_id":"req_m","request":{"subtype":"mcp_message","server_name":"mindrune","message":{"method":"tools/call","params":{"name":"offer_choices","arguments":{"question":"Publish the new banner?","choices":[{"label":"Publish","message":"/publish"},{"label":"Not now","message":"Leave it for now."}]},"_meta":{"claudecode/toolUseId":"t_c","progressToken":2}},"jsonrpc":"2.0","id":2}}}'
+CHOICE_CALL='{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"t_c","name":"mcp__mindrune__offer_choices","input":{"question":"Publish the new banner?","choices":[{"label":"Publish","message":"/publish"},{"label":"Not now","message":"Leave it for now."}]}}]}}'
+CHOICE_DONE='{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t_c","content":[{"type":"text","text":"Shown to the user."}]}]}}'
 HOOK_REQUEST='{"type":"control_request","request_id":"req_h","request":{"subtype":"hook_callback","callback_id":"cb_1","input":{}}}'
 
 if [ -n "${ANTHROPIC_CANARY+x}" ]; then
@@ -72,6 +79,10 @@ while IFS= read -r line; do
     printf '%s\n' "$INIT" "$MSG_START" "$TOOL_CALL" "$MSG_STOP" "$PERMISSION_REQUEST"
   elif [[ "$line" == *'"type":"control_response"'* && "$line" == *req_p* && "$line" == *'"behavior":"allow"'* ]]; then
     printf '%s\n' "$TOOL_DONE" "$RESULT_OK"
+  elif [[ "$line" == *offer-choices* ]]; then
+    printf '%s\n' "$INIT" "$MSG_START" "$CHOICE_REQUEST"
+  elif [[ "$line" == *'"mcp_response"'* && "$line" == *req_m* ]]; then
+    printf '%s\n' "$CHOICE_CALL" "$MSG_STOP" "$CHOICE_DONE" "$MSG_START" "$TEXT_START" "$DELTA_OK" "$ASSISTANT_OK" "$BLOCK_STOP" "$MSG_STOP" "$RESULT_OK"
   elif [[ "$line" == *'"subtype":"set_model"'* ]]; then
     id=$(request_id "$line")
     printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"model":"claude-sonnet-5-5"}}}\n' "$id"

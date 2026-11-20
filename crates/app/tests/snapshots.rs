@@ -8,9 +8,9 @@ use std::process::Command;
 /// The scenes that make up the window's screens: one session's, in the order it meets them,
 /// then those with many sessions, the sidebar's menus, a stored session's, tiles side by side,
 /// the right panel beside them, the chips of an input box, the question whether to quit, a
-/// picture open large, the colours of sessions that are ready or need the user, and the Deleted
-/// view with its questions. Each runs in the binary's own window size unless a size is given,
-/// as `--size` takes it.
+/// picture open large, the colours of sessions that are ready or need the user, the Deleted
+/// view with its questions, and a task list open and folded and a choice box. Each runs in the
+/// binary's own window size unless a size is given, as `--size` takes it.
 const SCENES: &[(&str, Option<&str>)] = &[
     ("checking", None),
     ("signed-out", None),
@@ -55,7 +55,26 @@ const SCENES: &[(&str, Option<&str>)] = &[
     ("deleted-empty", None),
     ("delete-group-ask", None),
     ("delete-all-ask", None),
+    ("tasks", None),
+    // The binary's own 1,200 by 800 is the size the scene's column of two is made for: its
+    // upper tile is short enough that the list starts folded.
+    ("tasks-folded", None),
+    ("choices", None),
 ];
+
+/// The scenes whose part arrives after the first frame, with that part's key before its
+/// session's number (`mr-tasks-1`): a task list and a choice box are drawn from the second
+/// frame of the app's life and slide and fade in. They are taken at [`SETTLED_AT`], and the
+/// part must be drawn there at rest.
+const ARRIVING: &[(&str, &str)] = &[
+    ("tasks", "mr-tasks-"),
+    ("tasks-folded", "mr-tasks-"),
+    ("choices", "mr-choices-"),
+];
+
+/// When a scene of [`ARRIVING`] is taken, in seconds, as `--at` takes it: well after its part
+/// has settled, about 0.3 s after it first shows.
+const SETTLED_AT: &str = "1";
 
 /// A window wide enough for three tiles of more than 420 points each beside the sidebar. The
 /// `tiles-drag`, `tiles-stack-drag` and `tiles-move` scenes place their line or outline for
@@ -113,6 +132,13 @@ fn snap(scene: &str, size: Option<&str>, theme: &str, out: &Path, dirs_root: &Pa
     if let Some(size) = size {
         command.args(["--size", size]);
     }
+    let arriving = ARRIVING
+        .iter()
+        .find(|(name, _)| *name == scene)
+        .map(|&(_, part)| part);
+    if arriving.is_some() {
+        command.args(["--at", SETTLED_AT]);
+    }
     let run = command
         .output()
         .unwrap_or_else(|e| panic!("{scene} ({theme}): the binary did not start: {e}"));
@@ -155,4 +181,18 @@ fn snap(scene: &str, size: Option<&str>, theme: &str, out: &Path, dirs_root: &Pa
         elements.iter().any(|e| e["key"] == "mr-root"),
         "{scene} ({theme}): no element keyed mr-root"
     );
+    if let Some(part) = arriving {
+        let at_rest = elements.iter().any(|e| {
+            e["key"]
+                .as_str()
+                .and_then(|key| key.strip_prefix(part))
+                .is_some_and(|n| n.parse::<u64>().is_ok())
+                && e["opacity"] == 1.0
+                && e.get("moving").is_none_or(|moving| moving != true)
+        });
+        assert!(
+            at_rest,
+            "{scene} ({theme}): no element keyed {part}N drawn at rest"
+        );
+    }
 }

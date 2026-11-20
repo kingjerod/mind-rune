@@ -4,7 +4,7 @@
 
 use mr_agent::{
     Account, Answer, Capabilities, QuestionAnswer, RequestId, SessionCommand, SessionEvent,
-    UserRequest, UserRequestKind,
+    TaskStatus, UserRequest, UserRequestKind,
 };
 use mr_claude::{Incoming, PermissionReply, Translator, parse_line};
 use mr_core::{
@@ -432,4 +432,83 @@ fn recordings_played_in_three_tiles_at_once_each_show_what_they_show_alone() {
             );
         }
     }
+}
+
+/// The recording named `name` among the adapter's fixtures.
+fn fixture(name: &str) -> Recording {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../claude/tests/fixtures/live")
+        .join(name);
+    Recording::read(&path)
+}
+
+/// Plays the lines of `player`'s recording after the first `from`, up to and including the
+/// 1-based line `through`. Gives `through`: the lines played so far.
+fn play_through(player: &mut Player, app: &mut App, from: usize, through: usize) -> usize {
+    for line in from..through {
+        player.play_line(app, line);
+    }
+    through
+}
+
+#[test]
+fn the_recorded_offer_ends_as_two_buttons_and_a_click_sends_its_message() {
+    let recording = fixture("v14-choices.jsonl");
+    let mut app = signed_in_app();
+    let mut player = Player::new(&mut app, &recording, Place::Focused);
+    let key = player.key;
+    // Line 85 is the first turn's result: the offer was made before it, while the turn ran.
+    play_through(&mut player, &mut app, 0, 84);
+    assert_eq!(app.choices(key), None, "the turn still runs");
+    play_through(&mut player, &mut app, 84, 85);
+    let offer = app.choices(key).expect("offered");
+    assert_eq!(
+        offer
+            .choices
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Keep them", "Delete them"]
+    );
+    assert!(app.can_choose(key));
+    let effects = app.choose(key, 0);
+    let sent: Vec<&SessionCommand> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Send { open, command } if *open == player.open => Some(command),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [&SessionCommand::Send {
+            text: "Keep the three text files.".into(),
+            attachments: vec![],
+        }]
+    );
+    assert_eq!(app.choices(key), None);
+}
+
+#[test]
+fn the_recorded_task_list_fills_ticks_off_and_is_gone_at_the_turns_end() {
+    let recording = fixture("v12-tasks.jsonl");
+    let mut app = signed_in_app();
+    let mut player = Player::new(&mut app, &recording, Place::Focused);
+    // Line 73 is the result of the call that set the first step going.
+    let played = play_through(&mut player, &mut app, 0, 73);
+    let tasks = &player.session(&app).tasks;
+    let statuses: Vec<&TaskStatus> = tasks.steps().iter().map(|step| &step.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            &TaskStatus::InProgress,
+            &TaskStatus::Pending,
+            &TaskStatus::Pending
+        ]
+    );
+    assert_eq!(tasks.done(), 0);
+    // Line 211 is the first turn's result, with every step ticked.
+    play_through(&mut player, &mut app, played, 211);
+    assert!(player.session(&app).tasks.is_empty());
+    assert_eq!(app.choices(player.key), None, "no offer was made");
 }

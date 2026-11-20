@@ -1,12 +1,13 @@
 //! Colours and sizes. The theme is the kit's neutral one, following the system's light or
-//! dark setting; the only colours named here are the black of the two scrims and the icon's
-//! green and orange, with what is written on them.
+//! dark setting; the only colours named here are the black of the two scrims, the grey of a
+//! neutral button in either setting and the icon's green and orange, with what is written on
+//! them.
 
 use std::sync::OnceLock;
 
 use mr_core::{Level, Mark};
-use rune::Color;
 use rune::color::srgb_decode;
+use rune::{Color, oklch};
 use rune_kit::Kit;
 
 /// The height of a usage line's bar.
@@ -18,9 +19,17 @@ pub const SCREEN_WIDTH: f32 = 420.0;
 /// How strong the scrim under a dialog is in the dark setting: black at this share.
 const DARK_SCRIM: f32 = 0.6;
 
+/// How light a neutral button is in the dark setting, as `oklch` takes it. The kit's own is a
+/// card's fill (0.232), so a button on a card showed by its faint edge alone.
+const DARK_BUTTON: f32 = 0.34;
+
+/// How light a neutral button is in the light setting: the kit's own is a card's white.
+const LIGHT_BUTTON: f32 = 0.92;
+
 /// The kit's neutral theme for this setting, built once. In the dark setting the scrim under a
 /// dialog is stronger than the kit's own: black at 30% hardly shows on a dark window, and the
-/// dialog's edge was hard to find.
+/// dialog's edge was hard to find. A neutral button is a grey that stands apart from a card in
+/// either setting ([`DARK_BUTTON`], [`LIGHT_BUTTON`]), in the kit's hue.
 pub fn kit(dark: bool) -> &'static Kit {
     static DARK: OnceLock<Kit> = OnceLock::new();
     static LIGHT: OnceLock<Kit> = OnceLock::new();
@@ -30,6 +39,8 @@ pub fn kit(dark: bool) -> &'static Kit {
         if dark {
             kit.c.scrim = Color::BLACK.alpha(DARK_SCRIM);
         }
+        let button = if dark { DARK_BUTTON } else { LIGHT_BUTTON };
+        kit.c.bg_button_neutral = oklch(button, 0.005, 265.0);
         kit
     })
 }
@@ -137,6 +148,30 @@ mod tests {
         assert!(black(viewer));
         assert!((viewer.a - 0.7).abs() < 1e-6);
         assert!(viewer.a > dark.a && viewer.a > light.a);
+    }
+
+    #[test]
+    fn a_neutral_button_stands_apart_in_either_setting() {
+        let dark = kit(true);
+        let button = dark.c.bg_button_neutral;
+        for under in [dark.c.bg_base, dark.c.page] {
+            assert!(
+                button.luminance() > under.luminance(),
+                "lighter than {under:?}"
+            );
+            let ratio = contrast(button, under);
+            assert!(ratio >= 1.3, "a contrast of {ratio} with {under:?}");
+        }
+        assert!(contrast(button, dark.c.text_base) >= 4.5, "its label reads");
+        // In the light setting it is darker than a card, and than the page beside one.
+        let light = kit(false);
+        let button = light.c.bg_button_neutral;
+        assert!(contrast(button, light.c.bg_base) >= 1.2);
+        assert!(button.luminance() < light.c.page.luminance());
+        assert!(
+            contrast(button, light.c.text_base) >= 4.5,
+            "its label reads"
+        );
     }
 
     #[test]

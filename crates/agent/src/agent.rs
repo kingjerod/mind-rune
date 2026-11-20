@@ -3,9 +3,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::choices::Choices;
 use crate::command::{ImageData, SessionCommand};
 use crate::event::{PermissionMode, SessionEvent, ToolDetail, ToolOutcome};
 use crate::ids::{SessionId, ToolCallId};
+use crate::tasks::TaskStep;
 
 /// Receives one session's events, in the order [`SessionEvent`] describes.
 ///
@@ -144,6 +146,10 @@ pub struct StoredHistory {
     pub permission_mode: Option<PermissionMode>,
     /// The effort level of its last reply, when the store says.
     pub effort: Option<String>,
+    /// The task list as the stored conversation leaves it; empty when it has no open step.
+    pub tasks: Vec<TaskStep>,
+    /// The choices offered last, with nothing said after them.
+    pub choices: Option<Choices>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::encode::{PermissionReply, get_context_usage, get_settings};
 use crate::mode::mode_from_wire;
+use crate::tasks::{self, Hidden};
 use crate::time::iso8601_to_unix;
 use crate::wire::{Block, BlockKind, Incoming, StreamEvent, ToolResult};
 
@@ -106,6 +107,10 @@ pub struct Translator {
     /// has not come yet, by `tool_use` id. They are not reported as tool calls, nor are their
     /// results.
     request_calls: HashSet<String>,
+    /// Calls of the main conversation that are not shown as tool calls (see [`tasks::hidden`])
+    /// and whose result has not come yet, by `tool_use` id, with what each does. Dropped at a
+    /// turn's `result`: a call never answered does nothing.
+    hidden_calls: HashMap<String, Hidden>,
     /// The requests to send next, in order. See [`Translator::take_requests`].
     requests: Vec<(Tracked, Value)>,
     /// The background tasks last counted: by the program's own record, or as at least one
@@ -199,7 +204,17 @@ impl Translator {
             } => results
                 .into_iter()
                 .filter(|result| !self.request_calls.remove(&result.tool_use_id))
-                .map(tool_finished)
+                .filter_map(
+                    |result| match self.hidden_calls.remove(&result.tool_use_id) {
+                        Some(hidden) => tasks::finished(
+                            hidden,
+                            result.is_error,
+                            &result.structured,
+                            &result.text,
+                        ),
+                        None => Some(tool_finished(result)),
+                    },
+                )
                 .collect(),
             Incoming::ControlRequest {
                 request_id,
@@ -614,6 +629,10 @@ impl Translator {
                     self.request_calls.insert(id);
                 }
                 Block::ToolUse { id, name, input } => {
+                    if let Some(hidden) = tasks::hidden(&name, &input) {
+                        self.hidden_calls.insert(id, hidden);
+                        continue;
+                    }
                     let detail = tool_detail(&name, &input);
                     events.push(SessionEvent::ToolStarted {
                         id: ToolCallId(id),
@@ -788,6 +807,7 @@ impl Translator {
     ) -> Vec<SessionEvent> {
         self.turn_open = false;
         self.streaming = false;
+        self.hidden_calls.clear();
         self.open_block = None;
         self.block_has_text = false;
         self.read_after_start_or_turn();
@@ -1109,7 +1129,9 @@ pub fn tool_detail(name: &str, input: &Value) -> ToolDetail {
 mod tests {
     use super::*;
     use crate::wire::parse_line;
-    use mr_agent::{ModelOption, QuestionAnswer};
+    use mr_agent::{
+        Choice, Choices, ModelOption, QuestionAnswer, TaskChange, TaskStatus, TaskStep,
+    };
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -1483,6 +1505,329 @@ mod tests {
                     }
                 },
             ]
+        );
+    }
+
+    /// An assistant record of the main conversation with one tool call.
+    fn tool_use(id: &str, name: &str, input: Value) -> String {
+        json!({"type":"assistant","message":{"id":format!("m_{id}"),"content":[
+            {"type":"tool_use","id":id,"name":name,"input":input}]},"parent_tool_use_id":null})
+        .to_string()
+    }
+
+    /// A user record with one tool result, and its top-level `tool_use_result` when given.
+    fn tool_result(id: &str, text: &str, is_error: bool, structured: Option<Value>) -> String {
+        let mut block = json!({"tool_use_id":id,"type":"tool_result","content":text});
+        if is_error {
+            block["is_error"] = json!(true);
+        }
+        let mut record = json!({"type":"user","message":{"role":"user","content":[block]},"parent_tool_use_id":null});
+        if let Some(structured) = structured {
+            record["tool_use_result"] = structured;
+        }
+        record.to_string()
+    }
+
+    fn create_a() -> String {
+        tool_use(
+            "t1",
+            "TaskCreate",
+            json!({"subject":"Create a.txt","description":"Write a.txt with one line","activeForm":"Creating a.txt"}),
+        )
+    }
+
+    fn created_a(id: &str, is_error: bool) -> String {
+        tool_result(
+            id,
+            "Task #1 created successfully: Create a.txt",
+            is_error,
+            Some(
+                json!({"task":{"id":"1","subject":"Create a.txt","description":"Write a.txt with one line"}}),
+            ),
+        )
+    }
+
+    #[test]
+    fn a_task_call_becomes_a_step_when_its_result_names_the_id() {
+        let events = feed(&[INIT, MSG_START, &create_a(), &created_a("t1", false)]);
+        assert_eq!(
+            &events[2..],
+            &[SessionEvent::TaskAdded(TaskStep {
+                id: "1".into(),
+                subject: "Create a.txt".into(),
+                active: Some("Creating a.txt".into()),
+                status: TaskStatus::Pending,
+            })]
+        );
+        let in_background = tool_use("t2", "TaskList", json!({"run_in_background":true}));
+        let listed = tool_result("t2", "No tasks found", false, None);
+        assert_eq!(
+            feed(&[INIT, MSG_START, &in_background, &listed]).len(),
+            2,
+            "no tool line and no background task"
+        );
+        let sub = r#"{"type":"assistant","parent_tool_use_id":"t9","message":{"id":"m3","content":[{"type":"tool_use","id":"t3","name":"TaskCreate","input":{"subject":"S"}}]}}"#;
+        let sub_done = r#"{"type":"user","parent_tool_use_id":"t9","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"Task #7 created successfully: S"}]}}"#;
+        assert_eq!(
+            feed(&[INIT, MSG_START, sub, sub_done]).len(),
+            2,
+            "a sub-agent's list is not shown"
+        );
+    }
+
+    #[test]
+    fn a_task_call_that_failed_or_was_never_answered_adds_nothing() {
+        let events = feed(&[INIT, MSG_START, &create_a(), &created_a("t1", true)]);
+        assert_eq!(
+            &events[2..],
+            &[],
+            "a failed call adds no step and no tool line"
+        );
+        let events = feed(&[
+            INIT,
+            MSG_START,
+            &create_a(),
+            RESULT_OK,
+            MSG_START,
+            &created_a("t1", false),
+        ]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TaskAdded(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn an_update_changes_a_step_and_deleted_removes_it() {
+        let mut translator = Translator::new();
+        let mut push = |line: &str| translator.push(parse_line(line));
+        push(INIT);
+        push(MSG_START);
+        let update = tool_use(
+            "t1",
+            "TaskUpdate",
+            json!({"taskId":"1","status":"in_progress"}),
+        );
+        assert_eq!(push(&update), []);
+        let updated = tool_result(
+            "t1",
+            "Updated task #1 status",
+            false,
+            Some(
+                json!({"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"pending","to":"in_progress"}}),
+            ),
+        );
+        assert_eq!(
+            push(&updated),
+            [SessionEvent::TaskChanged(TaskChange {
+                id: "1".into(),
+                status: Some(TaskStatus::InProgress),
+                subject: None,
+                active: None,
+            })]
+        );
+        let delete = tool_use("t2", "TaskUpdate", json!({"taskId":"4","status":"deleted"}));
+        assert_eq!(push(&delete), []);
+        let deleted = tool_result("t2", "Updated task #4 deleted", false, None);
+        assert_eq!(
+            push(&deleted),
+            [SessionEvent::TaskRemoved { id: "4".into() }]
+        );
+    }
+
+    #[test]
+    fn an_offer_is_announced_at_its_result_and_a_refused_or_failed_one_is_not() {
+        let mut translator = Translator::new();
+        let mut push = |line: &str| translator.push(parse_line(line));
+        push(INIT);
+        push(MSG_START);
+        let choice = |label: &str| json!({"label": label, "message": format!("{label}, please.")});
+        let offer = |id: &str| {
+            tool_use(
+                id,
+                "mcp__mindrune__offer_choices",
+                json!({"question":"Keep the files?","choices":[choice("Keep"), choice("Delete")]}),
+            )
+        };
+        let expected = Choices::new(
+            "Keep the files?",
+            vec![
+                Choice {
+                    label: "Keep".into(),
+                    message: "Keep, please.".into(),
+                },
+                Choice {
+                    label: "Delete".into(),
+                    message: "Delete, please.".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(push(&offer("t1")), [], "nothing at the call");
+        let shown = |id: &str| {
+            tool_result(
+                id,
+                "Shown to the user.",
+                false,
+                Some(json!([{"type":"text","text":"Shown to the user."}])),
+            )
+        };
+        assert_eq!(push(&shown("t1")), [SessionEvent::ChoicesOffered(expected)]);
+        let four = tool_use(
+            "t2",
+            "mcp__mindrune__offer_choices",
+            json!({"question":"Which?","choices":[choice("A"), choice("B"), choice("C"), choice("D")]}),
+        );
+        assert_eq!(push(&four), []);
+        let refused = tool_result("t2", "One to three choices are needed.", true, None);
+        assert_eq!(push(&refused), []);
+        assert_eq!(push(&offer("t3")), []);
+        let denied = tool_result("t3", "Permission to use the tool was denied.", true, None);
+        assert_eq!(push(&denied), [], "the program refused the call: no box");
+    }
+
+    #[test]
+    fn an_offer_whose_result_comes_after_its_turn_shows_nothing() {
+        let offer = tool_use(
+            "t1",
+            "mcp__mindrune__offer_choices",
+            json!({"question":"Go on?","choices":[{"label":"Yes","message":"Yes."}]}),
+        );
+        let shown = tool_result("t1", "Shown to the user.", false, None);
+        let events = feed(&[INIT, MSG_START, &offer, RESULT_OK, MSG_START, &shown]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ChoicesOffered(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_create_whose_result_gives_no_id_adds_nothing() {
+        let created = tool_result("t1", "Done.", false, Some(json!({"ok":true})));
+        let events = feed(&[INIT, MSG_START, &create_a(), &created]);
+        assert_eq!(&events[2..], &[], "no step and no tool line");
+    }
+
+    #[test]
+    fn a_result_without_its_call_is_an_ordinary_result() {
+        let events = feed(&[INIT, MSG_START, &created_a("t9", false)]);
+        assert_eq!(
+            &events[2..],
+            &[SessionEvent::ToolFinished {
+                id: ToolCallId("t9".into()),
+                outcome: ToolOutcome::Ok {
+                    output: "Task #1 created successfully: Create a.txt".into()
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn the_recorded_task_list_gives_six_steps_and_no_tool_line_of_its_own() {
+        let events = replay("v12-tasks.jsonl");
+        let added: Vec<(&str, &str, Option<&str>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::TaskAdded(step) => Some((
+                    step.id.as_str(),
+                    step.subject.as_str(),
+                    step.active.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added.len(), 6);
+        assert_eq!(added[0], ("1", "Create a.txt", Some("Creating a.txt")));
+        assert_eq!(added[5].0, "6");
+        let changes: Vec<&TaskChange> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::TaskChanged(change) => Some(change),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes.len(), 12);
+        assert_eq!(
+            changes[0],
+            &TaskChange {
+                id: "1".into(),
+                status: Some(TaskStatus::InProgress),
+                subject: None,
+                active: None
+            }
+        );
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolStarted { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Write", "Write", "Write", "Bash", "Edit", "Edit", "Edit", "Bash"
+            ]
+        );
+        let finished = events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::TurnFinished(_)))
+            .count();
+        assert_eq!(finished, 2);
+    }
+
+    #[test]
+    fn the_recorded_offer_is_announced_before_its_turn_ends() {
+        let events = replay("v14-choices.jsonl");
+        let offers: Vec<&Choices> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ChoicesOffered(choices) => Some(choices),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(
+            offers[0].question,
+            "Keep or delete the three text files in this folder?"
+        );
+        assert_eq!(
+            offers[0].choices,
+            [
+                Choice {
+                    label: "Keep them".into(),
+                    message: "Keep the three text files.".into()
+                },
+                Choice {
+                    label: "Delete them".into(),
+                    message: "Delete the three text files in this folder.".into()
+                }
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, SessionEvent::ToolStarted { .. })),
+            "its search and its call are hidden"
+        );
+        let offer_at = events
+            .iter()
+            .position(|e| matches!(e, SessionEvent::ChoicesOffered(_)))
+            .unwrap();
+        let end_at = events
+            .iter()
+            .position(|e| matches!(e, SessionEvent::TurnFinished(_)))
+            .unwrap();
+        assert!(offer_at < end_at);
+        assert!(
+            events[offer_at..end_at]
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TextDelta(_))),
+            "Claude wrote on after it"
         );
     }
 

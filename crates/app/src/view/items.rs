@@ -803,7 +803,9 @@ fn line(
     }
 }
 
-fn spinner(kit: &Kit) -> El {
+/// The spinner of a line whose work goes on: a thought, a running tool call, the task list's
+/// current step.
+pub(super) fn spinner(kit: &Kit) -> El {
     Spinner::new()
         .size(LINE_ICON)
         .color(kit.c.icon_muted)

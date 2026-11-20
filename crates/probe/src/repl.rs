@@ -18,6 +18,8 @@ use mr_claude::{
 };
 use serde_json::{Value, json};
 
+use crate::choices;
+
 /// How long the probe waits for a child to end after its input was closed.
 const EXIT_WAIT: Duration = Duration::from_secs(5);
 
@@ -117,6 +119,8 @@ pub struct RawOptions {
     pub full_login: bool,
     /// Passed to the program after the probe's own arguments, in this order.
     pub extra_args: Vec<String>,
+    /// Serve the choice tool to the program and answer its requests for it (`choices`).
+    pub choices: bool,
 }
 
 /// What the probe needs to answer a `can_use_tool` request later.
@@ -133,6 +137,9 @@ enum Event {
     Typed(String),
     InputEnded,
     ChildExited(ExitInfo),
+    /// The program's message for an in-process server: the request's id and its `request`
+    /// object.
+    ForServer(String, Value),
 }
 
 /// The record file, flushed after every line because another process may be
@@ -192,7 +199,7 @@ pub fn run_raw(options: RawOptions) -> Result<(), String> {
     let fresh_id = SessionId(uuid::Uuid::new_v4().to_string());
     let config = SpawnConfig {
         program: options.program,
-        args: program_args(&spec, &fresh_id, &options.extra_args),
+        args: program_args(&spec, &fresh_id, &options.extra_args, options.choices),
         cwd: options.cwd,
         env: child_env(std::env::vars().collect(), options.full_login),
     };
@@ -202,6 +209,7 @@ pub fn run_raw(options: RawOptions) -> Result<(), String> {
         let recorder = Arc::clone(&recorder);
         let pending = Arc::clone(&pending);
         let events = events.clone();
+        let for_server = events.clone();
         ClaudeProcess::spawn(
             config,
             move |line| {
@@ -209,6 +217,9 @@ pub fn run_raw(options: RawOptions) -> Result<(), String> {
                 remember_permission_request(&line, &pending);
                 // A closed stdout must not stop the session.
                 let _ = writeln!(io::stdout().lock(), "< {}", echoed(&line));
+                if let Some((id, body)) = choices::request(&line) {
+                    let _ = for_server.send(Event::ForServer(id, body));
+                }
             },
             move |info| {
                 let _ = events.send(Event::ChildExited(info));
@@ -244,6 +255,12 @@ pub fn run_raw(options: RawOptions) -> Result<(), String> {
                 }
             }
             Ok(Event::InputEnded) => break,
+            Ok(Event::ForServer(id, body)) => {
+                // Answered also without `--choices`: the program waits for some answer.
+                if let Err(message) = session.send_line(&mr_claude::choices::reply(&id, &body)) {
+                    eprintln!("probe: {message}");
+                }
+            }
             Ok(Event::ChildExited(info)) => {
                 report_exit(&info);
                 return Ok(());
@@ -317,9 +334,18 @@ fn hide_addresses(value: &mut Value) -> bool {
     }
 }
 
-/// The program's arguments: the probe's own for `spec`, then `extra` as given.
-fn program_args(spec: &StartSpec, fresh_id: &SessionId, extra: &[String]) -> Vec<String> {
+/// The program's arguments: the probe's own for `spec`, with `choices` those of the choice
+/// tool, then `extra` as given.
+fn program_args(
+    spec: &StartSpec,
+    fresh_id: &SessionId,
+    extra: &[String],
+    choices: bool,
+) -> Vec<String> {
     let mut args = build_args(spec, Some(fresh_id));
+    if choices {
+        args.extend(mr_claude::choices::args());
+    }
     args.extend_from_slice(extra);
     args
 }
@@ -534,11 +560,17 @@ mod tests {
         spec.model = Some("opus".into());
         let id = SessionId("11111111-1111-4111-8111-111111111111".into());
         let extra = vec!["--replay-user-messages".to_string(), "--debug".to_string()];
-        let args = program_args(&spec, &id, &extra);
+        let args = program_args(&spec, &id, &extra, false);
         let own = build_args(&spec, Some(&id));
         assert_eq!(args[..own.len()], own[..]);
         assert_eq!(args[own.len()..], extra[..]);
-        assert_eq!(program_args(&spec, &id, &[]), own);
+        assert_eq!(program_args(&spec, &id, &[], false), own);
+        // The choice tool's come between, so an extra one can still override them.
+        let with = program_args(&spec, &id, &extra, true);
+        let tool = mr_claude::choices::args();
+        assert_eq!(with[..own.len()], own[..]);
+        assert_eq!(with[own.len()..own.len() + tool.len()], tool[..]);
+        assert_eq!(with[own.len() + tool.len()..], extra[..]);
     }
 
     #[test]

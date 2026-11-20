@@ -302,6 +302,19 @@ fn a_permission_request_is_answered_and_the_turn_goes_on() {
 }
 
 #[test]
+fn the_programs_call_of_the_choice_tool_is_answered() {
+    let (handle, rx) = open_stub();
+    send_text(&*handle, "offer-choices please");
+    // The stub finishes the turn only once the server's answer reached it.
+    wait_for(&rx, |event| match event {
+        SessionEvent::TurnFinished(summary) => Some(summary.clone()),
+        SessionEvent::TurnFailed { reason } => panic!("the turn failed: {reason}"),
+        SessionEvent::CommandFailed { .. } => panic!("a command failed: {event:?}"),
+        _ => None,
+    });
+}
+
+#[test]
 fn a_model_change_is_sent_and_confirmed() {
     let (handle, rx) = open_stub();
     handle

@@ -7,9 +7,9 @@ use std::fmt;
 use std::path::PathBuf;
 
 use mr_agent::{
-    Answer, Attachment, CommandKind, ContextBreakdown, ContextKind, ImageData, ModelOption,
-    PermissionMode, RemoteAccess, RemoteFailure, RequestId, SessionCommand, SessionEvent,
-    SessionId, StartSpec, StoredHistory, StoredSession,
+    Answer, Attachment, Choices, CommandKind, ContextBreakdown, ContextKind, ImageData,
+    ModelOption, PermissionMode, RemoteAccess, RemoteFailure, RequestId, SessionCommand,
+    SessionEvent, SessionId, StartSpec, StoredHistory, StoredSession, TaskList,
 };
 
 use crate::attach::{Chip, ChipState, Prepared};
@@ -138,6 +138,17 @@ pub struct Session {
     pub remote_wanted: bool,
     /// Why it last failed, in words for the user, until the next change.
     pub remote_said: Option<String>,
+    /// The steps its agent said it works through: kept while one is open when a turn ends,
+    /// and taken from the stored conversation before this run ran a turn or after the
+    /// conversation was let go.
+    pub tasks: TaskList,
+    /// The last offer of a turn that ended as finished, until the next turn starts or a message
+    /// of the user's leaves; taken from the stored conversation before this run ran a turn or
+    /// after the conversation was let go.
+    choices: Option<Choices>,
+    /// The offer a wake forgot, until the wake is undone ([`Session::unwake`] puts it back) or
+    /// the program is started for it.
+    choices_aside: Option<Choices>,
     /// What the running program was last asked of Remote Control, until its answer settles it.
     remote_asked: Option<bool>,
     /// The level the running program was last asked for, until its answer settles it.
@@ -168,6 +179,9 @@ pub struct Session {
     redelivery_starts: usize,
     /// Its program ran a turn in this run, whoever sent the prompt.
     ran_turn: bool,
+    /// Its conversation was given back to the store ([`Session::let_go`]) and no turn ran since:
+    /// the next history's list and offer are the session's, whatever `ran_turn` says.
+    let_go_since_turn: bool,
     /// `user_title` waits for a program to confirm it: it is kept between runs and told to
     /// each program that starts. Not after the program confirmed or refused it.
     name_pending: bool,
@@ -199,6 +213,9 @@ impl Session {
             remote: Remote::Off,
             remote_wanted: false,
             remote_said: None,
+            tasks: TaskList::default(),
+            choices: None,
+            choices_aside: None,
             remote_asked: None,
             effort_asked: None,
             chosen_model: None,
@@ -212,6 +229,7 @@ impl Session {
             program_gone: false,
             redelivery_starts: 0,
             ran_turn: false,
+            let_go_since_turn: false,
             name_pending: false,
         }
     }
@@ -231,8 +249,9 @@ impl Session {
     /// messages with `pictures` as [`Conversation::from_history`] takes them. The history's
     /// model, effort and mode are taken when neither the user nor the program has named them
     /// yet, except Bypass or an unknown mode, which leave the mode as it is; a resting session
-    /// forgets an effort level its model is known not to take. A history that is already
-    /// loaded is not loaded again.
+    /// forgets an effort level its model is known not to take. Its task list and its offer are
+    /// each taken when the session has none and this run has not run a turn, or none since the
+    /// conversation was let go. A history that is already loaded is not loaded again.
     pub fn load_history(&mut self, history: StoredHistory, pictures: &[Vec<u64>]) {
         if self.history == HistoryState::Loaded {
             return;
@@ -257,6 +276,14 @@ impl Session {
         {
             self.mode = mode;
         }
+        let fresh = !self.ran_turn || self.let_go_since_turn;
+        if fresh && self.tasks.is_empty() {
+            self.tasks = TaskList::from_steps(history.tasks);
+        }
+        if fresh && self.choices.is_none() {
+            self.choices = history.choices;
+        }
+        self.let_go_since_turn = false;
         self.history = HistoryState::Loaded;
     }
 
@@ -317,8 +344,10 @@ impl Session {
     }
 
     /// Gives the conversation back to the store: `Loaded` or `Loading` becomes `NotLoaded` and the
-    /// items go. Only for a session at rest that is stored, with nothing queued or undelivered.
-    /// Says whether it did. Its `generation` goes up: the items were replaced.
+    /// items go, with the task list and the offers: the store is the truth for a session no
+    /// program runs for, and the next history gives them back. Only for a session at rest that
+    /// is stored, with nothing queued or undelivered. Says whether it did. Its `generation` goes
+    /// up: the items were replaced.
     pub fn let_go(&mut self) -> bool {
         if self.phase != Phase::Resting
             || !self.is_stored()
@@ -331,6 +360,9 @@ impl Session {
         }
         self.conversation = Conversation::new();
         self.sent_images.clear();
+        self.tasks = TaskList::default();
+        self.forget_choices();
+        self.let_go_since_turn = true;
         self.history = HistoryState::NotLoaded;
         self.read_from = None;
         self.generation += 1;
@@ -366,23 +398,30 @@ impl Session {
 
     /// Resting to Opening, with `text` and the chips queued for when the program is ready.
     /// Trimmed as [`Session::submit`] trims; a resting session is woken only when
-    /// [`Session::can_send`] holds, and keeps its chips otherwise.
+    /// [`Session::can_send`] holds, and keeps its chips otherwise. The offer it forgets is kept
+    /// aside for [`Session::unwake`].
     pub fn wake(&mut self, text: &str) {
         if self.phase != Phase::Resting || !self.can_send(text) {
             return;
         }
         self.phase = Phase::Opening;
+        let offer = self.choices.take();
         let message = self.take_message(text);
         self.queue(message);
+        self.choices_aside = offer;
     }
 
     /// Undoes `wake` before a program was opened: back to Resting, giving the text back and
-    /// the chips to the session, as [`Session::take_queued`] does.
+    /// the chips to the session, as [`Session::take_queued`] does, and the offer the wake
+    /// forgot.
     pub fn unwake(&mut self) -> Option<String> {
         if self.phase != Phase::Opening || !self.is_stored() {
             return None;
         }
         self.phase = Phase::Resting;
+        if let Some(offer) = self.choices_aside.take() {
+            self.choices = Some(offer);
+        }
         self.take_queued()
     }
 
@@ -411,19 +450,22 @@ impl Session {
         spec
     }
 
-    /// A message could not be handed over: Working goes back to Idle.
+    /// A message could not be handed over: Working goes back to Idle, and the turn has ended for
+    /// the task list. It leaves no offer.
     pub fn send_failed(&mut self) {
         self.handed_over = self.handed_over.saturating_sub(1);
         if self.phase == Phase::Working {
             self.phase = Phase::Idle;
+            self.tasks.turn_ended();
+            self.forget_choices();
         }
     }
 
     /// A message's `Send` was refused because the program had ended: the message is kept in
     /// `undelivered` and no longer counts as handed over. When it was `this_program`, the one the
-    /// session has now, nothing more goes to it, and Working goes back to Idle. A message of an
-    /// earlier program is sent now when the session is Idle, and otherwise waits as a queued
-    /// message does.
+    /// session has now, nothing more goes to it, and Working goes back to Idle as at a turn's
+    /// end, with no offer. A message of an earlier program is sent now when the session is Idle,
+    /// and otherwise waits as a queued message does.
     pub fn keep_undelivered(
         &mut self,
         message: Undelivered,
@@ -435,6 +477,8 @@ impl Session {
             self.program_gone = true;
             if self.phase == Phase::Working {
                 self.phase = Phase::Idle;
+                self.tasks.turn_ended();
+                self.forget_choices();
             }
             return Vec::new();
         }
@@ -517,6 +561,7 @@ impl Session {
                     self.mode_known = true;
                     self.background = 0;
                     self.phase = Phase::Idle;
+                    self.choices_aside = None;
                     let mut commands: Vec<SessionCommand> = self
                         .pending_name()
                         .map(SessionCommand::Rename)
@@ -532,7 +577,9 @@ impl Session {
             }
             SessionEvent::TurnStarted => {
                 self.ran_turn = true;
+                self.let_go_since_turn = false;
                 self.redelivery_starts = 0;
+                self.forget_choices();
                 if !self.at_rest() {
                     self.phase = if self.conversation.waiting() > 0 {
                         Phase::NeedsUser
@@ -553,13 +600,19 @@ impl Session {
                     if summary.context_used.is_some() {
                         self.context_used = summary.context_used;
                     }
+                    if summary.interrupted {
+                        self.forget_choices();
+                    }
                     self.phase = Phase::Idle;
+                    self.tasks.turn_ended();
                     return self.send_queued();
                 }
             }
             SessionEvent::TurnFailed { .. } => {
                 if self.in_turn() {
+                    self.forget_choices();
                     self.phase = Phase::Idle;
+                    self.tasks.turn_ended();
                     return self.send_queued();
                 }
             }
@@ -581,6 +634,21 @@ impl Session {
             SessionEvent::RemoteAccess(state) => self.take_remote(state),
             SessionEvent::ContextBreakdown(breakdown) => self.context_parts = Some(breakdown),
             SessionEvent::BackgroundTasks { running } => self.background = running,
+            SessionEvent::TaskAdded(step) => {
+                self.tasks.add(step);
+            }
+            SessionEvent::TaskChanged(change) => {
+                self.tasks.change(&change);
+            }
+            SessionEvent::TaskRemoved { id } => {
+                self.tasks.remove(&id);
+            }
+            // The last offer of a turn is the one it ends with.
+            SessionEvent::ChoicesOffered(choices) => {
+                if self.in_turn() {
+                    self.choices = Some(choices);
+                }
+            }
             SessionEvent::CommandFailed { what, reason } => {
                 if what == CommandKind::Rename {
                     // The name stays on screen for this run, and is neither kept nor told again.
@@ -606,13 +674,19 @@ impl Session {
                 self.conversation
                     .push_notice(NoticeKind::CommandFailed, &format!("{wording}: {reason}"));
             }
-            // A clean end leaves a stored conversation that the next message carries on.
+            // A clean end leaves a stored conversation that the next message carries on. An
+            // offer made in a turn the end cut short is forgotten; one shown at the end stays.
             SessionEvent::Exited { clean, detail } => {
+                if self.in_turn() {
+                    self.forget_choices();
+                }
+                self.choices_aside = None;
                 self.remote = Remote::Off;
                 self.background = 0;
                 self.remote_asked = None;
                 self.effort_asked = None;
                 self.program_gone = false;
+                self.tasks.turn_ended();
                 self.phase = if clean && self.is_stored() {
                     Phase::Resting
                 } else {
@@ -713,8 +787,10 @@ impl Session {
         }
     }
 
-    /// `text` without its trailing whitespace, and all the chips, which leave the session.
+    /// `text` without its trailing whitespace, and all the chips, which leave the session. The
+    /// offer is forgotten: the user has answered it, by a choice or otherwise.
     fn take_message(&mut self, text: &str) -> Outgoing {
+        self.forget_choices();
         Outgoing {
             text: text.trim_end().into(),
             chips: std::mem::take(&mut self.chips),
@@ -908,6 +984,38 @@ impl Session {
         self.redelivery_starts += 1;
         self.phase = Phase::Opening;
         true
+    }
+
+    /// Forgets the offer, and the one a wake kept aside.
+    fn forget_choices(&mut self) {
+        self.choices = None;
+        self.choices_aside = None;
+    }
+
+    /// Forgets the offer a wake kept aside, for a session no [`Session::unwake`] will reach.
+    pub(crate) fn forget_choices_aside(&mut self) {
+        self.choices_aside = None;
+    }
+
+    /// Whether `text`, trimmed as a message is, is the message of one of the choices offered
+    /// now.
+    pub(crate) fn is_a_choice(&self, text: &str) -> bool {
+        self.choices().is_some_and(|offer| {
+            offer
+                .choices
+                .iter()
+                .any(|choice| choice.message == text.trim_end())
+        })
+    }
+
+    /// The offer its last turn ended with, while it can be answered: the session idles or
+    /// rests, no message waits to go and no request waits.
+    pub fn choices(&self) -> Option<&Choices> {
+        let free = matches!(self.phase, Phase::Idle | Phase::Resting)
+            && self.queued.is_none()
+            && self.undelivered.is_empty()
+            && self.conversation.waiting() == 0;
+        self.choices.as_ref().filter(|_| free)
     }
 
     /// It can be sent a message: its program runs or starts, or it rests and a message wakes
@@ -1175,7 +1283,25 @@ pub fn answer_words(answer: &Answer) -> String {
 /// Test data shared with other modules' tests in this crate.
 #[cfg(test)]
 pub(crate) mod testing {
-    use mr_agent::{ModelOption, PermissionMode, SessionId, SessionInfo};
+    use mr_agent::{Choice, Choices, ModelOption, PermissionMode, SessionId, SessionInfo};
+
+    /// An offer of two choices, the first a slash command.
+    pub(crate) fn offer() -> Choices {
+        Choices::new(
+            "Publish the new banner?",
+            vec![
+                Choice {
+                    label: "Publish".into(),
+                    message: "/publish".into(),
+                },
+                Choice {
+                    label: "Not now".into(),
+                    message: "Leave it for now.".into(),
+                },
+            ],
+        )
+        .unwrap()
+    }
 
     /// What a started session reports: id `s1`, folder `/p`, the Haiku model,
     /// and two models to choose from.
@@ -1210,15 +1336,15 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::info;
+    use super::testing::{info, offer};
     use super::*;
     use crate::attach::{Kind, Prepared, Problem, Source};
     use crate::conversation::{DID_NOT_FINISH, ItemBody};
     use crate::tools::{ToolCall, ToolGroup};
     use mr_agent::{
-        Attachment, HistoryItem, ImageData, QuestionAnswer, RemoteAccess, RemoteFailure,
-        SessionInfo, StoredHistory, StoredSession, ToolCallId, ToolDetail, ToolOutcome,
-        TurnSummary, UserRequest, UserRequestKind,
+        Attachment, Choice, Choices, HistoryItem, ImageData, QuestionAnswer, RemoteAccess,
+        RemoteFailure, SessionInfo, StoredHistory, StoredSession, TaskChange, TaskStatus, TaskStep,
+        ToolCallId, ToolDetail, ToolOutcome, TurnSummary, UserRequest, UserRequestKind,
     };
     use std::sync::Arc;
 
@@ -1896,6 +2022,8 @@ mod tests {
                 model: None,
                 permission_mode: None,
                 effort: None,
+                tasks: Vec::new(),
+                choices: None,
             },
             &[],
         );
@@ -2031,6 +2159,8 @@ mod tests {
                 permission_mode: Some(PermissionMode::Plan),
                 earlier_left_out: false,
                 effort: None,
+                tasks: Vec::new(),
+                choices: None,
             },
             &[],
         );
@@ -3560,5 +3690,491 @@ mod tests {
         assert_eq!(again, vec![red.clone()], "sent again");
         assert!(at_hand(&s, 4, &red));
         assert_eq!(s.sent_images.len(), 1, "held once");
+    }
+
+    fn task(id: &str, status: TaskStatus) -> TaskStep {
+        TaskStep {
+            id: id.into(),
+            subject: format!("Step {id}"),
+            active: None,
+            status,
+        }
+    }
+
+    fn added(id: &str) -> SessionEvent {
+        SessionEvent::TaskAdded(task(id, TaskStatus::Pending))
+    }
+
+    fn ticked(id: &str, status: TaskStatus) -> SessionEvent {
+        SessionEvent::TaskChanged(TaskChange {
+            id: id.into(),
+            status: Some(status),
+            subject: None,
+            active: None,
+        })
+    }
+
+    /// A started session in a turn that added steps 1 and 2 and completed step 1.
+    fn one_of_two_done() -> Session {
+        let mut s = started();
+        s.submit("Make two files");
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(added("1"), 0.0);
+        s.apply(added("2"), 0.0);
+        s.apply(ticked("1", TaskStatus::InProgress), 0.0);
+        s.apply(ticked("1", TaskStatus::Completed), 0.0);
+        s
+    }
+
+    fn stored_tasks(steps: Vec<TaskStep>) -> StoredHistory {
+        StoredHistory {
+            items: vec![said("one")],
+            tasks: steps,
+            ..StoredHistory::default()
+        }
+    }
+
+    fn step_ids(s: &Session) -> Vec<&str> {
+        s.tasks
+            .steps()
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_list_follows_the_events_and_stays_while_a_step_is_open() {
+        let mut s = one_of_two_done();
+        s.apply(done(), 0.0);
+        assert_eq!(s.tasks.steps().len(), 2, "step 2 is open");
+        assert_eq!((s.tasks.done(), s.tasks.current()), (1, Some(1)));
+    }
+
+    #[test]
+    fn a_turn_that_ends_with_every_step_ticked_clears_the_list() {
+        let mut s = one_of_two_done();
+        s.apply(ticked("2", TaskStatus::Completed), 0.0);
+        assert_eq!(s.tasks.done(), 2, "kept until the turn ends");
+        s.apply(done(), 0.0);
+        assert!(s.tasks.is_empty());
+    }
+
+    #[test]
+    fn a_failed_turn_and_an_exit_end_the_turn_for_the_list_too() {
+        let mut s = one_of_two_done();
+        s.apply(ticked("2", TaskStatus::Completed), 0.0);
+        s.apply(
+            SessionEvent::TurnFailed {
+                reason: "overloaded".into(),
+            },
+            0.0,
+        );
+        assert!(s.tasks.is_empty(), "a failed turn");
+
+        let mut s = one_of_two_done();
+        s.apply(ticked("2", TaskStatus::Completed), 0.0);
+        s.apply(killed(), 0.0);
+        assert!(s.tasks.is_empty(), "an exit");
+    }
+
+    #[test]
+    fn a_message_that_was_not_handed_over_ends_the_turn_for_the_list_too() {
+        let mut s = started();
+        s.apply(
+            SessionEvent::TaskAdded(task("1", TaskStatus::Completed)),
+            0.0,
+        );
+        s.submit("Carry on");
+        s.send_failed();
+        assert_eq!(s.phase, Phase::Idle);
+        assert!(s.tasks.is_empty(), "a Send that failed");
+
+        let mut s = started();
+        s.apply(
+            SessionEvent::TaskAdded(task("1", TaskStatus::Completed)),
+            0.0,
+        );
+        s.submit("Carry on");
+        s.keep_undelivered(
+            Undelivered {
+                text: "Carry on".into(),
+                attachments: Vec::new(),
+            },
+            true,
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        assert!(s.tasks.is_empty(), "a Send its program refused as closed");
+    }
+
+    #[test]
+    fn a_removed_step_and_an_unknown_one_cost_nothing() {
+        let mut s = one_of_two_done();
+        s.apply(SessionEvent::TaskRemoved { id: "1".into() }, 0.0);
+        s.apply(ticked("9", TaskStatus::Completed), 0.0);
+        s.apply(SessionEvent::TaskRemoved { id: "9".into() }, 0.0);
+        assert_eq!(step_ids(&s), ["2"]);
+    }
+
+    #[test]
+    fn the_stored_list_is_taken_only_before_this_run_ran_a_turn() {
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_tasks(vec![task("3", TaskStatus::InProgress)]), &[]);
+        assert_eq!(step_ids(&s), ["3"], "a resting session takes it");
+
+        let mut s = Session::resting(&stored());
+        s.wake("Make a file");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(added("5"), 0.0);
+        s.apply(done(), 0.0);
+        s.load_history(stored_tasks(vec![task("3", TaskStatus::Pending)]), &[]);
+        assert_eq!(step_ids(&s), ["5"], "this run's list wins");
+
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_tasks(vec![task("3", TaskStatus::Pending)]), &[]);
+        s.load_history(
+            stored_tasks(vec![
+                task("3", TaskStatus::Pending),
+                task("4", TaskStatus::Pending),
+            ]),
+            &[],
+        );
+        assert_eq!(step_ids(&s), ["3"], "taken once");
+
+        let mut s = Session::resting(&stored());
+        s.wake("Make a file");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(added("5"), 0.0);
+        s.apply(ticked("5", TaskStatus::Completed), 0.0);
+        s.apply(done(), 0.0);
+        assert!(s.tasks.is_empty(), "every step was ticked");
+        s.load_history(stored_tasks(vec![task("3", TaskStatus::Pending)]), &[]);
+        assert!(
+            s.tasks.is_empty(),
+            "this run's turn cleared it: a late history is not taken"
+        );
+    }
+
+    /// A resting session that ran a turn in this run, which left step 5 open and offered
+    /// [`offer`], and then ended.
+    fn ran_and_rests() -> Session {
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_tasks(Vec::new()), &[]);
+        s.wake("Make a file");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(added("5"), 0.0);
+        s.apply(offered_now(offer()), 0.0);
+        s.apply(done(), 0.0);
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!((step_ids(&s), s.choices()), (vec!["5"], Some(&offer())));
+        s
+    }
+
+    #[test]
+    fn a_conversation_that_is_let_go_takes_its_list_and_its_offer_with_it() {
+        let mut s = ran_and_rests();
+        assert!(s.let_go());
+        assert!(s.tasks.is_empty() && s.choices().is_none());
+        s.load_history(
+            StoredHistory {
+                choices: Some(other_offer()),
+                ..stored_tasks(vec![
+                    task("3", TaskStatus::Pending),
+                    task("4", TaskStatus::InProgress),
+                ])
+            },
+            &[],
+        );
+        assert_eq!(step_ids(&s), ["3", "4"], "the store's list");
+        assert_eq!(s.choices(), Some(&other_offer()), "the store's offer");
+
+        let mut s = ran_and_rests();
+        assert!(s.let_go());
+        s.load_history(stored_tasks(Vec::new()), &[]);
+        assert!(s.tasks.is_empty(), "the store has no list");
+        assert_eq!(s.choices(), None, "and no offer");
+    }
+
+    #[test]
+    fn a_task_event_is_applied_at_rest_and_while_opening() {
+        let mut s = Session::resting(&stored());
+        s.apply(added("1"), 0.0);
+        assert_eq!(step_ids(&s), ["1"], "resting");
+        let mut s = Session::opening("/p");
+        s.apply(added("1"), 0.0);
+        s.apply(ticked("1", TaskStatus::InProgress), 0.0);
+        assert_eq!(step_ids(&s), ["1"], "opening");
+        assert_eq!(s.tasks.current(), Some(0));
+    }
+
+    #[test]
+    fn a_new_and_a_resting_session_have_no_list() {
+        assert!(Session::opening("/p").tasks.is_empty());
+        assert!(Session::resting(&stored()).tasks.is_empty());
+    }
+
+    fn other_offer() -> Choices {
+        Choices::new(
+            "Which colour?",
+            vec![Choice {
+                label: "Red".into(),
+                message: "Make it red.".into(),
+            }],
+        )
+        .unwrap()
+    }
+
+    fn offered_now(choices: Choices) -> SessionEvent {
+        SessionEvent::ChoicesOffered(choices)
+    }
+
+    /// A started session in a turn that offered [`offer`].
+    fn offering() -> Session {
+        let mut s = started();
+        s.submit("go");
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(offered_now(offer()), 0.0);
+        s
+    }
+
+    /// [`offering`] once its turn has ended: the offer shows.
+    fn offer_shown() -> Session {
+        let mut s = offering();
+        s.apply(done(), 0.0);
+        assert_eq!(s.choices(), Some(&offer()));
+        s
+    }
+
+    fn stored_offer(choices: Choices) -> StoredHistory {
+        StoredHistory {
+            items: vec![said("one")],
+            choices: Some(choices),
+            ..StoredHistory::default()
+        }
+    }
+
+    #[test]
+    fn an_offer_shows_only_once_its_turn_has_ended() {
+        let mut s = offering();
+        assert_eq!(s.choices(), None, "the turn still runs");
+        s.apply(done(), 0.0);
+        assert_eq!(s.choices(), Some(&offer()));
+    }
+
+    #[test]
+    fn the_last_offer_of_a_turn_wins_and_one_outside_a_turn_is_ignored() {
+        let mut s = offering();
+        s.apply(offered_now(other_offer()), 0.0);
+        s.apply(done(), 0.0);
+        assert_eq!(
+            s.choices(),
+            Some(&other_offer()),
+            "the second replaces the first"
+        );
+        s.apply(offered_now(offer()), 0.0);
+        assert_eq!(s.choices(), Some(&other_offer()), "idle: ignored");
+
+        let mut s = started();
+        s.apply(offered_now(offer()), 0.0);
+        assert_eq!(s.choices(), None, "no turn runs");
+        let mut s = Session::resting(&stored());
+        s.apply(offered_now(offer()), 0.0);
+        assert_eq!(s.choices(), None, "it rests");
+    }
+
+    #[test]
+    fn sending_anything_forgets_the_offer() {
+        // Each turn below ends with no `TurnStarted` seen, so only the message forgets it.
+        let mut s = offer_shown();
+        s.submit("something else");
+        assert_eq!(s.choices(), None);
+        s.apply(done(), 0.0);
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.choices(), None, "also once idle again");
+
+        // A message typed while the turn still runs is queued: it forgets the offer too.
+        let mut s = offering();
+        s.submit("and then this");
+        s.apply(done(), 0.0);
+        s.apply(done(), 0.0);
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.choices(), None);
+
+        // So does the message that wakes a resting session, once its program has it.
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        assert_eq!(s.choices(), Some(&offer()));
+        s.wake("Carry on");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(done(), 0.0);
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.choices(), None);
+    }
+
+    #[test]
+    fn a_wake_that_is_undone_puts_the_offer_back() {
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        s.wake("/publish");
+        assert_eq!(s.choices(), None, "woken");
+        assert_eq!(s.unwake().as_deref(), Some("/publish"));
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.choices(), Some(&offer()));
+
+        // A message that joined the woken one forgets it for good.
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        s.wake("/publish");
+        s.submit("and more");
+        assert_eq!(s.unwake().as_deref(), Some("/publish\n\nand more"));
+        assert_eq!(s.choices(), None);
+    }
+
+    #[test]
+    fn a_wake_whose_program_was_started_puts_nothing_back() {
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        s.wake("/publish");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        assert_eq!(s.unwake(), None, "it no longer opens");
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(done(), 0.0);
+        assert_eq!(s.choices(), None, "also after that turn ends");
+        assert_eq!(s.unwake(), None);
+        assert_eq!(s.choices(), None);
+
+        // Nothing stays aside for a later open: not after the program started ...
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        s.wake("/publish");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.reopening();
+        s.unwake();
+        assert_eq!(s.choices(), None, "started");
+
+        // ... nor after a program that ended before it started.
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        s.wake("/publish");
+        s.apply(killed(), 0.0);
+        s.reopening();
+        assert_eq!(s.unwake().as_deref(), Some("/publish"));
+        assert_eq!(s.choices(), None, "ended");
+    }
+
+    #[test]
+    fn a_stopped_or_failed_turn_leaves_no_offer() {
+        let mut s = offering();
+        s.apply(
+            SessionEvent::TurnFinished(TurnSummary {
+                cost_usd: 0.25,
+                context_used: None,
+                duration_ms: 1,
+                interrupted: true,
+            }),
+            0.0,
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.choices(), None, "stopped");
+
+        let mut s = offering();
+        s.apply(
+            SessionEvent::TurnFailed {
+                reason: "overloaded".into(),
+            },
+            0.0,
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.choices(), None, "failed");
+    }
+
+    #[test]
+    fn a_message_that_was_not_handed_over_leaves_no_offer() {
+        let mut s = offering();
+        s.send_failed();
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.choices(), None, "a Send that failed");
+
+        let mut s = offering();
+        s.keep_undelivered(
+            Undelivered {
+                text: "go".into(),
+                attachments: Vec::new(),
+            },
+            true,
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        s.undelivered.clear();
+        assert_eq!(s.choices(), None, "a Send its program refused as closed");
+    }
+
+    #[test]
+    fn an_exit_in_a_turn_forgets_the_offer_and_one_at_rest_keeps_it() {
+        let mut s = offering();
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.choices(), None, "it ended mid-turn");
+
+        let mut s = offer_shown();
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.choices(), Some(&offer()), "an idle program that stops");
+    }
+
+    #[test]
+    fn a_new_turn_that_starts_by_itself_forgets_the_offer() {
+        let mut s = offer_shown();
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(done(), 0.0);
+        assert_eq!(s.choices(), None);
+    }
+
+    #[test]
+    fn the_offer_hides_while_a_request_waits_or_a_message_is_queued() {
+        let mut s = offer_shown();
+        s.apply(permission("p1"), 0.0);
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.choices(), None, "a request waits");
+        s.apply(
+            SessionEvent::RequestWithdrawn {
+                id: RequestId("p1".into()),
+            },
+            0.0,
+        );
+        assert_eq!(s.choices(), Some(&offer()));
+
+        // A woken session whose stored offer arrives late, and whose program ends before it
+        // started: the message still waits to go.
+        let mut s = Session::resting(&stored());
+        s.wake("Make a file");
+        s.load_history(stored_offer(offer()), &[]);
+        s.apply(clean_exit(), 0.0);
+        assert_eq!(s.phase, Phase::Resting);
+        assert_eq!(s.choices(), None, "a message is queued");
+        s.take_queued();
+        assert_eq!(s.choices(), Some(&offer()), "taken back");
+    }
+
+    #[test]
+    fn the_stored_offer_is_taken_only_before_this_run_ran_a_turn() {
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        assert_eq!(s.choices(), Some(&offer()), "a resting session shows it");
+
+        let mut s = Session::resting(&stored());
+        s.wake("Make a file");
+        s.apply(SessionEvent::Started(info()), 0.0);
+        s.apply(SessionEvent::TurnStarted, 0.0);
+        s.apply(done(), 0.0);
+        s.load_history(stored_offer(offer()), &[]);
+        assert_eq!(s.choices(), None, "this run's turn offered nothing");
+
+        let mut s = Session::resting(&stored());
+        s.load_history(stored_offer(offer()), &[]);
+        s.load_history(stored_offer(other_offer()), &[]);
+        assert_eq!(s.choices(), Some(&offer()), "taken once");
     }
 }
